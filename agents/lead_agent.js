@@ -56,14 +56,29 @@ async function handleInbound({ from, name, text }) {
   }
 
   // 2. Build or retrieve conversation history
-  const history = getHistory(from);
+  const history    = getHistory(from);
+  const msgCount   = store.getLead(from)?.messageCount ?? 0;
+
   if (history.length === 0 && name) {
-    // First message — prime the system with their name
+    // First message — give the AI the lead's name and behavioral constraints
     history.push({
       role: 'system',
-      content: `The lead's name is ${name}. Their WhatsApp number is ${from}.`,
+      content:
+        `Lead name: ${name}. Phone: ${from}.\n` +
+        `STRICT RULES for this conversation:\n` +
+        `1. Never start a message with the person's name. Use it at most once every 4-5 messages — only mid-sentence, never as an opener.\n` +
+        `2. This is message #${msgCount + 1} in the thread. The name count so far: 0. Enforce the 1-per-5 limit.\n` +
+        `3. Answer questions directly. Do not pivot to the trial offer until at least 2 exchanges have happened.\n` +
+        `4. If the user asks about pricing twice, give a bracket (350–400 NIS/month) and do not repeat the trial offer.`,
+    });
+  } else if (msgCount > 0 && msgCount % 5 === 0) {
+    // Every 5 messages remind the AI of the name constraint so it doesn't drift
+    history.push({
+      role: 'system',
+      content: `Reminder: you are on message #${msgCount + 1}. Do not start the next reply with the person's name.`,
     });
   }
+
   history.push({ role: 'user', content: text });
 
   // 3. Generate AI reply
@@ -83,7 +98,7 @@ async function handleInbound({ from, name, text }) {
     saveHistory(from, history);
   } catch (err) {
     logger.error('OpenAI error in lead_agent', { error: err.message });
-    reply = `Hi ${name ?? 'there'}! We're having a small technical issue right now. Our team will be in touch with you very shortly 🙏`;
+    reply = `שלום! נתקלנו בתקלה טכנית קטנה. הצוות שלנו יחזור אליך בהקדם 🙏`;
   }
 
   // 4. Score the lead silently (logged, not sent)

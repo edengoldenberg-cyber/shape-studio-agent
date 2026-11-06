@@ -4,7 +4,7 @@ const express = require('express');
 const cron    = require('node-cron');
 const logger  = require('./utils/logger');
 
-const { verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, releaseQueuedMessages, sendText, notifyLeadTeam } = require('./services/whatsapp.service');
+const { verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, releaseQueuedMessages, sendText, alertOwner, notifyLeadTeam } = require('./services/whatsapp.service');
 const { fetchAndNormalizeLead } = require('./services/metaLeads');
 const { captureRawBody, verifyMetaSignature } = require('./middleware/security');
 const inbox = require('./utils/whatsapp_inbox');
@@ -975,19 +975,21 @@ function e164ToIsraeli(e164) {
 // ── Intent detection (Hebrew scheduling patterns) ─────────────────────────────
 
 const INTENT_PATTERNS = {
-  fixed_booking:  /שבץ אותי קבוע|לקבוע קבוע|להירשם קבוע|מנוי קבוע|כל שבוע/,
-  cancellation:   /ביטול|תבטל[יה]?|לבטל|לא אגיע|לא מגיע[ה]?|לא יכול[ה]?|אבטל|ביטלתי|להסיר|תסיר אותי/,
-  booking:        /תשבץ[יה]?|שיבוץ|לשבץ|רוצה מקום|תרשמ[יה]|להירשם|להצטרף|רשמ[יה] אותי|קבע[יה] לי|אני רוצ[האה] להירשם/,
+  fixed_booking:    /שבץ אותי קבוע|לקבוע קבוע|להירשם קבוע|מנוי קבוע|כל שבוע/,
+  cancellation:     /ביטול|תבטל[יה]?|לבטל|לא אגיע|לא מגיע[ה]?|לא יכול[ה]?|אבטל|ביטלתי|להסיר|תסיר אותי/,
+  booking:          /תשבץ[יה]?|שיבוץ|לשבץ|רוצה מקום|תרשמ[יה]|להירשם|להצטרף|רשמ[יה] אותי|קבע[יה] לי|אני רוצ[האה] להירשם/,
+  representative:   /נציג|לדבר עם מישהו|לדבר עם אדם|לדבר עם בן אדם|העבר[יה]? אות[יה] לאדם|שמישהו יחזור|שיתקשרו|שיצרו קשר|אדם אמיתי/,
   // schedule_query covers both schedule listings AND instructor-specific questions
-  schedule_query: /לוח שיעורים|מה יש|מתי יש|יש שיעור|יש מקום|מה קורה|סדר יום|מה הלוח|איזה שיעורים|מה התוכנית|מה הוא שיעור|מי מדריך|מי המדריך|מי מלמד|מי מנהל|מי נותן|באיזה שעה|בכמה|מה השעה|שיעור.{0,15}ב(יום|ערב|בוקר|צהריים)|ב(יום\s)?(ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת)/,
+  schedule_query:   /לוח שיעורים|מה יש|מתי יש|יש שיעור|יש מקום|מה קורה|סדר יום|מה הלוח|איזה שיעורים|מה התוכנית|מה הוא שיעור|מי מדריך|מי המדריך|מי מלמד|מי מנהל|מי נותן|באיזה שעה|בכמה|מה השעה|שיעור.{0,15}ב(יום|ערב|בוקר|צהריים)|ב(יום\s)?(ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת)/,
 };
 
 function detectSchedulingIntent(text) {
   if (!text) return 'general';
-  if (INTENT_PATTERNS.fixed_booking.test(text))  return 'fixed_booking';
-  if (INTENT_PATTERNS.cancellation.test(text))   return 'cancellation';
-  if (INTENT_PATTERNS.booking.test(text))        return 'booking';
-  if (INTENT_PATTERNS.schedule_query.test(text)) return 'schedule_query';
+  if (INTENT_PATTERNS.representative.test(text))  return 'representative';
+  if (INTENT_PATTERNS.fixed_booking.test(text))   return 'fixed_booking';
+  if (INTENT_PATTERNS.cancellation.test(text))    return 'cancellation';
+  if (INTENT_PATTERNS.booking.test(text))         return 'booking';
+  if (INTENT_PATTERNS.schedule_query.test(text))  return 'schedule_query';
   return 'general';
 }
 
@@ -1016,13 +1018,47 @@ function isInstructorQuery(text) {
   return /מי מדריך|מי המדריך|מי מלמד|מי נותן|מי מנהל/.test(text ?? '');
 }
 
+// Extract a class-name keyword from the message for precise filtering.
+// Returns a RegExp to match class names, or null if no specific class mentioned.
+function extractClassFilter(text) {
+  if (!text) return null;
+  const t = text.toLowerCase();
+
+  // Map of Hebrew/English keywords → partial class name pattern
+  const CLASS_KEYWORDS = [
+    [/פילאטיס מכשירים|reformer|מכשירים/,              /reformer|מכשירים/i],
+    [/פילאטיס בר|barre|pilates barre/,                 /barre/i],
+    [/אימון כח|strength|כוח/,                          /strength|כח|כוח/i],
+    [/all in|אול אין|אול-אין/,                         /all\s*in/i],
+    [/עיצוב|חיטוב|toning|sculpt|concept/,              /toning|sculpt|עיצוב|חיטוב/i],
+    [/יוגה|yoga|ashtanga/,                             /yoga|יוגה|ashtanga/i],
+    [/קנגו|kangoo/,                                    /kangoo|קנגו/i],
+  ];
+
+  for (const [detect, matchRe] of CLASS_KEYWORDS) {
+    if (detect.test(t)) return matchRe;
+  }
+  return null;
+}
+
 async function buildSchedulingReply(intent, msg, clientMatch) {
-  const firstName  = (msg.name ?? clientMatch.arboxName ?? '').split(' ')[0] || 'שלום';
-  const msgText    = msg.text ?? '';
+  const msgText = msg.text ?? '';
+
+  // ── Representative / callback request ────────────────────────────────────────
+  if (intent === 'representative') {
+    const phone = normalizeToE164(msg.from);
+    store.upsertLead(phone, {
+      name: msg.name ?? clientMatch.arboxName ?? undefined,
+      meta: { ...(store.getLead(phone)?.meta ?? {}), awaitingCallbackTime: true, callbackRequestedAt: new Date().toISOString() },
+    });
+    store.logEvent('callback_requested', phone, { name: msg.name });
+    logger.info('Callback requested', { phone });
+    return `בשמחה! באיזו שעה או יום יהיה לך נוח שיחזרו אליך? 📞`;
+  }
 
   if (intent === 'cancellation') {
     return (
-      `${firstName}, בקשת הביטול שלך התקבלה ✅\n` +
+      `בקשת הביטול התקבלה ✅\n` +
       `אנחנו מעדכנים את הלוח ונחזור אליך עם אישור. ` +
       `אם תרצה/י לתאם מועד חלופי — רק תגיד/י 🗓️`
     );
@@ -1030,50 +1066,61 @@ async function buildSchedulingReply(intent, msg, clientMatch) {
 
   if (intent === 'fixed_booking') {
     return (
-      `${firstName}, נשמח לשבץ אותך קבוע! 🎯\n` +
+      `נשמח לשבץ אותך קבוע! 🎯\n` +
       `אחד מהצוות ייצור איתך קשר תוך שעה לתיאום. ` +
-      `איזה שיעור מעניין אותך? (Reformer, Pilates Barre, Strength Training…)`
+      `איזה שיעור מעניין אותך?`
     );
   }
 
   // For booking / schedule_query — pull live Arbox schedule for the right day
-  // Pass the message text so checkSchedule can extract the requested day-of-week
   let scheduleData = { classes: [], total: 0, date: null };
   try {
     scheduleData = await barakAgent.checkSchedule(msgText);
-  } catch { /* non-fatal — reply without schedule data */ }
+  } catch { /* non-fatal */ }
 
   if (intent === 'booking' || intent === 'schedule_query') {
     if (!scheduleData.classes?.length) {
       const dayLabel = scheduleData.date ? formatDateHe(scheduleData.date) : 'היום';
-      return `${firstName}, אין שיעורים ב${dayLabel}. לוח השיעורים המלא זמין בסטודיו — רוצה שאבדוק יום אחר? 🗓️`;
+      return `אין שיעורים ב${dayLabel}. רוצה שאבדוק יום אחר? 🗓️`;
     }
 
-    const dayLabel = scheduleData.date ? formatDateHe(scheduleData.date) : 'היום';
+    const dayLabel      = scheduleData.date ? formatDateHe(scheduleData.date) : 'היום';
     const instructorOnly = isInstructorQuery(msgText);
+    const classFilter    = extractClassFilter(msgText);
+
+    // Surgical filter: when the user named a specific class, show only that class
+    const relevantClasses = classFilter
+      ? scheduleData.classes.filter(c => classFilter.test(c.name))
+      : scheduleData.classes;
+
+    // If a class was named but none found that day, say so precisely
+    if (classFilter && !relevantClasses.length) {
+      const className = msgText.match(/פילאטיס מכשירים|reformer|פילאטיס בר|barre|אימון כח|strength|all in|עיצוב|חיטוב|יוגה|yoga|קנגו|kangoo/i)?.[0] ?? 'השיעור המבוקש';
+      return `לא מצאתי ${className} ב${dayLabel}. רוצה שאבדוק יום אחר? 🗓️`;
+    }
+
+    const displayClasses = relevantClasses.slice(0, 8);
 
     if (instructorOnly) {
-      // User asked specifically about an instructor — show instructor per class
-      const lines = scheduleData.classes.slice(0, 8).map(c =>
-        `• ${c.start} | ${c.name} → מדריך/ה: *${c.staff}*`
+      // Asked specifically about an instructor — answer only that
+      const lines = displayClasses.map(c =>
+        `• ${c.start} | ${c.name}\n  מדריך/ה: *${c.staff}*`
       ).join('\n');
-      return (
-        `${firstName}, המדריכים ב${dayLabel} ב-Shape Studio:\n\n` +
-        `${lines}`
-      );
+      return `ב${dayLabel}:\n\n${lines}`;
     }
 
-    // General schedule listing — show time, name, instructor, capacity
-    const lines = scheduleData.classes.slice(0, 8).map(c => {
+    // General schedule listing
+    const lines = displayClasses.map(c => {
       const cap = capacityFor(c.name);
       return `• ${c.start}–${c.end} | ${c.name}\n  מדריך/ה: ${c.staff} | ${cap} מקומות`;
     }).join('\n');
 
-    return (
-      `${firstName}, הנה שיעורי ה${dayLabel} ב-Shape Studio 🏋️\n\n` +
-      `${lines}\n\n` +
-      `רוצה מקום? ענה/י עם שם השיעור 💪`
-    );
+    // Only add a name greeting if this is a filtered (personal) query, not a full listing
+    const preamble = classFilter
+      ? `ב${dayLabel} 🏋️\n\n`
+      : `שיעורי ה${dayLabel} ב-Shape Studio 🏋️\n\n`;
+
+    return `${preamble}${lines}\n\nרוצה מקום? ענה/י עם שם השיעור 💪`;
   }
 
   return null;
@@ -1104,6 +1151,47 @@ async function processInboundWAMessage(msg) {
 
   // 2. Intent detection (only meaningful for text messages)
   const intent = msg.type === 'text' ? detectSchedulingIntent(msg.text) : 'general';
+
+  // ── Callback-time interception ────────────────────────────────────────────────
+  // When this person previously requested a human callback (awaitingCallbackTime),
+  // their NEXT message is the preferred callback time — capture it and confirm.
+  const leadState = store.getLead(fromNorm);
+  if (leadState?.meta?.awaitingCallbackTime && msg.type === 'text' && msg.text?.trim() &&
+      intent !== 'representative') {
+    const preferredTime = msg.text.trim();
+    const callbackName  = msg.name ?? clientMatch.arboxName ?? fromNorm;
+
+    // Clear the awaiting flag and log the callback task
+    store.upsertLead(fromNorm, {
+      meta: { ...(leadState.meta ?? {}), awaitingCallbackTime: false, callbackTime: preferredTime },
+    });
+    store.logEvent('callback_scheduled', fromNorm, { name: callbackName, preferredTime });
+    logger.info('Callback time captured', { phone: fromNorm, preferredTime });
+
+    // Alert studio owner so they can action it
+    alertOwner(
+      `📞 בקשת חזרה לשיחה`,
+      `*שם:* ${callbackName}\n*טלפון:* ${fromIsraeli ?? fromNorm}\n*זמן מועדף:* ${preferredTime}`
+    ).catch(() => {});
+
+    const confirmMsg = `מצוין, רשמתי — ${preferredTime}. הצוות יצור איתך קשר. יש עוד משהו שאוכל לעזור? 😊`;
+
+    if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
+      await sendText(fromNorm, confirmMsg).catch(err =>
+        logger.warn('Callback confirm send failed', { error: err.message })
+      );
+    }
+    store.logEvent('message_out', fromNorm, { preview: confirmMsg.slice(0, 80), agent: 'barak', source: 'callback_confirm' });
+
+    // Store inbox entry and exit — no further routing needed
+    inbox.push({
+      from: fromNorm, fromIsraeli, name: msg.name ?? clientMatch.arboxName ?? null,
+      text: msg.text, messageId: msg.messageId, timestamp: msg.timestamp,
+      receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
+      clientMatch, intent: 'callback_time', route: 'callback_confirm', barakReply: confirmMsg,
+    });
+    return { inboxEntry: null, clientMatch, intent: 'callback_time', route: 'callback_confirm', barakReply: confirmMsg };
+  }
 
   // 3. Routing decision
   let route     = 'unhandled';
