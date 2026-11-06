@@ -34,6 +34,7 @@
     <button class="tab-btn"        data-tab="sandbox">🧪 סנדבוקס</button>
     <button class="tab-btn"        data-tab="whatsapp">💬 וואטסאפ לייב</button>
     <button class="tab-btn"        data-tab="automations">⚙️ אוטומציות</button>
+    <button class="tab-btn"        data-tab="knowledge">🧠 ידע סוכן</button>
     <button class="tab-btn"        data-tab="health">🟢 מצב מערכת</button>
   </nav>
 
@@ -904,6 +905,123 @@
     <!-- ══════════════════════════════════════════════════════════════════════
          HEALTH — System Status
     ══════════════════════════════════════════════════════════════════════════ -->
+    <!-- ══════════════════════════════════════════════════════════════════════
+         KNOWLEDGE — Agent Memory Management
+    ══════════════════════════════════════════════════════════════════════════ -->
+    <section id="tab-knowledge" class="tab-panel">
+
+      <!-- Sync Banner -->
+      <div class="knowledge-sync-banner">
+        <div class="knowledge-sync-info">
+          <div class="knowledge-sync-title">🧠 זיכרון הסוכן</div>
+          <div class="knowledge-sync-sub" id="kn-last-synced">טרם סונכרן בסשן זה</div>
+        </div>
+        <button class="btn btn-knowledge-sync" id="btn-sync-knowledge">
+          🔄 רענן זיכרון סוכן
+        </button>
+      </div>
+
+      <!-- Sync result -->
+      <div id="kn-sync-result" class="knowledge-sync-result" style="display:none"></div>
+
+      <!-- Sub-nav -->
+      <nav class="knowledge-subnav">
+        <button class="kn-sv-btn active" data-knview="staff">👩‍🏫 צוות ומומחיות</button>
+        <button class="kn-sv-btn"        data-knview="packages">💳 מנויים ומחירים</button>
+        <button class="kn-sv-btn"        data-knview="verify">✅ אימות ידע</button>
+      </nav>
+
+      <!-- VIEW: Staff Directory -->
+      <div id="kn-view-staff">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>👩‍🏫 ספריית צוות — Shape Studio</h2>
+            <div style="display:flex;gap:8px;align-items:center">
+              <span class="refresh-tag" id="kn-staff-updated"></span>
+              <button class="btn btn-primary" id="btn-save-staff" style="font-size:12px;padding:6px 14px">💾 שמור שינויים</button>
+            </div>
+          </div>
+          <div class="knowledge-hint">
+            סמן ✅ ב<strong>שיקומי</strong> או <strong>לידה</strong> כדי שהסוכן יפנה לאותו מדריך כשמישהו שואל על אימון מותאם.
+            מלא <strong>התמחויות</strong> כדי שהסוכן יוכל לתאר אותן ב-WhatsApp.
+          </div>
+          <div class="table-wrapper">
+            <table class="leads-table" id="kn-staff-table">
+              <thead><tr>
+                <th>שם</th>
+                <th>התמחויות</th>
+                <th>🏥 שיקומי</th>
+                <th>🤰 לידה</th>
+                <th>ביוגרפיה קצרה</th>
+              </tr></thead>
+              <tbody id="kn-staff-tbody">
+                <tr><td colspan="5" class="empty-state">טוען...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- VIEW: Subscription Packages -->
+      <div id="kn-view-packages" style="display:none">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>💳 מנויים ומחירים</h2>
+            <div style="display:flex;gap:8px;align-items:center">
+              <span class="refresh-tag" id="kn-pkg-updated"></span>
+              <button class="btn btn-primary" id="btn-save-packages" style="font-size:12px;padding:6px 14px">💾 שמור שינויים</button>
+            </div>
+          </div>
+          <div class="knowledge-hint">
+            <strong>כלל גישה אוניברסלית:</strong> כל מנוי כולל גישה לכל סוגי האימונים. הסוכן ידגיש זאת אוטומטית.
+            עדכן את <strong>מחיר</strong> כדי שהסוכן יציג נתונים אמיתיים ולא יגיד "פנה לסטודיו".
+          </div>
+
+          <!-- Trial offer -->
+          <div class="pkg-trial-row" id="kn-trial-row">
+            <div class="pkg-trial-label">🎯 הצעת היכרות</div>
+            <div class="pkg-trial-fields" id="kn-trial-fields"></div>
+          </div>
+
+          <!-- Monthly packages table -->
+          <div class="table-wrapper" style="margin-top:16px">
+            <table class="leads-table" id="kn-pkg-table">
+              <thead><tr>
+                <th>שם חבילה</th>
+                <th>כניסות/חודש</th>
+                <th>מחיר (₪/חודש)</th>
+                <th>מתאים ל-</th>
+                <th>תיאור</th>
+              </tr></thead>
+              <tbody id="kn-pkg-tbody">
+                <tr><td colspan="5" class="empty-state">טוען...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- VIEW: Verification -->
+      <div id="kn-view-verify" style="display:none">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>✅ אימות ידע — בדיקת תשובות הסוכן</h2>
+          </div>
+          <div class="knowledge-hint">
+            שלח שאלות בדיקה ישירות לסוכן ובדוק שהוא מחזיר את הנתונים הנכונים.
+          </div>
+          <div class="kn-verify-grid">
+            <button class="kn-verify-btn" data-q="מה זה כולל?" data-label="גישה אוניברסלית">מה כולל המנוי?</button>
+            <button class="kn-verify-btn" data-q="כמה עולה מנוי חודשי?" data-label="מחירי מנויים">מחיר מנוי</button>
+            <button class="kn-verify-btn" data-q="יש לכם מדריכה שיקומית?" data-label="מדריך שיקומי">מדריך שיקומי</button>
+            <button class="kn-verify-btn" data-q="מי מדריך פילאטיס מכשירים ביום שישי?" data-label="מדריך Reformer שישי">מדריך Reformer שישי</button>
+          </div>
+          <div id="kn-verify-result" class="kn-verify-result" style="display:none"></div>
+        </div>
+      </div>
+
+    </section>
+
     <section id="tab-health" class="tab-panel">
       <div class="health-grid" id="health-grid"></div>
       <div class="panel">

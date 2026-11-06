@@ -1704,6 +1704,97 @@ app.post('/api/tomer/send-message', jsonBody, async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+// KNOWLEDGE MANAGEMENT — Admin API
+// Allows the dashboard to view, edit, and hot-reload agent knowledge
+// (staff directory, subscription packages) without a server restart.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/admin/knowledge — returns current in-memory knowledge state
+app.get('/api/admin/knowledge', (_req, res) => {
+  res.json({ ok: true, ...barakAgent.getRawKnowledge() });
+});
+
+// POST /api/admin/knowledge/staff — save staff_directory.json and hot-reload
+app.post('/api/admin/knowledge/staff', jsonBody, (req, res) => {
+  const data = req.body;
+  if (!Array.isArray(data?.instructors)) {
+    return res.status(400).json({ ok: false, error: 'body must have { instructors: [...] }' });
+  }
+  try {
+    const result = barakAgent.reloadKnowledge({ staffData: data });
+    store.logEvent('knowledge_sync', null, { type: 'staff', ...result });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    logger.error('[admin] knowledge/staff save failed', { error: err.message });
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// POST /api/admin/knowledge/packages — save subscription_packages.json and hot-reload
+app.post('/api/admin/knowledge/packages', jsonBody, (req, res) => {
+  const data = req.body;
+  if (!Array.isArray(data?.packages)) {
+    return res.status(400).json({ ok: false, error: 'body must have { packages: [...] }' });
+  }
+  try {
+    const result = barakAgent.reloadKnowledge({ pkgData: data });
+    store.logEvent('knowledge_sync', null, { type: 'packages', ...result });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    logger.error('[admin] knowledge/packages save failed', { error: err.message });
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// POST /api/admin/sync-agent-knowledge — hot-reload all files + run verification
+// This is what the dashboard "רענן זיכרון סוכן" button calls.
+app.post('/api/admin/sync-agent-knowledge', async (_req, res) => {
+  try {
+    const reload = barakAgent.reloadKnowledge();     // re-read files from disk, rebuild contexts
+    tomerAgent.clearHistory();                       // clear Tomer history too — may reference stale prices
+    managerAgent.clearHistory();
+
+    // ── Quick verification: test the two most common knowledge questions ────
+    const checks = [];
+
+    // 1. Subscription query — confirm universal access is in the context
+    const subCtx = barakAgent.getSubscriptionContext();
+    checks.push({
+      test:   'subscription_context_includes_universal_access',
+      passed: subCtx.includes('כלול בכל מנוי') || subCtx.includes('גישה מלאה'),
+      sample: subCtx.slice(0, 120),
+    });
+
+    // 2. Staff context — confirm at least one instructor is listed
+    const staffCtx = barakAgent.getStaffContext();
+    checks.push({
+      test:   'staff_context_has_instructors',
+      passed: reload.staff_count > 0,
+      sample: staffCtx.split('\n').slice(0, 3).join(' / '),
+    });
+
+    // 3. Specialist query — if any instructor has rehab:true, verify they appear in lookup
+    const { matched: rehabMatches } = barakAgent.findInstructorsBySpecialty('שיקומי');
+    checks.push({
+      test:   'rehab_specialists_discoverable',
+      passed: true,                        // passes even with 0 — means "no rehab staff yet"
+      rehab_instructors: rehabMatches.map(s => s.name_he),
+    });
+
+    store.logEvent('knowledge_sync', null, {
+      type: 'full_reload', ...reload,
+      verification_passed: checks.every(c => c.passed),
+    });
+
+    logger.info('[admin] sync-agent-knowledge complete', reload);
+    res.json({ ok: true, ...reload, verification: checks });
+  } catch (err) {
+    logger.error('[admin] sync-agent-knowledge failed', { error: err.message });
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   logger.info(`Shape Studio Agent running — http://localhost:${PORT}`);

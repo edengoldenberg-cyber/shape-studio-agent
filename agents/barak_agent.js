@@ -17,23 +17,26 @@ const BARAK_PROMPT = BUSINESS_CONTEXT + '\n\n---\n\n' + fs.readFileSync(
   path.join(__dirname, '../prompts/barak_prompt.md'), 'utf8'
 );
 
-// ── Staff directory & subscription packages (loaded once at startup) ──────────
-// These files are the single source of truth — edit them directly, never hard-code
-// values in prompts or agent logic.
+// ── Staff directory & subscription packages ───────────────────────────────────
+// Loaded from disk at startup; hot-reloadable at runtime via reloadKnowledge().
+// All context strings are module-level lets so the AI always sees the latest data.
 
-function loadJSON(relPath, fallback) {
+const STAFF_PATH  = path.join(__dirname, '../data/staff_directory.json');
+const PKG_PATH    = path.join(__dirname, '../data/subscription_packages.json');
+
+function loadJSON(filePath, fallback) {
   try {
-    return JSON.parse(fs.readFileSync(path.join(__dirname, relPath), 'utf8'));
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
   } catch (err) {
-    logger.warn(`[barak] Could not load ${relPath}: ${err.message}`);
+    logger.warn(`[barak] Could not load ${filePath}: ${err.message}`);
     return fallback;
   }
 }
 
-const STAFF_DIR  = loadJSON('../data/staff_directory.json', { instructors: [] });
-const SUB_PKG    = loadJSON('../data/subscription_packages.json', { trial: null, packages: [], _universal_access: '' });
+let STAFF_DIR  = loadJSON(STAFF_PATH, { instructors: [] });
+let SUB_PKG    = loadJSON(PKG_PATH,   { trial: null, packages: [], _universal_access: '' });
 
-// Pre-build a compact staff context string injected into every Barak AI call
+// Build a compact staff context string injected into every Barak AI call
 function buildStaffContext() {
   const lines = ['## Staff Directory'];
   for (const s of STAFF_DIR.instructors) {
@@ -49,7 +52,7 @@ function buildStaffContext() {
   return lines.join('\n');
 }
 
-// Pre-build a compact subscription context string
+// Build a compact subscription context string
 function buildSubscriptionContext() {
   const lines = ['## מנויי הסטודיו'];
   if (SUB_PKG._universal_access) {
@@ -68,8 +71,46 @@ function buildSubscriptionContext() {
   return lines.join('\n');
 }
 
-const STAFF_CONTEXT        = buildStaffContext();
-const SUBSCRIPTION_CONTEXT = buildSubscriptionContext();
+// Mutable context strings — rebuilt by reloadKnowledge()
+let STAFF_CONTEXT        = buildStaffContext();
+let SUBSCRIPTION_CONTEXT = buildSubscriptionContext();
+
+/**
+ * Hot-reload staff and package data from disk without restarting the server.
+ * Optionally accepts pre-validated data objects (from admin save endpoint)
+ * so the caller can persist + reload in one shot.
+ */
+function reloadKnowledge({ staffData, pkgData } = {}) {
+  if (staffData) {
+    fs.writeFileSync(STAFF_PATH, JSON.stringify(staffData, null, 2), 'utf8');
+    STAFF_DIR = staffData;
+  } else {
+    STAFF_DIR = loadJSON(STAFF_PATH, STAFF_DIR);
+  }
+
+  if (pkgData) {
+    fs.writeFileSync(PKG_PATH, JSON.stringify(pkgData, null, 2), 'utf8');
+    SUB_PKG = pkgData;
+  } else {
+    SUB_PKG = loadJSON(PKG_PATH, SUB_PKG);
+  }
+
+  STAFF_CONTEXT        = buildStaffContext();
+  SUBSCRIPTION_CONTEXT = buildSubscriptionContext();
+
+  // Clear conversation history so the next chat message starts with fresh context
+  barakHistory = [];
+
+  const result = {
+    reloaded_at:      new Date().toISOString(),
+    staff_count:      STAFF_DIR.instructors?.length ?? 0,
+    packages_count:   (SUB_PKG.packages?.length ?? 0) + (SUB_PKG.trial ? 1 : 0),
+    contexts_rebuilt: true,
+    history_cleared:  true,
+  };
+  logger.info('[barak] Knowledge reloaded', result);
+  return result;
+}
 
 let barakHistory = [];
 
@@ -627,6 +668,18 @@ function arboxConfigured() {
 
 function clearHistory() { barakHistory = []; }
 
+/** Returns raw in-memory knowledge objects (for the admin GET endpoint). */
+function getRawKnowledge() {
+  return {
+    staff:    STAFF_DIR,
+    packages: SUB_PKG,
+    contexts: {
+      staff:        STAFF_CONTEXT,
+      subscription: SUBSCRIPTION_CONTEXT,
+    },
+  };
+}
+
 module.exports = {
   chat,
   syncLeadToArbox,
@@ -643,4 +696,6 @@ module.exports = {
   findInstructorsBySpecialty,
   getSubscriptionContext,
   getStaffContext,
+  reloadKnowledge,
+  getRawKnowledge,
 };

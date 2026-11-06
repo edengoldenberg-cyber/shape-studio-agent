@@ -35,6 +35,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
       case 'sandbox':     initSandbox();         break;
       case 'whatsapp':    loadWhatsAppInbox();    break;
       case 'automations': loadAutomations();     break;
+      case 'knowledge':   loadKnowledge();       break;
     }
   });
 });
@@ -2003,6 +2004,260 @@ async function runWaSimulate() {
     if (btn) { btn.disabled = false; btn.textContent = '▶ שלח'; }
   }
 }
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   KNOWLEDGE TAB — Staff directory, subscription packages, agent sync
+   ══════════════════════════════════════════════════════════════════════════════ */
+
+let knowledgeData   = null;   // cached raw data from /api/admin/knowledge
+let activeKnView    = 'staff';
+
+// ── Sub-nav wiring ────────────────────────────────────────────────────────────
+document.querySelectorAll('.kn-sv-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.kn-sv-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    activeKnView = btn.dataset.knview;
+    showKnView(activeKnView);
+  });
+});
+
+function showKnView(view) {
+  ['staff','packages','verify'].forEach(v => {
+    const el = document.getElementById(`kn-view-${v}`);
+    if (el) el.style.display = v === view ? '' : 'none';
+  });
+}
+
+// ── Load knowledge from server ────────────────────────────────────────────────
+async function loadKnowledge(force = false) {
+  if (knowledgeData && !force) { renderKnowledge(knowledgeData); return; }
+  try {
+    const d = await fetch('/api/admin/knowledge').then(r => r.json());
+    knowledgeData = d;
+    renderKnowledge(d);
+  } catch (err) {
+    toast(`❌ שגיאה בטעינת ידע: ${err.message}`);
+  }
+}
+
+function renderKnowledge(d) {
+  renderStaffTable(d.staff?.instructors ?? []);
+  renderPackages(d.packages ?? {});
+  showKnView(activeKnView);
+}
+
+// ── Staff table ───────────────────────────────────────────────────────────────
+function renderStaffTable(instructors) {
+  const tbody = document.getElementById('kn-staff-tbody');
+  if (!tbody) return;
+  if (!instructors.length) {
+    tbody.innerHTML = `<tr><td colspan="5" class="empty-state">אין מדריכים בספרייה</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = instructors.map((s, i) => {
+    const specs = (s.specialties ?? []).join(', ');
+    const bio   = s.bio ?? '';
+    return `
+      <tr data-idx="${i}">
+        <td style="font-weight:600;white-space:nowrap">${esc(s.name_he)}<br><span style="font-size:11px;color:var(--muted)">${esc(s.name_en ?? '')}</span></td>
+        <td><input class="kn-edit-input kn-spec" data-idx="${i}" value="${esc(specs)}" placeholder="פילאטיס, שיקומי..." style="min-width:160px"/></td>
+        <td style="text-align:center">
+          <button class="kn-toggle-btn ${s.rehab ? 'on' : 'off'}" data-idx="${i}" data-field="rehab" title="${s.rehab ? 'שיקומי ✓' : 'לא שיקומי'}">
+            ${s.rehab ? '✅' : '⬜'}
+          </button>
+        </td>
+        <td style="text-align:center">
+          <button class="kn-toggle-btn ${s.pre_postnatal ? 'on' : 'off'}" data-idx="${i}" data-field="pre_postnatal" title="${s.pre_postnatal ? 'לידה ✓' : 'לא לידה'}">
+            ${s.pre_postnatal ? '✅' : '⬜'}
+          </button>
+        </td>
+        <td><input class="kn-edit-input kn-bio" data-idx="${i}" value="${esc(bio)}" placeholder="תיאור קצר..." style="min-width:180px"/></td>
+      </tr>`;
+  }).join('');
+
+  // Toggle buttons
+  tbody.querySelectorAll('.kn-toggle-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const idx   = parseInt(btn.dataset.idx, 10);
+      const field = btn.dataset.field;
+      knowledgeData.staff.instructors[idx][field] = !knowledgeData.staff.instructors[idx][field];
+      renderStaffTable(knowledgeData.staff.instructors);
+    });
+  });
+
+  // Live-sync text inputs into knowledgeData
+  tbody.querySelectorAll('.kn-spec').forEach(inp => {
+    inp.addEventListener('change', () => {
+      const idx = parseInt(inp.dataset.idx, 10);
+      knowledgeData.staff.instructors[idx].specialties =
+        inp.value.split(',').map(s => s.trim()).filter(Boolean);
+    });
+  });
+  tbody.querySelectorAll('.kn-bio').forEach(inp => {
+    inp.addEventListener('change', () => {
+      const idx = parseInt(inp.dataset.idx, 10);
+      knowledgeData.staff.instructors[idx].bio = inp.value.trim();
+    });
+  });
+
+  const upEl = document.getElementById('kn-staff-updated');
+  if (upEl) upEl.textContent = 'עודכן: ' + now();
+}
+
+// ── Packages panel ────────────────────────────────────────────────────────────
+function renderPackages(pkg) {
+  // Trial
+  const trialFields = document.getElementById('kn-trial-fields');
+  if (trialFields && pkg.trial) {
+    const t = pkg.trial;
+    trialFields.innerHTML = `
+      <label>כניסות: <input class="kn-edit-input" id="kn-trial-entries" value="${esc(String(t.entries ?? 2))}" style="max-width:60px"/></label>
+      <label>מחיר ₪: <input class="kn-edit-input" id="kn-trial-price" type="number" value="${t.price_ils ?? ''}" placeholder="60" style="max-width:80px"/></label>
+      <label>תיאור: <input class="kn-edit-input" id="kn-trial-desc" value="${esc(t.description ?? '')}" style="min-width:220px"/></label>
+    `;
+    document.getElementById('kn-trial-entries')?.addEventListener('change', e => { knowledgeData.packages.trial.entries = parseInt(e.target.value) || 2; });
+    document.getElementById('kn-trial-price')?.addEventListener('change',   e => { knowledgeData.packages.trial.price_ils = e.target.value ? parseFloat(e.target.value) : null; });
+    document.getElementById('kn-trial-desc')?.addEventListener('change',   e => { knowledgeData.packages.trial.description = e.target.value.trim(); });
+  }
+
+  // Monthly packages
+  const tbody = document.getElementById('kn-pkg-tbody');
+  if (!tbody) return;
+  const packages = pkg.packages ?? [];
+  if (!packages.length) {
+    tbody.innerHTML = `<tr><td colspan="5" class="empty-state">אין חבילות מנוי</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = packages.map((p, i) => `
+    <tr data-idx="${i}">
+      <td><input class="kn-edit-input kn-pkg-name" data-idx="${i}" value="${esc(p.name ?? '')}" /></td>
+      <td style="text-align:center">${p.entries_per_month != null ? p.entries_per_month : '∞'}</td>
+      <td><input class="kn-edit-input kn-pkg-price" data-idx="${i}" type="number" value="${p.price_ils ?? ''}" placeholder="לפי בקשה" style="max-width:100px"/></td>
+      <td><input class="kn-edit-input kn-pkg-best" data-idx="${i}" value="${esc(p.best_for ?? '')}" /></td>
+      <td><input class="kn-edit-input kn-pkg-desc" data-idx="${i}" value="${esc(p.description ?? '')}" style="min-width:180px"/></td>
+    </tr>`).join('');
+
+  tbody.querySelectorAll('.kn-pkg-name').forEach(inp => {
+    inp.addEventListener('change', () => { knowledgeData.packages.packages[parseInt(inp.dataset.idx)].name = inp.value.trim(); });
+  });
+  tbody.querySelectorAll('.kn-pkg-price').forEach(inp => {
+    inp.addEventListener('change', () => {
+      knowledgeData.packages.packages[parseInt(inp.dataset.idx)].price_ils = inp.value ? parseFloat(inp.value) : null;
+    });
+  });
+  tbody.querySelectorAll('.kn-pkg-best').forEach(inp => {
+    inp.addEventListener('change', () => { knowledgeData.packages.packages[parseInt(inp.dataset.idx)].best_for = inp.value.trim(); });
+  });
+  tbody.querySelectorAll('.kn-pkg-desc').forEach(inp => {
+    inp.addEventListener('change', () => { knowledgeData.packages.packages[parseInt(inp.dataset.idx)].description = inp.value.trim(); });
+  });
+
+  const upEl = document.getElementById('kn-pkg-updated');
+  if (upEl) upEl.textContent = 'עודכן: ' + now();
+}
+
+// ── Save staff ────────────────────────────────────────────────────────────────
+document.getElementById('btn-save-staff')?.addEventListener('click', async () => {
+  const btn = document.getElementById('btn-save-staff');
+  btn.disabled = true; btn.textContent = '⏳ שומר...';
+  try {
+    const r = await post('/api/admin/knowledge/staff', knowledgeData.staff);
+    if (!r.ok) throw new Error(r.error);
+    // Trigger full reload so contexts rebuild
+    await triggerSync(false);
+    toast('✅ פרטי צוות נשמרו ו-Agent עודכן');
+  } catch (err) {
+    toast(`❌ ${err.message}`);
+  } finally {
+    btn.disabled = false; btn.textContent = '💾 שמור שינויים';
+  }
+});
+
+// ── Save packages ─────────────────────────────────────────────────────────────
+document.getElementById('btn-save-packages')?.addEventListener('click', async () => {
+  const btn = document.getElementById('btn-save-packages');
+  btn.disabled = true; btn.textContent = '⏳ שומר...';
+  try {
+    const r = await post('/api/admin/knowledge/packages', knowledgeData.packages);
+    if (!r.ok) throw new Error(r.error);
+    await triggerSync(false);
+    toast('✅ פרטי מנויים נשמרו ו-Agent עודכן');
+  } catch (err) {
+    toast(`❌ ${err.message}`);
+  } finally {
+    btn.disabled = false; btn.textContent = '💾 שמור שינויים';
+  }
+});
+
+// ── Sync button (top banner) ──────────────────────────────────────────────────
+document.getElementById('btn-sync-knowledge')?.addEventListener('click', async () => {
+  await triggerSync(true);
+});
+
+async function triggerSync(showDetails = true) {
+  const btn    = document.getElementById('btn-sync-knowledge');
+  const result = document.getElementById('kn-sync-result');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ מסנכרן...'; }
+  if (result) result.style.display = 'none';
+
+  try {
+    const d = await post('/api/admin/sync-agent-knowledge', {});
+    if (!d.ok) throw new Error(d.error);
+
+    // Refresh local cache
+    knowledgeData = null;
+    await loadKnowledge(true);
+
+    const ts  = new Date(d.reloaded_at).toLocaleTimeString('he-IL');
+    const sub = document.getElementById('kn-last-synced');
+    if (sub) sub.textContent = `סונכרן ב-${ts} | ${d.staff_count} מדריכים · ${d.packages_count} חבילות`;
+
+    if (showDetails && result) {
+      const checks = (d.verification ?? []).map(c =>
+        `${c.passed ? '✅' : '❌'} ${c.test}${c.sample ? ` — ${c.sample.slice(0,80)}` : ''}${c.rehab_instructors?.length ? ` | שיקומי: ${c.rehab_instructors.join(', ')}` : ''}`
+      ).join('\n');
+      result.className = 'knowledge-sync-result';
+      result.innerHTML = `<strong>✅ הסוכן עודכן בהצלחה</strong> — ${ts}<br><pre style="margin:8px 0 0;font-size:12px;white-space:pre-wrap">${esc(checks)}</pre>`;
+      result.style.display = '';
+    }
+    toast('✅ זיכרון סוכן רוענן');
+  } catch (err) {
+    if (result) {
+      result.className = 'knowledge-sync-result error';
+      result.textContent = `❌ שגיאה: ${err.message}`;
+      result.style.display = '';
+    }
+    toast(`❌ ${err.message}`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '🔄 רענן זיכרון סוכן'; }
+  }
+}
+
+// ── Verification buttons ──────────────────────────────────────────────────────
+document.querySelectorAll('.kn-verify-btn').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const q      = btn.dataset.q;
+    const label  = btn.dataset.label;
+    const result = document.getElementById('kn-verify-result');
+    result.style.display = '';
+    result.innerHTML = `<div class="vr-intent">⏳ שולח: "${esc(q)}"...</div>`;
+
+    try {
+      const d = await post('/api/whatsapp/simulate', { from: '972500000001', name: 'בדיקה', text: q });
+      const intent = d.intent ?? '—';
+      const route  = d.route  ?? '—';
+      const reply  = d.barakReply;
+      result.innerHTML = `
+        <div class="vr-intent">📋 <strong>${esc(label)}</strong> | כוונה: <code>${esc(intent)}</code> · ניתוב: <code>${esc(route)}</code></div>
+        ${reply
+          ? `<div class="vr-reply" style="margin-top:8px;white-space:pre-wrap">${esc(reply)}</div>`
+          : `<div class="vr-lead-ai" style="margin-top:8px">↳ נשלח ל-lead_agent (תשובת AI בוואטסאפ ישירות)</div>`}`;
+    } catch (err) {
+      result.innerHTML = `<div class="vr-intent" style="color:var(--hot)">❌ ${esc(err.message)}</div>`;
+    }
+  });
+});
 
 /* ── Boot ───────────────────────────────────────────────────────────────────── */
 pingServer();
