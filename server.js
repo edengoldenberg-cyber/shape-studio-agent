@@ -979,17 +979,23 @@ const INTENT_PATTERNS = {
   cancellation:     /ביטול|תבטל[יה]?|לבטל|לא אגיע|לא מגיע[ה]?|לא יכול[ה]?|אבטל|ביטלתי|להסיר|תסיר אותי/,
   booking:          /תשבץ[יה]?|שיבוץ|לשבץ|רוצה מקום|תרשמ[יה]|להירשם|להצטרף|רשמ[יה] אותי|קבע[יה] לי|אני רוצ[האה] להירשם/,
   representative:   /נציג|לדבר עם מישהו|לדבר עם אדם|לדבר עם בן אדם|העבר[יה]? אות[יה] לאדם|שמישהו יחזור|שיתקשרו|שיצרו קשר|אדם אמיתי/,
+  // specialist_query: rehab, pre/post-natal, specific instructor background
+  specialist_query: /שיקומ|rehab|rehabilit|מדריכ.{0,5}שיקומ|אחרי לידה|לאחר לידה|בהריון|pre.?natal|post.?natal|מדריכ.{0,10}מוסמכ|קורס.{0,10}מדריכ|מתמחה ב|מתמחה עם/,
+  // subscription_query: questions about membership packages and what's included
+  subscription_query: /מה זה כולל|כולל מה|מה כלול|מה נכלל|איזה שיעורים כלול|כמה כניסות|מנוי חודשי|מנויים|חבילה|חבילות|כמה עולה מנוי|מחיר מנוי|עלות מנוי|כמה עולה חבר|מנוי ב|מנוי ל/,
   // schedule_query covers both schedule listings AND instructor-specific questions
   schedule_query:   /לוח שיעורים|מה יש|מתי יש|יש שיעור|יש מקום|מה קורה|סדר יום|מה הלוח|איזה שיעורים|מה התוכנית|מה הוא שיעור|מי מדריך|מי המדריך|מי מלמד|מי מנהל|מי נותן|באיזה שעה|בכמה|מה השעה|שיעור.{0,15}ב(יום|ערב|בוקר|צהריים)|ב(יום\s)?(ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת)/,
 };
 
 function detectSchedulingIntent(text) {
   if (!text) return 'general';
-  if (INTENT_PATTERNS.representative.test(text))  return 'representative';
-  if (INTENT_PATTERNS.fixed_booking.test(text))   return 'fixed_booking';
-  if (INTENT_PATTERNS.cancellation.test(text))    return 'cancellation';
-  if (INTENT_PATTERNS.booking.test(text))         return 'booking';
-  if (INTENT_PATTERNS.schedule_query.test(text))  return 'schedule_query';
+  if (INTENT_PATTERNS.representative.test(text))    return 'representative';
+  if (INTENT_PATTERNS.fixed_booking.test(text))     return 'fixed_booking';
+  if (INTENT_PATTERNS.cancellation.test(text))      return 'cancellation';
+  if (INTENT_PATTERNS.booking.test(text))           return 'booking';
+  if (INTENT_PATTERNS.specialist_query.test(text))  return 'specialist_query';
+  if (INTENT_PATTERNS.subscription_query.test(text)) return 'subscription_query';
+  if (INTENT_PATTERNS.schedule_query.test(text))    return 'schedule_query';
   return 'general';
 }
 
@@ -1001,8 +1007,11 @@ const CLASS_CAPACITY = {
   reformer: 8,
 };
 
+// Both English "Reformer" and Hebrew "פילאטיס מכשירים" (and variants) → 8
+const REFORMER_PATTERN = /reformer|מכשירים/i;
+
 function capacityFor(className) {
-  return /reformer/i.test(className ?? '') ? CLASS_CAPACITY.reformer : CLASS_CAPACITY.default;
+  return REFORMER_PATTERN.test(className ?? '') ? CLASS_CAPACITY.reformer : CLASS_CAPACITY.default;
 }
 
 // Hebrew weekday names for display
@@ -1054,6 +1063,55 @@ async function buildSchedulingReply(intent, msg, clientMatch) {
     store.logEvent('callback_requested', phone, { name: msg.name });
     logger.info('Callback requested', { phone });
     return `בשמחה! באיזו שעה או יום יהיה לך נוח שיחזרו אליך? 📞`;
+  }
+
+  // ── Specialist instructor query ──────────────────────────────────────────────
+  if (intent === 'specialist_query') {
+    const { matched, all } = barakAgent.findInstructorsBySpecialty(msgText);
+    if (matched.length) {
+      const lines = matched.map(s => {
+        const specs = s.specialties?.length ? s.specialties.join(' | ') : '';
+        const flags = [
+          s.rehab         ? '🏥 שיקומי'       : null,
+          s.pre_postnatal ? '🤰 לידה ולאחריה' : null,
+        ].filter(Boolean).join(' ');
+        const bio = s.bio ? `\n  ${s.bio}` : '';
+        return `• *${s.name_he}* — ${specs}${flags ? ` ${flags}` : ''}${bio}`;
+      }).join('\n');
+      return `יש לנו מדריכ/ה מתאים/ה:\n\n${lines}\n\nרוצה לתאם שיעור?`;
+    }
+    // No match in directory → transparent answer
+    return `נכון לעכשיו אין לנו מידע מלא על מדריכים בהתמחות זו. אפשר לפנות לסטודיו ישירות כדי לקבל תשובה מדויקת.`;
+  }
+
+  // ── Subscription / membership query (Bug 3 & 4) ───────────────────────────
+  if (intent === 'subscription_query') {
+    const subCtx    = barakAgent.getSubscriptionContext();
+    // Check if the question is specifically about what's included
+    const isIncludesQ = /מה זה כולל|כולל מה|מה כלול|מה נכלל|איזה שיעורים כלול/.test(msgText);
+
+    if (isIncludesQ) {
+      return (
+        `המנוי כולל גישה מלאה לכל סוגי האימונים בסטודיו 🏋️\n\n` +
+        `פילאטיס מכשירים (Reformer) · אימוני כוח · Pilates Barre · ` +
+        `Concept Toning · ALL IN · Ashtanga Yoga · Kangoo Jumps\n\n` +
+        `אין הגבלה לסוג שיעור — רק מספר הכניסות החודשי קובע את החבילה.`
+      );
+    }
+
+    // General pricing question — return structured packages from the data file
+    const lines = [];
+    if (barakAgent.getSubscriptionContext().includes('מנויים חודשיים')) {
+      lines.push(`השתמש בנתוני המנויים שצויינו ב-context שלך כדי לענות.`);
+    }
+    // Fall through to tomerAgent.chat so the AI can compose a natural answer
+    // using SUBSCRIPTION_CONTEXT already injected into barak's system messages
+    return await tomerAgent.chat(
+      `המשתמש שאל: "${msgText}"\n\n` +
+      `ענה בעברית על מבנה המנויים של Shape Studio לפי הנתונים הבאים:\n\n${subCtx}\n\n` +
+      `כלל חשוב: כל מנוי כולל גישה לכל סוגי האימונים. ציין זאת בתשובה. ` +
+      `אם המחיר לא מצוין (null) — ציין "פנה/י לסטודיו לפרטי מחיר". עד 4 שורות.`
+    );
   }
 
   if (intent === 'cancellation') {

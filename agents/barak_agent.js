@@ -17,6 +17,60 @@ const BARAK_PROMPT = BUSINESS_CONTEXT + '\n\n---\n\n' + fs.readFileSync(
   path.join(__dirname, '../prompts/barak_prompt.md'), 'utf8'
 );
 
+// ── Staff directory & subscription packages (loaded once at startup) ──────────
+// These files are the single source of truth — edit them directly, never hard-code
+// values in prompts or agent logic.
+
+function loadJSON(relPath, fallback) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(__dirname, relPath), 'utf8'));
+  } catch (err) {
+    logger.warn(`[barak] Could not load ${relPath}: ${err.message}`);
+    return fallback;
+  }
+}
+
+const STAFF_DIR  = loadJSON('../data/staff_directory.json', { instructors: [] });
+const SUB_PKG    = loadJSON('../data/subscription_packages.json', { trial: null, packages: [], _universal_access: '' });
+
+// Pre-build a compact staff context string injected into every Barak AI call
+function buildStaffContext() {
+  const lines = ['## Staff Directory'];
+  for (const s of STAFF_DIR.instructors) {
+    const specs  = s.specialties?.length ? s.specialties.join(', ') : 'ללא מידע';
+    const flags  = [
+      s.rehab          ? '🏥 שיקומי'       : null,
+      s.pre_postnatal  ? '🤰 לידה ולאחריה' : null,
+    ].filter(Boolean).join(' | ');
+    const certLine = s.certifications?.length ? ` | תעודות: ${s.certifications.join(', ')}` : '';
+    const bioLine  = s.bio ? ` — ${s.bio}` : '';
+    lines.push(`• ${s.name_he}${s.name_en ? ` (${s.name_en})` : ''}: ${specs}${flags ? ` | ${flags}` : ''}${certLine}${bioLine}`);
+  }
+  return lines.join('\n');
+}
+
+// Pre-build a compact subscription context string
+function buildSubscriptionContext() {
+  const lines = ['## מנויי הסטודיו'];
+  if (SUB_PKG._universal_access) {
+    lines.push(`\n**כלול בכל מנוי:** ${SUB_PKG._universal_access}\n`);
+  }
+  if (SUB_PKG.trial) {
+    const t = SUB_PKG.trial;
+    lines.push(`**${t.name}:** ${t.entries} אימונים ב-${t.price_ils} ש"ח — ${t.description}`);
+  }
+  lines.push('');
+  lines.push('**מנויים חודשיים לפי מספר כניסות:**');
+  for (const p of (SUB_PKG.packages ?? [])) {
+    const price = p.price_ils != null ? `${p.price_ils} ש"ח/חודש` : 'מחיר — פנה/י לסטודיו';
+    lines.push(`• **${p.name}** — ${price} | ${p.description} | מתאים ל: ${p.best_for}`);
+  }
+  return lines.join('\n');
+}
+
+const STAFF_CONTEXT        = buildStaffContext();
+const SUBSCRIPTION_CONTEXT = buildSubscriptionContext();
+
 let barakHistory = [];
 
 // ── Live Arbox tools ──────────────────────────────────────────────────────────
@@ -120,9 +174,10 @@ async function checkSchedule(dateOrQuery) {
     const classes  = await arbox.getUpcomingClasses({ days: 14, limit: 100 });
     const filtered = classes.filter(c => c.date === targetDate);
 
-    // Apply canonical capacity limits (Reformer = 8, all others = 10)
+    // Apply canonical capacity limits (Reformer = 8, all others = 10).
+    // Pattern covers both "Reformer" (English) and "פילאטיס מכשירים" (Hebrew).
     const withCapacity = filtered.map(c => {
-      const isReformer = /reformer/i.test(c.session_name ?? '');
+      const isReformer = /reformer|מכשירים/i.test(c.session_name ?? '');
       return {
         id:              c.schedule_id,
         name:            c.session_name,
@@ -199,7 +254,7 @@ async function buildContext() {
   // Group classes by date and apply canonical capacity limits
   const classesByDate = {};
   for (const c of allClasses) {
-    const isReformer = /reformer/i.test(c.session_name ?? '');
+    const isReformer = /reformer|מכשירים/i.test(c.session_name ?? '');
     const entry = {
       name:  c.session_name,
       start: c.start_time,
@@ -306,6 +361,10 @@ async function chat(userMessage) {
       messages:    [
         { role: 'system', content: BARAK_PROMPT },
         { role: 'system', content: context },
+        // Staff directory and subscription packages are injected as separate system
+        // messages so they never compete for space with the live Arbox context.
+        { role: 'system', content: STAFF_CONTEXT },
+        { role: 'system', content: SUBSCRIPTION_CONTEXT },
         ...barakHistory,
       ],
       temperature: 0.2,
@@ -321,6 +380,33 @@ async function chat(userMessage) {
   barakHistory = barakHistory.slice(-30);
   return reply;
 }
+
+// ── Staff directory public helpers ─────────────────────────────────────────────
+
+/**
+ * Find instructors matching a specialty keyword (rehab, pre/post-natal, etc.)
+ * @param {string} query - free Hebrew/English text
+ * @returns {{ matched: object[], all: object[] }}
+ */
+function findInstructorsBySpecialty(query) {
+  const q = (query ?? '').toLowerCase();
+  const matched = STAFF_DIR.instructors.filter(s => {
+    // Check rehab / שיקומי flag
+    if (/שיקומ|rehab|rehabilit/.test(q) && s.rehab) return true;
+    // Check pre/post-natal flag
+    if (/הריון|לידה|לאחר לידה|postnatal|prenatal|maternity/.test(q) && s.pre_postnatal) return true;
+    // Check freetext against specialties and certifications
+    return (s.specialties ?? []).some(sp => sp.toLowerCase().includes(q) || q.includes(sp.toLowerCase()))
+      || (s.certifications ?? []).some(c => c.toLowerCase().includes(q));
+  });
+  return { matched, all: STAFF_DIR.instructors };
+}
+
+/** Return subscription package context string (for lead_agent and server.js). */
+function getSubscriptionContext() { return SUBSCRIPTION_CONTEXT; }
+
+/** Return staff directory context string. */
+function getStaffContext() { return STAFF_CONTEXT; }
 
 // ── Data Validation & Integrity Audit ────────────────────────────────────────
 
@@ -554,4 +640,7 @@ module.exports = {
   runDataValidation,
   getLastValidation,
   clearHistory,
+  findInstructorsBySpecialty,
+  getSubscriptionContext,
+  getStaffContext,
 };

@@ -1,0 +1,40 @@
+{
+  "_note": "Update price_ils, entries_per_month, and description whenever pricing changes. The agent reads this file at startup and uses it to answer pricing questions. Set a field to null to hide it from users.",
+  "_universal_access": "כל מנוי — בכל רמה — כולל גישה מלאה לכל סוגי האימונים בסטודיו: פילאטיס מכשירים (Reformer), אימוני כוח, Pilates Barre, Concept Toning, ALL IN, Ashtanga Yoga, Kangoo Jumps. אין הגבלה לסוג שיעור בתוך החבילה.",
+  "trial": {
+    "name": "הצעת היכרות",
+    "entries": 2,
+    "price_ils": 60,
+    "commitment": false,
+    "description": "2 אימונים לבחירה, ללא התחייבות — לחברים חדשים בלבד."
+  },
+  "packages": [
+    {
+      "id": "pkg_8",
+      "name": "8 כניסות לחודש",
+      "entries_per_month": 8,
+      "price_ils": null,
+      "commitment_months": 1,
+      "description": "מתאים לאלה שמגיעים פעמיים בשבוע. גישה לכל סוגי האימונים.",
+      "best_for": "מגיעים 2× בשבוע"
+    },
+    {
+      "id": "pkg_12",
+      "name": "12 כניסות לחודש",
+      "entries_per_month": 12,
+      "price_ils": null,
+      "commitment_months": 1,
+      "description": "מתאים לאלה שמגיעים 3 פעמים בשבוע. הפופולרי ביותר בסטודיו.",
+      "best_for": "מגיעים 3× בשבוע — הפופולרי ביותר"
+    },
+    {
+      "id": "pkg_unlimited",
+      "name": "ללא הגבלה",
+      "entries_per_month": null,
+      "price_ils": null,
+      "commitment_months": 1,
+      "description": "גישה בלתי מוגבלת לכל האימונים כל החודש.",
+      "best_for": "מגיעים 4+ בשבוע"
+    }
+  ]
+}

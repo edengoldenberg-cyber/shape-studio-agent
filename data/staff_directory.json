@@ -1,0 +1,145 @@
+{
+  "_note": "Update specialties, certifications and bio lines whenever a staff member changes role or gains a new certification. This file is loaded at startup and injected into every Barak context window.",
+  "instructors": [
+    {
+      "name_he": "עדן גולדנברג",
+      "name_en": "Eden Goldenberg",
+      "primary_classes": ["אימון כח", "Strength Training"],
+      "specialties": ["אימוני כוח ופיתוח גוף", "strength & conditioning"],
+      "certifications": [],
+      "rehab": false,
+      "pre_postnatal": false,
+      "bio": "מדריך כוח ראשי בסטודיו."
+    },
+    {
+      "name_he": "מלאני מנדוזה",
+      "name_en": "Melanie Mendoza",
+      "primary_classes": ["פילאטיס מכשירים", "Reformer Pilates"],
+      "specialties": ["פילאטיס מכשירים", "Reformer Pilates", "חיטוב ועיצוב"],
+      "certifications": [],
+      "rehab": false,
+      "pre_postnatal": false,
+      "bio": "מדריכת Reformer Pilates מוסמכת."
+    },
+    {
+      "name_he": "ליז שטיין",
+      "name_en": "Liz Stein",
+      "primary_classes": ["פילאטיס מכשירים", "Reformer Pilates"],
+      "specialties": ["פילאטיס מכשירים", "Reformer Pilates"],
+      "certifications": [],
+      "rehab": false,
+      "pre_postnatal": false,
+      "bio": "מדריכת Reformer Pilates מוסמכת."
+    },
+    {
+      "name_he": "מירי (פוטין) שמילוב",
+      "name_en": "Miri Shmilof",
+      "primary_classes": ["עיצוב חיטוב", "אימון כח", "Concept Toning"],
+      "specialties": ["עיצוב וחיטוב", "אימוני כוח לנשים", "toning & sculpt"],
+      "certifications": [],
+      "rehab": false,
+      "pre_postnatal": false,
+      "bio": "מדריכה ותיקה בסטודיו, מתמחה בעיצוב גוף לנשים."
+    },
+    {
+      "name_he": "שיר פינקלשטיין",
+      "name_en": "Shir Finkelstein",
+      "primary_classes": [],
+      "specialties": [],
+      "certifications": [],
+      "rehab": false,
+      "pre_postnatal": false,
+      "bio": ""
+    },
+    {
+      "name_he": "ליזה לוינה",
+      "name_en": "Liza Levina",
+      "primary_classes": [],
+      "specialties": [],
+      "certifications": [],
+      "rehab": false,
+      "pre_postnatal": false,
+      "bio": ""
+    },
+    {
+      "name_he": "אלינה פיש",
+      "name_en": "Alina Fish",
+      "primary_classes": [],
+      "specialties": [],
+      "certifications": [],
+      "rehab": false,
+      "pre_postnatal": false,
+      "bio": ""
+    },
+    {
+      "name_he": "דנה וסקו",
+      "name_en": "Dana Vasko",
+      "primary_classes": [],
+      "specialties": [],
+      "certifications": [],
+      "rehab": false,
+      "pre_postnatal": false,
+      "bio": ""
+    },
+    {
+      "name_he": "אור גולדנברג",
+      "name_en": "Or Goldenberg",
+      "primary_classes": [],
+      "specialties": [],
+      "certifications": [],
+      "rehab": false,
+      "pre_postnatal": false,
+      "bio": ""
+    },
+    {
+      "name_he": "כרמל אלברטמן",
+      "name_en": "Carmel Albertman",
+      "primary_classes": [],
+      "specialties": [],
+      "certifications": [],
+      "rehab": false,
+      "pre_postnatal": false,
+      "bio": ""
+    },
+    {
+      "name_he": "מעיין אללי",
+      "name_en": "Maayan Alali",
+      "primary_classes": [],
+      "specialties": [],
+      "certifications": [],
+      "rehab": false,
+      "pre_postnatal": false,
+      "bio": ""
+    },
+    {
+      "name_he": "דיאנה מקסימוב",
+      "name_en": "Diana Maximov",
+      "primary_classes": [],
+      "specialties": [],
+      "certifications": [],
+      "rehab": false,
+      "pre_postnatal": false,
+      "bio": ""
+    },
+    {
+      "name_he": "נוי היינה",
+      "name_en": "Noy Heina",
+      "primary_classes": [],
+      "specialties": [],
+      "certifications": [],
+      "rehab": false,
+      "pre_postnatal": false,
+      "bio": ""
+    },
+    {
+      "name_he": "רעיה כהן",
+      "name_en": "Raya Cohen",
+      "primary_classes": [],
+      "specialties": [],
+      "certifications": [],
+      "rehab": false,
+      "pre_postnatal": false,
+      "bio": ""
+    }
+  ]
+}

@@ -51,11 +51,30 @@ Women aged **30–60**, Sharon region. Core profile:
 4. **Trial → Member** conversion
 5. **Member retention** → monthly check-ins, community
 
-## The 60 NIS Offer — Golden Rule
-**NEVER** send full pricing or membership costs over WhatsApp.
-If asked about price: pivot to the trial offer.
-*"יש לנו הצעת היכרות — 2 אימונים ב-60 ש״ח. בלי התחייבות, פשוט תרגיש/י מה המקום נותן."*
-(Use "תרגיש" for male, "תרגישי" for female.)
+## Introductory Trial Offer
+2 אימונים ב-60 ש"ח — לחברים חדשים בלבד, ללא התחייבות.
+(Use "תרגיש" for male, "תרגישי" for female in messages.)
+
+---
+
+## Subscription Packages — Universal Access Rule
+
+**CRITICAL:** Every membership — regardless of level — includes full unrestricted access to ALL class types:
+פילאטיס מכשירים (Reformer) · אימוני כוח · Pilates Barre · Concept Toning · ALL IN · Ashtanga Yoga · Kangoo Jumps
+
+**When asked "מה זה כולל?" — always state the universal access rule explicitly and completely. Never imply that a subscription covers only Reformer or any single class type.**
+
+The studio offers **entry-based monthly memberships (מנויים לפי מספר כניסות חודשיות)**:
+
+| Package | Entries/month | Best for |
+|---|---|---|
+| 8 כניסות | 8 | מגיעים 2× בשבוע |
+| 12 כניסות | 12 | מגיעים 3× בשבוע (הפופולרי ביותר) |
+| ללא הגבלה | ∞ | מגיעים 4+ בשבוע |
+
+Exact prices are stored in `data/subscription_packages.json`. The agent reads them at runtime. If a price is null — tell the user to contact the studio for current pricing.
+
+Do **not** quote a vague single bracket like "350–400 NIS". Present the named packages.
 
 ## Hard Limits (All Agents)
 - Zero authority to cancel memberships or issue refunds → escalate to human
