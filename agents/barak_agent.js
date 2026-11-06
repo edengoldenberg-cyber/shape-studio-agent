@@ -68,34 +68,76 @@ async function lookupClient(phoneOrName) {
   return { query, results, total: results.length };
 }
 
-/**
- * Pull today's (or a given date's) class schedule from Arbox.
- */
-async function checkSchedule(date) {
-  const targetDate = date
-    ? new Date(date).toISOString().split('T')[0]
-    : new Date().toISOString().split('T')[0];
+// ── Hebrew day-of-week resolver ───────────────────────────────────────────────
+// Maps Hebrew day names to the nearest future date with that weekday.
+// Sunday = 0 (Israel week starts Sunday).
 
-  const endDate = new Date(new Date(targetDate).getTime() + 86400000)
-    .toISOString().split('T')[0];
+const HE_DAY_MAP = {
+  'ראשון':  0, 'sunday':    0,
+  'שני':    1, 'monday':    1,
+  'שלישי':  2, 'tuesday':   2,
+  'רביעי':  3, 'wednesday': 3,
+  'חמישי':  4, 'thursday':  4,
+  'שישי':   5, 'friday':    5,
+  'שבת':    6, 'saturday':  6,
+};
+
+function resolveTargetDate(query) {
+  if (!query) return new Date().toISOString().split('T')[0];
+
+  // If it's already a YYYY-MM-DD date string, return it directly
+  if (/^\d{4}-\d{2}-\d{2}$/.test(query)) return query;
+
+  const lc = query.toLowerCase();
+  for (const [token, weekday] of Object.entries(HE_DAY_MAP)) {
+    if (lc.includes(token)) {
+      const today  = new Date();
+      const diff   = (weekday - today.getDay() + 7) % 7 || 7; // always future
+      const target = new Date(today);
+      target.setDate(today.getDate() + diff);
+      return target.toISOString().split('T')[0];
+    }
+  }
+
+  // "היום" / "today" — stay on today
+  if (lc.includes('היום') || lc.includes('today')) {
+    return new Date().toISOString().split('T')[0];
+  }
+
+  return new Date().toISOString().split('T')[0];
+}
+
+/**
+ * Pull a day's class schedule from Arbox.
+ * @param {string} [dateOrQuery] - ISO date, Hebrew day name, or free text containing a day name.
+ *   Omit for today.
+ */
+async function checkSchedule(dateOrQuery) {
+  const targetDate = resolveTargetDate(dateOrQuery ?? null);
 
   try {
-    const classes = await arbox.getUpcomingClasses({ days: 1, limit: 30 });
+    // Fetch 14 days so any day-of-week query within 2 weeks is covered
+    const classes  = await arbox.getUpcomingClasses({ days: 14, limit: 100 });
     const filtered = classes.filter(c => c.date === targetDate);
 
-    store.logEvent('barak_schedule_check', null, {
-      agent: 'barak', date: targetDate, classCount: filtered.length,
+    // Apply canonical capacity limits (Reformer = 8, all others = 10)
+    const withCapacity = filtered.map(c => {
+      const isReformer = /reformer/i.test(c.session_name ?? '');
+      return {
+        id:              c.schedule_id,
+        name:            c.session_name,
+        start:           c.start_time,
+        end:             c.end_time,
+        maxParticipants: isReformer ? 8 : 10,
+        staff:           c.staff_member?.name ?? '—',
+        date:            c.date,
+      };
     });
-    return {
-      date: targetDate,
-      classes: filtered.map(c => ({
-        id: c.schedule_id, name: c.session_name,
-        start: c.start_time, end: c.end_time,
-        maxParticipants: c.max_participants,
-        staff: c.staff_member?.name ?? '—',
-      })),
-      total: filtered.length,
-    };
+
+    store.logEvent('barak_schedule_check', null, {
+      agent: 'barak', date: targetDate, classCount: withCapacity.length,
+    });
+    return { date: targetDate, classes: withCapacity, total: withCapacity.length };
   } catch (err) {
     return { date: targetDate, error: err.message, classes: [] };
   }
@@ -146,12 +188,30 @@ async function buildContext() {
   const now      = new Date().toLocaleString('he-IL', { timeZone: 'Asia/Jerusalem' });
 
   // Fetch live Arbox data in parallel (graceful failures)
-  const [classified, todayClasses, staffList, retention] = await Promise.all([
+  // Schedule: fetch 14 days so day-of-week queries ("ביום שלישי") are always answerable
+  const [classified, allClasses, staffList, retention] = await Promise.all([
     arbox.classifyMemberships({ limit: 500 }).catch(() => null),
-    checkSchedule().catch(() => ({ classes: [], total: 0 })),
+    arbox.getUpcomingClasses({ days: 14, limit: 200 }).catch(() => []),
     arbox.getStaff().catch(() => []),
     arbox.getRetentionHealth(store).catch(() => null),
   ]);
+
+  // Group classes by date and apply canonical capacity limits
+  const classesByDate = {};
+  for (const c of allClasses) {
+    const isReformer = /reformer/i.test(c.session_name ?? '');
+    const entry = {
+      name:  c.session_name,
+      start: c.start_time,
+      end:   c.end_time,
+      staff: c.staff_member?.name ?? '—',
+      maxParticipants: isReformer ? 8 : 10,
+    };
+    (classesByDate[c.date] = classesByDate[c.date] ?? []).push(entry);
+  }
+
+  const todayStr      = new Date().toISOString().split('T')[0];
+  const todayClasses  = { classes: classesByDate[todayStr] ?? [], total: (classesByDate[todayStr] ?? []).length };
   const detail = classified?.summary ?? null;
   const lastVal = getLastValidation();
 
@@ -197,10 +257,27 @@ async function buildContext() {
   lines.push('### שיעורים היום');
   if (todayClasses.total > 0) {
     todayClasses.classes.forEach(c =>
-      lines.push(`  • ${c.start} ${c.name} | מדריך: ${c.staff} | ${c.maxParticipants} מקומות`)
+      lines.push(`  • ${c.start}–${c.end} | ${c.name} | מדריך: ${c.staff} | מקסימום: ${c.maxParticipants}`)
     );
   } else {
     lines.push('  אין שיעורים היום');
+  }
+
+  // Full week schedule — allows Barak AI to answer "מי מדריך ביום שלישי בערב?" accurately
+  const HE_DAYS_DISPLAY = ['ראשון','שני','שלישי','רביעי','חמישי','שישי','שבת'];
+  const sortedDates = Object.keys(classesByDate).sort().filter(d => d >= todayStr).slice(0, 7);
+  if (sortedDates.length > 1) {
+    lines.push('', '### לוח שיעורים שבועי (14 ימים קדימה)');
+    for (const date of sortedDates) {
+      if (date === todayStr) continue; // already shown above
+      const d       = new Date(date);
+      const heDay   = HE_DAYS_DISPLAY[d.getDay()];
+      const display = `${heDay} ${d.toLocaleDateString('he-IL', { day: 'numeric', month: 'numeric' })}`;
+      lines.push(`  📅 ${display}`);
+      (classesByDate[date] ?? []).forEach(c =>
+        lines.push(`    • ${c.start}–${c.end} | ${c.name} | מדריך: ${c.staff} | מקס: ${c.maxParticipants}`)
+      );
+    }
   }
 
   if (retention) {

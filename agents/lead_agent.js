@@ -129,11 +129,11 @@ function scoreLeadFromHistory(history) {
 }
 
 async function sendIntroOffer(to, name) {
-  const firstName = name?.split(' ')[0] ?? 'there';
+  const firstName = name?.split(' ')[0] ?? 'שלום';
   const message =
-    `${firstName}, before I forget — we have an exclusive intro offer for new members 🎉\n\n` +
-    `*2 full workouts of your choice for just 60 NIS.* No commitment, no pressure — just come feel the vibe and see if Shape Studio is right for you.\n\n` +
-    `Spots are limited. Want me to reserve yours? 💪`;
+    `${firstName}, אם תרצה/י לנסות — יש לנו הצעת היכרות למצטרפים חדשים.\n\n` +
+    `*2 אימונים לבחירה ב-60 ש״ח.* בלי התחייבות, פשוט תרגיש/י מה המקום נותן ותחליט/י.\n\n` +
+    `מעניין אותך? 💪`;
   await sendText(to, message);
 }
 

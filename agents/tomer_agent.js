@@ -107,21 +107,52 @@ async function runDailyChecks() {
   return result;
 }
 
+// ── Gender detection ──────────────────────────────────────────────────────────
+// Infers lead gender from first name so messages use correct Hebrew forms.
+// Returns 'male' | 'female'. Defaults to 'female' (studio's primary audience).
+
+const MALE_FIRST_NAMES = new Set([
+  'עדן', 'eden', 'אמיר', 'amir', 'יוסי', 'yossi', 'דוד', 'david', 'ניר', 'nir',
+  'גל', 'gal', 'רון', 'ron', 'עמית', 'amit', 'נועם', 'noam', 'אבי', 'avi',
+  'יוני', 'joni', 'אלון', 'alon', 'שחר', 'shahar', 'אריאל', 'ariel', 'אורי', 'uri',
+  'ליאור', 'lior', 'רועי', 'roi', 'אסף', 'assaf', 'עמר', 'omer', 'תמיר', 'tamir',
+  'ינון', 'yanon', 'אייל', 'eyal', 'שלומי', 'shlomi', 'מתן', 'matan', 'ניצן', 'nitzan',
+]);
+
+function detectGender(lead) {
+  const firstName = (lead.name ?? '').trim().split(/\s+/)[0].toLowerCase();
+  return MALE_FIRST_NAMES.has(firstName) ? 'male' : 'female';
+}
+
 // ── Message senders ───────────────────────────────────────────────────────────
 
 async function sendReEngagement(phone, firstName, touchNumber) {
+  const lead   = store.getLead(phone);
+  const gender = detectGender(lead ?? { name: firstName });
+
   const messages = {
-    1: `${firstName}, שלום! 😊 קצת שקט מצידך — רציתי לבדוק שהכל בסדר. אנחנו פה ב-Shape Studio עם מקום בשיעורים. הגיע הזמן לנסות? 💪`,
-    2: `${firstName}, שבוע עבר! אנחנו עדיין פה ועדיין רוצים לראות אותך. אולי שיעור אחר יתאים יותר? ספרי לי מה מעניין אותך ואני אמצא לך זמן. 🧘‍♀️`,
-    3: `${firstName}, לא רוצה להעיק — אבל לא אוכל לא לשאול 🙂 אם עדיין מתלבטת, אשמח לענות על שאלות. ואם שינית כיוון — אין בעיה. תמיד מוזמנת. 🙏`,
+    1: {
+      female: `${firstName}, שלום! 😊 קצת שקט — רציתי לבדוק שהכל בסדר. אנחנו פה ב-Shape Studio. הגיע הזמן לנסות? 💪`,
+      male:   `${firstName}, שלום! 😊 קצת שקט מצידך — רציתי לבדוק שהכל בסדר. אנחנו פה ב-Shape Studio. הגיע הזמן לנסות? 💪`,
+    },
+    2: {
+      female: `${firstName}, שבוע עבר! עדיין רוצים לראות אותך. אולי שיעור אחר יתאים יותר? ספרי לי מה מעניין אותך ואמצא לך זמן. 🧘‍♀️`,
+      male:   `${firstName}, שבוע עבר! עדיין רוצים לראות אותך. אולי שיעור אחר יתאים יותר? ספר לי מה מעניין אותך ואמצא לך זמן. 💪`,
+    },
+    3: {
+      female: `${firstName}, לא רוצה להעיק 🙂 אם עדיין מתלבטת, אשמח לענות על שאלות. ואם שינית כיוון — אין בעיה. תמיד מוזמנת. 🙏`,
+      male:   `${firstName}, לא רוצה להעיק 🙂 אם עדיין מתלבט, אשמח לענות על שאלות. ואם שינית כיוון — אין בעיה. תמיד מוזמן. 🙏`,
+    },
   };
-  await sendText(phone, messages[touchNumber] ?? messages[1]);
-  store.logEvent('re_engagement_sent', phone, { touchNumber });
-  logger.info('Re-engagement sent', { phone, touchNumber });
+
+  const set = messages[touchNumber] ?? messages[1];
+  await sendText(phone, set[gender]);
+  store.logEvent('re_engagement_sent', phone, { touchNumber, gender });
+  logger.info('Re-engagement sent', { phone, touchNumber, gender });
 }
 
 async function sendIntroFollowUp(phone, firstName) {
-  const msg = `${firstName}, שלחנו לך לאחרונה הצעת היכרות מיוחדת — 2 אימונים ב-60 ש״ח. עדיין תקפה! רוצה לקבוע? 🎯`;
+  const msg = `${firstName}, שלחנו לך לאחרונה הצעת היכרות — 2 אימונים ב-60 ש״ח. עדיין תקפה! רוצה לקבוע? 🎯`;
   await sendText(phone, msg);
   store.logEvent('re_engagement_sent', phone, { type: 'intro_followup' });
   logger.info('Intro offer follow-up sent', { phone });

@@ -978,7 +978,8 @@ const INTENT_PATTERNS = {
   fixed_booking:  /שבץ אותי קבוע|לקבוע קבוע|להירשם קבוע|מנוי קבוע|כל שבוע/,
   cancellation:   /ביטול|תבטל[יה]?|לבטל|לא אגיע|לא מגיע[ה]?|לא יכול[ה]?|אבטל|ביטלתי|להסיר|תסיר אותי/,
   booking:        /תשבץ[יה]?|שיבוץ|לשבץ|רוצה מקום|תרשמ[יה]|להירשם|להצטרף|רשמ[יה] אותי|קבע[יה] לי|אני רוצ[האה] להירשם/,
-  schedule_query: /לוח שיעורים|מה יש|מתי יש|יש שיעור|יש מקום|מה קורה|סדר יום|מה הלוח|איזה שיעורים|מה התוכנית|מה הוא שיעור/,
+  // schedule_query covers both schedule listings AND instructor-specific questions
+  schedule_query: /לוח שיעורים|מה יש|מתי יש|יש שיעור|יש מקום|מה קורה|סדר יום|מה הלוח|איזה שיעורים|מה התוכנית|מה הוא שיעור|מי מדריך|מי המדריך|מי מלמד|מי מנהל|מי נותן|באיזה שעה|בכמה|מה השעה|שיעור.{0,15}ב(יום|ערב|בוקר|צהריים)|ב(יום\s)?(ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת)/,
 };
 
 function detectSchedulingIntent(text) {
@@ -992,14 +993,38 @@ function detectSchedulingIntent(text) {
 
 // ── Barak scheduling draft reply ──────────────────────────────────────────────
 
+// Class capacity constants — single source of truth
+const CLASS_CAPACITY = {
+  default:  10,
+  reformer: 8,
+};
+
+function capacityFor(className) {
+  return /reformer/i.test(className ?? '') ? CLASS_CAPACITY.reformer : CLASS_CAPACITY.default;
+}
+
+// Hebrew weekday names for display
+const HE_DAYS_DISPLAY = ['ראשון','שני','שלישי','רביעי','חמישי','שישי','שבת'];
+
+function formatDateHe(isoDate) {
+  const d = new Date(isoDate);
+  return `${HE_DAYS_DISPLAY[d.getDay()]} ${d.toLocaleDateString('he-IL', { day:'numeric', month:'numeric' })}`;
+}
+
+// Detect whether the message is asking about a specific instructor
+function isInstructorQuery(text) {
+  return /מי מדריך|מי המדריך|מי מלמד|מי נותן|מי מנהל/.test(text ?? '');
+}
+
 async function buildSchedulingReply(intent, msg, clientMatch) {
-  const firstName = (msg.name ?? clientMatch.arboxName ?? '').split(' ')[0] || 'שלום';
+  const firstName  = (msg.name ?? clientMatch.arboxName ?? '').split(' ')[0] || 'שלום';
+  const msgText    = msg.text ?? '';
 
   if (intent === 'cancellation') {
     return (
       `${firstName}, בקשת הביטול שלך התקבלה ✅\n` +
       `אנחנו מעדכנים את הלוח ונחזור אליך עם אישור. ` +
-      `אם תרצ/י לתאם מועד חלופי — רק תגיד/י! 🗓️`
+      `אם תרצה/י לתאם מועד חלופי — רק תגיד/י 🗓️`
     );
   }
 
@@ -1011,23 +1036,43 @@ async function buildSchedulingReply(intent, msg, clientMatch) {
     );
   }
 
-  // For booking / schedule_query — pull live schedule from Barak
-  let scheduleData = { classes: [], total: 0 };
+  // For booking / schedule_query — pull live Arbox schedule for the right day
+  // Pass the message text so checkSchedule can extract the requested day-of-week
+  let scheduleData = { classes: [], total: 0, date: null };
   try {
-    scheduleData = await barakAgent.checkSchedule();
+    scheduleData = await barakAgent.checkSchedule(msgText);
   } catch { /* non-fatal — reply without schedule data */ }
 
   if (intent === 'booking' || intent === 'schedule_query') {
     if (!scheduleData.classes?.length) {
-      return `${firstName}, אין שיעורים נוספים היום. בדוק/י את הלוח שלנו מחר בבוקר! 🗓️`;
+      const dayLabel = scheduleData.date ? formatDateHe(scheduleData.date) : 'היום';
+      return `${firstName}, אין שיעורים ב${dayLabel}. לוח השיעורים המלא זמין בסטודיו — רוצה שאבדוק יום אחר? 🗓️`;
     }
-    const lines = scheduleData.classes.slice(0, 5).map(c =>
-      `• ${c.start} — ${c.name} (מדריך/ה: ${c.staff}, ${c.maxParticipants} מקומות)`
-    ).join('\n');
+
+    const dayLabel = scheduleData.date ? formatDateHe(scheduleData.date) : 'היום';
+    const instructorOnly = isInstructorQuery(msgText);
+
+    if (instructorOnly) {
+      // User asked specifically about an instructor — show instructor per class
+      const lines = scheduleData.classes.slice(0, 8).map(c =>
+        `• ${c.start} | ${c.name} → מדריך/ה: *${c.staff}*`
+      ).join('\n');
+      return (
+        `${firstName}, המדריכים ב${dayLabel} ב-Shape Studio:\n\n` +
+        `${lines}`
+      );
+    }
+
+    // General schedule listing — show time, name, instructor, capacity
+    const lines = scheduleData.classes.slice(0, 8).map(c => {
+      const cap = capacityFor(c.name);
+      return `• ${c.start}–${c.end} | ${c.name}\n  מדריך/ה: ${c.staff} | ${cap} מקומות`;
+    }).join('\n');
+
     return (
-      `${firstName}, הנה השיעורים הקרובים היום ב-Shape Studio 🏋️\n\n` +
+      `${firstName}, הנה שיעורי ה${dayLabel} ב-Shape Studio 🏋️\n\n` +
       `${lines}\n\n` +
-      `רוצה מקום? ענה/י עם שם השיעור שמעניין אותך 💪`
+      `רוצה מקום? ענה/י עם שם השיעור 💪`
     );
   }
 
