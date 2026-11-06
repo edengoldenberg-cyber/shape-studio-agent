@@ -1,0 +1,43 @@
+{
+  "_note": "Staff roster for appointment routing and notifications. Edit via dashboard (/api/admin/staff). Phone must be E.164 without + (e.g. 972501234567). Email is used for calendar invites and email alerts.",
+  "default_assignee_id": "eden",
+  "appointment_duration_min": 30,
+  "staff": [
+    {
+      "id": "eden",
+      "name_he": "עדן",
+      "name_en": "Eden Goldenberg",
+      "phone": "972535716559",
+      "email": "",
+      "role": "owner",
+      "active": true,
+      "is_default_assignee": true,
+      "classes": ["Strength Training", "אימון כח"],
+      "note": "מנהל הסטודיו"
+    },
+    {
+      "id": "melanie",
+      "name_he": "מלאני",
+      "name_en": "Melanie Mendoza",
+      "phone": "",
+      "email": "",
+      "role": "instructor",
+      "active": true,
+      "is_default_assignee": false,
+      "classes": ["Reformer Pilates", "פילאטיס מכשירים"],
+      "note": "Reformer Pilates specialist"
+    },
+    {
+      "id": "miri",
+      "name_he": "מירי",
+      "name_en": "Miri Shmilof",
+      "phone": "",
+      "email": "",
+      "role": "instructor",
+      "active": true,
+      "is_default_assignee": false,
+      "classes": ["Concept Toning", "עיצוב חיטוב"],
+      "note": ""
+    }
+  ]
+}

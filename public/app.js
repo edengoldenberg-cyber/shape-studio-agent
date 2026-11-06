@@ -33,7 +33,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
       case 'tomer':       loadTomerQueue();      break;
       case 'health':      loadHealth();          break;
       case 'sandbox':     initSandbox();         break;
-      case 'whatsapp':    loadWhatsAppInbox();    break;
+      case 'whatsapp':    loadWaThreads(); connectWaSSE(); break;
       case 'automations': loadAutomations();     break;
       case 'knowledge':   loadKnowledge();       break;
     }
@@ -1670,27 +1670,35 @@ function feedDetail(e) {
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════
-   WHATSAPP LIVE INBOX
+   WHATSAPP LIVE — Threaded Chat Interface
    ══════════════════════════════════════════════════════════════════════════════ */
 
 // ── State ─────────────────────────────────────────────────────────────────────
-let waMessages      = [];     // all messages from last fetch
-let waActiveId      = null;   // id of selected message
-let waActiveFilter  = 'all';  // current filter chip
+let waThreads      = [];    // cached thread summaries
+let waActivePhone  = null;  // phone of currently open thread
+let waActiveThread = null;  // full thread data with messages
+let waSearchQuery  = '';    // search filter text
+let waSSE          = null;  // EventSource for real-time updates
 
-// ── Intent label / colour maps ────────────────────────────────────────────────
+// ── Intent / route label maps ─────────────────────────────────────────────────
 const WA_INTENT = {
-  cancellation:   { label: 'ביטול',        cls: 'cancellation' },
-  booking:        { label: 'הזמנה',        cls: 'booking' },
-  fixed_booking:  { label: 'שיבוץ קבוע',  cls: 'fixed_booking' },
-  schedule_query: { label: 'לוח שיעורים', cls: 'schedule_query' },
-  general:        { label: 'כללי',          cls: 'general' },
+  cancellation:          { label: 'ביטול',       cls: 'cancellation'   },
+  booking:               { label: 'הזמנה',       cls: 'booking'        },
+  fixed_booking:         { label: 'שיבוץ קבוע', cls: 'fixed_booking'  },
+  reschedule:            { label: 'שינוי מועד',  cls: 'booking'        },
+  representative:        { label: 'נציג',         cls: 'booking'        },
+  schedule_query:        { label: 'לוח שיעורים',cls: 'schedule_query' },
+  general:               { label: 'כללי',         cls: 'general'        },
 };
 
 const WA_ROUTE = {
-  barak:      { label: 'ברק',        cls: 'barak' },
-  lead_agent: { label: 'ליד-סוכן',  cls: 'lead_agent' },
-  unhandled:  { label: 'לא נוצל',   cls: 'general' },
+  barak:                   { label: 'ברק',         cls: 'barak'      },
+  lead_agent:              { label: 'ליד-סוכן',   cls: 'lead_agent' },
+  tomer:                   { label: 'תומר',        cls: 'barak'      },
+  appointment_created:     { label: 'פגישה',       cls: 'booking'    },
+  appointment_rescheduled: { label: 'שינוי פגישה',cls: 'booking'    },
+  reschedule_prompt:       { label: 'שינוי מועד', cls: 'booking'    },
+  unhandled:               { label: 'לא נוצל',    cls: 'general'    },
 };
 
 const AVATAR_COLORS = ['#4f46e5','#ec4899','#10b981','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#84cc16'];
@@ -1703,257 +1711,291 @@ function initials(name) {
   if (!name) return '?';
   return name.trim().split(/\s+/).map(w => w[0]).join('').slice(0, 2).toUpperCase();
 }
+function formatThreadTime(ts) {
+  if (!ts) return '';
+  const d   = new Date(ts);
+  const now = new Date();
+  if (d.toDateString() === now.toDateString())
+    return d.toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' });
+  const yesterday = new Date(now); yesterday.setDate(now.getDate() - 1);
+  if (d.toDateString() === yesterday.toDateString()) return 'אתמול';
+  return d.toLocaleDateString('he-IL', { day: 'numeric', month: 'numeric' });
+}
 
-// ── Load inbox ────────────────────────────────────────────────────────────────
-async function loadWhatsAppInbox() {
+// ── SSE connection ────────────────────────────────────────────────────────────
+function connectWaSSE() {
+  if (waSSE) return;
+  const dot = document.getElementById('wa-sse-dot');
   try {
-    const [inboxRes, statsRes] = await Promise.all([
-      fetch('/api/whatsapp/inbox?limit=50').then(r => r.json()),
-      fetch('/api/whatsapp/stats').then(r => r.json()),
-    ]);
-    waMessages = inboxRes.messages ?? [];
-    renderWaStats(statsRes, inboxRes.messages ?? []);
-    renderWaMsgList();
-    const upEl = document.getElementById('wa-inbox-updated');
-    if (upEl) upEl.textContent = 'עודכן: ' + now();
-  } catch (e) {
-    console.error('loadWhatsAppInbox', e);
-    setTBody !== undefined && document.getElementById('wa-messages-list')
-      && (document.getElementById('wa-messages-list').innerHTML = `<div class="empty-state" style="padding:32px">שגיאה: ${esc(e.message)}</div>`);
+    waSSE = new EventSource('/api/whatsapp/stream');
+
+    waSSE.onopen = () => {
+      if (dot) { dot.classList.remove('disconnected'); dot.classList.add('connected'); dot.title = 'מחובר — בזמן אמת'; }
+    };
+    waSSE.onmessage = (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        if (data.event === 'message') {
+          loadWaThreads(false);
+          if (waActivePhone && waActivePhone === data.phone) loadActiveThread(data.phone);
+        }
+      } catch {}
+    };
+    waSSE.onerror = () => {
+      if (dot) { dot.classList.remove('connected'); dot.classList.add('disconnected'); dot.title = 'לא מחובר'; }
+      waSSE.close(); waSSE = null;
+      setTimeout(connectWaSSE, 5000);
+    };
+  } catch {
+    if (dot) { dot.classList.add('disconnected'); dot.title = 'SSE לא נתמך'; }
   }
 }
 
-function renderWaStats(stats, messages) {
-  setTxt('ws-total',  stats.total  ?? 0);
-  setTxt('ws-unread', stats.unread ?? 0);
+// ── Load threads ─────────────────────────────────────────────────────────────
+async function loadWaThreads(autoSelectFirst = true) {
+  try {
+    const [threadsData, statsData] = await Promise.all([
+      fetch('/api/whatsapp/threads?limit=60').then(r => r.json()),
+      fetch('/api/whatsapp/stats').then(r => r.json()),
+    ]);
+    waThreads = threadsData.threads ?? [];
+    renderWaThreadStats(threadsData, statsData);
+    renderWaThreadList();
+    if (autoSelectFirst && !waActivePhone && waThreads.length > 0) {
+      selectWaThread(waThreads[0].phone);
+    }
+  } catch (e) { console.error('loadWaThreads', e); }
+}
 
-  const ic = stats.intentCounts ?? {};
-  const schedCount  = (ic.schedule_query ?? 0) + (ic.booking ?? 0) + (ic.fixed_booking ?? 0);
-  const cancelCount = ic.cancellation ?? 0;
-  setTxt('ws-sched',  schedCount);
-  setTxt('ws-cancel', cancelCount);
+// Alias for the refresh timer and any other callers
+function loadWhatsAppInbox() { loadWaThreads(false); }
 
-  const clientCount = messages.filter(m => m.clientMatch?.matchType === 'member').length;
-  const leadCount   = messages.filter(m => m.clientMatch?.matchType === 'lead').length;
+// ── Stats chips ───────────────────────────────────────────────────────────────
+function renderWaThreadStats(threadsData, statsData) {
+  setTxt('ws-total',  threadsData.threads?.length ?? 0);
+  setTxt('ws-unread', threadsData.unread ?? 0);
+
+  const ic = statsData.intentCounts ?? {};
+  setTxt('ws-sched',  (ic.schedule_query ?? 0) + (ic.booking ?? 0) + (ic.fixed_booking ?? 0));
+  setTxt('ws-cancel', ic.cancellation ?? 0);
+
+  const clientCount = (threadsData.threads ?? []).filter(t => t.clientMatch?.matchType === 'member').length;
+  const leadCount   = (threadsData.threads ?? []).filter(t => t.clientMatch?.matchType === 'lead').length;
   setTxt('ws-client', clientCount);
   setTxt('ws-lead',   leadCount);
 }
 
-// ── Render message list ───────────────────────────────────────────────────────
-function renderWaMsgList() {
-  const el = document.getElementById('wa-messages-list');
+// ── Thread list rendering ─────────────────────────────────────────────────────
+function renderWaThreadList() {
+  const el = document.getElementById('wa-threads-list');
   if (!el) return;
 
-  const filtered = waActiveFilter === 'all'    ? waMessages
-    : waActiveFilter === 'unread'              ? waMessages.filter(m => !m.readAt)
-    : waMessages.filter(m => m.intent === waActiveFilter);
+  const q = waSearchQuery.toLowerCase().trim();
+  const filtered = q
+    ? waThreads.filter(t =>
+        (t.name || '').toLowerCase().includes(q) ||
+        (t.phone || '').includes(q) ||
+        (t.fromIsraeli || '').includes(q)
+      )
+    : waThreads;
 
   if (!filtered.length) {
-    el.innerHTML = `<div class="empty-state" style="padding:32px">אין הודעות בקטגוריה זו</div>`;
+    el.innerHTML = `<div class="wa-threads-empty">${q ? 'לא נמצאו תוצאות' : 'אין שיחות עדיין'}</div>`;
     return;
   }
 
-  el.innerHTML = filtered.map(m => {
-    const intent    = WA_INTENT[m.intent]  ?? WA_INTENT.general;
-    const route     = WA_ROUTE[m.route]   ?? WA_ROUTE.unhandled;
-    const match     = m.clientMatch ?? {};
-    const clientCls = match.found ? match.matchType ?? 'new' : 'new';
-    const clientLbl = match.found
-      ? (match.matchType === 'member' ? '✅ לקוח' : '🎯 ליד')
-      : '➕ חדש';
-    const displayName = m.name || m.fromIsraeli || m.from;
-    const phone       = m.fromIsraeli || m.from;
-    const isUnread    = !m.readAt;
-    const isSelected  = m.id === waActiveId;
-    const timeStr     = m.receivedAt
-      ? new Date(m.receivedAt).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' })
-      : '—';
-    const color = avatarColor(displayName);
+  el.innerHTML = filtered.map(t => {
+    const isActive  = t.phone === waActivePhone;
+    const hasUnread = t.unreadCount > 0;
+    const display   = t.name || t.fromIsraeli || t.phone;
+    const color     = avatarColor(display);
+    const timeStr   = formatThreadTime(t.lastAt);
+    const cm        = t.clientMatch;
+    const badgeCls  = cm?.matchType === 'member' ? 'member' : cm?.matchType === 'lead' ? 'lead' : '';
 
     return `
-    <div class="wa-msg-item ${isUnread ? 'wa-unread' : ''} ${isSelected ? 'wa-selected' : ''}"
-         data-id="${esc(m.id)}" onclick="selectWaMessage('${esc(m.id)}')">
-      <div class="wa-unread-dot"></div>
-      <div class="wa-avatar" style="background:${color}">${esc(initials(displayName))}</div>
-      <div class="wa-msg-body">
-        <div class="wa-msg-top">
-          <span class="wa-sender-name">${esc(displayName)}</span>
-          <span class="wa-msg-time">${timeStr}</span>
+    <div class="wa-thread-item${isActive ? ' active' : ''}${hasUnread ? ' has-unread' : ''}"
+         onclick="selectWaThread('${esc(t.phone)}')">
+      <div class="wa-thread-avatar" style="background:${color}">${initials(display)}</div>
+      <div class="wa-thread-info">
+        <div class="wa-thread-row1">
+          <span class="wa-thread-name">${esc(display)}</span>
+          <span class="wa-thread-time">${esc(timeStr)}</span>
         </div>
-        <div class="wa-msg-preview">${esc((m.text || '').slice(0, 65))}</div>
-        <div class="wa-msg-tags">
-          <span class="wa-intent-tag ${intent.cls}">${intent.label}</span>
-          <span class="wa-client-badge ${clientCls}">${clientLbl}</span>
-          <span class="wa-route-badge ${route.cls}">${route.label}</span>
+        <div class="wa-thread-row2">
+          <span class="wa-thread-preview">${esc((t.lastText || '').slice(0, 48))}</span>
+          ${hasUnread ? `<span class="wa-thread-badge">${t.unreadCount}</span>` : ''}
         </div>
+        ${badgeCls ? `<div class="wa-thread-row3"><span class="wa-client-badge ${badgeCls}">${cm.matchType === 'member' ? '✅ לקוח' : '🎯 ליד'}</span></div>` : ''}
       </div>
     </div>`;
   }).join('');
 }
 
-// ── Select & show message detail ──────────────────────────────────────────────
-function selectWaMessage(id) {
-  waActiveId = id;
-  const msg = waMessages.find(m => m.id === id);
-  if (!msg) return;
+// ── Select & open thread ──────────────────────────────────────────────────────
+async function selectWaThread(phone) {
+  waActivePhone = phone;
+  renderWaThreadList();
 
-  // Re-render list to update selected state
-  renderWaMsgList();
+  document.getElementById('wa-chat-pane-empty')?.style.setProperty('display', 'none');
+  const tv = document.getElementById('wa-thread-view');
+  if (tv) tv.style.display = 'flex';
 
-  const emptyEl  = document.getElementById('wa-chat-empty');
-  const detailEl = document.getElementById('wa-chat-detail');
-  if (!emptyEl || !detailEl) return;
-  emptyEl.style.display  = 'none';
-  detailEl.style.display = 'block';
+  await loadActiveThread(phone);
+}
 
-  const intent    = WA_INTENT[msg.intent] ?? WA_INTENT.general;
-  const route     = WA_ROUTE[msg.route]  ?? WA_ROUTE.unhandled;
-  const match     = msg.clientMatch ?? {};
-  const displayName = msg.name || msg.fromIsraeli || msg.from;
-  const phone       = msg.fromIsraeli ? msg.fromIsraeli.replace(/(\d{3})(\d{3,4})(\d{4})/, '$1-$2-$3') : (msg.from || '—');
-  const ts          = msg.timestamp ? new Date(msg.timestamp).toLocaleString('he-IL') : '—';
-  const color       = avatarColor(displayName);
+async function loadActiveThread(phone) {
+  try {
+    const d = await fetch(`/api/whatsapp/threads/${encodeURIComponent(phone)}`).then(r => r.json());
+    if (d.error) return;
+    waActiveThread = d.thread;
 
-  // Arbox match block
-  const arboxHtml = match.found ? `
-    <div class="wa-arbox-box">
-      <div class="wa-arbox-box-label">✅ לקוח נמצא ב-Arbox</div>
-      <div class="wa-arbox-row">
-        <div class="wa-arbox-field">
-          <span class="wa-arbox-field-label">שם</span>
-          <span class="wa-arbox-field-val">${esc(match.arboxName ?? '—')}</span>
-        </div>
-        <div class="wa-arbox-field">
-          <span class="wa-arbox-field-label">סוג</span>
-          <span class="wa-arbox-field-val">${match.matchType === 'member' ? '👤 לקוח ישיר' : '🎯 ליד'}</span>
-        </div>
-        <div class="wa-arbox-field">
-          <span class="wa-arbox-field-label">סטטוס</span>
-          <span class="wa-arbox-field-val">${match.isActive ? '<span style="color:var(--green)">● פעיל</span>' : '<span style="color:var(--muted)">○ לא פעיל</span>'}</span>
-        </div>
-        ${match.arboxId ? `<div class="wa-arbox-field"><span class="wa-arbox-field-label">Arbox ID</span><span class="wa-arbox-field-val" style="font-size:11px;color:var(--muted)">${esc(match.arboxId)}</span></div>` : ''}
-      </div>
-    </div>` : `
-    <div class="wa-arbox-box no-match">
-      <div class="wa-arbox-box-label">Arbox — לא נמצא</div>
-      <div style="font-size:13px;color:var(--muted)">מספר זה אינו ברשומות Arbox. ייתכן ליד חדש.</div>
-    </div>`;
+    const t = waThreads.find(x => x.phone === phone);
+    if (t) t.unreadCount = 0;
+    renderWaThreadList();
 
-  // Barak reply block
-  const barakHtml = msg.barakReply ? `
-    <div class="wa-barak-box">
-      <div class="wa-barak-box-label">🤖 תשובת ברק — טיוטה מוכנה לשליחה</div>
-      <div class="wa-barak-box-text">${esc(msg.barakReply)}</div>
-      <div class="wa-barak-box-foot">
-        <button class="btn btn-primary" style="font-size:12px;padding:6px 14px"
-          onclick="waCopyReply('${esc(msg.id)}')">📋 העתק תשובה</button>
-        <button class="btn btn-secondary" style="font-size:12px;padding:6px 14px"
-          onclick="toast('שליחה ידנית — WhatsApp API נדרש')">📤 שלח</button>
-      </div>
-    </div>` : '';
+    renderWaThreadHeader(d.thread);
+    renderWaThreadMessages(d.thread.messages ?? []);
+  } catch (e) { console.error('loadActiveThread', e); }
+}
 
-  // Media indicator
-  const isBubbleMedia = msg.mediaType && msg.mediaType !== 'text';
-  const bubbleCls     = isBubbleMedia ? 'wa-bubble media' : 'wa-bubble';
-  const bubbleIcon    = {
-    image: '🖼️', video: '🎥', audio: '🎵', voice: '🎤',
-    document: '📄', location: '📍', sticker: '🖼️', reaction: '😊',
-    interactive: '🔘',
-  }[msg.mediaType] ?? '💬';
+// ── Thread header ─────────────────────────────────────────────────────────────
+function renderWaThreadHeader(thread) {
+  const el = document.getElementById('wa-thread-header');
+  if (!el) return;
 
-  detailEl.innerHTML = `
-    <div class="wa-chat-hdr">
-      <div class="wa-avatar" style="background:${color};width:44px;height:44px;font-size:16px">${esc(initials(displayName))}</div>
-      <div class="wa-chat-hdr-info">
-        <div class="wa-chat-hdr-name">${esc(displayName)}</div>
-        <div class="wa-chat-hdr-phone" dir="ltr">${esc(phone)}</div>
-      </div>
-      <div class="wa-chat-hdr-badges">
-        <span class="wa-intent-tag ${intent.cls}">${intent.label}</span>
-        <span class="wa-route-badge ${route.cls}">${route.label}</span>
-        ${match.found ? `<span class="wa-client-badge ${match.matchType ?? 'new'}">${match.matchType === 'member' ? '✅ לקוח' : '🎯 ליד'}</span>` : ''}
-      </div>
+  const display = thread.name || thread.phone;
+  const phone   = thread.fromIsraeli || thread.phone;
+  const color   = avatarColor(display);
+  const cm      = thread.clientMatch;
+
+  el.innerHTML = `
+    <div class="wa-thdr-avatar" style="background:${color}">${initials(display)}</div>
+    <div class="wa-thdr-info">
+      <div class="wa-thdr-name">${esc(display)}</div>
+      <div class="wa-thdr-phone" dir="ltr">${esc(phone)}</div>
     </div>
-    <div class="wa-chat-body">
-      <div class="wa-bubble-wrap">
-        <div class="wa-bubble-label">${isBubbleMedia ? bubbleIcon + ' ' + msg.mediaType : '💬 הודעה'}</div>
-        <div class="${bubbleCls}">${esc(msg.text || '—')}</div>
-      </div>
-      <div class="wa-meta-grid">
-        <div class="wa-meta-item">
-          <div class="wa-meta-item-label">זמן קבלה</div>
-          <div class="wa-meta-item-val">${ts}</div>
-        </div>
-        <div class="wa-meta-item">
-          <div class="wa-meta-item-label">כוונה</div>
-          <div class="wa-meta-item-val"><span class="wa-intent-tag ${intent.cls}">${intent.label}</span></div>
-        </div>
-        <div class="wa-meta-item">
-          <div class="wa-meta-item-label">ניתוב</div>
-          <div class="wa-meta-item-val"><span class="wa-route-badge ${route.cls}">${route.label}</span></div>
-        </div>
-        <div class="wa-meta-item">
-          <div class="wa-meta-item-label">סוג מדיה</div>
-          <div class="wa-meta-item-val">${esc(msg.mediaType ?? 'text')}</div>
-        </div>
-        <div class="wa-meta-item">
-          <div class="wa-meta-item-label">נקרא</div>
-          <div class="wa-meta-item-val">${msg.readAt ? new Date(msg.readAt).toLocaleTimeString('he-IL', {hour:'2-digit',minute:'2-digit'}) : '<span style="color:var(--hot);font-weight:700">לא נקרא</span>'}</div>
-        </div>
-        <div class="wa-meta-item">
-          <div class="wa-meta-item-label">Inbox ID</div>
-          <div class="wa-meta-item-val" style="font-size:11px;color:var(--muted)">${esc(msg.id.slice(-10))}</div>
-        </div>
-      </div>
-      ${barakHtml}
-      ${arboxHtml}
+    <div class="wa-thdr-actions">
+      ${cm?.found && cm.matchType === 'member'
+        ? `<span class="wa-client-badge member">✅ לקוח Arbox</span>`
+        : cm?.found && cm.matchType === 'lead'
+        ? `<span class="wa-client-badge lead">🎯 ליד Arbox</span>`
+        : ''}
+      <span class="wa-msg-count-badge">${thread.messages?.length ?? 0} הודעות</span>
+      <a class="wa-open-link" href="https://wa.me/${thread.phone}" target="_blank">📱 פתח</a>
     </div>`;
+}
 
-  // Mark as read via API
-  if (!msg.readAt) {
-    fetch(`/api/whatsapp/inbox/${id}/read`, { method: 'POST' }).then(() => {
-      const m = waMessages.find(x => x.id === id);
-      if (m) m.readAt = new Date();
-      renderWaMsgList();
-    }).catch(() => {});
+// ── Messages rendering ────────────────────────────────────────────────────────
+function renderWaThreadMessages(messages) {
+  const el = document.getElementById('wa-thread-messages');
+  if (!el) return;
+
+  if (!messages.length) {
+    el.innerHTML = `<div class="wa-msgs-empty">אין הודעות בשיחה זו</div>`;
+    return;
   }
 
-  const upEl = document.getElementById('wa-chat-updated');
-  if (upEl) upEl.textContent = 'נבחר: ' + new Date(msg.receivedAt).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' });
-}
+  let currentDate = null;
+  const parts = [];
 
-function waCopyReply(id) {
-  const msg = waMessages.find(m => m.id === id);
-  if (!msg?.barakReply) return;
-  navigator.clipboard.writeText(msg.barakReply).then(
-    () => toast('✅ תשובת ברק הועתקה'),
-    () => toast('❌ העתקה נכשלה')
-  );
-}
+  messages.forEach(m => {
+    const ts   = m.timestamp ? new Date(m.timestamp) : new Date();
+    const dStr = ts.toLocaleDateString('he-IL', { weekday: 'long', day: 'numeric', month: 'long' });
 
-// ── Filter chips ──────────────────────────────────────────────────────────────
-document.querySelectorAll('.wa-filter').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('.wa-filter').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    waActiveFilter = btn.dataset.wf;
-    renderWaMsgList();
+    if (dStr !== currentDate) {
+      currentDate = dStr;
+      parts.push(`<div class="wa-date-divider"><span>${esc(dStr)}</span></div>`);
+    }
+
+    const isOut   = m.direction === 'out';
+    const timeStr = ts.toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' });
+
+    const agentLabel = isOut
+      ? m.agentId === 'barak'  ? '🤖 ברק'
+      : m.agentId === 'tomer'  ? '💚 תומר'
+      : m.agentId === 'manual' ? '✍️ ידני'
+      : m.agentId              ? esc(m.agentId) : 'שלחנו'
+      : null;
+
+    const intentInfo = !isOut && m.intent && WA_INTENT[m.intent] ? WA_INTENT[m.intent] : null;
+
+    const mediaTag = !isOut && m.mediaType && m.mediaType !== 'text'
+      ? `<span class="bubble-media-tag">${({'image':'🖼️','video':'🎥','audio':'🎵','voice':'🎤','document':'📄'}[m.mediaType]??'📎')} ${m.mediaType}</span>`
+      : '';
+
+    parts.push(`
+      <div class="wa-msg-row ${isOut ? 'wa-msg-out' : 'wa-msg-in'}">
+        <div class="wa-bubble ${isOut ? 'bubble-out' : 'bubble-in'}">
+          ${mediaTag}
+          <div class="bubble-text">${esc(m.text || (m.mediaType ? `[${m.mediaType}]` : '—'))}</div>
+          <div class="bubble-footer">
+            ${agentLabel ? `<span class="bubble-agent">${agentLabel}</span>` : ''}
+            ${intentInfo ? `<span class="wa-intent-tag ${intentInfo.cls}" style="font-size:10px;padding:1px 6px">${intentInfo.label}</span>` : ''}
+            <span class="bubble-time">${timeStr}</span>
+          </div>
+        </div>
+      </div>`);
   });
-});
 
-// ── Refresh + read-all buttons ────────────────────────────────────────────────
-document.getElementById('btn-wa-refresh')?.addEventListener('click', () => {
-  loadWhatsAppInbox();
-});
+  el.innerHTML = parts.join('');
+  el.scrollTop = el.scrollHeight;
+}
+
+// ── Reply ─────────────────────────────────────────────────────────────────────
+async function sendWaReply() {
+  const input = document.getElementById('wa-reply-input');
+  const btn   = document.getElementById('wa-reply-send');
+  const text  = input?.value.trim();
+  if (!text)          { toast('⚠️ הזן הודעה'); return; }
+  if (!waActivePhone) { toast('⚠️ בחר שיחה תחילה'); return; }
+
+  btn.disabled = true; btn.textContent = '⏳';
+  try {
+    await post(`/api/whatsapp/threads/${encodeURIComponent(waActivePhone)}/send`, {
+      text, name: waActiveThread?.name ?? null,
+    });
+    input.value = '';
+    await loadActiveThread(waActivePhone);
+    toast('✅ הודעה נשלחה');
+  } catch (err) {
+    toast(`❌ שליחה נכשלה — ${err.message}`);
+  } finally {
+    btn.disabled = false; btn.textContent = 'שלח ›';
+  }
+}
+
+// ── Event wiring ──────────────────────────────────────────────────────────────
+document.getElementById('btn-wa-refresh')?.addEventListener('click', () => loadWaThreads(false));
 
 document.getElementById('btn-wa-read-all')?.addEventListener('click', async () => {
   await fetch('/api/whatsapp/inbox/read-all', { method: 'POST' });
-  waMessages.forEach(m => { if (!m.readAt) m.readAt = new Date(); });
-  renderWaMsgList();
+  waThreads.forEach(t => { t.unreadCount = 0; });
+  renderWaThreadList();
   toast('✅ כל ההודעות סומנו כנקרא');
 });
 
-// ── Example pill click-to-fill ────────────────────────────────────────────────
+document.getElementById('wa-thread-search')?.addEventListener('input', (e) => {
+  waSearchQuery = e.target.value;
+  renderWaThreadList();
+});
+
+document.getElementById('wa-reply-send')?.addEventListener('click', sendWaReply);
+document.getElementById('wa-reply-input')?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendWaReply(); }
+});
+
+// Collapsible simulator toggle
+document.getElementById('wa-sim-toggle')?.addEventListener('click', () => {
+  const body = document.getElementById('wa-sim-expanded');
+  const btn  = document.getElementById('wa-sim-toggle');
+  if (!body) return;
+  const open = body.style.display !== 'none';
+  body.style.display = open ? 'none' : 'block';
+  btn.textContent = `🧪 כלי בדיקה — סימולציית הודעה נכנסת ${open ? '▾' : '▴'}`;
+});
+
+// Example pills
 document.querySelectorAll('.wa-pill').forEach(pill => {
   pill.addEventListener('click', () => {
     const input = document.getElementById('wa-sim-text');
@@ -1996,7 +2038,7 @@ async function runWaSimulate() {
     }
     toast('✅ הודעת בדיקה נשלחה');
     if (document.querySelector('.tab-btn.active')?.dataset?.tab === 'whatsapp') {
-      setTimeout(loadWhatsAppInbox, 600);
+      setTimeout(() => loadWaThreads(false), 600);
     }
   } catch (err) {
     toast(`❌ ${err.message}`);
@@ -2268,7 +2310,7 @@ refreshTimer = setInterval(() => {
   const active = document.querySelector('.tab-btn.active')?.dataset?.tab;
   if (active === 'maya' || active === 'barak') loadBarakPanel();
   if (active === 'maya') { loadMayaStats(); loadAgentFeed(); }
-  if (active === 'whatsapp') loadWhatsAppInbox();
+  if (active === 'whatsapp') loadWaThreads(false);
 }, 5000);
 
 // Feed auto-refresh every 10s regardless of active tab

@@ -1,5 +1,6 @@
 require('dotenv').config();
 const path    = require('path');
+const fs      = require('fs');
 const express = require('express');
 const cron    = require('node-cron');
 const logger  = require('./utils/logger');
@@ -17,11 +18,46 @@ const barakAgent     = require('./agents/barak_agent');
 const retentionAgent = require('./agents/retention_agent');
 const contentAgent   = require('./agents/content_agent');
 
-const { initWorkers } = require('./workers/scheduler');
-const automations     = require('./utils/automation_store');
+const { initWorkers }                  = require('./workers/scheduler');
+const automations                      = require('./utils/automation_store');
+const aptStore                         = require('./utils/appointment_store');
+const calendarSvc                      = require('./services/calendar.service');
+const notifySvc                        = require('./services/notification.service');
 
-const app  = express();
-const PORT = process.env.PORT ?? 3000;
+// ── Staff configuration (hot-reloadable) ─────────────────────────────────────
+
+const STAFF_CONFIG_PATH = path.join(__dirname, 'data/staff_config.json');
+
+function loadStaffConfig() {
+  try { return JSON.parse(fs.readFileSync(STAFF_CONFIG_PATH, 'utf8')); }
+  catch { return { staff: [], default_assignee_id: null, appointment_duration_min: 30 }; }
+}
+
+let staffConfig = loadStaffConfig();
+
+function findStaff(id) {
+  return staffConfig.staff?.find(s => s.id === id) ?? null;
+}
+function defaultStaff() {
+  return findStaff(staffConfig.default_assignee_id) ??
+         staffConfig.staff?.find(s => s.active) ??
+         null;
+}
+
+const app         = express();
+const PORT        = process.env.PORT ?? 3000;
+const aptIcsCache = new Map(); // aptId → ICS string (in-memory, lost on restart — regenerate on demand)
+
+// ── Server-Sent Events — real-time push to dashboard clients ──────────────────
+const sseClients = new Set();
+
+function broadcastSse(event, data) {
+  if (!sseClients.size) return;
+  const payload = `data: ${JSON.stringify({ event, ...data })}\n\n`;
+  for (const res of sseClients) {
+    try { res.write(payload); } catch { sseClients.delete(res); }
+  }
+}
 
 // ── Bypass ngrok browser-warning page ────────────────────────────────────────
 app.use((_req, res, next) => {
@@ -979,6 +1015,7 @@ const INTENT_PATTERNS = {
   cancellation:     /ביטול|תבטל[יה]?|לבטל|לא אגיע|לא מגיע[ה]?|לא יכול[ה]?|אבטל|ביטלתי|להסיר|תסיר אותי/,
   booking:          /תשבץ[יה]?|שיבוץ|לשבץ|רוצה מקום|תרשמ[יה]|להירשם|להצטרף|רשמ[יה] אותי|קבע[יה] לי|אני רוצ[האה] להירשם/,
   representative:   /נציג|לדבר עם מישהו|לדבר עם אדם|לדבר עם בן אדם|העבר[יה]? אות[יה] לאדם|שמישהו יחזור|שיתקשרו|שיצרו קשר|אדם אמיתי/,
+  reschedule:       /לדחות|לשנות שעה|שעה אחרת|יום אחר|לא יכול[ה]? עכשיו|לא יכול[ה]? אז|פספסנו|לא הצלחתי|תקבע מחדש|זמן אחר|מועד אחר|לתזמן מחדש/,
   // specialist_query: rehab, pre/post-natal, specific instructor background
   specialist_query: /שיקומ|rehab|rehabilit|מדריכ.{0,5}שיקומ|אחרי לידה|לאחר לידה|בהריון|pre.?natal|post.?natal|מדריכ.{0,10}מוסמכ|קורס.{0,10}מדריכ|מתמחה ב|מתמחה עם/,
   // subscription_query: questions about membership packages and what's included
@@ -989,13 +1026,14 @@ const INTENT_PATTERNS = {
 
 function detectSchedulingIntent(text) {
   if (!text) return 'general';
-  if (INTENT_PATTERNS.representative.test(text))    return 'representative';
-  if (INTENT_PATTERNS.fixed_booking.test(text))     return 'fixed_booking';
-  if (INTENT_PATTERNS.cancellation.test(text))      return 'cancellation';
-  if (INTENT_PATTERNS.booking.test(text))           return 'booking';
-  if (INTENT_PATTERNS.specialist_query.test(text))  return 'specialist_query';
+  if (INTENT_PATTERNS.representative.test(text))     return 'representative';
+  if (INTENT_PATTERNS.reschedule.test(text))         return 'reschedule';
+  if (INTENT_PATTERNS.fixed_booking.test(text))      return 'fixed_booking';
+  if (INTENT_PATTERNS.cancellation.test(text))       return 'cancellation';
+  if (INTENT_PATTERNS.booking.test(text))            return 'booking';
+  if (INTENT_PATTERNS.specialist_query.test(text))   return 'specialist_query';
   if (INTENT_PATTERNS.subscription_query.test(text)) return 'subscription_query';
-  if (INTENT_PATTERNS.schedule_query.test(text))    return 'schedule_query';
+  if (INTENT_PATTERNS.schedule_query.test(text))     return 'schedule_query';
   return 'general';
 }
 
@@ -1052,6 +1090,11 @@ function extractClassFilter(text) {
 
 async function buildSchedulingReply(intent, msg, clientMatch) {
   const msgText = msg.text ?? '';
+
+  // ── Reschedule / appointment-change request ───────────────────────────────────
+  if (intent === 'reschedule') {
+    return `בהחלט! באיזו שעה או יום יהיה לך נוח? 🗓️`;
+  }
 
   // ── Representative / callback request ────────────────────────────────────────
   if (intent === 'representative') {
@@ -1210,45 +1253,179 @@ async function processInboundWAMessage(msg) {
   // 2. Intent detection (only meaningful for text messages)
   const intent = msg.type === 'text' ? detectSchedulingIntent(msg.text) : 'general';
 
+  // ── Reschedule intent — lead asks to change an existing appointment ──────────
+  if (intent === 'reschedule') {
+    const existingApt = aptStore.getActiveByPhone(fromNorm);
+    if (existingApt) {
+      aptStore.update(existingApt.id, { status: 'rescheduled' });
+      store.logEvent('appointment_reschedule_requested', fromNorm, { aptId: existingApt.id, oldTime: existingApt.rawTime });
+    }
+    // Set awaiting flag so the next message is treated as the new time.
+    // reschedulingAptId lets the callback handler send a reschedule notification
+    // instead of a fresh "confirmed" notification.
+    store.upsertLead(fromNorm, {
+      meta: {
+        ...(store.getLead(fromNorm)?.meta ?? {}),
+        awaitingCallbackTime: true,
+        callbackRequestedAt:  new Date().toISOString(),
+        reschedulingAptId:    existingApt?.id ?? null,
+        reschedulingOldTime:  existingApt?.rawTime ?? null,
+      },
+    });
+    const rescheduleMsg = `בהחלט! באיזו שעה או יום יהיה לך נוח? 🗓️`;
+    if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
+      await sendText(fromNorm, rescheduleMsg).catch(() => {});
+    }
+    const rscInboxEntry = inbox.push({
+      from: fromNorm, fromIsraeli, name: msg.name ?? clientMatch.arboxName ?? null,
+      text: msg.text, messageId: msg.messageId, timestamp: msg.timestamp,
+      receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
+      clientMatch, intent: 'reschedule', route: 'reschedule_prompt', barakReply: rescheduleMsg,
+    });
+    return { inboxEntry: rscInboxEntry, clientMatch, intent: 'reschedule', route: 'reschedule_prompt', barakReply: rescheduleMsg };
+  }
+
   // ── Callback-time interception ────────────────────────────────────────────────
   // When this person previously requested a human callback (awaitingCallbackTime),
-  // their NEXT message is the preferred callback time — capture it and confirm.
+  // their NEXT non-intent message is the preferred callback time.
+  //
+  // Three cases handled here:
+  //   A. noShowAptId     — the worker flagged a no-show; lead is now giving a new time
+  //   B. reschedulingAptId — lead explicitly asked to reschedule; now providing new time
+  //   C. neither         — fresh appointment (first-time callback request)
   const leadState = store.getLead(fromNorm);
   if (leadState?.meta?.awaitingCallbackTime && msg.type === 'text' && msg.text?.trim() &&
-      intent !== 'representative') {
-    const preferredTime = msg.text.trim();
-    const callbackName  = msg.name ?? clientMatch.arboxName ?? fromNorm;
+      intent !== 'representative' && intent !== 'reschedule') {
+    const rawTime      = msg.text.trim();
+    const callbackName = msg.name ?? clientMatch.arboxName ?? fromNorm;
 
-    // Clear the awaiting flag and log the callback task
+    // Determine whether this is a reschedule of an existing appointment
+    const prevAptId   = leadState.meta.noShowAptId ?? leadState.meta.reschedulingAptId ?? null;
+    const prevApt     = prevAptId ? aptStore.get(prevAptId) : null;
+    const oldTimeLabel = prevApt?.rawTime ?? leadState.meta.reschedulingOldTime ?? null;
+    const isReschedule = !!(prevApt || oldTimeLabel);
+
+    // Clear all awaiting-callback flags immediately
     store.upsertLead(fromNorm, {
-      meta: { ...(leadState.meta ?? {}), awaitingCallbackTime: false, callbackTime: preferredTime },
+      meta: {
+        ...(leadState.meta ?? {}),
+        awaitingCallbackTime: false,
+        callbackTime:         rawTime,
+        noShowAptId:          null,
+        reschedulingAptId:    null,
+        reschedulingOldTime:  null,
+      },
     });
-    store.logEvent('callback_scheduled', fromNorm, { name: callbackName, preferredTime });
-    logger.info('Callback time captured', { phone: fromNorm, preferredTime });
 
-    // Alert studio owner so they can action it
-    alertOwner(
-      `📞 בקשת חזרה לשיחה`,
-      `*שם:* ${callbackName}\n*טלפון:* ${fromIsraeli ?? fromNorm}\n*זמן מועדף:* ${preferredTime}`
-    ).catch(() => {});
+    const assignedStaff = defaultStaff();
 
-    const confirmMsg = `מצוין, רשמתי — ${preferredTime}. הצוות יצור איתך קשר. יש עוד משהו שאוכל לעזור? 😊`;
+    // ── Create or update the appointment record ───────────────────────────────
+    let apt;
+    if (isReschedule && prevApt) {
+      // Reuse the same appointment record — reset it to 'confirmed' with the new time.
+      // This preserves the history (original createdAt, same id) while reflecting the change.
+      apt = aptStore.update(prevAptId, {
+        status:        'confirmed',
+        rawTime,
+        scheduledAt:   null,         // will be filled in async below
+        reminderSent:  false,
+        noShowAlerted: false,
+      });
+      store.logEvent('appointment_rescheduled', fromNorm, {
+        aptId:    prevAptId,
+        rawTime,
+        oldTime:  oldTimeLabel,
+        trigger:  leadState.meta.noShowAptId ? 'no_show' : 'lead_request',
+      });
+      logger.info('Appointment rescheduled', { phone: fromNorm, rawTime, aptId: prevAptId, oldTime: oldTimeLabel });
+    } else {
+      // Fresh appointment
+      apt = aptStore.create({
+        leadPhone:       fromNorm,
+        leadName:        callbackName,
+        rawTime,
+        scheduledAt:     null,
+        durationMin:     staffConfig.appointment_duration_min ?? 30,
+        assignedStaffId: assignedStaff?.id ?? 'eden',
+      });
+      store.logEvent('appointment_created', fromNorm, { aptId: apt.id, rawTime, staff: apt.assignedStaffId });
+      logger.info('Appointment created', { phone: fromNorm, rawTime, aptId: apt.id });
+    }
+
+    // ── Async: parse time + calendar + notify all staff ───────────────────────
+    setImmediate(async () => {
+      try {
+        // Cancel old Google Calendar event when rescheduling
+        if (isReschedule && prevApt?.calendarEventId) {
+          await calendarSvc.cancelCalendarEvent(prevApt).catch(() => {});
+        }
+
+        const { scheduledAt, icsContent, googleEventId } =
+          await calendarSvc.createCalendarEntry(apt, assignedStaff);
+
+        aptStore.update(apt.id, { scheduledAt, calendarEventId: googleEventId });
+
+        if (icsContent) aptIcsCache.set(apt.id, icsContent);
+
+        const backendBase = process.env.BACKEND_URL || 'https://shape-studio-agent-production.up.railway.app';
+        const icsUrl      = icsContent ? `${backendBase}/api/calendar/appointment/${apt.id}.ics` : null;
+
+        if (isReschedule) {
+          // Notify all active staff: "rescheduled — was X, now Y"
+          await notifySvc.notifyStaffRescheduled(
+            { ...apt, scheduledAt },
+            assignedStaff,
+            oldTimeLabel ?? '—'
+          );
+        } else {
+          // Notify all active staff: "new appointment confirmed"
+          await notifySvc.notifyStaffCallbackConfirmed(
+            { ...apt, scheduledAt },
+            assignedStaff,
+            icsUrl
+          );
+        }
+
+        store.logEvent('appointment_staff_notified', fromNorm, {
+          aptId:   apt.id,
+          staffId: apt.assignedStaffId,
+          type:    isReschedule ? 'rescheduled' : 'confirmed',
+        });
+      } catch (err) {
+        logger.error('Appointment background tasks failed', { aptId: apt.id, error: err.message });
+      }
+    });
+
+    // ── Confirm to lead ───────────────────────────────────────────────────────
+    const confirmMsg = isReschedule
+      ? `מעולה! קבענו מחדש ל-${rawTime} ✅\nנציג מהצוות ייצור איתך קשר בזמן החדש. 😊`
+      : `מעולה! השיחה נקבעה ל-${rawTime} ✅\nנציג מהצוות ייצור איתך קשר. יש עוד משהו שאוכל לעזור? 😊`;
 
     if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
       await sendText(fromNorm, confirmMsg).catch(err =>
         logger.warn('Callback confirm send failed', { error: err.message })
       );
     }
-    store.logEvent('message_out', fromNorm, { preview: confirmMsg.slice(0, 80), agent: 'barak', source: 'callback_confirm' });
 
-    // Store inbox entry and exit — no further routing needed
+    const eventType = isReschedule ? 'appointment_rescheduled_confirmed' : 'appointment_confirmed';
+    store.logEvent(eventType, fromNorm, { aptId: apt.id, preview: confirmMsg.slice(0, 80) });
+
     const cbInboxEntry = inbox.push({
       from: fromNorm, fromIsraeli, name: msg.name ?? clientMatch.arboxName ?? null,
       text: msg.text, messageId: msg.messageId, timestamp: msg.timestamp,
       receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
-      clientMatch, intent: 'callback_time', route: 'callback_confirm', barakReply: confirmMsg,
+      clientMatch,
+      intent:    isReschedule ? 'reschedule_time' : 'callback_time',
+      route:     isReschedule ? 'appointment_rescheduled' : 'appointment_created',
+      barakReply: confirmMsg,
     });
-    return { inboxEntry: cbInboxEntry, clientMatch, intent: 'callback_time', route: 'callback_confirm', barakReply: confirmMsg };
+    return {
+      inboxEntry: cbInboxEntry,
+      clientMatch,
+      intent:    isReschedule ? 'reschedule_time' : 'callback_time',
+      route:     isReschedule ? 'appointment_rescheduled' : 'appointment_created',
+      barakReply: confirmMsg,
+    };
   }
 
   // 3. Routing decision
@@ -1376,9 +1553,9 @@ app.post('/api/whatsapp/webhook', captureRawBody, verifyMetaSignature, async (re
 
   logger.info('WA webhook inbound', { from: msg.from, type: msg.type, preview: msg.text?.slice(0, 60) });
 
-  processInboundWAMessage(msg).catch(err =>
-    logger.error('WA pipeline error', { error: err.message, from: msg.from })
-  );
+  processInboundWAMessage(msg)
+    .then(r => r && broadcastSse('message', { phone: r.inboxEntry.from, name: r.inboxEntry.name ?? null }))
+    .catch(err => logger.error('WA pipeline error', { error: err.message, from: msg.from }));
 });
 
 // ── POST /api/green-api/webhook — inbound messages from Green API ─────────────
@@ -1412,9 +1589,9 @@ app.post('/api/green-api/webhook', express.json({ limit: '1mb' }), async (req, r
   });
 
   // Route through the full CRM pipeline — same logic as /api/whatsapp/webhook
-  processInboundWAMessage(msg).catch(err =>
-    logger.error('WA pipeline error (Green API)', { error: err.message, from: msg.from })
-  );
+  processInboundWAMessage(msg)
+    .then(r => r && broadcastSse('message', { phone: r.inboxEntry.from, name: r.inboxEntry.name ?? null }))
+    .catch(err => logger.error('WA pipeline error (Green API)', { error: err.message, from: msg.from }));
 });
 
 // ── GET /api/whatsapp/inbox — paginated inbox for the dashboard ───────────────
@@ -1467,6 +1644,7 @@ app.post('/api/whatsapp/simulate', jsonBody, async (req, res) => {
 
   try {
     const result = await processInboundWAMessage(msg);
+    broadcastSse('message', { phone: result.inboxEntry.from, name: result.inboxEntry.name ?? null });
     res.json({
       ok: true,
       inboxId:     result.inboxEntry.id,
@@ -1792,6 +1970,176 @@ app.post('/api/admin/sync-agent-knowledge', async (_req, res) => {
   } catch (err) {
     logger.error('[admin] sync-agent-knowledge failed', { error: err.message });
     res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// STAFF MANAGEMENT API
+// ══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/admin/staff — return current staff roster
+app.get('/api/admin/staff', (_req, res) => {
+  res.json({ ok: true, ...staffConfig });
+});
+
+// POST /api/admin/staff — save updated roster
+app.post('/api/admin/staff', jsonBody, (req, res) => {
+  const data = req.body;
+  if (!Array.isArray(data?.staff)) {
+    return res.status(400).json({ ok: false, error: 'body must have { staff: [...] }' });
+  }
+  try {
+    fs.writeFileSync(STAFF_CONFIG_PATH, JSON.stringify(data, null, 2), 'utf8');
+    staffConfig = data;
+    store.logEvent('staff_config_updated', null, { count: data.staff.length });
+    res.json({ ok: true, staff_count: data.staff.length, updatedAt: new Date() });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// APPOINTMENTS API
+// ══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/admin/appointments — all appointments (paginated, latest first)
+app.get('/api/admin/appointments', (req, res) => {
+  const limit  = Math.min(parseInt(req.query.limit ?? '50', 10), 200);
+  const status = req.query.status;
+  let apts = aptStore.getAll()
+    .sort((a, b) => b.createdAt - a.createdAt);
+  if (status) apts = apts.filter(a => a.status === status);
+  res.json({ ok: true, total: apts.length, appointments: apts.slice(0, limit) });
+});
+
+// PATCH /api/admin/appointments/:id — update status
+app.patch('/api/admin/appointments/:id', jsonBody, (req, res) => {
+  const apt = aptStore.update(req.params.id, req.body);
+  if (!apt) return res.status(404).json({ ok: false, error: 'Appointment not found' });
+  store.logEvent('appointment_updated_manual', apt.leadPhone, { aptId: apt.id, ...req.body });
+  res.json({ ok: true, appointment: apt });
+});
+
+// POST /api/admin/appointments/:id/complete — mark completed
+app.post('/api/admin/appointments/:id/complete', (req, res) => {
+  const apt = aptStore.markCompleted(req.params.id);
+  if (!apt) return res.status(404).json({ ok: false, error: 'Appointment not found' });
+  store.logEvent('appointment_completed', apt.leadPhone, { aptId: apt.id });
+  res.json({ ok: true, appointment: apt });
+});
+
+// POST /api/admin/appointments/:id/cancel — cancel and alert staff
+app.post('/api/admin/appointments/:id/cancel', async (req, res) => {
+  const apt = aptStore.markCancelled(req.params.id);
+  if (!apt) return res.status(404).json({ ok: false, error: 'Appointment not found' });
+  calendarSvc.cancelCalendarEvent(apt).catch(() => {});
+  store.logEvent('appointment_cancelled', apt.leadPhone, { aptId: apt.id });
+  res.json({ ok: true, appointment: apt });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CALENDAR — ICS file serving
+// ══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/calendar/appointment/:id.ics — download ICS for appointment
+app.get('/api/calendar/appointment/:id.ics', async (req, res) => {
+  const id  = req.params.id.replace(/\.ics$/, '');
+  const apt = aptStore.get(id);
+  if (!apt) return res.status(404).send('Appointment not found');
+
+  // Try cache first
+  let ics = aptIcsCache.get(id);
+
+  // If not in cache (e.g. after server restart), regenerate
+  if (!ics && apt.scheduledAt) {
+    const staff = findStaff(apt.assignedStaffId);
+    ics = calendarSvc.buildICS(apt, staff);
+    if (ics) aptIcsCache.set(id, ics);
+  }
+
+  if (!ics) {
+    return res.status(422).send('Calendar event could not be generated (appointment time not yet parsed)');
+  }
+
+  res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="appointment-${id.slice(0,8)}.ics"`);
+  res.send(ics);
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// WHATSAPP THREADS API + SSE STREAM
+// ══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/whatsapp/stream — Server-Sent Events for real-time inbox updates
+app.get('/api/whatsapp/stream', (req, res) => {
+  res.setHeader('Content-Type',  'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection',    'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // tell nginx not to buffer
+  res.flushHeaders();
+
+  // Send initial "connected" event so the client knows the connection is live
+  res.write(`data: ${JSON.stringify({ event: 'connected' })}\n\n`);
+
+  // Heartbeat every 20s to prevent proxy timeouts
+  const hb = setInterval(() => { try { res.write(':ping\n\n'); } catch {} }, 20000);
+
+  sseClients.add(res);
+  req.on('close', () => { sseClients.delete(res); clearInterval(hb); });
+});
+
+// Helper: strip full messages[] from a thread for the list view (keeps payload small)
+function summarizeThread(t) {
+  return {
+    phone:        t.phone,
+    name:         t.name,
+    fromIsraeli:  t.fromIsraeli,
+    lastText:     t.lastText,
+    lastAt:       t.lastAt,
+    unreadCount:  t.unreadCount,
+    messageCount: t.messages.length,
+    clientMatch:  t.clientMatch ?? null,
+  };
+}
+
+// GET /api/whatsapp/threads — paginated thread list (no message bodies)
+app.get('/api/whatsapp/threads', (req, res) => {
+  const limit   = Math.min(parseInt(req.query.limit ?? '60', 10), 200);
+  const threads = inbox.getThreads({ limit });
+  const unread  = threads.reduce((sum, t) => sum + t.unreadCount, 0);
+  res.json({
+    threads:  threads.map(summarizeThread),
+    total:    threads.length,
+    unread,
+    ts: new Date(),
+  });
+});
+
+// GET /api/whatsapp/threads/:phone — full thread with all messages; also marks it read
+app.get('/api/whatsapp/threads/:phone', (req, res) => {
+  const phone  = req.params.phone;
+  const thread = inbox.getThread(phone);
+  if (!thread) return res.status(404).json({ error: 'Thread not found' });
+  inbox.markThreadRead(phone);
+  res.json({ thread, ts: new Date() });
+});
+
+// POST /api/whatsapp/threads/:phone/send — send a manual reply from the dashboard
+app.post('/api/whatsapp/threads/:phone/send', jsonBody, async (req, res) => {
+  const phone = req.params.phone;
+  const { text, name } = req.body ?? {};
+  if (!phone || !text?.trim()) return res.status(400).json({ error: 'phone and text required' });
+
+  try {
+    await sendText(phone, text.trim());
+    inbox.pushOutbound({ phone, name: name ?? null, text: text.trim(), agentId: 'manual' });
+    store.logEvent('message_out', phone, { preview: text.slice(0, 80), agent: 'manual', source: 'dashboard' });
+    broadcastSse('message', { phone, name: name ?? null, direction: 'out' });
+    logger.info('Dashboard manual reply sent', { phone });
+    res.json({ ok: true, sentAt: new Date() });
+  } catch (err) {
+    logger.error('Thread send error', { phone, error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 

@@ -264,7 +264,12 @@ function initWorkers(store) {
   startTomerRetentionLoop(store);
   startBarakIngestionWorker(store);
   startMayaDailyBriefing(store);
-  logger.info('Workers: all 3 autonomous workers initialized and running');
+
+  // Appointment reminders + no-show detection (every 15 min)
+  const { initAppointmentWorker } = require('./appointment_worker');
+  initAppointmentWorker(store);
+
+  logger.info('Workers: all 4 autonomous workers initialized and running');
 
   // Run Barak ingestion immediately on boot for instant health check
   setImmediate(() => runBarakIngestion(store));

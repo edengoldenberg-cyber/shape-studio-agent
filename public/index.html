@@ -806,100 +806,98 @@
     </section>
 
     <!-- ══════════════════════════════════════════════════════════════════════
-         WHATSAPP LIVE INBOX
+         WHATSAPP LIVE — Threaded Chat Interface
     ══════════════════════════════════════════════════════════════════════════ -->
     <section id="tab-whatsapp" class="tab-panel">
 
-      <!-- Quick-stats chips -->
+      <!-- Stats chips -->
       <div class="wa-stats-row" id="wa-stats-row">
-        <div class="wa-stat-chip"><span class="wa-stat-val" id="ws-total">—</span><span class="wa-stat-lbl">הודעות סה"כ</span></div>
+        <div class="wa-stat-chip"><span class="wa-stat-val" id="ws-total">—</span><span class="wa-stat-lbl">שיחות</span></div>
         <div class="wa-stat-chip unread"><span class="wa-stat-val" id="ws-unread">—</span><span class="wa-stat-lbl">לא נקרא</span></div>
-        <div class="wa-stat-chip sched"><span class="wa-stat-val" id="ws-sched">—</span><span class="wa-stat-lbl">בקשות לוח</span></div>
+        <div class="wa-stat-chip sched"><span class="wa-stat-val" id="ws-sched">—</span><span class="wa-stat-lbl">בקשות שיבוץ</span></div>
         <div class="wa-stat-chip cancel"><span class="wa-stat-val" id="ws-cancel">—</span><span class="wa-stat-lbl">ביטולים</span></div>
-        <div class="wa-stat-chip client"><span class="wa-stat-val" id="ws-client">—</span><span class="wa-stat-lbl">לקוחות Arbox</span></div>
+        <div class="wa-stat-chip client"><span class="wa-stat-val" id="ws-client">—</span><span class="wa-stat-lbl">לקוחות</span></div>
         <div class="wa-stat-chip lead"><span class="wa-stat-val" id="ws-lead">—</span><span class="wa-stat-lbl">לידים</span></div>
       </div>
 
-      <div class="wa-layout">
+      <!-- CHAT LAYOUT -->
+      <div class="wa-chat-layout">
 
-        <!-- ── Left col: inbox list ── -->
-        <div class="wa-inbox-col">
-          <div class="panel wa-inbox-panel">
-            <div class="panel-header">
-              <h2>📥 הודעות נכנסות</h2>
-              <div style="display:flex;gap:8px;flex-wrap:wrap">
-                <button class="btn btn-secondary" id="btn-wa-refresh" style="font-size:13px;padding:6px 14px">🔄 רענן</button>
-                <button class="btn btn-secondary" id="btn-wa-read-all" style="font-size:13px;padding:6px 14px">✓ סמן הכל כנקרא</button>
-              </div>
+        <!-- Left: Thread list sidebar -->
+        <div class="wa-threads-sidebar">
+          <div class="wa-threads-topbar">
+            <span class="wa-threads-title">💬 שיחות</span>
+            <div class="wa-threads-topbar-actions">
+              <span class="wa-sse-dot" id="wa-sse-dot" title="ממתין לחיבור">●</span>
+              <button class="wa-icon-btn" id="btn-wa-refresh"  title="רענן">↻</button>
+              <button class="wa-icon-btn" id="btn-wa-read-all" title="סמן הכל כנקרא">✓</button>
             </div>
-            <!-- Filter chips -->
-            <div class="wa-filter-row">
-              <button class="wa-filter active" data-wf="all">הכל</button>
-              <button class="wa-filter" data-wf="unread">לא נקרא</button>
-              <button class="wa-filter" data-wf="cancellation">ביטול</button>
-              <button class="wa-filter" data-wf="booking">הזמנה</button>
-              <button class="wa-filter" data-wf="schedule_query">לוח</button>
-              <button class="wa-filter" data-wf="general">כללי</button>
-            </div>
-            <div class="wa-msg-list" id="wa-messages-list">
-              <div class="empty-state" style="padding:32px">טוען הודעות...</div>
-            </div>
-            <div class="panel-footer">
-              <span class="refresh-tag" id="wa-inbox-updated"></span>
+          </div>
+          <div class="wa-threads-searchrow">
+            <input class="wa-search-input" id="wa-thread-search" placeholder="חיפוש לפי שם או טלפון..." />
+          </div>
+          <div class="wa-threads-list" id="wa-threads-list">
+            <div class="wa-threads-empty">טוען שיחות...</div>
+          </div>
+        </div>
+
+        <!-- Right: Chat pane -->
+        <div class="wa-chat-pane">
+
+          <!-- Empty state before any thread is selected -->
+          <div class="wa-chat-pane-empty" id="wa-chat-pane-empty">
+            <div class="wa-pane-empty-icon">💬</div>
+            <div class="wa-pane-empty-title">בחר שיחה</div>
+            <div class="wa-pane-empty-sub">לחץ על לקוח מהרשימה כדי לפתוח את השיחה המלאה</div>
+          </div>
+
+          <!-- Active thread -->
+          <div class="wa-thread-view" id="wa-thread-view" style="display:none">
+
+            <!-- Contact header bar -->
+            <div class="wa-thread-header" id="wa-thread-header"><!-- filled by JS --></div>
+
+            <!-- Scrollable messages area -->
+            <div class="wa-thread-messages" id="wa-thread-messages"><!-- filled by JS --></div>
+
+            <!-- Reply input at bottom -->
+            <div class="wa-reply-bar">
+              <input class="wa-reply-input" id="wa-reply-input"
+                placeholder="הקלד הודעה לשליחה ב-WhatsApp..." autocomplete="off" dir="auto" />
+              <button class="wa-reply-send-btn" id="wa-reply-send">שלח ›</button>
             </div>
           </div>
         </div>
 
-        <!-- ── Right col: chat window + simulator ── -->
-        <div class="wa-right-col">
+      </div><!-- /wa-chat-layout -->
 
-          <!-- Chat / detail window -->
-          <div class="panel wa-chat-panel" id="wa-chat-panel">
-            <div class="panel-header">
-              <h2>📱 פרטי שיחה</h2>
-              <span class="refresh-tag" id="wa-chat-updated"></span>
+      <!-- Collapsible simulator -->
+      <div class="wa-sim-collapsible">
+        <button class="wa-sim-toggle-btn" id="wa-sim-toggle">🧪 כלי בדיקה — סימולציית הודעה נכנסת ▾</button>
+        <div class="wa-sim-expanded" id="wa-sim-expanded" style="display:none">
+          <div class="wa-sim-body">
+            <div class="wa-sim-row">
+              <input id="wa-sim-phone" class="field-input" type="tel"  placeholder="טלפון  05XXXXXXXX" dir="ltr"/>
+              <input id="wa-sim-name"  class="field-input" type="text" placeholder="שם שולח" />
             </div>
-            <div class="wa-chat-empty" id="wa-chat-empty">
-              <div class="va-empty-icon">💬</div>
-              <div class="va-empty-title">בחר הודעה מהרשימה</div>
-              <div class="va-empty-sub">לחץ על הודעה כדי לראות פרטי שיחה, סיווג כוונה ותשובת ברק</div>
+            <div class="wa-sim-row" style="margin-top:10px">
+              <input id="wa-sim-text" class="field-input" type="text"
+                placeholder="תוכן ההודעה… למשל: תבטל לי את השיעור של מחר" style="flex:1" />
+              <button class="btn btn-primary" id="btn-wa-sim" style="white-space:nowrap">▶ שלח</button>
             </div>
-            <div class="wa-chat-detail" id="wa-chat-detail" style="display:none">
-              <!-- injected by JS -->
+            <div class="wa-example-pills" id="wa-example-pills">
+              <span class="wa-pill" data-txt="תבטל לי את השיעור של מחר">ביטול</span>
+              <span class="wa-pill" data-txt="תשבץ אותי קבוע בכל שני">שיבוץ קבוע</span>
+              <span class="wa-pill" data-txt="רוצה מקום בפילאטיס מחר">הזמנה</span>
+              <span class="wa-pill" data-txt="מה יש היום בסטודיו?">לוח שיעורים</span>
+              <span class="wa-pill" data-txt="שלום, כמה עולה מנוי?">שאלה כללית</span>
+              <span class="wa-pill" data-txt="לא אגיע היום לשיעור">לא מגיע</span>
             </div>
+            <div class="tool-result" id="wa-sim-result" style="display:none;margin-top:12px"></div>
           </div>
+        </div>
+      </div>
 
-          <!-- Simulation / testing tool -->
-          <div class="panel">
-            <div class="panel-header">
-              <h2>🧪 סימולציה — הודעה נכנסת</h2>
-              <span style="font-size:12px;color:var(--muted)">ללא WhatsApp אמיתי</span>
-            </div>
-            <div class="wa-sim-body">
-              <div class="wa-sim-row">
-                <input id="wa-sim-phone" class="field-input" type="tel"  placeholder="טלפון  05XXXXXXXX" dir="ltr"/>
-                <input id="wa-sim-name"  class="field-input" type="text" placeholder="שם שולח" />
-              </div>
-              <div class="wa-sim-row" style="margin-top:10px">
-                <input id="wa-sim-text"  class="field-input" type="text"
-                  placeholder="תוכן ההודעה… למשל: תבטל לי את השיעור של מחר" style="flex:1" />
-                <button class="btn btn-primary" id="btn-wa-sim" style="white-space:nowrap">▶ שלח</button>
-              </div>
-              <!-- quick-fill example pills -->
-              <div class="wa-example-pills" id="wa-example-pills">
-                <span class="wa-pill" data-txt="תבטל לי את השיעור של מחר">ביטול</span>
-                <span class="wa-pill" data-txt="תשבץ אותי קבוע בכל שני">שיבוץ קבוע</span>
-                <span class="wa-pill" data-txt="רוצה מקום בפילאטיס מחר">הזמנה</span>
-                <span class="wa-pill" data-txt="מה יש היום בסטודיו?">לוח שיעורים</span>
-                <span class="wa-pill" data-txt="שלום, כמה עולה מנוי?">שאלה כללית</span>
-                <span class="wa-pill" data-txt="לא אגיע היום לשיעור">לא מגיע</span>
-              </div>
-              <div class="tool-result" id="wa-sim-result" style="display:none;margin-top:12px"></div>
-            </div>
-          </div>
-
-        </div><!-- /wa-right-col -->
-      </div><!-- /wa-layout -->
     </section>
 
     <!-- ══════════════════════════════════════════════════════════════════════
