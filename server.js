@@ -1184,13 +1184,13 @@ async function processInboundWAMessage(msg) {
     store.logEvent('message_out', fromNorm, { preview: confirmMsg.slice(0, 80), agent: 'barak', source: 'callback_confirm' });
 
     // Store inbox entry and exit — no further routing needed
-    inbox.push({
+    const cbInboxEntry = inbox.push({
       from: fromNorm, fromIsraeli, name: msg.name ?? clientMatch.arboxName ?? null,
       text: msg.text, messageId: msg.messageId, timestamp: msg.timestamp,
       receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
       clientMatch, intent: 'callback_time', route: 'callback_confirm', barakReply: confirmMsg,
     });
-    return { inboxEntry: null, clientMatch, intent: 'callback_time', route: 'callback_confirm', barakReply: confirmMsg };
+    return { inboxEntry: cbInboxEntry, clientMatch, intent: 'callback_time', route: 'callback_confirm', barakReply: confirmMsg };
   }
 
   // 3. Routing decision
