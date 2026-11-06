@@ -4,7 +4,7 @@ const express = require('express');
 const cron    = require('node-cron');
 const logger  = require('./utils/logger');
 
-const { verifyWebhook, parseInbound, parseInboundRich, releaseQueuedMessages, sendText, notifyLeadTeam } = require('./services/whatsapp.service');
+const { verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, releaseQueuedMessages, sendText, notifyLeadTeam } = require('./services/whatsapp.service');
 const { fetchAndNormalizeLead } = require('./services/metaLeads');
 const { captureRawBody, verifyMetaSignature } = require('./middleware/security');
 const inbox = require('./utils/whatsapp_inbox');
@@ -1072,7 +1072,7 @@ async function processInboundWAMessage(msg) {
     route = 'barak';
     try { barakReply = await buildSchedulingReply(intent, msg, clientMatch); } catch { /* non-fatal */ }
   } else if (!isExistingClient) {
-    // Unknown sender or known lead → lead qualification pipeline
+    // Unknown sender or known lead → lead qualification pipeline (lead_agent sends its own reply)
     route = 'lead_agent';
     try {
       await leadAgent.handleInbound({
@@ -1084,8 +1084,21 @@ async function processInboundWAMessage(msg) {
       logger.error('Lead agent error in WA pipeline', { error: err.message, from: fromNorm });
     }
   } else {
-    // Existing client, non-scheduling message → Barak owns context
-    route = 'barak';
+    // Existing client, non-scheduling general message → Tomer handles retention context
+    // (Barak handles scheduling; Tomer handles ongoing engagement and check-ins)
+    route = 'tomer';
+    if (msg.type === 'text' && msg.text?.trim()) {
+      try {
+        const tomerPrompt =
+          `הודעה נכנסת מחבר/ת סטודיו פעיל/ה.\n` +
+          `שם: ${msg.name ?? clientMatch.arboxName ?? 'לא ידוע'}\n` +
+          `הודעה: "${msg.text}"\n\n` +
+          `ענה בעברית בצורה אישית, חמה ותומכת — עד 3 משפטים.`;
+        barakReply = await tomerAgent.chat(tomerPrompt);
+      } catch (err) {
+        logger.warn('Tomer general reply failed', { error: err.message, from: fromNorm });
+      }
+    }
   }
 
   // 4. Store in inbox ring buffer
@@ -1174,6 +1187,42 @@ app.post('/api/whatsapp/webhook', captureRawBody, verifyMetaSignature, async (re
 
   processInboundWAMessage(msg).catch(err =>
     logger.error('WA pipeline error', { error: err.message, from: msg.from })
+  );
+});
+
+// ── POST /api/green-api/webhook — inbound messages from Green API ─────────────
+//
+// Green API pushes webhooks in its own JSON format (NOT Meta Cloud API format).
+// It does NOT send X-Hub-Signature-256, so Meta's signature middleware must NOT
+// be used here — this endpoint handles its own minimal validation.
+//
+// Set this URL in the Green API dashboard:
+//   Settings → Notifications → Webhook URL:
+//   https://shape-studio-agent-production.up.railway.app/api/green-api/webhook
+//
+// Security: the endpoint URL itself is the access control (UUID-like path is fine,
+// but the current path is acceptable for a private deployment).
+app.post('/api/green-api/webhook', express.json({ limit: '1mb' }), async (req, res) => {
+  res.sendStatus(200); // respond immediately — Green API retries on non-200
+
+  const rawType = req.body?.typeWebhook;
+  logger.debug('Green API webhook received', { typeWebhook: rawType });
+
+  // Silently ignore non-message events (state changes, device info, delivery receipts)
+  if (!rawType || rawType !== 'incomingMessageReceived') return;
+
+  const msg = parseGreenApiWebhook(req.body);
+  if (!msg) return; // group message, unsupported type, or parse failure
+
+  logger.info('Green API inbound message', {
+    from:    msg.from,
+    type:    msg.type,
+    preview: msg.text?.slice(0, 60),
+  });
+
+  // Route through the full CRM pipeline — same logic as /api/whatsapp/webhook
+  processInboundWAMessage(msg).catch(err =>
+    logger.error('WA pipeline error (Green API)', { error: err.message, from: msg.from })
   );
 });
 

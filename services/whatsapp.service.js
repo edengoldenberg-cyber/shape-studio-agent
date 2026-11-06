@@ -267,4 +267,129 @@ async function notifyLeadTeam(lead, { formId, adId } = {}) {
   );
 }
 
-module.exports = { sendText, alertOwner, notifyLeadTeam, releaseQueuedMessages, verifyWebhook, parseInbound, parseInboundRich };
+/**
+ * Parse an inbound webhook payload from Green API into the same normalised
+ * message shape that processInboundWAMessage() and parseInboundRich() produce.
+ *
+ * Green API format (reference: https://green-api.com/en/docs/api/receiving/technology-webhook-endpoint/):
+ * {
+ *   typeWebhook:  "incomingMessageReceived",
+ *   instanceData: { idInstance, wid },
+ *   timestamp:    1234567890,
+ *   idMessage:    "BAE5F4886F532323",
+ *   senderData:   { chatId:"972XXXXXXXXX@c.us", chatName, senderName, senderContactName },
+ *   messageData:  { typeMessage:"textMessage", textMessageData:{ textMessage:"..." } }
+ * }
+ *
+ * Returns null for:
+ *   - Non-incoming events (status updates, outgoing echos, state changes)
+ *   - Group chat messages (chatId ends in @g.us)
+ *   - Unsupported message types (polls, etc.)
+ */
+function parseGreenApiWebhook(body) {
+  try {
+    // Only process genuine incoming messages
+    if (body?.typeWebhook !== 'incomingMessageReceived') return null;
+
+    const sender  = body.senderData;
+    const msgData = body.messageData;
+    if (!sender?.chatId || !msgData) return null;
+
+    // Skip group chats — only handle 1:1 messages
+    if (sender.chatId.endsWith('@g.us')) return null;
+
+    // Normalise phone: "972501234567@c.us" → "972501234567"
+    const from      = sender.chatId.replace(/@.*$/, '');
+    const name      = sender.senderContactName ?? sender.senderName ?? sender.chatName ?? null;
+    const messageId = body.idMessage ?? null;
+    const timestamp = new Date((body.timestamp ?? Math.floor(Date.now() / 1000)) * 1000);
+    const type      = msgData.typeMessage;
+
+    switch (type) {
+      case 'textMessage':
+        return {
+          from, name, messageId, timestamp,
+          type: 'text',
+          text: msgData.textMessageData?.textMessage ?? '',
+          mediaType: 'text', mediaCaption: null, mediaId: null,
+        };
+
+      case 'imageMessage': {
+        const img = msgData.imageMessageData ?? {};
+        return {
+          from, name, messageId, timestamp,
+          type: 'image',
+          text: img.caption ?? '[תמונה]',
+          mediaType: 'image', mediaCaption: img.caption ?? null, mediaId: null,
+        };
+      }
+
+      case 'videoMessage': {
+        const vid = msgData.videoMessageData ?? {};
+        return {
+          from, name, messageId, timestamp,
+          type: 'video',
+          text: vid.caption ?? '[וידאו]',
+          mediaType: 'video', mediaCaption: vid.caption ?? null, mediaId: null,
+        };
+      }
+
+      // Voice note (ptt = push-to-talk) and regular audio
+      case 'audioMessage':
+      case 'pttMessage':
+        return {
+          from, name, messageId, timestamp,
+          type: 'audio',
+          text: '[הודעה קולית]',
+          mediaType: 'audio', mediaCaption: null, mediaId: null,
+        };
+
+      case 'documentMessage': {
+        const doc = msgData.documentMessageData ?? {};
+        return {
+          from, name, messageId, timestamp,
+          type: 'document',
+          text: doc.caption ?? doc.fileName ?? '[מסמך]',
+          mediaType: 'document', mediaCaption: doc.caption ?? null, mediaId: null,
+        };
+      }
+
+      case 'locationMessage': {
+        const loc = msgData.locationMessageData ?? {};
+        const label = [loc.nameLocation, loc.address].filter(Boolean).join(' ')
+                   || `${loc.latitude ?? ''},${loc.longitude ?? ''}`;
+        return {
+          from, name, messageId, timestamp,
+          type: 'location',
+          text: `[מיקום] ${label}`.trim(),
+          mediaType: 'location', mediaCaption: null, mediaId: null,
+        };
+      }
+
+      case 'contactMessage':
+        return {
+          from, name, messageId, timestamp,
+          type: 'contact',
+          text: '[איש קשר]', mediaType: 'contact', mediaCaption: null, mediaId: null,
+        };
+
+      default:
+        // extendedTextMessage (links with previews) — treat as plain text
+        if (msgData.extendedTextMessageData?.text) {
+          return {
+            from, name, messageId, timestamp,
+            type: 'text',
+            text: msgData.extendedTextMessageData.text,
+            mediaType: 'text', mediaCaption: null, mediaId: null,
+          };
+        }
+        logger.debug('parseGreenApiWebhook: unsupported typeMessage — skipping', { type, from });
+        return null;
+    }
+  } catch (err) {
+    logger.error('parseGreenApiWebhook exception', { error: err.message });
+    return null;
+  }
+}
+
+module.exports = { sendText, alertOwner, notifyLeadTeam, releaseQueuedMessages, verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook };
