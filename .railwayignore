@@ -1,0 +1,9 @@
+logs/
+*.log
+.env
+node_modules/
+*.png
+*.jpg
+*.pdf
+test_*.js
+meta_webhook_test.js

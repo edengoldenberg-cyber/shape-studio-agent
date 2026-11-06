@@ -1,0 +1,2025 @@
+/* ════════════════════════════════════════════════════════════════════════════
+   Shape Studio — Multi-Agent Dashboard
+   Tabs: Maya · Dana · Tomer · Barak · Health
+   ════════════════════════════════════════════════════════════════════════════ */
+
+/* ── State ─────────────────────────────────────────────────────────────────── */
+let allLeads     = [];
+let activeFilter = 'all';
+let refreshTimer = null;
+
+/* ── Server ping ────────────────────────────────────────────────────────────── */
+async function pingServer() {
+  try {
+    await fetch('/health');
+    document.querySelector('.status-dot').classList.add('live');
+    document.getElementById('status-label').textContent = 'מערכת פעילה';
+  } catch {
+    document.querySelector('.status-dot').classList.remove('live');
+    document.getElementById('status-label').textContent = 'לא מחובר';
+  }
+}
+
+/* ── Tab switching ──────────────────────────────────────────────────────────── */
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+    switch (btn.dataset.tab) {
+      case 'maya':        loadMayaStats();       break;
+      case 'barak':       loadBarakPanel(); loadArboxOverview(); break;
+      case 'tomer':       loadTomerQueue();      break;
+      case 'health':      loadHealth();          break;
+      case 'sandbox':     initSandbox();         break;
+      case 'whatsapp':    loadWhatsAppInbox();    break;
+      case 'automations': loadAutomations();     break;
+    }
+  });
+});
+
+/* ── Filter buttons (Barak tab) ─────────────────────────────────────────────── */
+document.querySelectorAll('.filter-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    activeFilter = btn.dataset.filter;
+    renderBarakTable(allLeads);
+  });
+});
+
+/* ── Seed / Reset ───────────────────────────────────────────────────────────── */
+document.getElementById('btn-seed').addEventListener('click', async () => {
+  const r = await fetch('/api/store/seed', { method: 'POST' });
+  const { count } = await r.json();
+  toast(`✅ נטענו ${count} לידי דמו`);
+  loadBarakPanel();
+});
+
+document.getElementById('btn-reset').addEventListener('click', async () => {
+  if (!confirm('למחוק את כל נתוני הלידים?')) return;
+  await fetch('/api/store/reset', { method: 'POST' });
+  toast('🗑️ הנתונים נמחקו');
+  loadBarakPanel();
+  loadMayaStats();
+});
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   MAYA TAB
+   ══════════════════════════════════════════════════════════════════════════════ */
+
+async function loadMayaStats() {
+  try {
+    const [statsRes, summaryRes] = await Promise.all([
+      fetch('/api/stats').then(r => r.json()),
+      fetch('/api/maya/summary').then(r => r.json()),
+    ]);
+    renderMayaStats(statsRes.daily);
+    renderExecSummary(summaryRes);
+  } catch (e) { console.error('loadMayaStats', e); }
+}
+
+function renderExecSummary(data) {
+  if (!data) return;
+  const { funnel = {}, today = {}, members = {}, health = {} } = data;
+
+  setTxt('ef-leads',    funnel.leads    ?? '—');
+  setTxt('ef-hot',      funnel.hot      ?? '—');
+  setTxt('ef-intro',    funnel.introSent ?? '—');
+  setTxt('ef-redeemed', funnel.introRedeemed ?? '—');
+  setTxt('ef-booked',   funnel.converted ?? '—');
+  setTxt('ef-conv',     `המרה: ${funnel.convRate ?? 0}%`);
+
+  setTxt('em-active',  members.active  ?? '—');
+  setTxt('em-risk',    members.atRisk  ?? '—');
+  setTxt('em-churned', members.churned ?? '—');
+
+  setTxt('et-new',   today.newLeads   ?? '—');
+  setTxt('et-in',    today.messagesIn  ?? '—');
+  setTxt('et-reng',  today.reEngaged   ?? '—');
+  setTxt('et-score', health.avgScore != null ? health.avgScore + '/10' : '—');
+}
+
+function renderMayaStats(d) {
+  const el = document.getElementById('maya-stats');
+  if (!el) return;
+  const cards = [
+    { cls: '',       icon: '👥', val: d.totalLeads,      label: 'סה"כ לידים' },
+    { cls: 'hot',    icon: '🔥', val: d.hotLeadsTotal,   label: 'לידים חמים' },
+    { cls: 'warm',   icon: '🌡️', val: d.warmLeadsTotal,  label: 'לידים פושרים' },
+    { cls: '',       icon: '💬', val: d.messagesIn,       label: 'הודעות נכנסות' },
+    { cls: '',       icon: '🎯', val: d.introOffersSent,  label: 'הצעות שנשלחו' },
+    { cls: '',       icon: '🔁', val: d.reEngagedToday,   label: 'שומרו היום' },
+    d.crisisActive > 0
+      ? { cls: 'crisis', icon: '🚨', val: d.crisisActive, label: 'משבר פעיל' }
+      : null,
+  ].filter(Boolean);
+  el.innerHTML = cards.map(c => `
+    <div class="stat-card ${c.cls}">
+      <div class="stat-icon">${c.icon}</div>
+      <div class="stat-value">${c.val}</div>
+      <div class="stat-label">${c.label}</div>
+    </div>`).join('');
+}
+
+/* Maya full chat ──────────────────────────────────────────────────────────────*/
+const chatEl  = document.getElementById('chat-messages');
+const inputEl = document.getElementById('chat-input');
+const sendBtn = document.getElementById('send-btn');
+
+async function sendMayaMsg(text) {
+  text = text.trim();
+  if (!text) return;
+  inputEl.value = '';
+  sendBtn.disabled = true;
+  appendMsg(chatEl, 'user', text);
+  const tid = addTyping(chatEl);
+  try {
+    const { reply, error } = await post('/api/maya/chat', { message: text });
+    removeEl(tid);
+    appendMsg(chatEl, 'maya', error ? `שגיאה: ${error}` : reply);
+  } catch {
+    removeEl(tid);
+    appendMsg(chatEl, 'maya', 'שגיאה בחיבור לשרת');
+  } finally {
+    sendBtn.disabled = false;
+    inputEl.focus();
+  }
+}
+
+sendBtn.addEventListener('click',  () => sendMayaMsg(inputEl.value));
+inputEl.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) sendMayaMsg(inputEl.value); });
+document.querySelectorAll('.quick-btn').forEach(btn =>
+  btn.addEventListener('click', () => sendMayaMsg(btn.dataset.prompt))
+);
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   DANA TAB — Content + Video Analysis
+   ══════════════════════════════════════════════════════════════════════════════ */
+
+/* Content Pack ────────────────────────────────────────────────────────────────*/
+document.getElementById('btn-content-pack').addEventListener('click', async () => {
+  const btn      = document.getElementById('btn-content-pack');
+  const resultEl = document.getElementById('cp-result');
+  const cls      = document.getElementById('cp-class').value || undefined;
+  btn.disabled   = true;
+  btn.textContent = 'יוצר... ✨';
+  resultEl.style.display = 'none';
+  try {
+    const { pack, focusClass, error } = await post('/api/dana/content-pack', { focusClass: cls });
+    if (error) throw new Error(error);
+    resultEl.textContent = `פוקוס: ${focusClass}\n\n${pack}`;
+    resultEl.style.display = 'block';
+  } catch (err) { toast(`❌ ${err.message}`); }
+  finally { btn.disabled = false; btn.textContent = '✨ צרי חבילת תוכן'; }
+});
+
+/* Ad Copy ─────────────────────────────────────────────────────────────────────*/
+document.getElementById('btn-ad-copy').addEventListener('click', async () => {
+  const btn      = document.getElementById('btn-ad-copy');
+  const resultEl = document.getElementById('ac-result');
+  btn.disabled   = true;
+  btn.textContent = 'יוצר... 📝';
+  resultEl.style.display = 'none';
+  try {
+    const format    = document.getElementById('ac-format').value;
+    const objective = document.getElementById('ac-obj').value;
+    const { copy, error } = await post('/api/dana/ad-copy', { format, objective });
+    if (error) throw new Error(error);
+    resultEl.textContent = copy;
+    resultEl.style.display = 'block';
+  } catch (err) { toast(`❌ ${err.message}`); }
+  finally { btn.disabled = false; btn.textContent = '📝 צרי קופי'; }
+});
+
+/* Video Analysis ──────────────────────────────────────────────────────────────*/
+const vaSubmit = document.getElementById('va-submit');
+
+vaSubmit.addEventListener('click', submitVideoAnalysis);
+document.getElementById('va-desc').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && e.ctrlKey) submitVideoAnalysis();
+});
+
+async function submitVideoAnalysis() {
+  const title  = document.getElementById('va-title').value.trim() || 'סרטון ללא כותרת';
+  const desc   = document.getElementById('va-desc').value.trim();
+  const format = document.getElementById('va-format').value;
+  const goal   = document.getElementById('va-goal').value;
+  if (!desc) { toast('⚠️ יש להכניס תיאור לפני הניתוח'); return; }
+
+  vaSubmit.disabled    = true;
+  vaSubmit.innerHTML   = `מנתח... <span class="va-spinner"></span>`;
+
+  const emptyEl   = document.getElementById('va-empty-state');
+  const contentEl = document.getElementById('va-result-content');
+  emptyEl.style.display   = 'flex';
+  contentEl.style.display = 'none';
+  emptyEl.innerHTML = `
+    <div class="va-empty-icon" style="animation:va-spin 1.2s linear infinite">⚙️</div>
+    <div class="va-empty-title">מנתח...</div>
+    <div class="va-empty-sub">דנה קוראת את מסגרת מוסרי ומנקדת את הפריט שלך</div>`;
+
+  try {
+    const res = await fetch('/api/dana/analyze-video', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title, description: desc, format, goal }),
+    });
+    if (!res.ok) { const b = await res.json().catch(()=>({})); throw new Error(b.error || `HTTP ${res.status}`); }
+    const data = await res.json();
+
+    emptyEl.style.display = 'none';
+    contentEl.innerHTML   = renderResultHTML(data);
+    contentEl.style.display = 'flex';
+
+    contentEl.querySelectorAll('.fix-copy-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        try { await navigator.clipboard.writeText(btn.getAttribute('data-copy')); } catch {}
+        const orig = btn.textContent;
+        btn.textContent = '✅';
+        setTimeout(() => { btn.textContent = orig; }, 1400);
+      });
+    });
+    contentEl.querySelector('.va-review-toggle')?.addEventListener('click', function () {
+      const body = contentEl.querySelector('.va-review-body');
+      const open = body.classList.toggle('open');
+      this.querySelector('.toggle-arrow').textContent = open ? '▲' : '▼';
+    });
+    contentEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } catch (err) {
+    emptyEl.innerHTML = `<div class="va-empty-icon">❌</div><div class="va-empty-title">שגיאה</div><div class="va-empty-sub">${esc(err.message)}</div>`;
+    toast(`❌ ${err.message}`);
+  } finally {
+    vaSubmit.disabled = false;
+    vaSubmit.innerHTML = '🔍 נתח לפי מוסרי';
+  }
+}
+
+/* Video result rendering ──────────────────────────────────────────────────────*/
+function renderResultHTML(data) {
+  const { readiness=0, verdict='', scores={}, flags=[], strengths=[], fixes=[], review='', share_direction, accuracy, reasonings={} } = data;
+  const vKey = vaVerdictKey(verdict);
+  return [
+    renderVAHeader(readiness, verdict, vKey, share_direction, accuracy),
+    renderCriteriaPanel(scores, reasonings),
+    strengths.length ? renderStrengthsPanel(strengths) : '',
+    fixes.length     ? renderFixesPanel(fixes)          : '',
+    renderFlagsPanel(flags),
+    renderMosseriQuotePanel(review),
+    renderFullReviewPanel(review),
+  ].filter(Boolean).join('');
+}
+
+function vaVerdictKey(v) {
+  if (!v) return 'fix';
+  if (v.includes('לפרסם')) return 'publish';
+  if (v.includes('לגנוז')) return 'shelve';
+  return 'fix';
+}
+
+function renderVAHeader(readiness, verdict, vKey, share_direction, accuracy) {
+  const r = readiness ?? 0;
+  const circ = 263.9;
+  const offset = (circ * (1 - r / 100)).toFixed(1);
+  const color = r >= 75 ? 'var(--green)' : r >= 50 ? 'var(--warm)' : 'var(--hot)';
+  const label = { publish:'✅ לפרסם', fix:'⚠️ לתקן קודם', shelve:'🚫 לגנוז' }[vKey] ?? verdict;
+  return `
+  <div class="va-header-row">
+    <div class="score-ring-wrap">
+      <svg class="score-ring" viewBox="0 0 100 100">
+        <circle class="ring-track" cx="50" cy="50" r="42"/>
+        <circle class="ring-fill" cx="50" cy="50" r="42"
+          style="stroke:${color};stroke-dasharray:${circ};stroke-dashoffset:${offset}"/>
+      </svg>
+      <div class="score-number" style="color:${color}">${r}</div>
+    </div>
+    <div class="va-verdict-block">
+      <div class="va-verdict-lbl">פסק דין</div>
+      <div class="va-verdict ${vKey}">${label}</div>
+      ${share_direction ? `<div class="va-share">${esc(share_direction)}</div>` : ''}
+      ${accuracy        ? `<div class="va-accuracy">${esc(accuracy)}</div>`      : ''}
+    </div>
+  </div>`;
+}
+
+function renderCriteriaPanel(scores, reasonings) {
+  if (!scores) return '';
+  const META = [['C1','הוק',25],['C2','שליחות',20],['C3','ערך לזר',20],['C4','מבנה',15],['C5','מקוריות',10],['C6','קריאות',5],['C7','נושא',5]];
+  const rows = META.map(([k,lbl,wt]) => {
+    const v = scores[k] ?? 0;
+    const pct = (v/5*100).toFixed(0);
+    const color = v>=4?'var(--green)':v>=3?'var(--warm)':'var(--hot)';
+    const note = reasonings[k] ? `<div class="criteria-reasoning">${esc(reasonings[k])}</div>` : '';
+    return `<div class="criteria-row">
+      <div class="criteria-key">${k}</div>
+      <div class="criteria-label">${lbl} <span class="criteria-wt">×${wt}%</span></div>
+      <div class="criteria-track"><div class="criteria-fill" style="width:${pct}%;background:${color}"></div></div>
+      <div class="criteria-score" style="color:${color}">${v}/5</div>
+    </div>${note}`;
+  }).join('');
+  return `<div class="va-criteria-panel panel"><div class="panel-header"><h2>ציוני 7 הקריטריונים</h2></div><div style="padding:14px 20px 4px">${rows}</div></div>`;
+}
+
+function renderStrengthsPanel(strengths) {
+  const items = strengths.map(s=>`<div class="strength-item"><span class="strength-bullet">✓</span><span>${esc(s)}</span></div>`).join('');
+  return `<div class="va-strengths-panel panel"><div class="panel-header"><h2>מה עובד</h2></div><div style="padding:0 20px 12px">${items}</div></div>`;
+}
+
+function renderFixesPanel(fixes) {
+  const cards = fixes.slice(0,3).map((fix,i) => {
+    const cite = fix.citation ? `<div class="fix-citation">מוסרי, ${esc(fix.citation.date)}: "${esc(fix.citation.quote)}"</div>` : '';
+    const rw = fix.suggestedRewrite ?? '';
+    return `<div class="fix-card">
+      <div class="fix-header">
+        <div class="fix-num">${i+1}</div>
+        <div class="fix-name">${esc(fix.name??'')}</div>
+        ${fix.principleCode?`<span class="fix-principle">${esc(fix.principleCode)}</span>`:''}
+      </div>
+      <div class="fix-body">
+        <div><div class="fix-lbl">עכשיו</div><div class="fix-text">${esc(fix.currentText??'')}</div></div>
+        <div><div class="fix-lbl">במקום</div>
+          <div class="fix-text rewrite">${esc(rw)}<button class="fix-copy-btn" data-copy="${esc(rw)}">העתק</button></div>
+        </div>
+        <div><div class="fix-lbl">למה</div><div class="fix-why">${esc(fix.explanation??'')}</div>${cite}</div>
+      </div>
+    </div>`;
+  }).join('');
+  return `<div class="va-fixes-panel panel"><div class="panel-header"><h2>${fixes.length===3?'3':fixes.length} התיקונים הכי חשובים</h2></div><div style="padding:14px 20px">${cards}</div></div>`;
+}
+
+function renderFlagsPanel(flags) {
+  const HARD = new Set(['wordmark','aggregated','reupload']);
+  const LABELS = { wordmark:'סימן מים (−15)', aggregated:'תוכן מצובר (−15)', reupload:'העלאה חוזרת (−20)', unpaid_promise:'הבטחה לא ממומשת (−10)', ai_slick:'AI חלק מדי (−5)' };
+  const chips = (!flags||!flags.length)
+    ? `<span class="flag-chip none">✅ אין דגלי סיכון</span>`
+    : flags.map(f=>`<span class="flag-chip ${HARD.has(f)?'hard':'soft'}">⚠ ${LABELS[f]??f}</span>`).join('');
+  return `<div class="va-flags-panel panel"><div class="panel-header"><h2>דגלי סיכון</h2></div><div style="padding:10px 20px 14px"><div class="flags-row">${chips}</div></div></div>`;
+}
+
+function renderMosseriQuotePanel(reviewText) {
+  const lines = (reviewText??'').split('\n');
+  const idx   = lines.findIndex(l=>l.includes('מה מוסרי היה אומר'));
+  if (idx<0) return '';
+  const quote = lines.slice(idx+1).filter(l=>l.trim()).join(' ').trim();
+  if (!quote) return '';
+  return `<div class="va-quote-panel">
+    <div class="va-section-title" style="color:var(--primary);margin-bottom:10px">מה מוסרי היה אומר</div>
+    <div class="va-quote-text">${esc(quote)}</div>
+  </div>`;
+}
+
+function renderFullReviewPanel(reviewText) {
+  if (!reviewText) return '';
+  return `<div class="panel"><button class="va-review-toggle"><span>📋 ביקורת מלאה להעתקה</span><span class="toggle-arrow" style="font-size:11px">▼</span></button><pre class="va-review-body">${esc(reviewText)}</pre></div>`;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   TOMER TAB — Retention
+   ══════════════════════════════════════════════════════════════════════════════ */
+
+/* Tomer sub-nav ───────────────────────────────────────────────────────────────*/
+let activeTomerView = 'leads';
+
+document.querySelectorAll('.subnav-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.subnav-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    activeTomerView = btn.dataset.tview;
+    document.getElementById('tomer-view-leads').style.display   = activeTomerView === 'leads'   ? '' : 'none';
+    document.getElementById('tomer-view-members').style.display = activeTomerView === 'members' ? '' : 'none';
+    if (activeTomerView === 'members') loadTomerMembers();
+  });
+});
+
+document.getElementById('btn-tomer-refresh').addEventListener('click', () => {
+  if (activeTomerView === 'members') loadTomerMembers();
+  else loadTomerQueue();
+});
+
+document.getElementById('btn-tomer-checks').addEventListener('click', async () => {
+  const btn    = document.getElementById('btn-tomer-checks');
+  const result = document.getElementById('tomer-checks-result');
+  btn.disabled = true;
+  btn.textContent = 'מריץ...';
+  result.style.display = 'none';
+  try {
+    const data = await post('/api/tomer/run-checks', {});
+    result.textContent = `הושלם ✅\nרי-אנגייג'מנט: ${data.reEngaged ?? 0}\nפולו-אפ הצעות: ${data.introFollowUps ?? 0}\nדלגו: ${data.skipped ?? 0}\nשגיאות: ${data.errors ?? 0}`;
+    result.style.display = 'block';
+    toast('✅ הבדיקות הושלמו');
+    loadTomerQueue();
+  } catch (err) { toast(`❌ ${err.message}`); }
+  finally { btn.disabled = false; btn.textContent = '▶ הרץ בדיקות יומיות'; }
+});
+
+async function loadTomerQueue() {
+  const btn = document.getElementById('btn-tomer-refresh');
+  if (btn) btn.textContent = 'טוען...';
+
+  try {
+    const [queueRes, statsRes] = await Promise.all([
+      fetch('/api/tomer/queue'),
+      fetch('/api/stats'),
+    ]);
+    const queue   = await queueRes.json();
+    const { daily } = await statsRes.json();
+
+    // Update mini stats
+    const dormant  = queue.dormant  ?? [];
+    const intro    = queue.introNotRedeemed ?? [];
+    setTxt('ts-dormant', dormant.length);
+    setTxt('ts-intro',   intro.length);
+    setTxt('ts-today',   daily.reEngagedToday ?? 0);
+
+    // Merge + deduplicate by phone
+    const seen = new Set();
+    const all  = [...dormant, ...intro].filter(l => {
+      if (seen.has(l.phone)) return false;
+      seen.add(l.phone);
+      return true;
+    });
+
+    renderTomerQueue(all);
+    const upEl = document.getElementById('tomer-updated');
+    if (upEl) upEl.textContent = 'עודכן: ' + now();
+  } catch (err) {
+    setTBody('tomer-queue-tbody', 6, `שגיאה: ${esc(err.message)}`);
+  } finally {
+    if (btn) btn.textContent = '🔄 רענן';
+  }
+}
+
+function renderTomerQueue(leads) {
+  const tbody = document.getElementById('tomer-queue-tbody');
+  if (!leads?.length) {
+    tbody.innerHTML = `<tr><td colspan="6" class="empty-state">אין לידים בתור — הכל מטופל 🎉</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = leads.map(l => {
+    const days  = l.lastActivity ? Math.floor((Date.now() - new Date(l.lastActivity).getTime()) / 86400000) : '?';
+    const tier  = l.score >= 8 ? 'hot' : l.score >= 5 ? 'warm' : 'cold';
+    const color = days > 7 ? 'var(--hot)' : 'var(--warm)';
+    const introIcon = l.introOfferSent ? (l.introOfferRedeemed ? '✅ נוצלה' : '⏳ ממתינה') : '—';
+    return `<tr>
+      <td><span class="lead-name">${esc(l.name ?? '—')}</span></td>
+      <td><div class="score-cell"><span class="score-num">${l.score}</span><div class="score-track"><div class="score-fill ${tier}" style="width:${l.score*10}%"></div></div></div></td>
+      <td><span class="badge ${l.status||'new'}">${statusLabel(l.status)}</span></td>
+      <td style="text-align:center;font-weight:700;color:${color}">${days}ד</td>
+      <td style="text-align:center">${l.reEngagementCount ?? 0}</td>
+      <td style="font-size:12px">${introIcon}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function loadTomerMembers() {
+  try {
+    const data = await fetch('/api/tomer/members').then(r => r.json());
+    const { inactive = [], stats = {} } = data;
+
+    setTxt('tm-active',  stats.active  ?? '—');
+    setTxt('tm-risk',    stats.atRisk  ?? '—');
+    setTxt('tm-churned', stats.churned ?? '—');
+
+    renderMembersTable(inactive);
+    const upEl = document.getElementById('tomer-members-updated');
+    if (upEl) upEl.textContent = 'עודכן: ' + now();
+  } catch (err) {
+    setTBody('tomer-members-tbody', 5, `שגיאה: ${esc(err.message)}`);
+  }
+}
+
+function renderMembersTable(members) {
+  const tbody = document.getElementById('tomer-members-tbody');
+  if (!members?.length) {
+    tbody.innerHTML = `<tr><td colspan="5" class="empty-state">אין חברות בסיכון 🎉</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = members.map(m => {
+    const days  = m.lastAttendance
+      ? Math.floor((Date.now() - new Date(m.lastAttendance).getTime()) / 86400000)
+      : '∞';
+    const statusMap = { active: 'active', at_risk: 'warm', churned: 'crisis' };
+    const labelMap  = { active: '✅ פעילה', at_risk: '⚠️ בסיכון', churned: '🚨 עזבה' };
+    const cls = statusMap[m.status] ?? 'cold';
+    const color = days > 30 ? 'var(--hot)' : days > 14 ? 'var(--warm)' : 'var(--text)';
+    return `<tr>
+      <td><span class="lead-name">${esc(m.name ?? '—')}</span></td>
+      <td style="font-size:12px;color:var(--muted)">${esc(m.planType ?? '—')}</td>
+      <td style="text-align:center;font-weight:700;color:${color}">${days}ד</td>
+      <td style="text-align:center">${m.attendanceMonth ?? 0}</td>
+      <td><span class="badge ${cls}">${labelMap[m.status] ?? m.status}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   BARAK TAB — CRM & Arbox Management
+   ══════════════════════════════════════════════════════════════════════════════ */
+
+// ── Barak sub-navigation ──────────────────────────────────────────────────────
+let activeBarakView = 'pipeline';
+
+document.querySelectorAll('.barak-sv-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.barak-sv-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    activeBarakView = btn.dataset.bview;
+    document.querySelectorAll('[id^="barak-view-"]').forEach(v => v.style.display = 'none');
+    const viewEl = document.getElementById('barak-view-' + activeBarakView);
+    if (viewEl) viewEl.style.display = '';
+    if (activeBarakView === 'members')      loadArboxMembers();
+    if (activeBarakView === 'memberships')  loadMemberships();
+    if (activeBarakView === 'attendance')   loadAttendance();
+    if (activeBarakView === 'staff')        loadStaff();
+    if (activeBarakView === 'retention')    loadRetention();
+    if (activeBarakView === 'arbox-leads')  loadArboxLeads();
+    if (activeBarakView === 'schedule')     loadArboxSchedule();
+  });
+});
+
+// ── Arbox overview bar ────────────────────────────────────────────────────────
+async function loadArboxOverview() {
+  try {
+    const d = await fetch('/api/arbox/overview').then(r => r.json());
+    setTxt('aov-members', d.members?.active ?? '—');            // 148 — active clients
+    setTxt('aov-leads',   d.leads?.total ?? '—');
+    setTxt('aov-today',   d.schedule?.todayBookings > 0 ? d.schedule.todayBookings : (d.schedule?.today ?? '—')); // 53 bookings
+    setTxt('aov-week',    d.schedule?.total ?? '—');
+    // Update memberships summary bar if it's loaded
+    if (d.members?.activeMemberships != null) {
+      const msAgg = document.getElementById('ms-agg');
+      if (msAgg) msAgg.textContent = d.members.activeMemberships;
+    }
+    if (d.members?.expiringSoon != null) {
+      const msExp = document.getElementById('ms-expiring');
+      if (msExp && msExp.textContent === '—') msExp.textContent = d.members.expiringSoon;
+    }
+    const badge = document.getElementById('arbox-conn-badge');
+    if (badge) {
+      badge.textContent = d.connection?.ok
+        ? `✅ ${d.connection.location?.name ?? 'Arbox'} — ${d.connection.latencyMs}ms`
+        : `❌ ${d.connection?.error ?? 'לא מחובר'}`;
+      badge.style.color = d.connection?.ok ? 'var(--green)' : 'var(--hot)';
+    }
+  } catch { /* silent */ }
+}
+
+document.getElementById('btn-arbox-refresh')?.addEventListener('click', async () => {
+  const btn = document.getElementById('btn-arbox-refresh');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ טוען...'; }
+  membershipData = null; // clear cache so fresh data is fetched
+  await Promise.all([
+    loadArboxOverview(),
+    activeBarakView === 'members'      ? loadArboxMembers()      : Promise.resolve(),
+    activeBarakView === 'arbox-leads'  ? loadArboxLeads()        : Promise.resolve(),
+    activeBarakView === 'schedule'     ? loadArboxSchedule()     : Promise.resolve(),
+    activeBarakView === 'pipeline'     ? loadBarakPanel()        : Promise.resolve(),
+  ]);
+  if (btn) { btn.disabled = false; btn.textContent = '🔄 רענן Arbox'; }
+  toast('✅ נתוני Arbox עודכנו');
+});
+
+// ── Memberships (detailed — client + aggregatorMember) ───────────────────────
+
+let membershipData   = null;
+let activeMsTab      = 'activeClients';
+
+async function loadMemberships() {
+  const tbody = document.getElementById('memberships-tbody');
+  if (!membershipData) {
+    if (tbody) tbody.innerHTML = `<tr><td colspan="7" class="empty-state">טוען מ-Arbox...</td></tr>`;
+    try {
+      membershipData = await fetch('/api/arbox/classify').then(r => r.json());
+    } catch (err) {
+      if (tbody) tbody.innerHTML = `<tr><td colspan="7" class="empty-state">שגיאה: ${esc(err.message)}</td></tr>`;
+      return;
+    }
+  }
+  const s = membershipData.summary ?? {};
+  setTxt('ms-active',   s.activeClients     ?? s.totalActive ?? '—'); // 148
+  setTxt('ms-expiring', s.expiringSoon      ?? '—');                 // 9
+  setTxt('ms-expired',  s.recentlyExpired   ?? '—');
+  setTxt('ms-archived', s.archivedExpired   ?? '—');
+  setTxt('ms-agg',      s.activeMemberships ?? s.aggregators ?? '—'); // 161
+  const upEl = document.getElementById('memberships-updated');
+  if (upEl) upEl.textContent = 'עודכן: ' + now();
+  renderMembershipTab(activeMsTab);
+}
+
+const MS_TAB_TITLES = {
+  activeClients:   'לקוחות פעילים — active=1 (מדד קובע)',
+  expiringSoon:    'פגים בקרוב (active=1, end_date ≤30 ימים)',
+  recentlyExpired: 'פגו לאחרונה — ≤90 ימים (מועמדים לחזרה)',
+  archivedExpired: 'ארכיון היסטורי — >90 ימים (לא דורש פעולה)',
+  deactivated:     'בוטלו ידנית (active=0, ללא end_date)',
+  aggregators:     'Aggregator פעילים (ClassPass / Gympass)',
+  leads:           'לידים עם טלפון תקין',
+};
+
+function renderMembershipTab(tab) {
+  activeMsTab = tab;
+  if (!membershipData) return;
+  const titleEl = document.getElementById('ms-table-title');
+  if (titleEl) titleEl.textContent = MS_TAB_TITLES[tab] ?? tab;
+
+  const rows = membershipData.categories?.[tab] ?? [];
+  const tbody = document.getElementById('memberships-tbody');
+  if (!tbody) return;
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td colspan="7" class="empty-state">אין רשומות בקטגוריה זו</td></tr>`;
+    return;
+  }
+
+  const STATUS_MAP = {
+    active:          { cls:'ms-badge-active',   lbl:'✅ פעיל' },
+    expiringSoon:    { cls:'ms-badge-expiring', lbl:'⏳ פג בקרוב' },
+    recentlyExpired: { cls:'ms-badge-expired',  lbl:'📉 פג לאחרונה' },
+    archivedExpired: { cls:'',                  lbl:'🗄️ ארכיון' },
+    deactivated:     { cls:'ms-badge-expired',  lbl:'🚫 בוטל' },
+    aggregator:      { cls:'ms-badge-active',   lbl:'🤝 Aggregator' },
+    lead:            { cls:'',                  lbl:'🎯 ליד' },
+  };
+  const ROLE_HE = { client:'לקוח ישיר', aggregatorMember:'Aggregator', lead:'ליד', staffMember:'צוות' };
+
+  tbody.innerHTML = rows.map(m => {
+    const { cls, lbl } = STATUS_MAP[m.status] ?? { cls:'', lbl: m.status };
+    const roleLbl = ROLE_HE[m.role] ?? m.role;
+    const daysCell = m.daysLeft != null
+      ? `<span style="color:${m.daysLeft >= 0 ? 'var(--warm)' : 'var(--hot)'};font-weight:700">${Math.abs(m.daysLeft)}ד</span>`
+      : '—';
+    return `<tr>
+      <td><span class="lead-name">${esc(m.name || '—')}</span></td>
+      <td style="direction:ltr;font-variant-numeric:tabular-nums;font-size:12px">${esc(m.phone || '—')}</td>
+      <td style="font-size:12px">${esc(roleLbl)}</td>
+      <td style="font-size:12px">${esc(m.memberSince || '—')}</td>
+      <td style="font-size:12px;color:${m.status==='expired'?'var(--hot)':'var(--text)'}">${esc(m.memberEnd || '—')}</td>
+      <td style="text-align:center">${daysCell}</td>
+      <td><span class="ms-badge ${cls}">${lbl}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+// Membership sub-tab switching
+document.querySelectorAll('.ms-tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.ms-tab').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    renderMembershipTab(btn.dataset.mstab);
+  });
+});
+
+// ── Attendance & No-Shows ─────────────────────────────────────────────────────
+
+async function loadAttendance() {
+  const tbody = document.getElementById('attendance-risk-tbody');
+  if (tbody) tbody.innerHTML = `<tr><td colspan="5" class="empty-state">טוען...</td></tr>`;
+  try {
+    const d = await fetch('/api/arbox/attendance').then(r => r.json());
+    renderAttendanceToday(d.todayClasses ?? []);
+    renderAttendanceRisk(d.atRisk14d ?? []);
+    const upEl = document.getElementById('attendance-updated');
+    if (upEl) upEl.textContent = `${(d.atRisk14d ?? []).length} בסיכון | עודכן: ${now()}`;
+  } catch (err) {
+    if (tbody) tbody.innerHTML = `<tr><td colspan="5" class="empty-state">שגיאה: ${esc(err.message)}</td></tr>`;
+  }
+}
+
+function renderAttendanceToday(classes) {
+  const el = document.getElementById('attendance-today-list');
+  if (!el) return;
+  if (!classes.length) { el.innerHTML = '<div class="empty-state">אין שיעורים היום</div>'; return; }
+  el.innerHTML = classes.map(c => `
+    <div class="att-class-row">
+      <div class="att-time">${esc(c.start)}</div>
+      <div class="att-info">
+        <div class="att-name">${esc(c.name)}</div>
+        <div class="att-staff">${esc(c.staff)}</div>
+      </div>
+      <div class="att-spots">${c.maxParticipants} מקומות</div>
+      ${c.registrationLink ? `<a href="${esc(c.registrationLink)}" target="_blank" class="att-link">📅 הרשמה</a>` : ''}
+    </div>`).join('');
+}
+
+function renderAttendanceRisk(members) {
+  const tbody = document.getElementById('attendance-risk-tbody');
+  if (!tbody) return;
+  if (!members.length) { tbody.innerHTML = `<tr><td colspan="5" class="empty-state">אין חברים בסיכון 🎉</td></tr>`; return; }
+  tbody.innerHTML = members.map(m => {
+    const days  = m.daysSince ?? '∞';
+    const color = days > 30 ? 'var(--hot)' : 'var(--warm)';
+    const statusMap = { at_risk: 'warm', churned: 'crisis', active: 'active' };
+    const cls = statusMap[m.status] ?? 'cold';
+    return `<tr>
+      <td><span class="lead-name">${esc(m.name || '—')}</span></td>
+      <td style="font-size:12px;color:var(--muted)">${esc(m.planType || '—')}</td>
+      <td style="font-size:12px">${esc(m.lastAttendance ? new Date(m.lastAttendance).toLocaleDateString('he-IL') : '—')}</td>
+      <td style="text-align:center;font-weight:700;color:${color}">${days}ד</td>
+      <td><span class="badge ${cls}">${{'at_risk':'⚠️ בסיכון','churned':'🚨 עזב','active':'✅ פעיל'}[m.status]??m.status}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+// ── Staff Directory ────────────────────────────────────────────────────────────
+
+async function loadStaff() {
+  const grid = document.getElementById('staff-grid');
+  if (grid) grid.innerHTML = '<div class="empty-state">טוען מ-Arbox...</div>';
+  try {
+    const d = await fetch('/api/arbox/staff').then(r => r.json());
+    renderStaffGrid(d.staff ?? []);
+    const upEl = document.getElementById('staff-updated');
+    if (upEl) upEl.textContent = `${d.total} חברי צוות | עודכן: ${now()}`;
+  } catch (err) {
+    if (grid) grid.innerHTML = `<div class="empty-state">שגיאה: ${esc(err.message)}</div>`;
+  }
+}
+
+function renderStaffGrid(staff) {
+  const grid = document.getElementById('staff-grid');
+  if (!grid) return;
+  if (!staff.length) { grid.innerHTML = '<div class="empty-state">אין נתוני צוות</div>'; return; }
+  const COLORS = ['#4f46e5','#ec4899','#10b981','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#84cc16'];
+  grid.innerHTML = staff.map((s, i) => {
+    const initials = (s.name || '?').split(' ').map(w => w[0]).join('').slice(0,2).toUpperCase();
+    const color    = COLORS[i % COLORS.length];
+    return `<div class="staff-card">
+      <div class="staff-avatar" style="background:${color}">${initials}</div>
+      <div class="staff-name">${esc(s.name || '—')}</div>
+      <div class="staff-phone">${esc(s.phone || '—')}</div>
+      <div class="staff-status">${s.active ? '<span style="color:var(--green)">● פעיל</span>' : '<span style="color:var(--muted)">○ לא פעיל</span>'}</div>
+      ${s.joinedDate ? `<div class="staff-since">מ-${esc(s.joinedDate)}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+// ── Retention & Health ────────────────────────────────────────────────────────
+
+async function loadRetention() {
+  const kpiRow = document.getElementById('retention-kpi-row');
+  if (kpiRow) kpiRow.innerHTML = '<div class="empty-state">טוען...</div>';
+  try {
+    const d = await fetch('/api/arbox/retention').then(r => r.json());
+    renderRetentionKPIs(d.summary ?? {});
+    renderRetentionRecs(d.recommendations ?? []);
+    renderExpiringTable(d.expiringClients ?? []);
+    renderExpiredTable(d.expiredClients ?? []);
+  } catch (err) {
+    if (kpiRow) kpiRow.innerHTML = `<div class="empty-state">שגיאה: ${esc(err.message)}</div>`;
+  }
+}
+
+function renderRetentionKPIs(s) {
+  const el = document.getElementById('retention-kpi-row');
+  if (!el) return;
+  const kpis = [
+    { icon:'👥', val: s.clients ?? '—',         lbl:'לקוחות ישירים',    cls:'' },
+    { icon:'🤝', val: s.aggregators ?? '—',      lbl:'Aggregator',       cls:'' },
+    { icon:'👩‍🏫', val: s.staff ?? '—',            lbl:'צוות',             cls:'' },
+    { icon:'📈', val: s.retentionRate ?? '—',    lbl:'שימור',            cls:'green' },
+    { icon:'📉', val: s.churnRate ?? '—',        lbl:'נשירה',            cls:'hot' },
+    { icon:'⏳', val: s.expiringClients ?? '—',  lbl:'פגים תוך 30ד',    cls: s.expiringClients > 0 ? 'warm' : '' },
+    { icon:'❌', val: s.expiredClients ?? '—',   lbl:'פגו',              cls: s.expiredClients > 3 ? 'hot' : '' },
+    { icon:'🎯', val: s.arboxLeads ?? '—',       lbl:'לידים ב-Arbox',    cls:'' },
+  ];
+  el.innerHTML = kpis.map(k => `
+    <div class="ret-kpi-card">
+      <div class="ret-kpi-icon">${k.icon}</div>
+      <div class="ret-kpi-val${k.cls ? ' ' + k.cls : ''}">${k.val}</div>
+      <div class="ret-kpi-lbl">${k.lbl}</div>
+    </div>`).join('');
+}
+
+function renderRetentionRecs(recs) {
+  const el = document.getElementById('retention-recs');
+  if (!el) return;
+  if (!recs.length) { el.innerHTML = '<div class="empty-state">אין המלצות</div>'; return; }
+  el.innerHTML = recs.map(r => `<div class="ret-rec-row">${esc(r)}</div>`).join('');
+}
+
+function renderExpiringTable(members) {
+  const tbody = document.getElementById('expiring-tbody');
+  if (!tbody) return;
+  if (!members.length) { tbody.innerHTML = `<tr><td colspan="4" class="empty-state">אין פגים בקרוב 🎉</td></tr>`; return; }
+  tbody.innerHTML = members.map(m => `<tr>
+    <td><span class="lead-name">${esc(m.name || '—')}</span></td>
+    <td style="direction:ltr">${esc(m.phone || '—')}</td>
+    <td style="font-size:12px">${esc(m.endDate || '—')}</td>
+    <td style="text-align:center;color:var(--warm);font-weight:700">${m.daysLeft}ד</td>
+  </tr>`).join('');
+}
+
+function renderExpiredTable(members) {
+  const tbody = document.getElementById('expired-tbody');
+  if (!tbody) return;
+  if (!members.length) { tbody.innerHTML = `<tr><td colspan="3" class="empty-state">אין פגויים</td></tr>`; return; }
+  tbody.innerHTML = members.map(m => `<tr>
+    <td><span class="lead-name">${esc(m.name || '—')}</span></td>
+    <td style="direction:ltr">${esc(m.phone || '—')}</td>
+    <td style="font-size:12px;color:var(--hot)">${esc(m.endDate || '—')}</td>
+  </tr>`).join('');
+}
+
+// ── Arbox members panel ───────────────────────────────────────────────────────
+async function loadArboxMembers() {
+  const tbody = document.getElementById('arbox-members-tbody');
+  if (tbody) tbody.innerHTML = `<tr><td colspan="6" class="empty-state">טוען מ-Arbox...</td></tr>`;
+  try {
+    const d = await fetch('/api/arbox/members').then(r => r.json());
+    renderArboxMembers(d.members ?? []);
+    const upEl = document.getElementById('arbox-members-updated');
+    if (upEl) upEl.textContent = `${d.totalActive ?? d.members?.filter(m=>m.active).length ?? 0} פעילים | עודכן: ${now()}`;
+  } catch (err) {
+    if (tbody) tbody.innerHTML = `<tr><td colspan="6" class="empty-state">שגיאה: ${esc(err.message)}</td></tr>`;
+  }
+}
+
+function renderArboxMembers(members) {
+  const tbody = document.getElementById('arbox-members-tbody');
+  if (!tbody) return;
+  if (!members.length) { tbody.innerHTML = `<tr><td colspan="6" class="empty-state">אין חברים</td></tr>`; return; }
+  tbody.innerHTML = members.map(m => `<tr>
+    <td><span class="lead-name">${esc(m.name || '—')}</span></td>
+    <td style="direction:ltr;font-variant-numeric:tabular-nums">${esc(m.phone || '—')}</td>
+    <td style="font-size:12px;color:var(--muted)">${esc(roleHe(m.role))}</td>
+    <td style="font-size:12px">${esc(m.memberSince || '—')}</td>
+    <td style="font-size:12px;color:var(--muted)">${esc(m.memberEnd || 'ללא תאריך סיום')}</td>
+    <td style="text-align:center">${m.active ? '<span style="color:var(--green);font-weight:700">● פעיל</span>' : '<span style="color:var(--muted)">○ לא פעיל</span>'}</td>
+  </tr>`).join('');
+}
+
+function roleHe(role) {
+  return { staffMember: 'צוות', member: 'חבר', admin: 'מנהל' }[role] ?? role ?? '—';
+}
+
+// ── Arbox leads panel ─────────────────────────────────────────────────────────
+async function loadArboxLeads() {
+  const tbody = document.getElementById('arbox-leads-tbody');
+  if (tbody) tbody.innerHTML = `<tr><td colspan="5" class="empty-state">טוען מ-Arbox...</td></tr>`;
+  try {
+    const d = await fetch('/api/arbox/leads').then(r => r.json());
+    renderArboxLeads(d.leads ?? []);
+    const upEl = document.getElementById('arbox-leads-updated');
+    if (upEl) upEl.textContent = `${d.total} לידים | עודכן: ${now()}`;
+  } catch (err) {
+    if (tbody) tbody.innerHTML = `<tr><td colspan="5" class="empty-state">שגיאה: ${esc(err.message)}</td></tr>`;
+  }
+}
+
+function renderArboxLeads(leads) {
+  const tbody = document.getElementById('arbox-leads-tbody');
+  if (!tbody) return;
+  if (!leads.length) { tbody.innerHTML = `<tr><td colspan="5" class="empty-state">אין לידים</td></tr>`; return; }
+  tbody.innerHTML = leads.map(l => {
+    const statusColor = { 'לא נוצר קשר': 'var(--muted)', 'ללא מענה 2': 'var(--warm)', 'סגור': 'var(--green)' }[l.status] ?? 'var(--text)';
+    return `<tr>
+      <td><span class="lead-name">${esc(l.name || '—')}</span></td>
+      <td style="direction:ltr;font-variant-numeric:tabular-nums">${esc(l.phone || '—')}</td>
+      <td><span style="color:${statusColor};font-size:12px;font-weight:600">${esc(l.status || '—')}</span></td>
+      <td style="font-size:12px;color:var(--muted)">${esc(l.source || '—')}</td>
+      <td style="font-size:12px;color:var(--muted)">${esc(l.created || '—')}</td>
+    </tr>`;
+  }).join('');
+}
+
+// Lookup tool
+document.getElementById('btn-arbox-lookup')?.addEventListener('click', async () => {
+  const q = document.getElementById('arbox-lookup-input')?.value.trim();
+  if (!q) return;
+  const resEl = document.getElementById('arbox-lookup-result');
+  if (resEl) resEl.textContent = 'מחפש...';
+  try {
+    const d = await post('/api/barak/lookup-client', { query: q });
+    if (resEl) resEl.textContent = d.total > 0
+      ? `נמצאו ${d.total}: ${d.results.map(r => r.name || r.phone).join(', ')}`
+      : 'לא נמצא';
+    if (d.results?.length) renderArboxLeads(d.results.map(r => ({
+      name: r.name, phone: r.phone,
+      status: r.leadStatus || (r.active ? 'חבר פעיל' : '—'),
+      source: r.type === 'member' ? 'חבר סטודיו' : r.leadSource,
+      created: r.createdTime || r.memberSince,
+    })));
+  } catch (err) { if (resEl) resEl.textContent = `שגיאה: ${esc(err.message)}`; }
+});
+
+document.getElementById('arbox-lookup-input')?.addEventListener('keydown', e => {
+  if (e.key === 'Enter') document.getElementById('btn-arbox-lookup')?.click();
+});
+
+// ── Arbox schedule panel ──────────────────────────────────────────────────────
+async function loadArboxSchedule() {
+  const grid = document.getElementById('arbox-schedule-grid');
+  if (grid) grid.innerHTML = '<div class="empty-state">טוען מ-Arbox...</div>';
+  try {
+    const d = await fetch('/api/arbox/schedule?days=7').then(r => r.json());
+    renderScheduleGrid(d.classes ?? []);
+    const upEl = document.getElementById('arbox-sched-updated');
+    if (upEl) upEl.textContent = `${d.total} שיעורים | עודכן: ${now()}`;
+  } catch (err) {
+    if (grid) grid.innerHTML = `<div class="empty-state">שגיאה: ${esc(err.message)}</div>`;
+  }
+}
+
+function renderScheduleGrid(classes) {
+  const grid = document.getElementById('arbox-schedule-grid');
+  if (!grid) return;
+  if (!classes.length) { grid.innerHTML = '<div class="empty-state">אין שיעורים ב-7 ימים הקרובים</div>'; return; }
+
+  // Group by date
+  const byDate = {};
+  classes.forEach(c => { (byDate[c.date] = byDate[c.date] || []).push(c); });
+
+  const DAY_HE = ['ראשון','שני','שלישי','רביעי','חמישי','שישי','שבת'];
+  grid.innerHTML = Object.entries(byDate).map(([date, cls]) => {
+    const d   = new Date(date);
+    const day = DAY_HE[d.getDay()];
+    const rows = cls.map(c => `
+      <div class="sched-row">
+        <span class="sched-time">${esc(c.start)}</span>
+        <span class="sched-name">${esc(c.name)}</span>
+        <span class="sched-staff">${esc(c.staff)}</span>
+        <span class="sched-spots">${c.maxParticipants} מקומות</span>
+      </div>`).join('');
+    return `<div class="sched-day-card">
+      <div class="sched-day-header"><span class="sched-day-name">יום ${day}</span><span class="sched-day-date">${date}</span></div>
+      ${rows}
+    </div>`;
+  }).join('');
+}
+
+// Data integrity validation
+document.getElementById('btn-validate-data')?.addEventListener('click', async () => {
+  const btn = document.getElementById('btn-validate-data');
+  if (btn) { btn.disabled = true; btn.textContent = '🔍 בודק...'; }
+  try {
+    const d = await post('/api/barak/validate-data', {});
+    renderIntegrityReport(d);
+    toast(`ציון תקינות: ${d.integrityScore}/100 — ${d.verdict}`);
+  } catch (err) { toast(`❌ ${err.message}`); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = '🔍 בדיקת תקינות נתונים'; } }
+});
+
+function renderIntegrityReport(d) {
+  const box     = document.getElementById('integrity-report-box');
+  const scoreEl = document.getElementById('ir-score');
+  const verEl   = document.getElementById('ir-verdict');
+  const sumEl   = document.getElementById('ir-summary');
+  const issEl   = document.getElementById('ir-issues-list');
+  if (!box) return;
+
+  box.style.display = 'block';
+  const score  = d.integrityScore ?? 0;
+  const color  = score >= 90 ? 'var(--green)' : score >= 70 ? 'var(--warm)' : 'var(--hot)';
+  if (scoreEl) { scoreEl.textContent = score + '/100'; scoreEl.style.color = color; }
+  if (verEl)   verEl.textContent = d.verdict ?? '—';
+
+  const s = d.summary ?? {};
+  if (sumEl) sumEl.innerHTML = [
+    `<span class="ir-stat">בדקנו: <b>${s.totalChecked}</b></span>`,
+    `<span class="ir-stat" style="color:var(--hot)">טלפון לא תקין: <b>${s.invalidPhones}</b></span>`,
+    `<span class="ir-stat" style="color:var(--warm)">כפולים: <b>${s.duplicatePhones}</b></span>`,
+    `<span class="ir-stat" style="color:var(--warm)">רפאים: <b>${s.ghostSyncRecords}</b></span>`,
+    `<span class="ir-stat" style="color:var(--hot)">אי-התאמה: <b>${s.statusMismatches}</b></span>`,
+  ].join('');
+
+  const issues = d.issues ?? [];
+  if (issEl) {
+    const ISSUE_LABELS = {
+      invalid_phone:    { icon:'📵', label:'טלפון לא תקין' },
+      duplicate_phone:  { icon:'👥', label:'כפילות טלפון' },
+      ghost_sync:       { icon:'👻', label:'רשומת רפאים' },
+      status_mismatch:  { icon:'⚠️', label:'אי-התאמת סטטוס' },
+      test_record:      { icon:'🧪', label:'רשומת בדיקה' },
+    };
+    const SEV_COLOR = { high:'var(--hot)', medium:'var(--warm)', low:'var(--muted)' };
+    issEl.innerHTML = issues.length === 0
+      ? '<div style="padding:12px;color:var(--green);font-weight:600">✅ לא נמצאו בעיות</div>'
+      : issues.map(iss => {
+          const { icon, label } = ISSUE_LABELS[iss.type] ?? { icon:'⚠', label: iss.type };
+          const detail = iss.note || iss.duplicateOf || iss.arboxEndDate || '';
+          return `<div class="ir-issue-row">
+            <span class="ir-issue-icon">${icon}</span>
+            <span class="ir-issue-label" style="color:${SEV_COLOR[iss.severity]??'var(--text)'}">${label}</span>
+            <span class="ir-issue-name">${esc(iss.name||'—')}</span>
+            <span class="ir-issue-phone">${esc(iss.phone||'—')}</span>
+            ${detail ? `<span class="ir-issue-note">${esc(String(detail))}</span>` : ''}
+          </div>`;
+        }).join('');
+  }
+}
+
+// Pull Arbox leads into local store
+document.getElementById('btn-pull-arbox-leads')?.addEventListener('click', async () => {
+  const btn    = document.getElementById('btn-pull-arbox-leads');
+  const result = document.getElementById('barak-sync-result');
+  if (btn) { btn.disabled = true; btn.textContent = '⬇ מייבא...'; }
+  if (result) result.style.display = 'none';
+  try {
+    const d = await post('/api/barak/sync-leads', {});
+    const txt = d.error
+      ? `❌ ${d.error}`
+      : `✅ יובאו ${d.imported} חדשים | עודכנו ${d.updated} | דולגו ${d.skipped}`;
+    if (result) { result.textContent = txt; result.style.display = 'block'; }
+    toast('✅ ייבוא לידים מ-Arbox הושלם');
+    loadBarakPanel();
+  } catch (err) { toast(`❌ ${err.message}`); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = '⬇ ייבא לידים מ-Arbox'; } }
+});
+
+async function loadBarakPanel() {
+  try {
+    const [leadsRes, statsRes] = await Promise.all([
+      fetch('/api/leads'),
+      fetch('/api/stats'),
+    ]);
+    allLeads         = await leadsRes.json();
+    const { daily }  = await statsRes.json();
+    renderBarakStats(daily);
+    renderBarakTable(allLeads);
+    const upEl = document.getElementById('barak-updated');
+    if (upEl) upEl.textContent = 'עודכן: ' + now();
+  } catch (e) { console.error('loadBarakPanel', e); }
+}
+
+function renderBarakStats(d) {
+  const el = document.getElementById('barak-stats');
+  if (!el) return;
+  const cards = [
+    { cls: '',       icon: '👥', val: d.totalLeads,     label: 'סה"כ לידים' },
+    { cls: 'hot',    icon: '🔥', val: d.hotLeadsTotal,  label: 'חמים' },
+    { cls: 'warm',   icon: '🌡️', val: d.warmLeadsTotal, label: 'פושרים' },
+    { cls: '',       icon: '🎯', val: d.introOffersSent, label: 'הצעות שנשלחו' },
+    { cls: '',       icon: '📊', val: d.unsyncedLeads,  label: 'לא מסונכרן' },
+    d.crisisActive > 0 ? { cls: 'crisis', icon: '🚨', val: d.crisisActive, label: 'משבר' } : null,
+  ].filter(Boolean);
+  el.innerHTML = cards.map(c => `
+    <div class="stat-card ${c.cls}">
+      <div class="stat-icon">${c.icon}</div>
+      <div class="stat-value">${c.val}</div>
+      <div class="stat-label">${c.label}</div>
+    </div>`).join('');
+}
+
+function renderBarakTable(leads) {
+  const rows  = activeFilter === 'all' ? leads : leads.filter(l => l.status === activeFilter);
+  const tbody = document.getElementById('barak-leads-tbody');
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td colspan="8" class="empty-state">אין לידים להצגה</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = rows.map(l => {
+    const tier = l.score >= 8 ? 'hot' : l.score >= 5 ? 'warm' : 'cold';
+    const arbox = l.arboxSynced
+      ? `<span style="color:var(--green);font-size:12px">✅ ${l.arboxId ?? ''}</span>`
+      : `<span style="color:var(--muted);font-size:12px">—</span>`;
+    return `<tr>
+      <td><span class="lead-name">${esc(l.name ?? '—')}</span></td>
+      <td style="direction:ltr;text-align:right;font-variant-numeric:tabular-nums">${esc(l.phone)}</td>
+      <td><div class="score-cell"><span class="score-num">${l.score}</span><div class="score-track"><div class="score-fill ${tier}" style="width:${l.score*10}%"></div></div></div></td>
+      <td><span class="badge ${l.status||'new'}">${statusLabel(l.status)}</span></td>
+      <td>${l.messageCount}</td>
+      <td style="text-align:center">${l.introOfferSent ? '✅' : '—'}</td>
+      <td>${arbox}</td>
+      <td style="color:var(--muted)">${timeSince(l.lastActivity)}</td>
+    </tr>`;
+  }).join('');
+}
+
+/* Arbox sync ──────────────────────────────────────────────────────────────────*/
+document.getElementById('btn-sync-arbox').addEventListener('click', async () => {
+  const btn    = document.getElementById('btn-sync-arbox');
+  const result = document.getElementById('barak-sync-result');
+  btn.disabled = true;
+  btn.textContent = '🔄 מסנכרן...';
+  result.style.display = 'none';
+  try {
+    const data = await post('/api/barak/sync-arbox', {});
+    const txt  = data.error
+      ? `❌ ${data.error}`
+      : `✅ מסונכרנו: ${data.synced ?? 0} | דלגו: ${data.skipped ?? 0} | שגיאות: ${(data.errors ?? []).length}`;
+    result.textContent    = txt;
+    result.style.display  = 'block';
+    toast('סנכרון הושלם');
+    loadBarakPanel();
+  } catch (err) { toast(`❌ ${err.message}`); }
+  finally { btn.disabled = false; btn.textContent = '🔄 סנכרן הכל'; }
+});
+
+document.getElementById('btn-sync-status').addEventListener('click', async () => {
+  const statusEl = document.getElementById('barak-sync-status');
+  statusEl.textContent = 'טוען...';
+  try {
+    const data = await fetch('/api/barak/sync-status').then(r => r.json());
+    statusEl.textContent =
+      `סה"כ: ${data.total} | מסונכרן: ${data.synced} | ממתין: ${data.pending}` +
+      (data.pendingLeads?.length
+        ? '\n\nממתין לסנכרון:\n' + data.pendingLeads.map(l => `• ${l.name ?? l.phone} (${l.score}/10)`).join('\n')
+        : '');
+  } catch (err) { statusEl.textContent = `שגיאה: ${err.message}`; }
+});
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   HEALTH TAB
+   ══════════════════════════════════════════════════════════════════════════════ */
+
+async function loadHealth() {
+  try {
+    const res  = await fetch('/api/system');
+    const data = await res.json();
+
+    const agentCards = Object.values(data.agents).map(a => `
+      <div class="health-card">
+        <div class="health-card-top">
+          <span class="health-card-name">${esc(a.name)}</span>
+          <span class="hstatus active">● פעיל</span>
+        </div>
+        <div class="health-card-detail">${esc(a.role)}</div>
+      </div>`).join('');
+
+    const storeCard = `
+      <div class="health-card">
+        <div class="health-card-top">
+          <span class="health-card-name">Lead Store</span>
+          <span class="hstatus active">● פעיל</span>
+        </div>
+        <div class="health-card-detail">
+          ${data.store.totalLeads} לידים בזיכרון | ממוצע ציון: ${data.store.avgScore}/10
+          ${data.store.crisisActive > 0 ? `<br><strong style="color:var(--crisis)">⚠ ${data.store.crisisActive} משבר</strong>` : ''}
+        </div>
+      </div>`;
+
+    const svcLabels = { whatsapp: 'WhatsApp Business', arbox: 'Arbox CRM', openai: 'OpenAI' };
+    const svcCards  = Object.entries(data.services).map(([k, v]) => `
+      <div class="health-card">
+        <div class="health-card-top">
+          <span class="health-card-name">${svcLabels[k] ?? k}</span>
+          <span class="hstatus ${v.configured ? 'configured' : 'pending'}">${v.configured ? '● מוגדר' : '⚠ לא מוגדר'}</span>
+        </div>
+        <div class="health-card-detail">שירות חיצוני</div>
+      </div>`).join('');
+
+    document.getElementById('health-grid').innerHTML = agentCards + storeCard + svcCards;
+
+    const evEl = document.getElementById('events-list');
+    if (!data.events?.length) {
+      evEl.innerHTML = '<div class="empty-state">אין אירועים עדיין</div>';
+    } else {
+      evEl.innerHTML = data.events.map(e => `
+        <div class="event-row">
+          <span class="event-type ${e.type}">${translateEvent(e.type)}</span>
+          <span class="event-phone">${esc(e.phone?.slice(0,8) ?? '—')}•••</span>
+          <span class="event-detail">${esc(e.data?.name ?? e.data?.preview ?? e.data?.title ?? '')}</span>
+          <span class="event-time">${timeSince(e.ts)}</span>
+        </div>`).join('');
+    }
+
+    const upEl = document.getElementById('health-updated');
+    if (upEl) upEl.textContent = 'עודכן: ' + new Date().toLocaleTimeString('he-IL', { hour:'2-digit', minute:'2-digit' });
+  } catch (e) { console.error('loadHealth', e); }
+}
+
+function translateEvent(type) {
+  return ({
+    message_in:           '📩 הודעה נכנסת',
+    message_out:          '📤 הודעה יוצאת',
+    intro_offer_sent:     '🎯 הצעת היכרות',
+    crisis:               '🚨 משבר',
+    score_update:         '📊 עדכון ציון',
+    re_engagement_sent:   '💌 ריאנגייג\'מנט',
+    arbox_sync:           '🔗 סנכרון Arbox',
+    booking_confirmed:    '📅 הזמנה אושרה',
+    content_pack_generated:'🎨 חבילת תוכן',
+    ad_copy_generated:    '📐 קופי פרסומת',
+    video_analysis:       '🎬 ניתוח וידאו',
+    meta_lead_webhook:    '📱 ליד Meta',
+    manual_whatsapp:      '💬 WhatsApp ידני',
+  })[type] ?? type;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   MINI CHAT FACTORY
+   ══════════════════════════════════════════════════════════════════════════════ */
+
+function initMiniChat(inputId, sendBtnId, msgsId, endpoint) {
+  const input  = document.getElementById(inputId);
+  const btn    = document.getElementById(sendBtnId);
+  const msgs   = document.getElementById(msgsId);
+  if (!input || !btn || !msgs) return;
+
+  async function send() {
+    const text = input.value.trim();
+    if (!text) return;
+    input.value   = '';
+    btn.disabled  = true;
+    appendMiniMsg(msgs, 'user', text);
+    const tid = addMiniTyping(msgs);
+    try {
+      const { reply, error } = await post(endpoint, { message: text });
+      removeEl(tid);
+      appendMiniMsg(msgs, 'agent', error ? `שגיאה: ${error}` : reply);
+    } catch {
+      removeEl(tid);
+      appendMiniMsg(msgs, 'agent', 'שגיאה בחיבור לשרת');
+    } finally {
+      btn.disabled = false;
+      input.focus();
+    }
+  }
+
+  btn.addEventListener('click', send);
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+}
+
+function appendMiniMsg(container, role, text) {
+  const div = document.createElement('div');
+  div.className = `mini-msg ${role === 'agent' ? 'mini-agent' : 'mini-user'}`;
+  const safe = esc(text).replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').replace(/\*(.+?)\*/g,'<strong>$1</strong>').replace(/\n/g,'<br>');
+  div.innerHTML = `<div class="mini-bubble">${safe}</div>`;
+  container.appendChild(div);
+  container.scrollTop = container.scrollHeight;
+}
+
+function addMiniTyping(container) {
+  const id  = 'mt-' + Date.now();
+  const div = document.createElement('div');
+  div.id = id; div.className = 'mini-msg mini-agent';
+  div.innerHTML = `<div class="mini-bubble"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>`;
+  container.appendChild(div);
+  container.scrollTop = container.scrollHeight;
+  return id;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   MAYA FULL CHAT HELPERS
+   ══════════════════════════════════════════════════════════════════════════════ */
+
+function appendMsg(container, role, text) {
+  const div  = document.createElement('div');
+  div.className = `chat-msg ${role === 'maya' ? 'maya-msg' : 'user-msg'}`;
+  const safe = esc(text).replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').replace(/\*(.+?)\*/g,'<strong>$1</strong>').replace(/\n/g,'<br>');
+  const t    = new Date().toLocaleTimeString('he-IL', { hour:'2-digit', minute:'2-digit' });
+  div.innerHTML = `<div class="msg-bubble">${safe}</div><div class="msg-time">${t}</div>`;
+  container.appendChild(div);
+  container.scrollTop = container.scrollHeight;
+}
+
+function addTyping(container) {
+  const id  = 'ty-' + Date.now();
+  const div = document.createElement('div');
+  div.id = id; div.className = 'chat-msg maya-msg typing';
+  div.innerHTML = `<div class="msg-bubble"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>`;
+  container.appendChild(div);
+  container.scrollTop = container.scrollHeight;
+  return id;
+}
+
+/* ── Utilities ──────────────────────────────────────────────────────────────── */
+
+function removeEl(id) { document.getElementById(id)?.remove(); }
+
+function setTxt(id, val) { const el = document.getElementById(id); if (el) el.textContent = val; }
+
+function setTBody(tbodyId, cols, msg) {
+  const el = document.getElementById(tbodyId);
+  if (el) el.innerHTML = `<tr><td colspan="${cols}" class="empty-state">${msg}</td></tr>`;
+}
+
+async function post(url, body) {
+  const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  return res.json();
+}
+
+function statusLabel(status) {
+  return { hot:'🔥 חם', warm:'🌡️ פושר', cold:'❄️ קר', crisis:'🚨 משבר', new:'🆕 חדש' }[status] ?? status ?? '—';
+}
+
+function timeSince(date) {
+  if (!date) return '—';
+  const s = Math.floor((Date.now() - new Date(date).getTime()) / 1000);
+  if (s < 30)    return 'עכשיו';
+  if (s < 3600)  return `לפני ${Math.floor(s/60)||1} ד'`;
+  if (s < 86400) return `לפני ${Math.floor(s/3600)} שע'`;
+  return `לפני ${Math.floor(s/86400)} ימ'`;
+}
+
+function now() {
+  return new Date().toLocaleTimeString('he-IL', { hour:'2-digit', minute:'2-digit', second:'2-digit' });
+}
+
+function esc(str) {
+  return String(str ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function toast(msg) {
+  const el = document.createElement('div');
+  el.className   = 'toast';
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 3000);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   SANDBOX TAB — Interactive Agent Testing
+   ══════════════════════════════════════════════════════════════════════════════ */
+
+let activeAgent    = 'maya';
+let sandboxReady   = false;
+
+const AGENT_META = {
+  maya:  { label: 'מאיה', color: '#4f46e5', icon: '🏢' },
+  dana:  { label: 'דנה',  color: '#ec4899', icon: '🎨' },
+  tomer: { label: 'תומר', color: '#10b981', icon: '💌' },
+  barak: { label: 'ברק',  color: '#f59e0b', icon: '📊' },
+};
+
+async function initSandbox() {
+  if (sandboxReady) return;
+  sandboxReady = true;
+
+  // Load preset scenarios
+  try {
+    const { scenarios } = await fetch('/api/sandbox/scenarios').then(r => r.json());
+    renderScenarios(scenarios);
+  } catch { /* silent */ }
+
+  // Agent selector
+  document.querySelectorAll('.agent-sel-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.agent-sel-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      activeAgent = btn.dataset.agent;
+    });
+  });
+
+  // Run button
+  document.getElementById('sb-run')?.addEventListener('click', () => {
+    const msg = document.getElementById('sb-input')?.value.trim();
+    if (msg) runSandbox({ message: msg });
+  });
+
+  // Ctrl+Enter in textarea
+  document.getElementById('sb-input')?.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && e.ctrlKey) {
+      const msg = e.target.value.trim();
+      if (msg) runSandbox({ message: msg });
+    }
+  });
+}
+
+function renderScenarios(scenarios) {
+  const el = document.getElementById('scenario-list');
+  if (!el) return;
+  el.innerHTML = scenarios.map(s => `
+    <button class="scenario-btn" data-id="${esc(s.id)}" data-agent="${esc(s.agent)}">
+      <span class="sc-icon">${s.icon}</span>
+      <span class="sc-label">${esc(s.label)}</span>
+      <span class="sc-agent" style="color:${AGENT_META[s.agent]?.color ?? '#64748b'}">${AGENT_META[s.agent]?.label ?? s.agent}</span>
+    </button>`).join('');
+  el.querySelectorAll('.scenario-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      // Switch to that agent
+      activeAgent = btn.dataset.agent;
+      document.querySelectorAll('.agent-sel-btn').forEach(b => {
+        b.classList.toggle('active', b.dataset.agent === activeAgent);
+      });
+      runSandbox({ scenario: btn.dataset.id });
+    });
+  });
+}
+
+async function runSandbox({ message, scenario } = {}) {
+  const btn = document.getElementById('sb-run');
+  const emEl = document.getElementById('sb-empty');
+  const resEl = document.getElementById('sb-result');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ מריץ...'; }
+  if (emEl) emEl.style.display = 'flex';
+  if (resEl) resEl.style.display = 'none';
+  if (emEl) emEl.innerHTML = `
+    <div class="va-empty-icon" style="animation:va-spin 1s linear infinite">⚙️</div>
+    <div class="va-empty-title">מריץ סימולציה...</div>
+    <div class="va-empty-sub">${AGENT_META[activeAgent]?.icon} ${AGENT_META[activeAgent]?.label} עונה...</div>`;
+
+  try {
+    const data = await post('/api/sandbox/simulate', { agent: activeAgent, message, scenario });
+    renderSandboxResult(data);
+  } catch (err) {
+    if (emEl) emEl.innerHTML = `<div class="va-empty-icon">❌</div><div class="va-empty-title">שגיאה</div><div class="va-empty-sub">${esc(err.message)}</div>`;
+    toast(`❌ ${err.message}`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '▶ הרץ סימולציה'; }
+  }
+}
+
+function renderSandboxResult(data) {
+  const emEl  = document.getElementById('sb-empty');
+  const resEl = document.getElementById('sb-result');
+  const meta  = AGENT_META[data.agent] ?? {};
+
+  if (emEl) emEl.style.display = 'none';
+  if (resEl) resEl.style.display = 'block';
+
+  setTxt('sb-elapsed', `${data.elapsed ?? 0}ms`);
+
+  const badge = document.getElementById('sb-agent-label');
+  if (badge) {
+    badge.textContent = `${meta.icon ?? ''} ${meta.label ?? data.agent}`;
+    badge.style.background = meta.color ?? '#64748b';
+  }
+  const tag = document.getElementById('sb-scenario-tag');
+  if (tag) {
+    tag.textContent = data.scenario ? `תרחיש: ${data.scenario}` : '';
+    tag.style.display = data.scenario ? '' : 'none';
+  }
+
+  const promptEl = document.getElementById('sb-prompt-display');
+  if (promptEl) promptEl.textContent = data.prompt ?? '';
+
+  const replyEl = document.getElementById('sb-reply-display');
+  if (replyEl) {
+    const safe = esc(data.reply ?? '').replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/\n/g, '<br>');
+    replyEl.innerHTML = safe;
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   AUTOMATIONS TAB — Rules & Worker Control Panel
+   ══════════════════════════════════════════════════════════════════════════════ */
+
+const TRIGGER_LABELS = {
+  lead_silent:          'ליד שקט',
+  intro_not_redeemed:   'הצעה לא מומשת',
+  lead_score_hot:       'ליד חם',
+  member_inactive:      'חברה לא פעילה',
+  lead_unsynced:        'ליד לא מסונכרן',
+  meta_lead_webhook:    'ליד מ-Meta',
+};
+const ACTION_LABELS = {
+  send_whatsapp: '💬 WhatsApp',
+  alert_owner:   '🚨 התראת מנהל',
+  arbox_sync:    '🔗 סנכרון Arbox',
+  barak_ingest:  '📥 קליטת ליד',
+};
+
+async function loadAutomations() {
+  try {
+    const data = await fetch('/api/automations').then(r => r.json());
+    renderWorkerCards(data.workers ?? []);
+    renderRulesTable(data.rules ?? []);
+  } catch (e) { console.error('loadAutomations', e); }
+
+  try {
+    const logData = await fetch('/api/automations/log').then(r => r.json());
+    renderAutoLog(logData.log ?? []);
+  } catch { /* silent */ }
+}
+
+function renderWorkerCards(workers) {
+  const el = document.getElementById('auto-workers-grid');
+  if (!el) return;
+  el.innerHTML = workers.map(w => {
+    const color = AGENT_META[w.agent]?.color ?? '#64748b';
+    const lastRun = w.lastRun ? timeSince(w.lastRun) : 'טרם רץ';
+    return `<div class="auto-worker-card panel">
+      <div class="awc-top">
+        <div class="awc-badge" style="background:${color}">${AGENT_META[w.agent]?.icon ?? '🤖'}</div>
+        <div class="awc-info">
+          <div class="awc-name">${esc(w.name)}</div>
+          <div class="awc-sched">${esc(w.schedule)}</div>
+        </div>
+        <label class="toggle-switch">
+          <input type="checkbox" class="worker-toggle" data-id="${esc(w.id)}" ${w.enabled ? 'checked' : ''}>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="awc-stats">
+        <span class="awc-status ${w.enabled ? 'active' : 'paused'}">${w.enabled ? '● פעיל' : '⏸ מושהה'}</span>
+        <span class="awc-runs">הרצות: ${w.runCount ?? 0}</span>
+        <span class="awc-last">אחרון: ${lastRun}</span>
+      </div>
+    </div>`;
+  }).join('');
+
+  el.querySelectorAll('.worker-toggle').forEach(cb => {
+    cb.addEventListener('change', async () => {
+      const id = cb.dataset.id;
+      try {
+        await post('/api/automations/toggle-worker', { id, enabled: cb.checked });
+        toast(cb.checked ? '✅ Worker הופעל' : '⏸ Worker הושהה');
+      } catch { cb.checked = !cb.checked; toast('❌ שגיאה בשינוי worker'); }
+    });
+  });
+}
+
+function renderRulesTable(rules) {
+  const tbody = document.getElementById('auto-rules-tbody');
+  if (!tbody) return;
+  tbody.innerHTML = rules.map(r => {
+    const tLbl = TRIGGER_LABELS[r.trigger?.type] ?? r.trigger?.type ?? '—';
+    const aLbl = ACTION_LABELS[r.action?.type]   ?? r.action?.type  ?? '—';
+    const agentColor = AGENT_META[r.action?.agent]?.color ?? '#64748b';
+    const lastRun = r.lastRun ? timeSince(r.lastRun) : '—';
+    return `<tr>
+      <td style="text-align:center">
+        <label class="toggle-switch">
+          <input type="checkbox" class="rule-toggle" data-id="${esc(r.id)}" ${r.enabled ? 'checked' : ''}>
+          <span class="toggle-slider"></span>
+        </label>
+      </td>
+      <td><span class="lead-name">${esc(r.name)}</span></td>
+      <td><span class="badge warm" style="font-size:11px">${esc(tLbl)}</span></td>
+      <td style="font-size:12px">${aLbl}</td>
+      <td><span class="awc-badge" style="background:${agentColor};width:28px;height:14px;font-size:9px;display:inline-flex;align-items:center;justify-content:center;border-radius:7px;color:#fff">${AGENT_META[r.action?.agent]?.label ?? r.action?.agent ?? '—'}</span></td>
+      <td style="text-align:center">${r.executionCount ?? 0}</td>
+      <td style="color:var(--muted);font-size:12px">${lastRun}</td>
+    </tr>`;
+  }).join('');
+
+  tbody.querySelectorAll('.rule-toggle').forEach(cb => {
+    cb.addEventListener('change', async () => {
+      const id = cb.dataset.id;
+      try {
+        await post('/api/automations/toggle-rule', { id, enabled: cb.checked });
+        toast(cb.checked ? '✅ כלל הופעל' : '⏸ כלל הושהה');
+      } catch { cb.checked = !cb.checked; toast('❌ שגיאה'); }
+    });
+  });
+}
+
+function renderAutoLog(log) {
+  const el = document.getElementById('auto-log-list');
+  if (!el) return;
+  if (!log?.length) { el.innerHTML = '<div class="empty-state">אין הרצות עדיין</div>'; return; }
+  el.innerHTML = log.map(entry => {
+    const action = entry.result?.action ?? entry.result?.type ?? '';
+    const detail = entry.result?.enabled !== undefined
+      ? (entry.result.enabled ? 'הופעל' : 'הושהה')
+      : (entry.result?.phone ? maskPhone(entry.result.phone) : '');
+    return `<div class="feed-item">
+      <div class="feed-agent-badge" style="background:#64748b;font-size:9px">אוטו</div>
+      <div class="feed-body">
+        <div class="feed-event">${esc(entry.name ?? entry.id)}</div>
+        ${detail ? `<div class="feed-detail">${esc(String(detail))}</div>` : ''}
+      </div>
+      <div class="feed-time">${timeSince(entry.ts)}</div>
+    </div>`;
+  }).join('');
+}
+
+function maskPhone(p) {
+  if (!p || p.length < 7) return p ?? '—';
+  return p.slice(0, 5) + '••••' + p.slice(-3);
+}
+
+document.getElementById('btn-auto-refresh')?.addEventListener('click', loadAutomations);
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   AGENT ACTIVITY FEED — real-time autonomous action log
+   ══════════════════════════════════════════════════════════════════════════════ */
+
+const AGENT_COLORS = {
+  tomer: '#10b981', barak: '#f59e0b', dana: '#ec4899', maya: '#4f46e5',
+};
+const AGENT_LABELS = { tomer: 'תומר', barak: 'ברק', dana: 'דנה', maya: 'מאיה' };
+
+const FEED_EVENT_LABELS = {
+  tomer_followup_queued:  'פולו-אפ ליד — בתור',
+  tomer_member_check:     'בדיקת חבר סטודיו',
+  tomer_scan_complete:    'סריקת שימור הושלמה',
+  tomer_message_sent:     'הודעה נשלחה',
+  tomer_message_queued:   'הודעה בתור',
+  barak_ingestion_complete:'בדיקת CRM הושלמה',
+  barak_phone_invalid:    'מספר טלפון לא תקין',
+  barak_duplicate_flag:   'ליד כפול זוהה',
+  barak_high_value_pending:'ליד חם ללא הצעה',
+  maya_daily_briefing:    'סיכום יומי',
+  arbox_sync:             'סנכרון Arbox',
+  content_pack_generated: 'חבילת תוכן נוצרה',
+  ad_copy_generated:      'קופי פרסומת נוצר',
+  video_analysis:         'ניתוח וידאו',
+  meta_lead_webhook:      'ליד מ-Meta',
+  re_engagement_sent:     'ריאנגייג\'מנט נשלח',
+  intro_offer_sent:       'הצעת היכרות נשלחה',
+  booking_confirmed:      'הזמנה אושרה',
+  crisis:                 'משבר זוהה',
+  message_in:             'הודעה נכנסת',
+  message_out:            'הודעה יוצאת',
+  arbox_full_sync:        'סנכרון Arbox מלא',
+  manual_whatsapp:        'WhatsApp ידני',
+};
+
+async function loadAgentFeed() {
+  try {
+    const { events = [] } = await fetch('/api/system/events').then(r => r.json());
+    renderAgentFeed(events);
+    const upEl = document.getElementById('feed-updated');
+    if (upEl) upEl.textContent = 'עודכן: ' + now();
+  } catch (e) { /* silent fail — feed is non-critical */ }
+}
+
+function renderAgentFeed(events) {
+  const container = document.getElementById('agent-feed-list');
+  if (!container) return;
+  if (!events?.length) {
+    container.innerHTML = '<div class="empty-state">אין פעולות עדיין — הסוכנים מחכים לנתונים</div>';
+    return;
+  }
+  container.innerHTML = events.map(e => {
+    const agent  = e.data?.agent ?? guessAgent(e.type);
+    const color  = AGENT_COLORS[agent] ?? '#64748b';
+    const label  = AGENT_LABELS[agent] ?? agent ?? '—';
+    const evLbl  = FEED_EVENT_LABELS[e.type] ?? e.type;
+    const detail = feedDetail(e);
+    const t      = timeSince(e.ts);
+    return `<div class="feed-item">
+      <div class="feed-agent-badge" style="background:${color}">${esc(label)}</div>
+      <div class="feed-body">
+        <div class="feed-event">${esc(evLbl)}</div>
+        ${detail ? `<div class="feed-detail">${detail}</div>` : ''}
+      </div>
+      <div class="feed-time">${t}</div>
+    </div>`;
+  }).join('');
+}
+
+function guessAgent(type) {
+  if (!type) return null;
+  if (type.startsWith('tomer')) return 'tomer';
+  if (type.startsWith('barak') || type === 'arbox_sync' || type === 'arbox_full_sync') return 'barak';
+  if (type.startsWith('dana') || type === 'content_pack_generated' || type === 'ad_copy_generated' || type === 'video_analysis') return 'dana';
+  if (type.startsWith('maya')) return 'maya';
+  return null;
+}
+
+function feedDetail(e) {
+  const d = e.data ?? {};
+  if (d.headline)   return esc(d.headline);
+  if (d.preview)    return esc(d.preview);
+  if (d.name && d.touch)
+    return `${esc(d.name)} — נגיעה #${d.touch} (${d.silent ?? '?'}ד שקט)`;
+  if (d.name && d.daysSince !== undefined)
+    return `${esc(d.name)} — ${d.daysSince}ד ללא ביקור (${esc(d.planType ?? '')})`;
+  if (d.name && d.issue)
+    return `${esc(d.name)}: ${esc(d.issue)}`;
+  if (d.total !== undefined && d.actionsQueued !== undefined)
+    return `${d.dormantLeads ?? 0} לידים + ${d.inactiveMembers ?? 0} חברות → ${d.actionsQueued} פעולות`;
+  if (d.total !== undefined && d.pendingSync !== undefined)
+    return `${d.total} לידים נבדקו | ${d.invalid} לא תקינים | ${d.pendingSync} ממתינים לסנכרון`;
+  if (d.name)       return esc(d.name);
+  if (e.phone)      return esc(e.phone.slice(0, 8) + '•••');
+  return '';
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   WHATSAPP LIVE INBOX
+   ══════════════════════════════════════════════════════════════════════════════ */
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let waMessages      = [];     // all messages from last fetch
+let waActiveId      = null;   // id of selected message
+let waActiveFilter  = 'all';  // current filter chip
+
+// ── Intent label / colour maps ────────────────────────────────────────────────
+const WA_INTENT = {
+  cancellation:   { label: 'ביטול',        cls: 'cancellation' },
+  booking:        { label: 'הזמנה',        cls: 'booking' },
+  fixed_booking:  { label: 'שיבוץ קבוע',  cls: 'fixed_booking' },
+  schedule_query: { label: 'לוח שיעורים', cls: 'schedule_query' },
+  general:        { label: 'כללי',          cls: 'general' },
+};
+
+const WA_ROUTE = {
+  barak:      { label: 'ברק',        cls: 'barak' },
+  lead_agent: { label: 'ליד-סוכן',  cls: 'lead_agent' },
+  unhandled:  { label: 'לא נוצל',   cls: 'general' },
+};
+
+const AVATAR_COLORS = ['#4f46e5','#ec4899','#10b981','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#84cc16'];
+function avatarColor(str) {
+  let h = 0;
+  for (let i = 0; i < (str||'').length; i++) h = (h * 31 + str.charCodeAt(i)) & 0xffffffff;
+  return AVATAR_COLORS[Math.abs(h) % AVATAR_COLORS.length];
+}
+function initials(name) {
+  if (!name) return '?';
+  return name.trim().split(/\s+/).map(w => w[0]).join('').slice(0, 2).toUpperCase();
+}
+
+// ── Load inbox ────────────────────────────────────────────────────────────────
+async function loadWhatsAppInbox() {
+  try {
+    const [inboxRes, statsRes] = await Promise.all([
+      fetch('/api/whatsapp/inbox?limit=50').then(r => r.json()),
+      fetch('/api/whatsapp/stats').then(r => r.json()),
+    ]);
+    waMessages = inboxRes.messages ?? [];
+    renderWaStats(statsRes, inboxRes.messages ?? []);
+    renderWaMsgList();
+    const upEl = document.getElementById('wa-inbox-updated');
+    if (upEl) upEl.textContent = 'עודכן: ' + now();
+  } catch (e) {
+    console.error('loadWhatsAppInbox', e);
+    setTBody !== undefined && document.getElementById('wa-messages-list')
+      && (document.getElementById('wa-messages-list').innerHTML = `<div class="empty-state" style="padding:32px">שגיאה: ${esc(e.message)}</div>`);
+  }
+}
+
+function renderWaStats(stats, messages) {
+  setTxt('ws-total',  stats.total  ?? 0);
+  setTxt('ws-unread', stats.unread ?? 0);
+
+  const ic = stats.intentCounts ?? {};
+  const schedCount  = (ic.schedule_query ?? 0) + (ic.booking ?? 0) + (ic.fixed_booking ?? 0);
+  const cancelCount = ic.cancellation ?? 0;
+  setTxt('ws-sched',  schedCount);
+  setTxt('ws-cancel', cancelCount);
+
+  const clientCount = messages.filter(m => m.clientMatch?.matchType === 'member').length;
+  const leadCount   = messages.filter(m => m.clientMatch?.matchType === 'lead').length;
+  setTxt('ws-client', clientCount);
+  setTxt('ws-lead',   leadCount);
+}
+
+// ── Render message list ───────────────────────────────────────────────────────
+function renderWaMsgList() {
+  const el = document.getElementById('wa-messages-list');
+  if (!el) return;
+
+  const filtered = waActiveFilter === 'all'    ? waMessages
+    : waActiveFilter === 'unread'              ? waMessages.filter(m => !m.readAt)
+    : waMessages.filter(m => m.intent === waActiveFilter);
+
+  if (!filtered.length) {
+    el.innerHTML = `<div class="empty-state" style="padding:32px">אין הודעות בקטגוריה זו</div>`;
+    return;
+  }
+
+  el.innerHTML = filtered.map(m => {
+    const intent    = WA_INTENT[m.intent]  ?? WA_INTENT.general;
+    const route     = WA_ROUTE[m.route]   ?? WA_ROUTE.unhandled;
+    const match     = m.clientMatch ?? {};
+    const clientCls = match.found ? match.matchType ?? 'new' : 'new';
+    const clientLbl = match.found
+      ? (match.matchType === 'member' ? '✅ לקוח' : '🎯 ליד')
+      : '➕ חדש';
+    const displayName = m.name || m.fromIsraeli || m.from;
+    const phone       = m.fromIsraeli || m.from;
+    const isUnread    = !m.readAt;
+    const isSelected  = m.id === waActiveId;
+    const timeStr     = m.receivedAt
+      ? new Date(m.receivedAt).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' })
+      : '—';
+    const color = avatarColor(displayName);
+
+    return `
+    <div class="wa-msg-item ${isUnread ? 'wa-unread' : ''} ${isSelected ? 'wa-selected' : ''}"
+         data-id="${esc(m.id)}" onclick="selectWaMessage('${esc(m.id)}')">
+      <div class="wa-unread-dot"></div>
+      <div class="wa-avatar" style="background:${color}">${esc(initials(displayName))}</div>
+      <div class="wa-msg-body">
+        <div class="wa-msg-top">
+          <span class="wa-sender-name">${esc(displayName)}</span>
+          <span class="wa-msg-time">${timeStr}</span>
+        </div>
+        <div class="wa-msg-preview">${esc((m.text || '').slice(0, 65))}</div>
+        <div class="wa-msg-tags">
+          <span class="wa-intent-tag ${intent.cls}">${intent.label}</span>
+          <span class="wa-client-badge ${clientCls}">${clientLbl}</span>
+          <span class="wa-route-badge ${route.cls}">${route.label}</span>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ── Select & show message detail ──────────────────────────────────────────────
+function selectWaMessage(id) {
+  waActiveId = id;
+  const msg = waMessages.find(m => m.id === id);
+  if (!msg) return;
+
+  // Re-render list to update selected state
+  renderWaMsgList();
+
+  const emptyEl  = document.getElementById('wa-chat-empty');
+  const detailEl = document.getElementById('wa-chat-detail');
+  if (!emptyEl || !detailEl) return;
+  emptyEl.style.display  = 'none';
+  detailEl.style.display = 'block';
+
+  const intent    = WA_INTENT[msg.intent] ?? WA_INTENT.general;
+  const route     = WA_ROUTE[msg.route]  ?? WA_ROUTE.unhandled;
+  const match     = msg.clientMatch ?? {};
+  const displayName = msg.name || msg.fromIsraeli || msg.from;
+  const phone       = msg.fromIsraeli ? msg.fromIsraeli.replace(/(\d{3})(\d{3,4})(\d{4})/, '$1-$2-$3') : (msg.from || '—');
+  const ts          = msg.timestamp ? new Date(msg.timestamp).toLocaleString('he-IL') : '—';
+  const color       = avatarColor(displayName);
+
+  // Arbox match block
+  const arboxHtml = match.found ? `
+    <div class="wa-arbox-box">
+      <div class="wa-arbox-box-label">✅ לקוח נמצא ב-Arbox</div>
+      <div class="wa-arbox-row">
+        <div class="wa-arbox-field">
+          <span class="wa-arbox-field-label">שם</span>
+          <span class="wa-arbox-field-val">${esc(match.arboxName ?? '—')}</span>
+        </div>
+        <div class="wa-arbox-field">
+          <span class="wa-arbox-field-label">סוג</span>
+          <span class="wa-arbox-field-val">${match.matchType === 'member' ? '👤 לקוח ישיר' : '🎯 ליד'}</span>
+        </div>
+        <div class="wa-arbox-field">
+          <span class="wa-arbox-field-label">סטטוס</span>
+          <span class="wa-arbox-field-val">${match.isActive ? '<span style="color:var(--green)">● פעיל</span>' : '<span style="color:var(--muted)">○ לא פעיל</span>'}</span>
+        </div>
+        ${match.arboxId ? `<div class="wa-arbox-field"><span class="wa-arbox-field-label">Arbox ID</span><span class="wa-arbox-field-val" style="font-size:11px;color:var(--muted)">${esc(match.arboxId)}</span></div>` : ''}
+      </div>
+    </div>` : `
+    <div class="wa-arbox-box no-match">
+      <div class="wa-arbox-box-label">Arbox — לא נמצא</div>
+      <div style="font-size:13px;color:var(--muted)">מספר זה אינו ברשומות Arbox. ייתכן ליד חדש.</div>
+    </div>`;
+
+  // Barak reply block
+  const barakHtml = msg.barakReply ? `
+    <div class="wa-barak-box">
+      <div class="wa-barak-box-label">🤖 תשובת ברק — טיוטה מוכנה לשליחה</div>
+      <div class="wa-barak-box-text">${esc(msg.barakReply)}</div>
+      <div class="wa-barak-box-foot">
+        <button class="btn btn-primary" style="font-size:12px;padding:6px 14px"
+          onclick="waCopyReply('${esc(msg.id)}')">📋 העתק תשובה</button>
+        <button class="btn btn-secondary" style="font-size:12px;padding:6px 14px"
+          onclick="toast('שליחה ידנית — WhatsApp API נדרש')">📤 שלח</button>
+      </div>
+    </div>` : '';
+
+  // Media indicator
+  const isBubbleMedia = msg.mediaType && msg.mediaType !== 'text';
+  const bubbleCls     = isBubbleMedia ? 'wa-bubble media' : 'wa-bubble';
+  const bubbleIcon    = {
+    image: '🖼️', video: '🎥', audio: '🎵', voice: '🎤',
+    document: '📄', location: '📍', sticker: '🖼️', reaction: '😊',
+    interactive: '🔘',
+  }[msg.mediaType] ?? '💬';
+
+  detailEl.innerHTML = `
+    <div class="wa-chat-hdr">
+      <div class="wa-avatar" style="background:${color};width:44px;height:44px;font-size:16px">${esc(initials(displayName))}</div>
+      <div class="wa-chat-hdr-info">
+        <div class="wa-chat-hdr-name">${esc(displayName)}</div>
+        <div class="wa-chat-hdr-phone" dir="ltr">${esc(phone)}</div>
+      </div>
+      <div class="wa-chat-hdr-badges">
+        <span class="wa-intent-tag ${intent.cls}">${intent.label}</span>
+        <span class="wa-route-badge ${route.cls}">${route.label}</span>
+        ${match.found ? `<span class="wa-client-badge ${match.matchType ?? 'new'}">${match.matchType === 'member' ? '✅ לקוח' : '🎯 ליד'}</span>` : ''}
+      </div>
+    </div>
+    <div class="wa-chat-body">
+      <div class="wa-bubble-wrap">
+        <div class="wa-bubble-label">${isBubbleMedia ? bubbleIcon + ' ' + msg.mediaType : '💬 הודעה'}</div>
+        <div class="${bubbleCls}">${esc(msg.text || '—')}</div>
+      </div>
+      <div class="wa-meta-grid">
+        <div class="wa-meta-item">
+          <div class="wa-meta-item-label">זמן קבלה</div>
+          <div class="wa-meta-item-val">${ts}</div>
+        </div>
+        <div class="wa-meta-item">
+          <div class="wa-meta-item-label">כוונה</div>
+          <div class="wa-meta-item-val"><span class="wa-intent-tag ${intent.cls}">${intent.label}</span></div>
+        </div>
+        <div class="wa-meta-item">
+          <div class="wa-meta-item-label">ניתוב</div>
+          <div class="wa-meta-item-val"><span class="wa-route-badge ${route.cls}">${route.label}</span></div>
+        </div>
+        <div class="wa-meta-item">
+          <div class="wa-meta-item-label">סוג מדיה</div>
+          <div class="wa-meta-item-val">${esc(msg.mediaType ?? 'text')}</div>
+        </div>
+        <div class="wa-meta-item">
+          <div class="wa-meta-item-label">נקרא</div>
+          <div class="wa-meta-item-val">${msg.readAt ? new Date(msg.readAt).toLocaleTimeString('he-IL', {hour:'2-digit',minute:'2-digit'}) : '<span style="color:var(--hot);font-weight:700">לא נקרא</span>'}</div>
+        </div>
+        <div class="wa-meta-item">
+          <div class="wa-meta-item-label">Inbox ID</div>
+          <div class="wa-meta-item-val" style="font-size:11px;color:var(--muted)">${esc(msg.id.slice(-10))}</div>
+        </div>
+      </div>
+      ${barakHtml}
+      ${arboxHtml}
+    </div>`;
+
+  // Mark as read via API
+  if (!msg.readAt) {
+    fetch(`/api/whatsapp/inbox/${id}/read`, { method: 'POST' }).then(() => {
+      const m = waMessages.find(x => x.id === id);
+      if (m) m.readAt = new Date();
+      renderWaMsgList();
+    }).catch(() => {});
+  }
+
+  const upEl = document.getElementById('wa-chat-updated');
+  if (upEl) upEl.textContent = 'נבחר: ' + new Date(msg.receivedAt).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' });
+}
+
+function waCopyReply(id) {
+  const msg = waMessages.find(m => m.id === id);
+  if (!msg?.barakReply) return;
+  navigator.clipboard.writeText(msg.barakReply).then(
+    () => toast('✅ תשובת ברק הועתקה'),
+    () => toast('❌ העתקה נכשלה')
+  );
+}
+
+// ── Filter chips ──────────────────────────────────────────────────────────────
+document.querySelectorAll('.wa-filter').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.wa-filter').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    waActiveFilter = btn.dataset.wf;
+    renderWaMsgList();
+  });
+});
+
+// ── Refresh + read-all buttons ────────────────────────────────────────────────
+document.getElementById('btn-wa-refresh')?.addEventListener('click', () => {
+  loadWhatsAppInbox();
+});
+
+document.getElementById('btn-wa-read-all')?.addEventListener('click', async () => {
+  await fetch('/api/whatsapp/inbox/read-all', { method: 'POST' });
+  waMessages.forEach(m => { if (!m.readAt) m.readAt = new Date(); });
+  renderWaMsgList();
+  toast('✅ כל ההודעות סומנו כנקרא');
+});
+
+// ── Example pill click-to-fill ────────────────────────────────────────────────
+document.querySelectorAll('.wa-pill').forEach(pill => {
+  pill.addEventListener('click', () => {
+    const input = document.getElementById('wa-sim-text');
+    if (input) { input.value = pill.dataset.txt; input.focus(); }
+  });
+});
+
+// ── Simulate send ─────────────────────────────────────────────────────────────
+document.getElementById('btn-wa-sim')?.addEventListener('click', runWaSimulate);
+document.getElementById('wa-sim-text')?.addEventListener('keydown', e => {
+  if (e.key === 'Enter') runWaSimulate();
+});
+
+async function runWaSimulate() {
+  const btn    = document.getElementById('btn-wa-sim');
+  const result = document.getElementById('wa-sim-result');
+  const phone  = document.getElementById('wa-sim-phone')?.value.trim() || '0521111111';
+  const name   = document.getElementById('wa-sim-name')?.value.trim()  || 'בדיקה';
+  const text   = document.getElementById('wa-sim-text')?.value.trim();
+  if (!text) { toast('⚠️ יש להזין תוכן הודעה'); return; }
+
+  if (btn) { btn.disabled = true; btn.textContent = '⏳'; }
+  if (result) result.style.display = 'none';
+
+  try {
+    const d = await post('/api/whatsapp/simulate', { from: phone, name, text });
+    if (result) {
+      const intent = WA_INTENT[d.intent] ?? WA_INTENT.general;
+      const route  = WA_ROUTE[d.route]   ?? WA_ROUTE.unhandled;
+      const cMatch = d.clientMatch ?? {};
+      result.innerHTML = `
+        <div class="wa-sim-result-grid">
+          <div class="wa-sim-result-chip"><b>כוונה</b><span class="wa-intent-tag ${intent.cls}">${intent.label}</span></div>
+          <div class="wa-sim-result-chip"><b>ניתוב</b><span class="wa-route-badge ${route.cls}">${route.label}</span></div>
+          <div class="wa-sim-result-chip"><b>Arbox</b>${cMatch.found ? esc(cMatch.arboxName ?? '—') : 'לא נמצא'}</div>
+          <div class="wa-sim-result-chip"><b>Inbox ID</b><span style="color:var(--muted);font-size:11px">${esc((d.inboxId ?? '').slice(-8))}</span></div>
+        </div>
+        ${d.barakReply ? `<div style="margin-top:10px;padding:12px;background:#fffbeb;border:1px solid #fbbf24;border-radius:8px;font-size:13px;white-space:pre-wrap"><strong style="font-size:11px;color:#92400e;display:block;margin-bottom:6px">🤖 תשובת ברק</strong>${esc(d.barakReply)}</div>` : ''}`;
+      result.style.display = 'block';
+    }
+    toast('✅ הודעת בדיקה נשלחה');
+    if (document.querySelector('.tab-btn.active')?.dataset?.tab === 'whatsapp') {
+      setTimeout(loadWhatsAppInbox, 600);
+    }
+  } catch (err) {
+    toast(`❌ ${err.message}`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '▶ שלח'; }
+  }
+}
+
+/* ── Boot ───────────────────────────────────────────────────────────────────── */
+pingServer();
+loadMayaStats();
+loadAgentFeed();
+loadBarakPanel();
+refreshTimer = setInterval(() => {
+  const active = document.querySelector('.tab-btn.active')?.dataset?.tab;
+  if (active === 'maya' || active === 'barak') loadBarakPanel();
+  if (active === 'maya') { loadMayaStats(); loadAgentFeed(); }
+  if (active === 'whatsapp') loadWhatsAppInbox();
+}, 5000);
+
+// Feed auto-refresh every 10s regardless of active tab
+setInterval(loadAgentFeed, 10000);
+
+// Wire mini chats
+initMiniChat('dana-chat-input',  'dana-send',  'dana-chat-msgs',  '/api/dana/chat');
+initMiniChat('tomer-chat-input', 'tomer-send', 'tomer-chat-msgs', '/api/tomer/chat');
+initMiniChat('barak-chat-input', 'barak-send', 'barak-chat-msgs', '/api/barak/chat');

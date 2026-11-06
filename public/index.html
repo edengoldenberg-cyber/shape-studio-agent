@@ -1,0 +1,924 @@
+<!DOCTYPE html>
+<html dir="rtl" lang="he">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Shape Studio — מרכז שליטה AI</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Heebo:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ── Header ── -->
+  <header class="app-header">
+    <div class="header-brand">
+      <span class="brand-icon">🏋️</span>
+      <div>
+        <div class="brand-name">Shape Studio</div>
+        <div class="brand-sub">מרכז שליטה AI — צוות סוכנים</div>
+      </div>
+    </div>
+    <div class="header-status">
+      <span class="status-dot"></span>
+      <span class="status-label" id="status-label">מתחבר...</span>
+    </div>
+  </header>
+
+  <!-- ── Tabs ── -->
+  <nav class="tab-nav">
+    <button class="tab-btn active" data-tab="maya">🏢 מאיה</button>
+    <button class="tab-btn"        data-tab="dana">🎨 דנה</button>
+    <button class="tab-btn"        data-tab="tomer">💌 תומר</button>
+    <button class="tab-btn"        data-tab="barak">📊 ברק</button>
+    <button class="tab-btn"        data-tab="sandbox">🧪 סנדבוקס</button>
+    <button class="tab-btn"        data-tab="whatsapp">💬 וואטסאפ לייב</button>
+    <button class="tab-btn"        data-tab="automations">⚙️ אוטומציות</button>
+    <button class="tab-btn"        data-tab="health">🟢 מצב מערכת</button>
+  </nav>
+
+  <main class="app-main">
+
+    <!-- ══════════════════════════════════════════════════════════════════════
+         MAYA — Operations Manager
+    ══════════════════════════════════════════════════════════════════════════ -->
+    <section id="tab-maya" class="tab-panel active">
+
+      <div class="stats-grid" id="maya-stats"></div>
+
+      <!-- Executive Summary -->
+      <div class="exec-summary" id="exec-summary">
+        <div class="exec-section">
+          <div class="exec-label">משפך המרה</div>
+          <div class="exec-funnel" id="exec-funnel">
+            <div class="funnel-step"><div class="funnel-val" id="ef-leads">—</div><div class="funnel-lbl">לידים</div></div>
+            <div class="funnel-arrow">›</div>
+            <div class="funnel-step"><div class="funnel-val hot" id="ef-hot">—</div><div class="funnel-lbl">חמים</div></div>
+            <div class="funnel-arrow">›</div>
+            <div class="funnel-step"><div class="funnel-val" id="ef-intro">—</div><div class="funnel-lbl">הצעה נשלחה</div></div>
+            <div class="funnel-arrow">›</div>
+            <div class="funnel-step"><div class="funnel-val green" id="ef-redeemed">—</div><div class="funnel-lbl">מימשו</div></div>
+            <div class="funnel-arrow">›</div>
+            <div class="funnel-step"><div class="funnel-val green" id="ef-booked">—</div><div class="funnel-lbl">הזמינו</div></div>
+            <div class="funnel-pct" id="ef-conv">המרה: —%</div>
+          </div>
+        </div>
+        <div class="exec-section">
+          <div class="exec-label">חברות סטודיו</div>
+          <div class="exec-members" id="exec-members">
+            <div class="em-block active"><div class="em-val" id="em-active">—</div><div class="em-lbl">פעילות</div></div>
+            <div class="em-block risk"><div class="em-val" id="em-risk">—</div><div class="em-lbl">בסיכון</div></div>
+            <div class="em-block churn"><div class="em-val" id="em-churned">—</div><div class="em-lbl">עזבו</div></div>
+          </div>
+        </div>
+        <div class="exec-section">
+          <div class="exec-label">היום</div>
+          <div class="exec-today" id="exec-today">
+            <div class="et-row"><span class="et-lbl">לידים חדשים</span><span class="et-val" id="et-new">—</span></div>
+            <div class="et-row"><span class="et-lbl">הודעות נכנסות</span><span class="et-val" id="et-in">—</span></div>
+            <div class="et-row"><span class="et-lbl">ריאנגייג'מנט</span><span class="et-val" id="et-reng">—</span></div>
+            <div class="et-row"><span class="et-lbl">ממוצע ציון</span><span class="et-val" id="et-score">—</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="maya-layout">
+        <aside class="maya-sidebar">
+          <div class="agent-profile">
+            <div class="agent-avatar" style="background:linear-gradient(135deg,#4f46e5,#818cf8)">M</div>
+            <div class="agent-name">מאיה</div>
+            <div class="agent-role">מנהלת פעולות</div>
+          </div>
+          <div class="quick-actions">
+            <div class="quick-title">פעולות מהירות</div>
+            <button class="quick-btn" data-prompt="תני לי דוח יומי מלא של הפייפליין. כולל מי צריך טיפול והמלצה שלך.">📊 דוח יומי</button>
+            <button class="quick-btn" data-prompt="רשמי לי את כל הלידים החמים עכשיו. לגבי כל אחד — מה הצעד הכי נכון לעשות?">🔥 לידים חמים</button>
+            <button class="quick-btn" data-prompt="תני לי סיכום בריאות המערכת — התפלגות ציונים, משברים פעילים, מצב כללי.">💊 בריאות מערכת</button>
+            <button class="quick-btn" data-prompt="מי הלידים שלא קיבלו הצעת היכרות עדיין ומוכנים לקבל אותה?">🎯 הצעות ממתינות</button>
+            <button class="quick-btn" data-prompt="יש לידים שלא ענו כבר כמה שעות? מה הגיוני לעשות איתם?">🔕 לא מגיבים</button>
+          </div>
+          <div class="maya-hint">
+            <div class="hint-label">💡 טיפ</div>
+            שאלי אותי הכל — בעברית או באנגלית. אני מחוברת לנתוני הפייפליין בזמן אמת.
+          </div>
+        </aside>
+        <div class="maya-chat">
+          <div class="chat-messages" id="chat-messages">
+            <div class="chat-msg maya-msg">
+              <div class="msg-bubble">
+                שלום! אני מאיה, מנהלת הפעולות של Shape Studio 👋<br><br>
+                אני מחוברת לפייפליין הלידים בזמן אמת ויכולה לענות על כל שאלה עסקית —
+                דוחות, לידים חמים, משברים, המלצות פעולה.
+              </div>
+              <div class="msg-time">עכשיו</div>
+            </div>
+          </div>
+          <div class="chat-input-area">
+            <input type="text" id="chat-input" class="chat-input" placeholder="שאלי את מאיה..." autocomplete="off"/>
+            <button class="btn btn-primary" id="send-btn">שלח ›</button>
+          </div>
+        </div>
+      </div>
+      <!-- Agent Activity Feed -->
+      <div class="panel feed-panel">
+        <div class="panel-header">
+          <div class="feed-title-row">
+            <h2>🤖 פעילות סוכנים — בזמן אמת</h2>
+            <div class="live-badge"><span class="live-pulse"></span>LIVE</div>
+          </div>
+          <span class="refresh-tag" id="feed-updated"></span>
+        </div>
+        <div class="agent-feed-list" id="agent-feed-list">
+          <div class="empty-state">טוען פעילות סוכנים...</div>
+        </div>
+        <div class="panel-footer">
+          <span style="font-size:12px;color:var(--muted)">מתרענן כל 10 שניות · 50 פעולות אחרונות</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ══════════════════════════════════════════════════════════════════════
+         DANA — Content, Social & Video Analysis
+    ══════════════════════════════════════════════════════════════════════════ -->
+    <section id="tab-dana" class="tab-panel">
+      <div class="dana-layout">
+
+        <!-- Left sidebar: tools + mini chat -->
+        <aside class="dana-sidebar panel">
+          <div class="panel-header">
+            <div class="agent-profile-sm">
+              <div class="agent-avatar-sm" style="background:linear-gradient(135deg,#ec4899,#f97316)">D</div>
+              <div>
+                <div class="agent-name-sm">דנה</div>
+                <div class="agent-role-sm">תוכן, שיווק וניתוח וידאו</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Content Pack -->
+          <div class="tool-section">
+            <div class="tool-title">📸 חבילת תוכן דו-שבועית</div>
+            <div class="field-group">
+              <label class="field-label" for="cp-class">שיעור בפוקוס</label>
+              <select id="cp-class" class="field-select">
+                <option value="">אקראי 🎲</option>
+                <option value="Reformer Pilates">Reformer Pilates</option>
+                <option value="Strength Training">Strength Training</option>
+                <option value="Pilates Barre">Pilates Barre</option>
+                <option value="Concept Toning / Sculpt">Concept Toning</option>
+                <option value="ALL IN (פונקציונלי)">ALL IN</option>
+                <option value="Ashtanga Yoga">Ashtanga Yoga</option>
+                <option value="Kangoo Jumps">Kangoo Jumps</option>
+              </select>
+            </div>
+            <button class="btn btn-primary tool-btn" id="btn-content-pack">✨ צרי חבילת תוכן</button>
+            <div id="cp-result" class="tool-result" style="display:none"></div>
+          </div>
+
+          <!-- Ad Copy -->
+          <div class="tool-section">
+            <div class="tool-title">📐 קופי לפרסומת</div>
+            <div class="field-row">
+              <div class="field-group field-half">
+                <label class="field-label" for="ac-format">פורמט</label>
+                <select id="ac-format" class="field-select">
+                  <option value="4:5">Feed 4:5</option>
+                  <option value="9:16">Story 9:16</option>
+                  <option value="feed">Feed</option>
+                  <option value="story">Story</option>
+                </select>
+              </div>
+              <div class="field-group field-half">
+                <label class="field-label" for="ac-obj">מטרה</label>
+                <select id="ac-obj" class="field-select">
+                  <option value="conversion">המרה</option>
+                  <option value="awareness">מודעות</option>
+                  <option value="retention">שימור</option>
+                </select>
+              </div>
+            </div>
+            <button class="btn btn-secondary tool-btn" id="btn-ad-copy">📝 צרי קופי</button>
+            <div id="ac-result" class="tool-result" style="display:none"></div>
+          </div>
+
+          <!-- Dana mini chat -->
+          <div class="tool-section" style="border-top:1px solid var(--border);padding-top:16px">
+            <div class="tool-title">💬 שוחח עם דנה</div>
+            <div class="mini-chat">
+              <div class="mini-chat-msgs" id="dana-chat-msgs"></div>
+              <div class="mini-chat-row">
+                <input type="text" id="dana-chat-input" class="field-input" placeholder="שאלי את דנה..." autocomplete="off"/>
+                <button class="mini-send-btn" id="dana-send">›</button>
+              </div>
+            </div>
+          </div>
+        </aside>
+
+        <!-- Right main: video analysis -->
+        <div class="dana-main">
+          <div class="va-form-panel panel">
+            <div class="panel-header"><h2>🎬 ניתוח וידאו לפי מוסרי</h2></div>
+            <div class="va-form-body">
+              <div class="field-group">
+                <label class="field-label" for="va-title">כותרת הסרטון</label>
+                <input type="text" id="va-title" class="field-input" placeholder="ריל Reformer Pilates — Shape Studio"/>
+              </div>
+              <div class="field-group">
+                <label class="field-label" for="va-desc">תיאור / תסריט / תמליל</label>
+                <textarea id="va-desc" class="field-textarea" rows="7"
+                  placeholder="הוק: &quot;90% מהנשים לא יודעות שזה קיים&quot;&#10;גוף: הסבר על Reformer — מה זה, למה זה עובד...&#10;CTA: &quot;בואי לשיעור ניסיון ב-60 ש״ח&quot;"></textarea>
+                <div class="field-hint">Ctrl+Enter לשליחה מהירה</div>
+              </div>
+              <div class="field-row">
+                <div class="field-group field-half">
+                  <label class="field-label" for="va-format">פורמט</label>
+                  <select id="va-format" class="field-select">
+                    <option value="feed">Feed Reel (4:5)</option>
+                    <option value="trial">Trial Reel</option>
+                    <option value="carousel">Carousel</option>
+                    <option value="story">Story (9:16)</option>
+                    <option value="caption">Caption</option>
+                    <option value="cover">Cover</option>
+                  </select>
+                </div>
+                <div class="field-group field-half">
+                  <label class="field-label" for="va-goal">מטרה</label>
+                  <select id="va-goal" class="field-select">
+                    <option value="conversion">המרה — ניסיון</option>
+                    <option value="awareness">מודעות</option>
+                    <option value="retention">שימור</option>
+                  </select>
+                </div>
+              </div>
+              <button class="btn btn-primary va-btn-submit" id="va-submit">🔍 נתח לפי מוסרי</button>
+            </div>
+            <div class="va-framework-box">
+              <div class="va-fw-title">מסגרת מוסרי — 7 קריטריונים</div>
+              <div class="va-fw-chips">
+                <span class="va-chip">C1 הוק ×25%</span>
+                <span class="va-chip">C2 שליחות ×20%</span>
+                <span class="va-chip">C3 ערך לזר ×20%</span>
+                <span class="va-chip">C4 מבנה ×15%</span>
+                <span class="va-chip">C5 מקוריות ×10%</span>
+                <span class="va-chip">C6 קריאות ×5%</span>
+                <span class="va-chip">C7 נושא ×5%</span>
+              </div>
+              <div class="va-fw-note">74 עקרונות של מוסרי, ראש אינסטגרם. הציון לא מנבא חשיפה.</div>
+            </div>
+          </div>
+          <div class="va-results-panel" id="va-results-panel">
+            <div id="va-empty-state" class="va-empty">
+              <div class="va-empty-icon">🎬</div>
+              <div class="va-empty-title">ממתין לניתוח</div>
+              <div class="va-empty-sub">הכניסי כותרת ותיאור, בחרי פורמט ומטרה, ולחצי <strong>נתח לפי מוסרי</strong></div>
+            </div>
+            <div id="va-result-content" class="va-result-content" style="display:none"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ══════════════════════════════════════════════════════════════════════
+         TOMER — Retention & Follow-up
+    ══════════════════════════════════════════════════════════════════════════ -->
+    <section id="tab-tomer" class="tab-panel">
+      <div class="agent-layout">
+
+        <!-- Sidebar -->
+        <aside class="agent-sidebar panel">
+          <div class="panel-header">
+            <div class="agent-profile-sm">
+              <div class="agent-avatar-sm" style="background:linear-gradient(135deg,#10b981,#0ea5e9)">T</div>
+              <div>
+                <div class="agent-name-sm">תומר</div>
+                <div class="agent-role-sm">שימור ופולו-אפ</div>
+              </div>
+            </div>
+          </div>
+          <div class="agent-sidebar-body">
+            <div class="agent-mini-stats" id="tomer-mini-stats">
+              <div class="mini-stat"><div class="mini-stat-val" id="ts-dormant">—</div><div class="mini-stat-lbl">רדומים</div></div>
+              <div class="mini-stat"><div class="mini-stat-val" id="ts-intro">—</div><div class="mini-stat-lbl">הצעה לא נוצלה</div></div>
+              <div class="mini-stat"><div class="mini-stat-val" id="ts-today">—</div><div class="mini-stat-lbl">טופלו היום</div></div>
+            </div>
+
+            <div class="tool-section">
+              <button class="btn btn-primary tool-btn" id="btn-tomer-checks">▶ הרץ בדיקות יומיות</button>
+              <div id="tomer-checks-result" class="tool-result" style="display:none"></div>
+            </div>
+
+            <div class="tool-section" style="border-top:1px solid var(--border);padding-top:16px">
+              <div class="tool-title">💬 שוחח עם תומר</div>
+              <div class="mini-chat">
+                <div class="mini-chat-msgs" id="tomer-chat-msgs"></div>
+                <div class="mini-chat-row">
+                  <input type="text" id="tomer-chat-input" class="field-input" placeholder="שאלי את תומר..." autocomplete="off"/>
+                  <button class="mini-send-btn" id="tomer-send">›</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </aside>
+
+        <!-- Main: retention panels with sub-nav -->
+        <div class="agent-main">
+          <div class="panel">
+            <div class="panel-header">
+              <div class="tomer-subnav">
+                <button class="subnav-btn active" data-tview="leads">📋 לידים רדומים</button>
+                <button class="subnav-btn" data-tview="members">🏋️ חברות בסיכון</button>
+              </div>
+              <button class="btn btn-secondary" id="btn-tomer-refresh" style="font-size:13px;padding:6px 14px">🔄 רענן</button>
+            </div>
+
+            <!-- Leads queue view -->
+            <div id="tomer-view-leads">
+              <div class="table-wrapper">
+                <table class="leads-table">
+                  <thead>
+                    <tr>
+                      <th>שם</th>
+                      <th>ציון</th>
+                      <th>סטטוס</th>
+                      <th>ימי שקט</th>
+                      <th>RE#</th>
+                      <th>הצעת היכרות</th>
+                    </tr>
+                  </thead>
+                  <tbody id="tomer-queue-tbody">
+                    <tr><td colspan="6" class="empty-state">לחץ "רענן" לטעינת תור השימור</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <div class="panel-footer">
+                <span style="font-size:13px;color:var(--muted)">RE# = מספר ניסיונות ריאנגייג'מנט שנשלחו</span>
+                <span class="refresh-tag" id="tomer-updated"></span>
+              </div>
+            </div>
+
+            <!-- Members at-risk view -->
+            <div id="tomer-view-members" style="display:none">
+              <div class="members-stats-row" id="tomer-member-stats">
+                <div class="mini-stat"><div class="mini-stat-val" id="tm-active">—</div><div class="mini-stat-lbl">פעילות</div></div>
+                <div class="mini-stat risk"><div class="mini-stat-val" id="tm-risk">—</div><div class="mini-stat-lbl">בסיכון</div></div>
+                <div class="mini-stat churn"><div class="mini-stat-val" id="tm-churned">—</div><div class="mini-stat-lbl">עזבו</div></div>
+              </div>
+              <div class="table-wrapper">
+                <table class="leads-table">
+                  <thead>
+                    <tr>
+                      <th>שם</th>
+                      <th>תוכנית</th>
+                      <th>ביקור אחרון</th>
+                      <th>שיעורים החודש</th>
+                      <th>סטטוס</th>
+                    </tr>
+                  </thead>
+                  <tbody id="tomer-members-tbody">
+                    <tr><td colspan="5" class="empty-state">לחץ "רענן" לטעינת חברות</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <div class="panel-footer">
+                <span style="font-size:13px;color:var(--muted)">חברות שלא הגיעו 14+ ימים</span>
+                <span class="refresh-tag" id="tomer-members-updated"></span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ══════════════════════════════════════════════════════════════════════
+         BARAK — CRM & Arbox Management
+    ══════════════════════════════════════════════════════════════════════════ -->
+    <section id="tab-barak" class="tab-panel">
+
+      <!-- Overview stats row -->
+      <div class="stats-grid" id="barak-stats"></div>
+
+      <!-- Arbox overview cards -->
+      <div class="arbox-overview-bar" id="arbox-overview-bar">
+        <div class="arbox-ov-card">
+          <div class="arbox-ov-icon">👥</div>
+          <div class="arbox-ov-val" id="aov-members">—</div>
+          <div class="arbox-ov-lbl">חברים פעילים</div>
+        </div>
+        <div class="arbox-ov-card">
+          <div class="arbox-ov-icon">🎯</div>
+          <div class="arbox-ov-val" id="aov-leads">—</div>
+          <div class="arbox-ov-lbl">לידים ב-Arbox</div>
+        </div>
+        <div class="arbox-ov-card">
+          <div class="arbox-ov-icon">📅</div>
+          <div class="arbox-ov-val" id="aov-today">—</div>
+          <div class="arbox-ov-lbl">הזמנות היום</div>
+        </div>
+        <div class="arbox-ov-card">
+          <div class="arbox-ov-icon">📆</div>
+          <div class="arbox-ov-val" id="aov-week">—</div>
+          <div class="arbox-ov-lbl">שיעורים שבוע</div>
+        </div>
+        <div class="arbox-ov-conn" id="arbox-conn-badge">⏳ מתחבר...</div>
+        <button class="btn btn-primary arbox-refresh-btn" id="btn-arbox-refresh">🔄 רענן Arbox</button>
+      </div>
+
+      <!-- Sub-navigation -->
+      <nav class="barak-subnav">
+        <button class="barak-sv-btn active" data-bview="pipeline">📋 לידים</button>
+        <button class="barak-sv-btn" data-bview="memberships">💳 מנויים</button>
+        <button class="barak-sv-btn" data-bview="attendance">📊 נוכחות</button>
+        <button class="barak-sv-btn" data-bview="staff">👩‍🏫 צוות</button>
+        <button class="barak-sv-btn" data-bview="retention">📈 שימור</button>
+        <button class="barak-sv-btn" data-bview="arbox-leads">🎯 לידים Arbox</button>
+        <button class="barak-sv-btn" data-bview="schedule">📅 לוח שיעורים</button>
+        <button class="barak-sv-btn" data-bview="sync">🔗 סנכרון</button>
+      </nav>
+
+      <!-- VIEW: Local lead pipeline -->
+      <div id="barak-view-pipeline">
+        <div class="panel" style="margin-bottom:24px">
+          <div class="panel-header">
+            <h2>פייפליין לידים מקומיים</h2>
+            <div class="filter-bar">
+              <button class="filter-btn active" data-filter="all">הכל</button>
+              <button class="filter-btn" data-filter="hot">🔥 חמים</button>
+              <button class="filter-btn" data-filter="warm">🌡️ פושרים</button>
+              <button class="filter-btn" data-filter="cold">❄️ קרים</button>
+              <button class="filter-btn" data-filter="crisis">🚨 משבר</button>
+            </div>
+          </div>
+          <div class="table-wrapper">
+            <table class="leads-table">
+              <thead><tr>
+                <th>שם</th><th>טלפון</th><th>ציון</th><th>סטטוס</th>
+                <th>הודעות</th><th>הצעה</th><th>Arbox</th><th>פעילות</th>
+              </tr></thead>
+              <tbody id="barak-leads-tbody">
+                <tr><td colspan="8" class="empty-state">טוען...</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="panel-footer">
+            <button class="btn btn-secondary" id="btn-seed">🌱 טען דמו</button>
+            <button class="btn btn-danger"    id="btn-reset">🗑️ אפס</button>
+            <span class="refresh-tag" id="barak-updated"></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- VIEW: Memberships (detailed) -->
+      <div id="barak-view-memberships" style="display:none">
+        <div class="membership-summary-bar" id="membership-summary-bar">
+          <div class="ms-card active"><div class="ms-val" id="ms-active">—</div><div class="ms-lbl">פעילים (active=1)</div></div>
+          <div class="ms-card expiring"><div class="ms-val" id="ms-expiring">—</div><div class="ms-lbl">פגים בקרוב</div></div>
+          <div class="ms-card expired"><div class="ms-val" id="ms-expired">—</div><div class="ms-lbl">פגו לאחרונה (≤90ד)</div></div>
+          <div class="ms-card total"><div class="ms-val" id="ms-archived">—</div><div class="ms-lbl">ארכיון (>90ד)</div></div>
+          <div class="ms-card" style="border-color:var(--muted)"><div class="ms-val" id="ms-agg" style="color:var(--primary)">—</div><div class="ms-lbl">מנויים פעילים (כולל)</div></div>
+        </div>
+        <!-- Tabs within memberships -->
+        <div class="ms-tabs">
+          <button class="ms-tab active" data-mstab="activeClients">✅ פעילים</button>
+          <button class="ms-tab" data-mstab="expiringSoon">⏳ פגים בקרוב</button>
+          <button class="ms-tab" data-mstab="recentlyExpired">📉 פגו לאחרונה</button>
+          <button class="ms-tab" data-mstab="archivedExpired">🗄️ ארכיון</button>
+          <button class="ms-tab" data-mstab="deactivated">🚫 בוטלו</button>
+          <button class="ms-tab" data-mstab="aggregators">🤝 Aggregator</button>
+          <button class="ms-tab" data-mstab="leads">🎯 לידים</button>
+        </div>
+        <div class="panel">
+          <div class="panel-header">
+            <h2 id="ms-table-title">מנויים פעילים</h2>
+            <span class="refresh-tag" id="memberships-updated"></span>
+          </div>
+          <div class="table-wrapper">
+            <table class="leads-table">
+              <thead><tr>
+                <th>שם</th><th>טלפון</th><th>סוג מנוי</th>
+                <th>תחילת מנוי</th><th>סיום מנוי</th><th>ימים נותרים</th><th>סטטוס</th>
+              </tr></thead>
+              <tbody id="memberships-tbody">
+                <tr><td colspan="7" class="empty-state">לחץ "רענן Arbox" לטעינה</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- VIEW: Attendance & No-Shows -->
+      <div id="barak-view-attendance" style="display:none">
+        <div class="attendance-layout">
+          <div class="panel attendance-today-panel">
+            <div class="panel-header"><h2>📅 שיעורים היום</h2></div>
+            <div id="attendance-today-list" class="attendance-class-list">
+              <div class="empty-state">לחץ "רענן Arbox" לטעינה</div>
+            </div>
+          </div>
+          <div class="panel attendance-risk-panel">
+            <div class="panel-header">
+              <h2>⚠️ לא הגיעו 14+ ימים</h2>
+              <span class="refresh-tag" id="attendance-updated"></span>
+            </div>
+            <div class="table-wrapper">
+              <table class="leads-table">
+                <thead><tr>
+                  <th>שם</th><th>תוכנית</th><th>ביקור אחרון</th><th>ימי היעדרות</th><th>סטטוס</th>
+                </tr></thead>
+                <tbody id="attendance-risk-tbody">
+                  <tr><td colspan="5" class="empty-state">לחץ "רענן Arbox" לטעינה</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- VIEW: Staff Directory -->
+      <div id="barak-view-staff" style="display:none">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>👩‍🏫 צוות Shape Studio — Location 19392</h2>
+            <span class="refresh-tag" id="staff-updated"></span>
+          </div>
+          <div class="staff-grid" id="staff-grid">
+            <div class="empty-state">לחץ "רענן Arbox" לטעינה</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- VIEW: Retention & Health -->
+      <div id="barak-view-retention" style="display:none">
+        <div class="retention-layout">
+          <!-- KPI row -->
+          <div class="retention-kpi-row" id="retention-kpi-row"></div>
+          <!-- Recommendations -->
+          <div class="panel">
+            <div class="panel-header"><h2>🤖 המלצות ברק — מבוסס נתוני Arbox חיים</h2></div>
+            <div id="retention-recs" class="retention-recs-list"></div>
+          </div>
+          <!-- Expiring + Expired side by side -->
+          <div class="retention-tables-row">
+            <div class="panel">
+              <div class="panel-header"><h2>⏳ פגים תוך 30 יום</h2></div>
+              <div class="table-wrapper">
+                <table class="leads-table">
+                  <thead><tr><th>שם</th><th>טלפון</th><th>פג</th><th>ימים</th></tr></thead>
+                  <tbody id="expiring-tbody"><tr><td colspan="4" class="empty-state">—</td></tr></tbody>
+                </table>
+              </div>
+            </div>
+            <div class="panel">
+              <div class="panel-header"><h2>❌ מנויים שפגו</h2></div>
+              <div class="table-wrapper">
+                <table class="leads-table">
+                  <thead><tr><th>שם</th><th>טלפון</th><th>פג ב-</th></tr></thead>
+                  <tbody id="expired-tbody"><tr><td colspan="3" class="empty-state">—</td></tr></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- VIEW: Arbox members (existing, kept) -->
+      <div id="barak-view-members" style="display:none">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>👥 חברות Arbox — Location 19392</h2>
+            <span class="refresh-tag" id="arbox-members-updated"></span>
+          </div>
+          <div class="table-wrapper">
+            <table class="leads-table">
+              <thead><tr>
+                <th>שם</th><th>טלפון</th><th>תפקיד</th>
+                <th>מנוי מ-</th><th>עד</th><th>פעיל</th>
+              </tr></thead>
+              <tbody id="arbox-members-tbody">
+                <tr><td colspan="6" class="empty-state">לחץ "רענן Arbox" לטעינה</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- VIEW: Arbox leads -->
+      <div id="barak-view-arbox-leads" style="display:none">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>🎯 לידים Arbox — Location 19392</h2>
+            <span class="refresh-tag" id="arbox-leads-updated"></span>
+          </div>
+          <!-- Lookup tool -->
+          <div class="arbox-lookup-bar">
+            <input type="text" id="arbox-lookup-input" class="field-input"
+              placeholder="חיפוש לפי שם או טלפון..." style="flex:1;max-width:320px"/>
+            <button class="btn btn-primary" id="btn-arbox-lookup">🔍 חפש</button>
+            <div id="arbox-lookup-result" style="font-size:13px;color:var(--muted)"></div>
+          </div>
+          <div class="table-wrapper">
+            <table class="leads-table">
+              <thead><tr>
+                <th>שם</th><th>טלפון</th><th>סטטוס Arbox</th><th>מקור</th><th>נוצר</th>
+              </tr></thead>
+              <tbody id="arbox-leads-tbody">
+                <tr><td colspan="5" class="empty-state">לחץ "רענן Arbox" לטעינה</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- VIEW: Schedule -->
+      <div id="barak-view-schedule" style="display:none">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>📅 לוח שיעורים — 7 ימים הקרובים</h2>
+            <span class="refresh-tag" id="arbox-sched-updated"></span>
+          </div>
+          <div id="arbox-schedule-grid" class="schedule-grid">
+            <div class="empty-state">לחץ "רענן Arbox" לטעינה</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- VIEW: Sync + chat -->
+      <div id="barak-view-sync" style="display:none">
+        <div class="barak-lower">
+          <div class="panel barak-sync-panel">
+            <div class="panel-header"><h2>🔗 סנכרון Arbox CRM</h2></div>
+            <div class="barak-sync-body">
+              <div id="barak-sync-status" class="sync-status-box">לחץ "סטטוס" לבדיקה</div>
+              <div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap">
+                <button class="btn btn-primary"   id="btn-sync-arbox">🔄 סנכרן הכל</button>
+                <button class="btn btn-secondary" id="btn-sync-status">📋 סטטוס</button>
+                <button class="btn btn-secondary" id="btn-pull-arbox-leads">⬇ ייבא לידים מ-Arbox</button>
+                <button class="btn btn-secondary" id="btn-validate-data" style="border-color:var(--primary);color:var(--primary)">🔍 בדיקת תקינות נתונים</button>
+              </div>
+              <div id="barak-sync-result" class="tool-result" style="display:none;margin-top:12px"></div>
+            </div>
+            <!-- Integrity report panel -->
+            <div class="integrity-report-box" id="integrity-report-box" style="display:none;margin-top:20px">
+              <div class="ir-header">
+                <div class="ir-score-wrap">
+                  <div class="ir-score-label">ציון תקינות</div>
+                  <div class="ir-score-val" id="ir-score">—</div>
+                  <div class="ir-verdict" id="ir-verdict">—</div>
+                </div>
+                <div class="ir-summary" id="ir-summary"></div>
+              </div>
+              <div class="ir-issues-list" id="ir-issues-list"></div>
+            </div>
+          </div>
+          <div class="panel barak-chat-panel">
+            <div class="panel-header">
+              <div class="agent-profile-sm">
+                <div class="agent-avatar-sm" style="background:linear-gradient(135deg,#f59e0b,#ef4444)">B</div>
+                <div><div class="agent-name-sm">ברק</div><div class="agent-role-sm">CRM & Arbox — חי</div></div>
+              </div>
+            </div>
+            <div style="padding:12px 16px">
+              <div class="mini-chat">
+                <div class="mini-chat-msgs" id="barak-chat-msgs"></div>
+                <div class="mini-chat-row">
+                  <input type="text" id="barak-chat-input" class="field-input"
+                    placeholder="מה מצב הלידים? מי הגיע היום?" autocomplete="off"/>
+                  <button class="mini-send-btn" id="barak-send">›</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- ══════════════════════════════════════════════════════════════════════
+         SANDBOX — Interactive Agent Testing
+    ══════════════════════════════════════════════════════════════════════════ -->
+    <section id="tab-sandbox" class="tab-panel">
+      <div class="sandbox-layout">
+
+        <!-- Left: Agent selector + scenario controls -->
+        <aside class="sandbox-sidebar panel">
+          <div class="panel-header"><h2>🧪 Agent Testing Sandbox</h2></div>
+
+          <div class="sb-section">
+            <div class="sb-label">בחר סוכן</div>
+            <div class="agent-selector">
+              <button class="agent-sel-btn active" data-agent="maya"  style="--ac:#4f46e5">🏢 מאיה</button>
+              <button class="agent-sel-btn"        data-agent="dana"  style="--ac:#ec4899">🎨 דנה</button>
+              <button class="agent-sel-btn"        data-agent="tomer" style="--ac:#10b981">💌 תומר</button>
+              <button class="agent-sel-btn"        data-agent="barak" style="--ac:#f59e0b">📊 ברק</button>
+            </div>
+          </div>
+
+          <div class="sb-section">
+            <div class="sb-label">תרחישים מוכנים</div>
+            <div class="scenario-list" id="scenario-list">
+              <div class="empty-state" style="padding:12px">טוען תרחישים...</div>
+            </div>
+          </div>
+
+          <div class="sb-section">
+            <div class="sb-label">הודעה חופשית</div>
+            <textarea id="sb-input" class="field-textarea" rows="4"
+              placeholder="היי, כמה עולה מנוי Reformer Pilates?&#10;&#10;או: תן לי המלצה לפעולה הבאה על הלידים החמים..."></textarea>
+            <button class="btn btn-primary tool-btn" id="sb-run">▶ הרץ סימולציה</button>
+          </div>
+        </aside>
+
+        <!-- Right: Live output stream -->
+        <div class="sandbox-main">
+          <div class="panel sb-output-panel">
+            <div class="panel-header">
+              <h2>📡 פלט חי — תגובת הסוכן</h2>
+              <span class="refresh-tag" id="sb-elapsed"></span>
+            </div>
+            <div id="sb-empty" class="va-empty" style="min-height:200px">
+              <div class="va-empty-icon">🤖</div>
+              <div class="va-empty-title">ממתין להרצה</div>
+              <div class="va-empty-sub">בחר סוכן, הזן הודעה או לחץ על תרחיש</div>
+            </div>
+            <div id="sb-result" style="display:none;padding:20px;direction:rtl">
+              <div class="sb-meta-row">
+                <span class="sb-agent-badge" id="sb-agent-label"></span>
+                <span class="sb-scenario-tag" id="sb-scenario-tag"></span>
+              </div>
+              <div class="sb-block">
+                <div class="sb-block-title">📥 הקלט שנשלח</div>
+                <div class="sb-block-body" id="sb-prompt-display"></div>
+              </div>
+              <div class="sb-block">
+                <div class="sb-block-title">💬 תגובת הסוכן</div>
+                <div class="sb-block-body sb-reply" id="sb-reply-display"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Barak report cards below output -->
+          <div class="barak-reports-grid" id="barak-reports-grid" style="display:none">
+            <div class="panel report-card" id="rc-daily"></div>
+            <div class="panel report-card" id="rc-sync"></div>
+            <div class="panel report-card" id="rc-hot"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ══════════════════════════════════════════════════════════════════════
+         AUTOMATIONS — Rules & Worker Control Panel
+    ══════════════════════════════════════════════════════════════════════════ -->
+    <section id="tab-automations" class="tab-panel">
+
+      <!-- Worker status cards -->
+      <div class="auto-workers-grid" id="auto-workers-grid"></div>
+
+      <div class="auto-lower">
+        <!-- Rules table -->
+        <div class="panel auto-rules-panel">
+          <div class="panel-header"><h2>📋 חוקי אוטומציה</h2></div>
+          <div class="table-wrapper">
+            <table class="leads-table">
+              <thead>
+                <tr>
+                  <th>מופעל</th><th>שם הכלל</th><th>טריגר</th><th>פעולה</th><th>סוכן</th><th>הרצות</th><th>הרצה אחרונה</th>
+                </tr>
+              </thead>
+              <tbody id="auto-rules-tbody">
+                <tr><td colspan="7" class="empty-state">טוען חוקים...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Execution log -->
+        <div class="panel auto-log-panel">
+          <div class="panel-header">
+            <h2>📜 לוג הרצות</h2>
+            <button class="btn btn-secondary" id="btn-auto-refresh" style="font-size:13px;padding:6px 14px">🔄 רענן</button>
+          </div>
+          <div class="auto-log-list" id="auto-log-list">
+            <div class="empty-state">טוען לוג...</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ══════════════════════════════════════════════════════════════════════
+         WHATSAPP LIVE INBOX
+    ══════════════════════════════════════════════════════════════════════════ -->
+    <section id="tab-whatsapp" class="tab-panel">
+
+      <!-- Quick-stats chips -->
+      <div class="wa-stats-row" id="wa-stats-row">
+        <div class="wa-stat-chip"><span class="wa-stat-val" id="ws-total">—</span><span class="wa-stat-lbl">הודעות סה"כ</span></div>
+        <div class="wa-stat-chip unread"><span class="wa-stat-val" id="ws-unread">—</span><span class="wa-stat-lbl">לא נקרא</span></div>
+        <div class="wa-stat-chip sched"><span class="wa-stat-val" id="ws-sched">—</span><span class="wa-stat-lbl">בקשות לוח</span></div>
+        <div class="wa-stat-chip cancel"><span class="wa-stat-val" id="ws-cancel">—</span><span class="wa-stat-lbl">ביטולים</span></div>
+        <div class="wa-stat-chip client"><span class="wa-stat-val" id="ws-client">—</span><span class="wa-stat-lbl">לקוחות Arbox</span></div>
+        <div class="wa-stat-chip lead"><span class="wa-stat-val" id="ws-lead">—</span><span class="wa-stat-lbl">לידים</span></div>
+      </div>
+
+      <div class="wa-layout">
+
+        <!-- ── Left col: inbox list ── -->
+        <div class="wa-inbox-col">
+          <div class="panel wa-inbox-panel">
+            <div class="panel-header">
+              <h2>📥 הודעות נכנסות</h2>
+              <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <button class="btn btn-secondary" id="btn-wa-refresh" style="font-size:13px;padding:6px 14px">🔄 רענן</button>
+                <button class="btn btn-secondary" id="btn-wa-read-all" style="font-size:13px;padding:6px 14px">✓ סמן הכל כנקרא</button>
+              </div>
+            </div>
+            <!-- Filter chips -->
+            <div class="wa-filter-row">
+              <button class="wa-filter active" data-wf="all">הכל</button>
+              <button class="wa-filter" data-wf="unread">לא נקרא</button>
+              <button class="wa-filter" data-wf="cancellation">ביטול</button>
+              <button class="wa-filter" data-wf="booking">הזמנה</button>
+              <button class="wa-filter" data-wf="schedule_query">לוח</button>
+              <button class="wa-filter" data-wf="general">כללי</button>
+            </div>
+            <div class="wa-msg-list" id="wa-messages-list">
+              <div class="empty-state" style="padding:32px">טוען הודעות...</div>
+            </div>
+            <div class="panel-footer">
+              <span class="refresh-tag" id="wa-inbox-updated"></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- ── Right col: chat window + simulator ── -->
+        <div class="wa-right-col">
+
+          <!-- Chat / detail window -->
+          <div class="panel wa-chat-panel" id="wa-chat-panel">
+            <div class="panel-header">
+              <h2>📱 פרטי שיחה</h2>
+              <span class="refresh-tag" id="wa-chat-updated"></span>
+            </div>
+            <div class="wa-chat-empty" id="wa-chat-empty">
+              <div class="va-empty-icon">💬</div>
+              <div class="va-empty-title">בחר הודעה מהרשימה</div>
+              <div class="va-empty-sub">לחץ על הודעה כדי לראות פרטי שיחה, סיווג כוונה ותשובת ברק</div>
+            </div>
+            <div class="wa-chat-detail" id="wa-chat-detail" style="display:none">
+              <!-- injected by JS -->
+            </div>
+          </div>
+
+          <!-- Simulation / testing tool -->
+          <div class="panel">
+            <div class="panel-header">
+              <h2>🧪 סימולציה — הודעה נכנסת</h2>
+              <span style="font-size:12px;color:var(--muted)">ללא WhatsApp אמיתי</span>
+            </div>
+            <div class="wa-sim-body">
+              <div class="wa-sim-row">
+                <input id="wa-sim-phone" class="field-input" type="tel"  placeholder="טלפון  05XXXXXXXX" dir="ltr"/>
+                <input id="wa-sim-name"  class="field-input" type="text" placeholder="שם שולח" />
+              </div>
+              <div class="wa-sim-row" style="margin-top:10px">
+                <input id="wa-sim-text"  class="field-input" type="text"
+                  placeholder="תוכן ההודעה… למשל: תבטל לי את השיעור של מחר" style="flex:1" />
+                <button class="btn btn-primary" id="btn-wa-sim" style="white-space:nowrap">▶ שלח</button>
+              </div>
+              <!-- quick-fill example pills -->
+              <div class="wa-example-pills" id="wa-example-pills">
+                <span class="wa-pill" data-txt="תבטל לי את השיעור של מחר">ביטול</span>
+                <span class="wa-pill" data-txt="תשבץ אותי קבוע בכל שני">שיבוץ קבוע</span>
+                <span class="wa-pill" data-txt="רוצה מקום בפילאטיס מחר">הזמנה</span>
+                <span class="wa-pill" data-txt="מה יש היום בסטודיו?">לוח שיעורים</span>
+                <span class="wa-pill" data-txt="שלום, כמה עולה מנוי?">שאלה כללית</span>
+                <span class="wa-pill" data-txt="לא אגיע היום לשיעור">לא מגיע</span>
+              </div>
+              <div class="tool-result" id="wa-sim-result" style="display:none;margin-top:12px"></div>
+            </div>
+          </div>
+
+        </div><!-- /wa-right-col -->
+      </div><!-- /wa-layout -->
+    </section>
+
+    <!-- ══════════════════════════════════════════════════════════════════════
+         HEALTH — System Status
+    ══════════════════════════════════════════════════════════════════════════ -->
+    <section id="tab-health" class="tab-panel">
+      <div class="health-grid" id="health-grid"></div>
+      <div class="panel">
+        <div class="panel-header">
+          <h2>אירועים אחרונים</h2>
+          <span class="refresh-tag" id="health-updated"></span>
+        </div>
+        <div id="events-list" class="events-list">
+          <div class="empty-state">טוען אירועים...</div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
