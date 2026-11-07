@@ -1723,36 +1723,80 @@ app.post('/api/whatsapp/webhook', captureRawBody, verifyMetaSignature, async (re
 //   Settings → Notifications → Webhook URL:
 //   https://shape-studio-agent-production.up.railway.app/api/green-api/webhook
 //
-// Security: the endpoint URL itself is the access control (UUID-like path is fine,
-// but the current path is acceptable for a private deployment).
-app.post('/api/green-api/webhook', express.json({ limit: '1mb' }), async (req, res) => {
-  res.sendStatus(200); // respond immediately — Green API retries on non-200
+// IMPORTANT — respond BEFORE body parsing (same pattern as /api/webhooks/meta).
+// express.json() buffers the stream before calling the handler, pushing the 200
+// response past Green API's timeout window and triggering unnecessary retries.
+// Fix: no json middleware here; 200 is the FIRST statement, raw body is buffered
+// asynchronously, then parsed inside setImmediate after the response is flushed.
+app.post('/api/green-api/webhook', (req, res) => {
+  // ── 1. Respond to Green API before reading a single byte ─────────────────────
+  res.sendStatus(200);
 
-  const rawType = req.body?.typeWebhook;
-  logger.debug('Green API webhook received', { typeWebhook: rawType });
+  // ── 2. Buffer raw body ───────────────────────────────────────────────────────
+  const chunks = [];
+  req.on('data', chunk => chunks.push(chunk));
+  req.on('end', () => {
+    setImmediate(async () => {
+      // ── 3. Parse body ─────────────────────────────────────────────────────────
+      let body;
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString());
+      } catch {
+        logger.warn('[green-api/webhook] Received unparseable body — ignoring');
+        return;
+      }
 
-  // Silently ignore non-message events (state changes, device info, delivery receipts)
-  if (!rawType || rawType !== 'incomingMessageReceived') return;
+      const rawType = body?.typeWebhook ?? '(missing)';
 
-  const msg = parseGreenApiWebhook(req.body);
-  if (!msg) return; // group message, unsupported type, or parse failure
+      // Log EVERY webhook hit at INFO so Railway logs always show whether
+      // Green API is actually reaching the server.  Previously this was
+      // logger.debug — invisible at the default log level.
+      logger.info('[green-api/webhook] Received', { typeWebhook: rawType });
 
-  logger.info('Green API inbound message', {
-    from:    msg.from,
-    type:    msg.type,
-    preview: msg.text?.slice(0, 60),
+      // ── 4. Route by typeWebhook ───────────────────────────────────────────────
+      if (rawType !== 'incomingMessageReceived') {
+        // Non-message events (delivery receipts, state changes, device info, etc.)
+        // are logged above and then discarded — no inbox action needed.
+        // If you need to act on e.g. 'outgoingMessageStatus', add a handler here.
+        return;
+      }
+
+      // ── 5. Parse the inbound message shape ───────────────────────────────────
+      const msg = parseGreenApiWebhook(body);
+      if (!msg) {
+        // Group chat, unsupported media type, or parse failure — log enough to debug
+        logger.warn('[green-api/webhook] parseGreenApiWebhook returned null', {
+          chatId:  body?.senderData?.chatId,
+          msgType: body?.messageData?.typeMessage,
+        });
+        return;
+      }
+
+      logger.info('[green-api/webhook] Inbound message parsed', {
+        from:    msg.from,
+        type:    msg.type,
+        preview: msg.text?.slice(0, 60),
+      });
+
+      // ── 6. Full CRM pipeline → inbox → SSE → persist ─────────────────────────
+      processInboundWAMessage(msg)
+        .then(r => {
+          if (!r) return;
+          broadcastSse('message', { phone: r.inboxEntry.from, name: r.inboxEntry.name ?? null });
+          persist.saveInbox(inbox);
+          persist.saveLeads(store);
+          logger.info('[green-api/webhook] Message processed and persisted', {
+            from:   r.inboxEntry.from,
+            intent: r.intent,
+            route:  r.route,
+          });
+        })
+        .catch(err => logger.error('[green-api/webhook] Pipeline error', {
+          error: err.message,
+          from:  msg.from,
+        }));
+    });
   });
-
-  // Route through the full CRM pipeline — same logic as /api/whatsapp/webhook
-  processInboundWAMessage(msg)
-    .then(r => {
-      if (!r) return;
-      broadcastSse('message', { phone: r.inboxEntry.from, name: r.inboxEntry.name ?? null });
-      // Persist inbox + leads immediately so the live chat survives a restart
-      persist.saveInbox(inbox);
-      persist.saveLeads(store);
-    })
-    .catch(err => logger.error('WA pipeline error (Green API)', { error: err.message, from: msg.from }));
 });
 
 // ── GET /api/whatsapp/inbox — paginated inbox for the dashboard ───────────────
