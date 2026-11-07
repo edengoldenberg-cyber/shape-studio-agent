@@ -21,8 +21,9 @@ const BARAK_PROMPT = BUSINESS_CONTEXT + '\n\n---\n\n' + fs.readFileSync(
 // Loaded from disk at startup; hot-reloadable at runtime via reloadKnowledge().
 // All context strings are module-level lets so the AI always sees the latest data.
 
-const STAFF_PATH  = path.join(__dirname, '../data/staff_directory.json');
-const PKG_PATH    = path.join(__dirname, '../data/subscription_packages.json');
+const STAFF_PATH   = path.join(__dirname, '../data/staff_directory.json');
+const PKG_PATH     = path.join(__dirname, '../data/subscription_packages.json');
+const CLASSES_PATH = path.join(__dirname, '../data/classes_knowledge.json');
 
 function loadJSON(filePath, fallback) {
   try {
@@ -33,8 +34,9 @@ function loadJSON(filePath, fallback) {
   }
 }
 
-let STAFF_DIR  = loadJSON(STAFF_PATH, { instructors: [] });
-let SUB_PKG    = loadJSON(PKG_PATH,   { trial: null, packages: [], _universal_access: '' });
+let STAFF_DIR   = loadJSON(STAFF_PATH,   { instructors: [] });
+let SUB_PKG     = loadJSON(PKG_PATH,     { trial: null, packages: [], _universal_access: '' });
+let CLASSES_DATA = loadJSON(CLASSES_PATH, { classes: [], _universal_access: '' });
 
 // Build a compact staff context string injected into every Barak AI call
 function buildStaffContext() {
@@ -71,16 +73,33 @@ function buildSubscriptionContext() {
   return lines.join('\n');
 }
 
+// Build a compact classes/workouts context string
+function buildClassesContext() {
+  const lines = ['## שיעורים ואימונים — Shape Studio'];
+  if (CLASSES_DATA._universal_access) {
+    lines.push(`\n**כלול בכל מנוי:** ${CLASSES_DATA._universal_access}\n`);
+  }
+  for (const c of (CLASSES_DATA.classes ?? [])) {
+    const cap    = c.capacity ? `${c.capacity} משתתפים מקסימום` : '';
+    const intens = c.intensity ? ` | עצימות: ${c.intensity}` : '';
+    const best   = c.best_for  ? ` | מתאים ל: ${c.best_for}` : '';
+    const note   = c.notes     ? `\n  💡 ${c.notes}` : '';
+    lines.push(`• **${c.name_he}** (${c.name_en}) — ${cap}${intens}: ${c.pitch}${best}${note}`);
+  }
+  return lines.join('\n');
+}
+
 // Mutable context strings — rebuilt by reloadKnowledge()
 let STAFF_CONTEXT        = buildStaffContext();
 let SUBSCRIPTION_CONTEXT = buildSubscriptionContext();
+let CLASSES_CONTEXT      = buildClassesContext();
 
 /**
  * Hot-reload staff and package data from disk without restarting the server.
  * Optionally accepts pre-validated data objects (from admin save endpoint)
  * so the caller can persist + reload in one shot.
  */
-function reloadKnowledge({ staffData, pkgData } = {}) {
+function reloadKnowledge({ staffData, pkgData, classesData } = {}) {
   if (staffData) {
     fs.writeFileSync(STAFF_PATH, JSON.stringify(staffData, null, 2), 'utf8');
     STAFF_DIR = staffData;
@@ -95,8 +114,16 @@ function reloadKnowledge({ staffData, pkgData } = {}) {
     SUB_PKG = loadJSON(PKG_PATH, SUB_PKG);
   }
 
+  if (classesData) {
+    fs.writeFileSync(CLASSES_PATH, JSON.stringify(classesData, null, 2), 'utf8');
+    CLASSES_DATA = classesData;
+  } else {
+    CLASSES_DATA = loadJSON(CLASSES_PATH, CLASSES_DATA);
+  }
+
   STAFF_CONTEXT        = buildStaffContext();
   SUBSCRIPTION_CONTEXT = buildSubscriptionContext();
+  CLASSES_CONTEXT      = buildClassesContext();
 
   // Clear conversation history so the next chat message starts with fresh context
   barakHistory = [];
@@ -105,6 +132,7 @@ function reloadKnowledge({ staffData, pkgData } = {}) {
     reloaded_at:      new Date().toISOString(),
     staff_count:      STAFF_DIR.instructors?.length ?? 0,
     packages_count:   (SUB_PKG.packages?.length ?? 0) + (SUB_PKG.trial ? 1 : 0),
+    classes_count:    CLASSES_DATA.classes?.length ?? 0,
     contexts_rebuilt: true,
     history_cleared:  true,
   };
@@ -431,6 +459,7 @@ async function chat(userMessage) {
         // messages so they never compete for space with the live Arbox context.
         { role: 'system', content: STAFF_CONTEXT },
         { role: 'system', content: SUBSCRIPTION_CONTEXT },
+        { role: 'system', content: CLASSES_CONTEXT },
         ...barakHistory,
       ],
       temperature: 0.2,
@@ -698,12 +727,16 @@ function getRawKnowledge() {
   return {
     staff:    STAFF_DIR,
     packages: SUB_PKG,
+    classes:  CLASSES_DATA,
     contexts: {
       staff:        STAFF_CONTEXT,
       subscription: SUBSCRIPTION_CONTEXT,
+      classes:      CLASSES_CONTEXT,
     },
   };
 }
+
+function getClassesContext() { return CLASSES_CONTEXT; }
 
 module.exports = {
   chat,
@@ -721,6 +754,7 @@ module.exports = {
   findInstructorsBySpecialty,
   getSubscriptionContext,
   getStaffContext,
+  getClassesContext,
   reloadKnowledge,
   getRawKnowledge,
 };

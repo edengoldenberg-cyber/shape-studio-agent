@@ -2934,6 +2934,20 @@ app.post('/api/admin/knowledge/packages', jsonBody, (req, res) => {
   }
 });
 
+// POST /api/admin/knowledge/classes — save classes_knowledge.json and hot-reload
+app.post('/api/admin/knowledge/classes', jsonBody, (req, res) => {
+  const data = req.body;
+  if (!data?.classes) return res.status(400).json({ error: 'classes array required' });
+  try {
+    const result = barakAgent.reloadKnowledge({ classesData: data });
+    store.logEvent('knowledge_sync', null, { type: 'classes', classes_count: result.classes_count });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    logger.error('[admin] knowledge/classes save failed', { error: err.message });
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // POST /api/admin/sync-agent-knowledge — hot-reload all files + run verification
 // This is what the dashboard "רענן זיכרון סוכן" button calls.
 app.post('/api/admin/sync-agent-knowledge', async (_req, res) => {
@@ -2972,6 +2986,14 @@ app.post('/api/admin/sync-agent-knowledge', async (_req, res) => {
     store.logEvent('knowledge_sync', null, {
       type: 'full_reload', ...reload,
       verification_passed: checks.every(c => c.passed),
+    });
+
+    // 4. Classes context — confirm classes are loaded
+    const classesCtx = barakAgent.getClassesContext();
+    checks.push({
+      test:   'classes_context_loaded',
+      passed: reload.classes_count > 0,
+      sample: classesCtx.split('\n').slice(0, 2).join(' / '),
     });
 
     logger.info('[admin] sync-agent-knowledge complete', reload);

@@ -2358,7 +2358,7 @@ document.querySelectorAll('.kn-sv-btn').forEach(btn => {
 });
 
 function showKnView(view) {
-  ['staff', 'packages', 'verify', 'assets'].forEach(v => {
+  ['staff', 'packages', 'classes', 'verify', 'assets'].forEach(v => {
     const el = document.getElementById(`kn-view-${v}`);
     if (el) el.style.display = v === view ? '' : 'none';
   });
@@ -2525,6 +2525,7 @@ document.getElementById('btn-save-assets')?.addEventListener('click', async () =
 function renderKnowledge(d) {
   renderStaffTable(d.staff?.instructors ?? []);
   renderPackages(d.packages ?? {});
+  renderClassesTable(d.classes ?? {});
   showKnView(activeKnView);
 }
 
@@ -2637,6 +2638,76 @@ function renderPackages(pkg) {
   const upEl = document.getElementById('kn-pkg-updated');
   if (upEl) upEl.textContent = 'עודכן: ' + now();
 }
+
+// ── Classes / Workouts table ──────────────────────────────────────────────────
+
+function renderClassesTable(classesData) {
+  const tbody = document.getElementById('kn-classes-tbody');
+  if (!tbody) return;
+  const list = classesData.classes ?? [];
+  if (!list.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty-state">אין שיעורים מוגדרים</td></tr>';
+    return;
+  }
+
+  // Ensure knowledgeData.classes exists for live sync
+  if (knowledgeData && !knowledgeData.classes) knowledgeData.classes = classesData;
+
+  tbody.innerHTML = list.map((c, idx) => `
+    <tr>
+      <td style="font-weight:600;font-size:13px">${esc(c.name_he)}<br><span style="font-size:11px;color:var(--muted)">${esc(c.name_en ?? '')}</span></td>
+      <td style="text-align:center">
+        <input type="number" min="1" max="30" class="kn-edit-input kn-cls-cap" data-idx="${idx}" value="${c.capacity ?? ''}" style="width:52px;text-align:center"/>
+      </td>
+      <td>
+        <input type="text" class="kn-edit-input kn-cls-int" data-idx="${idx}" value="${esc(c.intensity ?? '')}" style="width:100%"/>
+      </td>
+      <td>
+        <input type="text" class="kn-edit-input kn-cls-pitch" data-idx="${idx}" value="${esc(c.pitch ?? '')}" style="width:100%"/>
+      </td>
+      <td>
+        <input type="text" class="kn-edit-input kn-cls-best" data-idx="${idx}" value="${esc(c.best_for ?? '')}" style="width:100%"/>
+      </td>
+      <td>
+        <input type="text" class="kn-edit-input kn-cls-notes" data-idx="${idx}" value="${esc(c.notes ?? '')}" style="width:100%"/>
+      </td>
+    </tr>`).join('');
+
+  // Live-sync edits back to knowledgeData.classes.classes
+  tbody.querySelectorAll('.kn-cls-cap,.kn-cls-int,.kn-cls-pitch,.kn-cls-best,.kn-cls-notes')
+    .forEach(input => {
+      input.addEventListener('input', () => {
+        const i = parseInt(input.dataset.idx, 10);
+        const field = input.classList.contains('kn-cls-cap')   ? 'capacity'
+                    : input.classList.contains('kn-cls-int')   ? 'intensity'
+                    : input.classList.contains('kn-cls-pitch') ? 'pitch'
+                    : input.classList.contains('kn-cls-best')  ? 'best_for'
+                    :                                            'notes';
+        if (knowledgeData?.classes?.classes?.[i]) {
+          knowledgeData.classes.classes[i][field] = field === 'capacity' ? parseInt(input.value, 10) : input.value;
+        }
+      });
+    });
+
+  const upEl = document.getElementById('kn-classes-updated');
+  if (upEl) upEl.textContent = 'עודכן: ' + now();
+}
+
+document.getElementById('btn-save-classes')?.addEventListener('click', async () => {
+  const btn = document.getElementById('btn-save-classes');
+  btn.disabled = true; btn.textContent = '⏳ שומר...';
+  try {
+    const data = knowledgeData?.classes;
+    if (!data) throw new Error('אין נתוני שיעורים בזיכרון');
+    await post('/api/admin/knowledge/classes', data);
+    await triggerSync(false);
+    toast('✅ פרטי השיעורים נשמרו ו-Agent עודכן');
+  } catch (err) {
+    toast(`❌ שגיאה: ${err.message}`);
+  } finally {
+    btn.disabled = false; btn.textContent = '💾 שמור שינויים';
+  }
+});
 
 // ── Save staff ────────────────────────────────────────────────────────────────
 document.getElementById('btn-save-staff')?.addEventListener('click', async () => {
