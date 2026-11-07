@@ -30,7 +30,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     switch (btn.dataset.tab) {
       case 'maya':        loadMayaStats();       break;
       case 'barak':       loadBarakPanel(); loadArboxOverview(); break;
-      case 'tomer':       loadTomerQueue();      break;
+      case 'tomer':       loadTomerQueue(); loadTomerSegments(); break;
       case 'health':      loadHealth();          break;
       case 'sandbox':     initSandbox();         break;
       case 'whatsapp':    loadWaThreads(); connectWaSSE(); break;
@@ -378,23 +378,24 @@ function renderFullReviewPanel(reviewText) {
    TOMER TAB — Retention
    ══════════════════════════════════════════════════════════════════════════════ */
 
-/* Tomer sub-nav ───────────────────────────────────────────────────────────────*/
-let activeTomerView = 'leads';
+/* Tomer segment sub-nav (5 retention tabs) ────────────────────────────────────*/
+let activeTomerSeg = 'onboarding';
 
-document.querySelectorAll('.subnav-btn').forEach(btn => {
+document.querySelectorAll('[data-tseg]').forEach(btn => {
   btn.addEventListener('click', () => {
-    document.querySelectorAll('.subnav-btn').forEach(b => b.classList.remove('active'));
+    // Deactivate only the Tomer segment buttons (not other panels' subnav-btns)
+    document.querySelectorAll('[data-tseg]').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
-    activeTomerView = btn.dataset.tview;
-    document.getElementById('tomer-view-leads').style.display   = activeTomerView === 'leads'   ? '' : 'none';
-    document.getElementById('tomer-view-members').style.display = activeTomerView === 'members' ? '' : 'none';
-    if (activeTomerView === 'members') loadTomerMembers();
+    activeTomerSeg = btn.dataset.tseg;
+    document.querySelectorAll('.tseg-panel').forEach(p => p.style.display = 'none');
+    const panel = document.getElementById('tseg-' + activeTomerSeg);
+    if (panel) panel.style.display = '';
   });
 });
 
 document.getElementById('btn-tomer-refresh').addEventListener('click', () => {
-  if (activeTomerView === 'members') loadTomerMembers();
-  else loadTomerQueue();
+  loadTomerQueue();      // sidebar mini-stats (dormant leads, intro offers)
+  loadTomerSegments();   // main 5-panel from live Arbox
 });
 
 document.getElementById('btn-tomer-checks').addEventListener('click', async () => {
@@ -452,6 +453,7 @@ async function loadTomerQueue() {
 
 function renderTomerQueue(leads) {
   const tbody = document.getElementById('tomer-queue-tbody');
+  if (!tbody) return; // element removed in new 5-panel layout
   if (!leads?.length) {
     tbody.innerHTML = `<tr><td colspan="6" class="empty-state">אין לידים בתור — הכל מטופל 🎉</td></tr>`;
     return;
@@ -491,6 +493,7 @@ async function loadTomerMembers() {
 
 function renderMembersTable(members) {
   const tbody = document.getElementById('tomer-members-tbody');
+  if (!tbody) return; // element removed in new 5-panel layout
   if (!members?.length) {
     tbody.innerHTML = `<tr><td colspan="5" class="empty-state">אין חברות בסיכון 🎉</td></tr>`;
     return;
@@ -511,6 +514,165 @@ function renderMembersTable(members) {
       <td><span class="badge ${cls}">${labelMap[m.status] ?? m.status}</span></td>
     </tr>`;
   }).join('');
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   TOMER — 5-SEGMENT CUSTOMER SUCCESS PANEL
+   ══════════════════════════════════════════════════════════════════════════════ */
+
+let _tomerSegs = null; // cached response from /api/tomer/segments
+
+async function loadTomerSegments() {
+  const btn = document.getElementById('btn-tomer-refresh');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ טוען...'; }
+  try {
+    _tomerSegs = await fetch('/api/tomer/segments').then(r => r.json());
+    if (_tomerSegs.error) throw new Error(_tomerSegs.error);
+
+    // Update badge counts on sub-tabs
+    _setBadge('badge-onboarding', _tomerSegs.onboarding?.count ?? 0);
+    _setBadge('badge-churn',      _tomerSegs.churnRisk?.count  ?? 0, 'risk');
+    _setBadge('badge-renewals',   _tomerSegs.renewals?.count   ?? 0);
+    _setBadge('badge-birthdays',  _tomerSegs.birthdays?.count  ?? 0);
+    _setBadge('badge-winback',    _tomerSegs.winBack?.count    ?? 0);
+
+    // Render whichever tab is currently active
+    _renderTomerSeg(activeTomerSeg);
+
+    const upEl = document.getElementById('tomer-seg-updated');
+    if (upEl) upEl.textContent = 'עודכן: ' + now();
+  } catch (err) {
+    console.error('loadTomerSegments', err);
+    toast(`❌ שגיאה בטעינת סגמנטים: ${err.message}`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '🔄 רענן'; }
+  }
+}
+
+function _setBadge(id, count, extraClass) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = count;
+  if (extraClass) el.classList.add(extraClass);
+}
+
+function _renderTomerSeg(seg) {
+  if (!_tomerSegs) return;
+  switch (seg) {
+    case 'onboarding': _renderOnboarding(_tomerSegs.onboarding?.members ?? []); break;
+    case 'churn_risk': _renderChurnRisk(_tomerSegs.churnRisk?.members  ?? []); break;
+    case 'renewals':   _renderRenewals(_tomerSegs.renewals);                    break;
+    case 'birthdays':  _renderBirthdays(_tomerSegs.birthdays);                  break;
+    case 'win_back':   _renderWinBack(_tomerSegs.winBack?.members      ?? []); break;
+  }
+}
+
+// ── Render helpers ────────────────────────────────────────────────────────────
+
+function _memberActionBtn(segment, phone, name, ctxJson) {
+  if (!phone || String(phone).includes('•')) return '<span style="color:var(--muted);font-size:11px">טלפון מוסתר</span>';
+  const ctxStr = esc(JSON.stringify(ctxJson ?? {}));
+  return `<button class="btn-seg-action" onclick="sendTomerAction('${segment}','${esc(phone)}','${esc(name)}',${ctxStr})">💬 שלח הודעה</button>`;
+}
+
+function _renderOnboarding(members) {
+  const tbody = document.getElementById('tseg-onboarding-tbody');
+  if (!tbody) return;
+  if (!members.length) { tbody.innerHTML = `<tr><td colspan="4" class="empty-state">אין חברים חדשים ב-14 הימים האחרונים</td></tr>`; return; }
+  tbody.innerHTML = members.map(m => `<tr>
+    <td><span class="lead-name">${esc(m.name)}</span></td>
+    <td style="font-weight:600">${m.daysSince != null ? `לפני ${m.daysSince} ימים` : '—'}</td>
+    <td style="font-size:12px;color:var(--muted)">${esc(m.memberSince ?? '—')}</td>
+    <td>${_memberActionBtn('onboarding', m.phone, m.name, {})}</td>
+  </tr>`).join('');
+}
+
+function _renderChurnRisk(members) {
+  const tbody = document.getElementById('tseg-churn_risk-tbody');
+  if (!tbody) return;
+  if (!members.length) { tbody.innerHTML = `<tr><td colspan="4" class="empty-state">אין חברים בסיכון נטישה 🎉</td></tr>`; return; }
+  tbody.innerHTML = members.map(m => {
+    const riskCls   = m.risk === 'red' ? 'hot' : 'warm';
+    const riskLabel = m.risk === 'red' ? '🔴 גבוה' : '🟡 בינוני';
+    const info = m.reason === 'expiring'
+      ? `פג בעוד <strong>${m.daysLeft}ד</strong>`
+      : m.daysSince != null
+        ? `${m.daysSince}ד ללא ביקור`
+        : '—';
+    const ctx = m.reason === 'expiring' ? { daysLeft: m.daysLeft } : { daysSince: m.daysSince };
+    return `<tr>
+      <td><span class="lead-name">${esc(m.name)}</span></td>
+      <td style="font-size:13px">${info}</td>
+      <td><span class="badge ${riskCls}">${riskLabel}</span></td>
+      <td>${_memberActionBtn('churn_risk', m.phone, m.name, ctx)}</td>
+    </tr>`;
+  }).join('');
+}
+
+function _renderRenewals(data) {
+  const soon    = data?.expiringSoon    ?? [];
+  const expired = data?.recentlyExpired ?? [];
+
+  const soonTbody = document.getElementById('tseg-renew-soon-tbody');
+  if (soonTbody) {
+    if (!soon.length) { soonTbody.innerHTML = `<tr><td colspan="4" class="empty-state">אין מנויים שפגים תוך 30 ימים</td></tr>`; }
+    else soonTbody.innerHTML = soon.map(m => `<tr>
+      <td><span class="lead-name">${esc(m.name)}</span></td>
+      <td style="font-size:12px">${esc(m.memberEnd ?? '—')}</td>
+      <td style="font-weight:700;color:${(m.daysLeft ?? 99) <= 7 ? 'var(--hot)' : 'var(--warm)'}">${m.daysLeft != null ? m.daysLeft + 'ד' : '—'}</td>
+      <td>${_memberActionBtn('renewal', m.phone, m.name, { daysLeft: m.daysLeft })}</td>
+    </tr>`).join('');
+  }
+
+  const expTbody = document.getElementById('tseg-renew-expired-tbody');
+  if (expTbody) {
+    if (!expired.length) { expTbody.innerHTML = `<tr><td colspan="4" class="empty-state">אין מנויים שפגו לאחרונה</td></tr>`; }
+    else expTbody.innerHTML = expired.map(m => `<tr>
+      <td><span class="lead-name">${esc(m.name)}</span></td>
+      <td style="font-size:12px">${esc(m.memberEnd ?? '—')}</td>
+      <td style="font-weight:700;color:var(--hot)">${m.daysGone != null ? m.daysGone + 'ד' : '—'}</td>
+      <td>${_memberActionBtn('win_back', m.phone, m.name, {})}</td>
+    </tr>`).join('');
+  }
+}
+
+function _renderBirthdays(data) {
+  const noteEl = document.getElementById('tseg-birthday-note');
+  const tbody  = document.getElementById('tseg-birthdays-tbody');
+  if (data?.note && noteEl) { noteEl.textContent = data.note; noteEl.style.display = ''; }
+  if (!tbody) return;
+  const members = data?.members ?? [];
+  if (!members.length) { tbody.innerHTML = `<tr><td colspan="3" class="empty-state">אין ימי הולדת החודש${data?.note ? ' — ' + data.note : ''}</td></tr>`; return; }
+  tbody.innerHTML = members.map(m => `<tr>
+    <td><span class="lead-name">${esc(m.name)}</span></td>
+    <td style="font-size:12px">${esc(m.dob ?? '—')}</td>
+    <td>${_memberActionBtn('birthday', m.phone, m.name, {})}</td>
+  </tr>`).join('');
+}
+
+function _renderWinBack(members) {
+  const tbody = document.getElementById('tseg-winback-tbody');
+  if (!tbody) return;
+  if (!members.length) { tbody.innerHTML = `<tr><td colspan="4" class="empty-state">אין חברים לשימור חוזר כרגע</td></tr>`; return; }
+  tbody.innerHTML = members.map(m => `<tr>
+    <td><span class="lead-name">${esc(m.name)}</span></td>
+    <td style="font-size:12px">${esc(m.memberEnd ?? '—')}</td>
+    <td style="font-weight:700;color:var(--hot)">${m.daysGone != null ? m.daysGone + 'ד' : '—'}</td>
+    <td>${_memberActionBtn('win_back', m.phone, m.name, {})}</td>
+  </tr>`).join('');
+}
+
+// ── Proactive action — send WhatsApp per segment ──────────────────────────────
+async function sendTomerAction(segment, phone, name, context) {
+  if (!phone || String(phone).includes('•')) { toast('⚠️ מספר טלפון מוסתר — לא ניתן לשלוח'); return; }
+  try {
+    const r = await post('/api/tomer/action', { segment, phone, name, context });
+    if (r.error) throw new Error(r.error);
+    toast(`✅ הודעה נשלחה ל-${esc(name || phone)}`);
+    store.logEvent?.('tomer_action_sent', phone, { segment });
+  } catch (err) {
+    toast(`❌ שליחה נכשלה — ${err.message}`);
+  }
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════

@@ -2403,6 +2403,148 @@ app.post('/api/tomer/send-message', jsonBody, async (req, res) => {
   }
 });
 
+// ── GET /api/tomer/segments — Live Arbox retention segments for the 5-panel UI ──
+// Calls arboxSvc.classifyMemberships() once and distributes the result across
+// all five Tomer segments: Onboarding · Churn Risk · Renewals · Birthdays · Win-Back
+app.get('/api/tomer/segments', async (_req, res) => {
+  try {
+    const arboxSvc = require('./services/arbox.service');
+    const r        = await arboxSvc.classifyMemberships({ limit: 500 });
+
+    const activeClients   = r.activeClients   ?? [];
+    const expiringSoon    = r.expiringSoon    ?? [];
+    const recentlyExpired = r.recentlyExpired ?? [];
+    const now             = new Date();
+
+    // Normalise one Arbox-enriched user to a UI-friendly object
+    const mapU = u => ({
+      user_id:     u.user_id,
+      name:        u._name  || `${u.first_name ?? ''} ${u.last_name ?? ''}`.trim() || '—',
+      phone:       u._phone ?? u.phone ?? null,
+      memberSince: u.membership_start_date ?? null,
+      memberEnd:   u.membership_end_date   ?? null,
+      daysLeft:    u._daysLeft ?? null,
+    });
+
+    // ── 1. Onboarding — active clients who joined in the last 14 days ───────────
+    const day14 = new Date(now - 14 * 86400000);
+    const onboarding = activeClients
+      .filter(u => u.membership_start_date && new Date(u.membership_start_date) >= day14)
+      .map(u => ({
+        ...mapU(u),
+        daysSince: Math.floor((now - new Date(u.membership_start_date)) / 86400000),
+      }))
+      .sort((a, b) => a.daysSince - b.daysSince);
+
+    // ── 2. Churn Risk — Arbox expiring (1-30d) ∪ local store inactive (10+ days) ─
+    const expiringMapped = expiringSoon.map(u => ({
+      ...mapU(u),
+      risk:   (u._daysLeft ?? 999) <= 7 ? 'red' : 'yellow',
+      reason: 'expiring',
+    }));
+    const expiringPhones = new Set(expiringMapped.map(u => u.phone).filter(Boolean));
+
+    const inactiveLocal = store.getInactiveMembers(10)
+      .filter(m => m.phone && !expiringPhones.has(m.phone))
+      .map(m => ({
+        user_id:       m.arboxId ?? null,
+        name:          m.name    ?? '—',
+        phone:         m.phone,
+        memberSince:   null,
+        memberEnd:     null,
+        daysLeft:      null,
+        lastAttendance: m.lastAttendance,
+        daysSince:     m.lastAttendance
+          ? Math.floor((now - new Date(m.lastAttendance)) / 86400000)
+          : null,
+        risk:   (!m.lastAttendance || Math.floor((now - new Date(m.lastAttendance)) / 86400000) >= 21) ? 'red' : 'yellow',
+        reason: 'inactive',
+      }));
+
+    const churnRisk = [...expiringMapped, ...inactiveLocal]
+      .sort((a, b) => (a.daysLeft ?? 999) - (b.daysLeft ?? 999) || (b.daysSince ?? 0) - (a.daysSince ?? 0));
+
+    // ── 3. Renewals — expiring soon (Arbox) + recently expired ─────────────────
+    const renewals = {
+      expiringSoon:    expiringSoon.map(mapU),
+      recentlyExpired: recentlyExpired.map(u => ({
+        ...mapU(u),
+        daysGone: u._daysLeft != null ? Math.abs(u._daysLeft) : null,
+      })),
+    };
+
+    // ── 4. Birthdays — try birth_date / birthday field on Arbox user objects ─────
+    // Arbox public API v3 does not expose a birthday field for most account tiers;
+    // return an empty list with a note when no data is found.
+    const thisMonth = now.getMonth() + 1; // 1–12
+    const withBday  = activeClients.filter(u => u.birth_date || u.birthday);
+    const birthdays = withBday
+      .map(u => ({ ...mapU(u), dob: u.birth_date ?? u.birthday, _m: new Date(u.birth_date ?? u.birthday).getMonth() + 1 }))
+      .filter(u => !isNaN(u._m) && u._m === thisMonth);
+
+    // ── 5. Win-Back — recently cancelled/expired (within 90 days) ───────────────
+    const winBack = recentlyExpired
+      .map(u => ({
+        ...mapU(u),
+        daysGone: u._daysLeft != null ? Math.abs(u._daysLeft) : null,
+      }))
+      .sort((a, b) => (a.daysGone ?? 999) - (b.daysGone ?? 999));
+
+    res.json({
+      onboarding: { count: onboarding.length, members: onboarding },
+      churnRisk:  { count: churnRisk.length,  members: churnRisk  },
+      renewals: {
+        count:          renewals.expiringSoon.length + renewals.recentlyExpired.length,
+        expiringSoon:   renewals.expiringSoon,
+        recentlyExpired: renewals.recentlyExpired,
+      },
+      birthdays: {
+        count:   birthdays.length,
+        members: birthdays,
+        note:    withBday.length === 0 && activeClients.length > 0
+          ? 'שדה תאריך לידה אינו זמין ב-API הציבורי של Arbox'
+          : null,
+      },
+      winBack: { count: winBack.length, members: winBack },
+      ts: new Date(),
+    });
+  } catch (err) {
+    logger.error('Tomer segments error', { error: err.message });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /api/tomer/action — proactive WhatsApp send per retention segment ──────
+app.post('/api/tomer/action', jsonBody, async (req, res) => {
+  const { segment, phone, name, context: ctx } = req.body ?? {};
+  if (!phone || !segment) return res.status(400).json({ error: 'phone and segment required' });
+  if (String(phone).includes('•')) return res.status(400).json({ error: 'Phone masked — cannot send' });
+
+  const firstName = (name ?? '').split(/\s+/)[0].trim() || null;
+  const hi = firstName ? `היי ${firstName}` : 'שלום';
+
+  const MSGS = {
+    onboarding: `${hi}! 🌱 שמחים שהצטרפת לשייפ סטודיו!\nאיך הולך עד כה? יש שאלות על השיעורים או הלוח? אנחנו כאן בשבילך 💪`,
+    churn_risk: `${hi}! ⭐ לא ראינו אותך${ctx?.daysSince ? ` כבר ${ctx.daysSince} ימים` : ' קצת זמן'}.\nהכל בסדר? נשמח לראות אותך בסטודיו שוב 🤸‍♀️`,
+    renewal:    `${hi}! 💳 המנוי שלך${ctx?.daysLeft != null ? ` פג בעוד ${ctx.daysLeft} ימים` : ' עומד לפוג בקרוב'}.\nרוצה לחדש? נשמח לעזור 😊`,
+    birthday:   `${hi}! 🎉 יום הולדת שמח!!\nשמחים שאת/ה חלק ממשפחת שייפ סטודיו. יום האימון הבא עלינו 🎂💪`,
+    win_back:   `${hi}! 🔄 פספסנו אותך בשייפ סטודיו!\nמה דעתך לחזור? יש לנו הצעה מיוחדת לחברים חוזרים 🌟`,
+  };
+
+  const message = MSGS[segment];
+  if (!message) return res.status(400).json({ error: `Unknown segment: ${segment}` });
+
+  try {
+    await sendText(phone, message, { bypassQuietHours: true });
+    store.logEvent('tomer_proactive_send', phone, { segment, name, preview: message.slice(0, 80) });
+    logger.info('Tomer proactive action sent', { segment, phone });
+    res.json({ ok: true, segment, preview: message.slice(0, 60), sentAt: new Date() });
+  } catch (err) {
+    logger.error('Tomer action send failed', { segment, phone, error: err.message });
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ══════════════════════════════════════════════════════════════════════════════
 // KNOWLEDGE MANAGEMENT — Admin API
 // Allows the dashboard to view, edit, and hot-reload agent knowledge

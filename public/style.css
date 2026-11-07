@@ -967,6 +967,46 @@ input  { font-family: inherit; }
 }
 .subnav-btn:hover:not(.active) { background: var(--primary-dim); color: var(--primary); }
 
+/* ── Tomer segment panel ────────────────────────────────────────────────────── */
+.tseg-panel { padding-top: 4px; }
+.seg-desc-bar {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 8px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+/* Badge count on segment sub-tabs */
+.seg-badge {
+  display: inline-block;
+  min-width: 18px;
+  padding: 1px 5px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 700;
+  background: var(--border);
+  color: var(--text);
+  margin-right: -4px;
+  vertical-align: middle;
+  transition: background .2s;
+}
+.seg-badge.risk { background: var(--hot); color: #fff; }
+.subnav-btn.active .seg-badge { background: rgba(255,255,255,.25); color: #fff; }
+/* Quick-action send button in segment tables */
+.btn-seg-action {
+  font-size: 11px;
+  padding: 4px 10px;
+  border-radius: 14px;
+  background: var(--primary-dim);
+  color: var(--primary);
+  border: 1px solid var(--primary);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all .15s;
+}
+.btn-seg-action:hover { background: var(--primary); color: #fff; }
+.btn-seg-action:disabled { opacity: .5; cursor: not-allowed; }
+
 /* ── Member stats row ──────────────────────────────────────────────────────── */
 .members-stats-row {
   display: flex;

@@ -321,72 +321,89 @@
           </div>
         </aside>
 
-        <!-- Main: retention panels with sub-nav -->
+        <!-- Main: 5-segment Customer Success panel -->
         <div class="agent-main">
           <div class="panel">
-            <div class="panel-header">
-              <div class="tomer-subnav">
-                <button class="subnav-btn active" data-tview="leads">📋 לידים רדומים</button>
-                <button class="subnav-btn" data-tview="members">🏋️ חברות בסיכון</button>
+
+            <!-- Segment sub-nav with live badge counts -->
+            <div class="panel-header" style="flex-wrap:wrap;gap:8px;padding-bottom:0">
+              <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+                <button class="subnav-btn active" data-tseg="onboarding">🌱 היכרות <span class="seg-badge" id="badge-onboarding">—</span></button>
+                <button class="subnav-btn" data-tseg="churn_risk">⚠️ סיכון נטישה <span class="seg-badge risk" id="badge-churn">—</span></button>
+                <button class="subnav-btn" data-tseg="renewals">💳 חידוש מנוי <span class="seg-badge" id="badge-renewals">—</span></button>
+                <button class="subnav-btn" data-tseg="birthdays">🎉 ימי הולדת <span class="seg-badge" id="badge-birthdays">—</span></button>
+                <button class="subnav-btn" data-tseg="win_back">🔄 שימור חוזר <span class="seg-badge" id="badge-winback">—</span></button>
               </div>
               <button class="btn btn-secondary" id="btn-tomer-refresh" style="font-size:13px;padding:6px 14px">🔄 רענן</button>
             </div>
 
-            <!-- Leads queue view -->
-            <div id="tomer-view-leads">
+            <!-- ── Segment: Onboarding ───────────────────────────────────── -->
+            <div id="tseg-onboarding" class="tseg-panel">
+              <div class="seg-desc-bar">חברים חדשים שהצטרפו ב-14 הימים האחרונים — הזדמנות ל-Onboarding פעיל לפני שמאבדים אותם.</div>
               <div class="table-wrapper">
                 <table class="leads-table">
-                  <thead>
-                    <tr>
-                      <th>שם</th>
-                      <th>ציון</th>
-                      <th>סטטוס</th>
-                      <th>ימי שקט</th>
-                      <th>RE#</th>
-                      <th>הצעת היכרות</th>
-                    </tr>
-                  </thead>
-                  <tbody id="tomer-queue-tbody">
-                    <tr><td colspan="6" class="empty-state">לחץ "רענן" לטעינת תור השימור</td></tr>
-                  </tbody>
+                  <thead><tr><th>שם</th><th>הצטרף/ה לפני</th><th>תאריך הצטרפות</th><th>פעולה</th></tr></thead>
+                  <tbody id="tseg-onboarding-tbody"><tr><td colspan="4" class="empty-state">לחץ "רענן" לטעינה</td></tr></tbody>
                 </table>
               </div>
-              <div class="panel-footer">
-                <span style="font-size:13px;color:var(--muted)">RE# = מספר ניסיונות ריאנגייג'מנט שנשלחו</span>
-                <span class="refresh-tag" id="tomer-updated"></span>
+              <div class="panel-footer"><span class="refresh-tag" id="tomer-seg-updated"></span></div>
+            </div>
+
+            <!-- ── Segment: Churn Risk ────────────────────────────────────── -->
+            <div id="tseg-churn_risk" class="tseg-panel" style="display:none">
+              <div class="seg-desc-bar">חברים פעילים שרמת הנוכחות שלהם ירדה משמעותית — לפני שהם עוזבים.</div>
+              <div class="table-wrapper">
+                <table class="leads-table">
+                  <thead><tr><th>שם</th><th>מידע</th><th>רמת סיכון</th><th>פעולה</th></tr></thead>
+                  <tbody id="tseg-churn_risk-tbody"><tr><td colspan="4" class="empty-state">לחץ "רענן" לטעינה</td></tr></tbody>
+                </table>
               </div>
             </div>
 
-            <!-- Members at-risk view -->
-            <div id="tomer-view-members" style="display:none">
-              <div class="members-stats-row" id="tomer-member-stats">
-                <div class="mini-stat"><div class="mini-stat-val" id="tm-active">—</div><div class="mini-stat-lbl">פעילות</div></div>
-                <div class="mini-stat risk"><div class="mini-stat-val" id="tm-risk">—</div><div class="mini-stat-lbl">בסיכון</div></div>
-                <div class="mini-stat churn"><div class="mini-stat-val" id="tm-churned">—</div><div class="mini-stat-lbl">עזבו</div></div>
-              </div>
+            <!-- ── Segment: Renewals ─────────────────────────────────────── -->
+            <div id="tseg-renewals" class="tseg-panel" style="display:none">
+              <div class="seg-desc-bar">מנויים שפגים בקרוב — חלון ההזדמנות לחידוש לפני שמתנתקים.</div>
+              <h4 style="margin:12px 20px 6px;font-size:13px;color:var(--warm)">⏳ פגים תוך 30 יום</h4>
               <div class="table-wrapper">
                 <table class="leads-table">
-                  <thead>
-                    <tr>
-                      <th>שם</th>
-                      <th>תוכנית</th>
-                      <th>ביקור אחרון</th>
-                      <th>שיעורים החודש</th>
-                      <th>סטטוס</th>
-                    </tr>
-                  </thead>
-                  <tbody id="tomer-members-tbody">
-                    <tr><td colspan="5" class="empty-state">לחץ "רענן" לטעינת חברות</td></tr>
-                  </tbody>
+                  <thead><tr><th>שם</th><th>תאריך פקיעה</th><th>ימים שנותרו</th><th>פעולה</th></tr></thead>
+                  <tbody id="tseg-renew-soon-tbody"><tr><td colspan="4" class="empty-state">לחץ "רענן" לטעינה</td></tr></tbody>
                 </table>
               </div>
-              <div class="panel-footer">
-                <span style="font-size:13px;color:var(--muted)">חברות שלא הגיעו 14+ ימים</span>
-                <span class="refresh-tag" id="tomer-members-updated"></span>
+              <h4 style="margin:16px 20px 6px;font-size:13px;color:var(--hot)">❌ פגו לאחרונה (≤90 ימים)</h4>
+              <div class="table-wrapper">
+                <table class="leads-table">
+                  <thead><tr><th>שם</th><th>תאריך פקיעה</th><th>ימים שעברו</th><th>פעולה</th></tr></thead>
+                  <tbody id="tseg-renew-expired-tbody"><tr><td colspan="4" class="empty-state">לחץ "רענן" לטעינה</td></tr></tbody>
+                </table>
               </div>
             </div>
-          </div>
-        </div>
+
+            <!-- ── Segment: Birthdays ────────────────────────────────────── -->
+            <div id="tseg-birthdays" class="tseg-panel" style="display:none">
+              <div class="seg-desc-bar">חברים עם יום הולדת החודש — רגע מושלם לחיזוק הקשר.</div>
+              <div id="tseg-birthday-note" style="display:none;margin:8px 20px;padding:10px 14px;background:var(--surface);border-radius:8px;font-size:12px;color:var(--muted)"></div>
+              <div class="table-wrapper">
+                <table class="leads-table">
+                  <thead><tr><th>שם</th><th>תאריך לידה</th><th>פעולה</th></tr></thead>
+                  <tbody id="tseg-birthdays-tbody"><tr><td colspan="3" class="empty-state">לחץ "רענן" לטעינה</td></tr></tbody>
+                </table>
+              </div>
+            </div>
+
+            <!-- ── Segment: Win-Back ─────────────────────────────────────── -->
+            <div id="tseg-win_back" class="tseg-panel" style="display:none">
+              <div class="seg-desc-bar">חברים שהמנוי שלהם פג ב-90 הימים האחרונים — פוטנציאל גבוה לחזרה.</div>
+              <div class="table-wrapper">
+                <table class="leads-table">
+                  <thead><tr><th>שם</th><th>תאריך פקיעה</th><th>ימים ממועד עזיבה</th><th>פעולה</th></tr></thead>
+                  <tbody id="tseg-winback-tbody"><tr><td colspan="4" class="empty-state">לחץ "רענן" לטעינה</td></tr></tbody>
+                </table>
+              </div>
+            </div>
+
+          </div><!-- /panel -->
+        </div><!-- /agent-main -->
       </div>
     </section>
 
