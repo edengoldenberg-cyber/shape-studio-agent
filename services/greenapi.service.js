@@ -24,17 +24,32 @@ const logger = require('../utils/logger');
 
 // ── Credential helpers ────────────────────────────────────────────────────────
 
-// Strip any accidental https:// prefix so Railway variables like
-// "https://1103.api.green-api.com" don't produce a double-protocol URL.
+// ── Credential resolution — MUST stay in sync with whatsapp.service.js ───────
+// Canonical Railway variables (set exactly these):
+//   GREEN_API_URL              — host only, e.g. "api.green-api.com"
+//   GREEN_API_ID_INSTANCE      — numeric instance ID from the Green API console
+//   GREEN_API_TOKEN_INSTANCE   — API token from the Green API console
+//
+// Fallback aliases accepted in this exact priority order (same as whatsapp.service.js
+// to prevent split-brain when both variables are set and only one is updated):
+//   instanceId: GREEN_API_ID_INSTANCE → GREEN_API_INSTANCE_ID
+//   token:      GREEN_API_TOKEN_INSTANCE → GREEN_API_API_TOKEN_INSTANCE → GREEN_API_TOKEN
+//
+// All values are trimmed — prevents invisible whitespace causing 401.
+function _env(name) {
+  const v = process.env[name];
+  return v ? v.trim() : null;
+}
+
 function sanitiseHost(raw) {
   if (!raw) return null;
   return raw.replace(/^https?:\/\//, '').replace(/\/$/, '');
 }
 
 function getConfig() {
-  const host       = sanitiseHost(process.env.GREEN_API_URL);
-  const instanceId = process.env.GREEN_API_INSTANCE_ID ?? process.env.GREEN_API_ID_INSTANCE ?? null;
-  const token      = process.env.GREEN_API_TOKEN       ?? process.env.GREEN_API_TOKEN_INSTANCE ?? null;
+  const host       = sanitiseHost(_env('GREEN_API_URL') ?? _env('GREEN_API_HOST'));
+  const instanceId = _env('GREEN_API_ID_INSTANCE')    ?? _env('GREEN_API_INSTANCE_ID')      ?? null;
+  const token      = _env('GREEN_API_TOKEN_INSTANCE') ?? _env('GREEN_API_API_TOKEN_INSTANCE') ?? _env('GREEN_API_TOKEN') ?? null;
   if (!host || !instanceId || !token) return null;
   return {
     base:  `https://${host}/waInstance${instanceId}`,
@@ -44,11 +59,10 @@ function getConfig() {
 }
 
 function isConfigured() {
-  return !!(
-    (process.env.GREEN_API_URL) &&
-    (process.env.GREEN_API_INSTANCE_ID ?? process.env.GREEN_API_ID_INSTANCE) &&
-    (process.env.GREEN_API_TOKEN       ?? process.env.GREEN_API_TOKEN_INSTANCE)
-  );
+  const host       = _env('GREEN_API_URL') ?? _env('GREEN_API_HOST');
+  const instanceId = _env('GREEN_API_ID_INSTANCE')    ?? _env('GREEN_API_INSTANCE_ID');
+  const token      = _env('GREEN_API_TOKEN_INSTANCE') ?? _env('GREEN_API_API_TOKEN_INSTANCE') ?? _env('GREEN_API_TOKEN');
+  return !!(host && instanceId && token);
 }
 
 // ── Low-level Green API calls ─────────────────────────────────────────────────
@@ -60,6 +74,9 @@ function isConfigured() {
 async function getInstanceState() {
   const cfg = getConfig();
   if (!cfg) return null;
+  const tokenVar = _env('GREEN_API_TOKEN_INSTANCE')     ? 'GREEN_API_TOKEN_INSTANCE'
+                 : _env('GREEN_API_API_TOKEN_INSTANCE') ? 'GREEN_API_API_TOKEN_INSTANCE'
+                 : 'GREEN_API_TOKEN';
   try {
     const { data } = await axios.get(
       `${cfg.base}/getStateInstance/${cfg.token}`,
@@ -67,7 +84,17 @@ async function getInstanceState() {
     );
     return data?.stateInstance ?? null;
   } catch (err) {
-    logger.warn('[green-sync] getStateInstance failed', { error: err.message });
+    const status = err.response?.status;
+    logger.warn('[green-sync] getStateInstance failed', {
+      error:        err.message,
+      httpStatus:   status,
+      instanceId:   cfg.instanceId,
+      tokenFrom:    tokenVar,
+      tokenLength:  cfg.token.length,
+      hint: status === 401
+        ? 'Token rejected — verify GREEN_API_TOKEN_INSTANCE matches the API Token Instance in the Green API console for this instance ID'
+        : undefined,
+    });
     return null;
   }
 }

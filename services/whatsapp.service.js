@@ -34,23 +34,38 @@ function getAdminPhones() {
 }
 
 // ── Green API credential resolution ──────────────────────────────────────────
-// Accepts BOTH naming conventions so Railway variables work regardless of which
-// name was used when they were created:
+// Canonical Railway variable names (set exactly these):
+//   GREEN_API_URL              — host only, e.g. "api.green-api.com"
+//   GREEN_API_ID_INSTANCE      — numeric instance ID shown in the Green API console
+//   GREEN_API_TOKEN_INSTANCE   — API token shown in the Green API console
 //
-//   Official Green API names:   GREEN_API_ID_INSTANCE  GREEN_API_TOKEN_INSTANCE
-//   Alternative names (legacy): GREEN_API_INSTANCE_ID  GREEN_API_TOKEN
-//   Host (both conventions):    GREEN_API_URL           GREEN_API_HOST
+// Legacy / alternate names accepted as fallbacks (checked in order):
+//   host:       GREEN_API_URL → GREEN_API_HOST
+//   instanceId: GREEN_API_ID_INSTANCE → GREEN_API_INSTANCE_ID
+//   token:      GREEN_API_TOKEN_INSTANCE → GREEN_API_API_TOKEN_INSTANCE → GREEN_API_TOKEN
 //
-// Set at least one pair on Railway — both are tried at runtime.
-// Host is sanitised: strip any accidental https:// prefix so Railway variables
-// like "https://1103.api.green-api.com" don't produce a double-protocol URL
-// (https://https://...) that causes ENOTFOUND at DNS resolution.
+// All values are trimmed — prevents invisible whitespace/newline in Railway vars
+// from producing a 401 when the token is otherwise correct.
+// Host is stripped of any accidental https:// prefix to prevent ENOTFOUND.
+function _env(name) {
+  const v = process.env[name];
+  return v ? v.trim() : null;
+}
+
 function getGreenCreds() {
-  const rawHost    = process.env.GREEN_API_URL ?? process.env.GREEN_API_HOST ?? null;
+  const rawHost    = _env('GREEN_API_URL') ?? _env('GREEN_API_HOST');
   const host       = rawHost ? rawHost.replace(/^https?:\/\//, '').replace(/\/$/, '') : null;
-  const instanceId = process.env.GREEN_API_ID_INSTANCE  ?? process.env.GREEN_API_INSTANCE_ID ?? null;
-  const token      = process.env.GREEN_API_TOKEN_INSTANCE ?? process.env.GREEN_API_TOKEN ?? null;
+  const instanceId = _env('GREEN_API_ID_INSTANCE')     ?? _env('GREEN_API_INSTANCE_ID') ?? null;
+  const token      = _env('GREEN_API_TOKEN_INSTANCE')  ?? _env('GREEN_API_API_TOKEN_INSTANCE') ?? _env('GREEN_API_TOKEN') ?? null;
   return { host, instanceId, token };
+}
+
+/** Returns the Railway variable name that actually provided the token (for diagnostic logs). */
+function _tokenSourceVar() {
+  if (_env('GREEN_API_TOKEN_INSTANCE'))     return 'GREEN_API_TOKEN_INSTANCE';
+  if (_env('GREEN_API_API_TOKEN_INSTANCE')) return 'GREEN_API_API_TOKEN_INSTANCE';
+  if (_env('GREEN_API_TOKEN'))              return 'GREEN_API_TOKEN';
+  return 'NOT_SET';
 }
 
 function buildSendUrl(method = 'sendMessage') {
@@ -82,20 +97,30 @@ async function probeGreenApiConnection() {
 
   if (!host || !instanceId || !token) {
     logger.error('[Green API] Credentials NOT configured — WhatsApp sending is disabled', {
-      GREEN_API_URL:              process.env.GREEN_API_URL          ? 'SET' : 'MISSING',
-      GREEN_API_HOST:             process.env.GREEN_API_HOST         ? 'SET' : 'MISSING',
-      GREEN_API_ID_INSTANCE:      process.env.GREEN_API_ID_INSTANCE  ? 'SET' : 'MISSING',
-      GREEN_API_INSTANCE_ID:      process.env.GREEN_API_INSTANCE_ID  ? 'SET' : 'MISSING',
-      GREEN_API_TOKEN_INSTANCE:   process.env.GREEN_API_TOKEN_INSTANCE ? 'SET' : 'MISSING',
-      GREEN_API_TOKEN:            process.env.GREEN_API_TOKEN        ? 'SET' : 'MISSING',
+      GREEN_API_URL:                  _env('GREEN_API_URL')                  ? 'SET' : 'MISSING',
+      GREEN_API_HOST:                 _env('GREEN_API_HOST')                 ? 'SET' : 'MISSING',
+      GREEN_API_ID_INSTANCE:          _env('GREEN_API_ID_INSTANCE')          ? 'SET' : 'MISSING',
+      GREEN_API_INSTANCE_ID:          _env('GREEN_API_INSTANCE_ID')          ? 'SET' : 'MISSING',
+      GREEN_API_TOKEN_INSTANCE:       _env('GREEN_API_TOKEN_INSTANCE')       ? 'SET' : 'MISSING',
+      GREEN_API_API_TOKEN_INSTANCE:   _env('GREEN_API_API_TOKEN_INSTANCE')   ? 'SET' : 'MISSING',
+      GREEN_API_TOKEN:                _env('GREEN_API_TOKEN')                ? 'SET' : 'MISSING',
     });
     return { ok: false, reason: 'credentials missing' };
   }
 
-  // Log the masked endpoint so the URL construction is visible in logs
-  const maskedToken = token.slice(0, 6) + '...' + token.slice(-4);
-  const probeUrl    = `https://${host}/waInstance${instanceId}/getStateInstance/${maskedToken}`;
-  logger.info('[Green API] Probing connection', { endpoint: probeUrl, instanceId });
+  // Log the masked endpoint + which variable actually provided the token.
+  // If the wrong variable is being read, this line makes it immediately visible in Railway logs.
+  const maskedToken = token.length >= 10
+    ? token.slice(0, 4) + '...' + token.slice(-4)
+    : '(token too short — check value)';
+  const tokenSourceVar = _tokenSourceVar();
+  logger.info('[Green API] Probing connection', {
+    host,
+    instanceId,
+    tokenFrom:    tokenSourceVar,
+    tokenMasked:  maskedToken,
+    tokenLength:  token.length,
+  });
 
   try {
     const { data } = await axios.get(
