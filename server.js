@@ -1814,62 +1814,84 @@ app.post('/api/whatsapp/simulate', jsonBody, async (req, res) => {
 // ══════════════════════════════════════════════════════════════════════════════
 
 // POST /api/webhooks/meta — Meta Lead Ads ingestion (Make.com → Railway)
-// Responds 200 immediately; all storage and WhatsApp processing run asynchronously
-// to prevent Make from timing out while the WhatsApp API call is in flight.
-app.post('/api/webhooks/meta', jsonBody, (req, res) => {
-  // ── 1. Parse lead synchronously (pure CPU — no I/O) ──────────────────────────
-  let lead = null;
-  try {
-    if (req.body?.entry) {
-      // Native Meta webhook format (direct subscription)
-      lead = parseMetaLeadWebhook(req.body);
-    } else {
-      // Make.com simplified format: { name, phone, email, adCampaign, formId, customQuestions }
-      const { name, phone, email, adCampaign, formId, customQuestions } = req.body ?? {};
-      if (!phone) return res.status(400).json({ error: 'phone required' });
-      const cleaned = String(phone).replace(/[\s\-+()]/g, '').replace(/^972/, '').replace(/^0/, '972').replace(/^(?!972)/, '972');
-      lead = {
-        phone:           cleaned,
-        name:            name           ?? null,
-        email:           email          ?? null,
-        adCampaign:      adCampaign     ?? null,
-        formId:          formId         ?? null,
-        customQuestions: customQuestions ?? null,
-      };
-    }
-    if (!lead?.phone) return res.status(400).json({ error: 'could not resolve phone from payload' });
-  } catch (err) {
-    logger.error('Meta webhook payload parse error', { error: err.message });
-    return res.status(400).json({ error: 'invalid payload' });
-  }
+//
+// CRITICAL: respond BEFORE body parsing. express.json() (jsonBody) buffers the
+// entire request body before calling the route handler — any stream delay or
+// middleware stall would push the response past Make's 120 s timeout, causing 499.
+// Fix: no jsonBody middleware here. The 200 is sent as the very first line,
+// then the raw body is buffered asynchronously and processed in setImmediate.
+app.post('/api/webhooks/meta', (req, res) => {
+  // ── 1. Flush 200 to Make IMMEDIATELY — before reading a single byte ───────────
+  res.status(200).json({ success: true, message: 'Lead received' });
 
-  // ── 2. Respond to Make immediately — before any async I/O ────────────────────
-  res.status(200).json({ success: true, message: 'Lead received', phone: lead.phone, ts: new Date() });
+  // ── 2. Buffer the raw body (small payload — typically < 1 KB from Make) ───────
+  const chunks = [];
+  req.on('data', chunk => chunks.push(chunk));
+  req.on('end', () => {
+    // ── 3. All parsing and heavy work run after the response is fully sent ───────
+    setImmediate(async () => {
+      let body;
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString());
+      } catch {
+        logger.warn('Meta webhook: body is not valid JSON — ignoring');
+        return;
+      }
 
-  // ── 3. All heavy work runs after the response is flushed ─────────────────────
-  setImmediate(async () => {
-    try {
-      store.upsertLead(lead.phone, {
-        name:   lead.name,
-        email:  lead.email,
-        status: 'new',
-        score:  5,
-        meta: {
-          source:          'meta_ads',
-          formId:          lead.formId,
-          adCampaign:      lead.adCampaign,
-          customQuestions: lead.customQuestions,
-        },
-      });
-      store.logEvent('meta_lead_webhook', lead.phone, { name: lead.name, source: 'meta_ads' });
-      automations.recordExecution('rule-008', { phone: lead.phone, name: lead.name });
-      logger.info('Meta webhook lead captured', { phone: lead.phone, name: lead.name, formId: lead.formId });
+      let lead = null;
+      try {
+        if (body?.entry) {
+          // Native Meta webhook format (direct subscription)
+          lead = parseMetaLeadWebhook(body);
+        } else {
+          // Make.com simplified format: { name, phone, email, adCampaign, formId, customQuestions }
+          const { name, phone, email, adCampaign, formId, customQuestions } = body ?? {};
+          if (!phone) {
+            logger.warn('Meta webhook: phone missing in payload');
+            return;
+          }
+          const cleaned = String(phone).replace(/[\s\-+()]/g, '').replace(/^972/, '').replace(/^0/, '972').replace(/^(?!972)/, '972');
+          lead = {
+            phone:           cleaned,
+            name:            name           ?? null,
+            email:           email          ?? null,
+            adCampaign:      adCampaign     ?? null,
+            formId:          formId         ?? null,
+            customQuestions: customQuestions ?? null,
+          };
+        }
+        if (!lead?.phone) {
+          logger.warn('Meta webhook: could not resolve phone from payload');
+          return;
+        }
+      } catch (err) {
+        logger.error('Meta webhook payload parse error', { error: err.message });
+        return;
+      }
 
-      await notifyLeadTeam(lead, { formId: lead.formId, adCampaign: lead.adCampaign })
-        .catch(err => logger.warn('notifyLeadTeam failed', { error: err.message }));
-    } catch (err) {
-      logger.error('Meta webhook async processing error', { error: err.message, phone: lead.phone });
-    }
+      try {
+        store.upsertLead(lead.phone, {
+          name:   lead.name,
+          email:  lead.email,
+          status: 'new',
+          score:  5,
+          meta: {
+            source:          'meta_ads',
+            formId:          lead.formId,
+            adCampaign:      lead.adCampaign,
+            customQuestions: lead.customQuestions,
+          },
+        });
+        store.logEvent('meta_lead_webhook', lead.phone, { name: lead.name, source: 'meta_ads' });
+        automations.recordExecution('rule-008', { phone: lead.phone, name: lead.name });
+        logger.info('Meta webhook lead captured', { phone: lead.phone, name: lead.name, formId: lead.formId });
+
+        await notifyLeadTeam(lead, { formId: lead.formId, adCampaign: lead.adCampaign })
+          .catch(err => logger.warn('notifyLeadTeam failed', { error: err.message }));
+      } catch (err) {
+        logger.error('Meta webhook async processing error', { error: err.message, phone: lead?.phone });
+      }
+    });
   });
 });
 
