@@ -78,6 +78,12 @@ function buildSendUrl(method = 'sendMessage') {
     ].filter(Boolean).join(', ');
     throw new Error(`Green API credentials missing on Railway: ${missing}`);
   }
+  // Guard against the common typo: "greenapi.com" (no hyphen) instead of
+  // "green-api.com".  Both may resolve at the DNS level but only the hyphenated
+  // domain is Green API's real API server.
+  if (/greenapi\.com/i.test(host) && !/green-api\.com/i.test(host)) {
+    logger.warn('[Green API] Host looks incorrect — domain should be green-api.com (with hyphen), got: ' + host);
+  }
   return `https://${host}/waInstance${instanceId}/${method}/${token}`;
 }
 
@@ -213,26 +219,50 @@ async function _dispatch(to, text) {
     throw credErr;
   }
 
+  // Log the masked URL at INFO level BEFORE the request so Railway logs always
+  // show which host is being targeted — the most common silent failure is a
+  // wrong domain (e.g. greenapi.com vs green-api.com) that only surfaces here.
+  const maskedUrl = url.replace(/\/[^/]{20,}$/, '/***TOKEN***');
+  logger.info('[Green API] Dispatching message', { to, chatId, endpoint: maskedUrl });
+
   try {
     const payload = { chatId, message: text };
     const { data } = await axios.post(url, payload, { headers: HEADERS, timeout: 15000 });
-    logger.debug('[Green API] Message sent', { to, chatId, idMessage: data?.idMessage });
+
+    // Success path — log at INFO so it appears in Railway default log view.
+    // debug() is filtered out at the default log level and would hide deliveries.
+    if (data?.idMessage) {
+      logger.info('[Green API] Message sent ✓', { to, chatId, idMessage: data.idMessage });
+    } else {
+      // Green API returned HTTP 200 but no idMessage — message was NOT queued.
+      // This typically means the WhatsApp session is not authorized (needs QR scan).
+      logger.warn('[Green API] Send returned 200 but no idMessage — message may NOT have been delivered', {
+        to, chatId, responseData: JSON.stringify(data).slice(0, 300),
+        hint: 'Check Green API console → instance state. If "notAuthorized", scan the QR code.',
+      });
+    }
     return data;
   } catch (err) {
     // Log the full HTTP error so Railway shows exactly what Green API returned
     const httpStatus   = err.response?.status;
     const responseBody = err.response?.data;
     const { host, instanceId } = getGreenCreds();
-    const maskedUrl = url?.replace(/\/[^/]{20,}$/, '/***TOKEN***') ?? url;
 
     logger.error('[Green API] Send failed', {
       to,
       chatId,
       httpStatus,
       responseBody,
-      endpoint:    maskedUrl,
+      endpoint:     maskedUrl,
       instanceId,
       networkError: !err.response ? err.message : undefined,
+      hint: httpStatus === 401
+        ? 'Token rejected — verify GREEN_API_TOKEN_INSTANCE matches the API Token Instance for this instance ID in the Green API console'
+        : httpStatus === 404
+        ? 'Instance not found — verify GREEN_API_ID_INSTANCE and that the host URL matches the instance server'
+        : !err.response
+        ? 'Network error — verify GREEN_API_URL is correct (should be e.g. 7103.api.green-api.com with hyphen)'
+        : undefined,
     });
     throw err;
   }
@@ -572,4 +602,4 @@ function parseGreenApiWebhook(body) {
   }
 }
 
-module.exports = { sendText, sendFileByUrl, alertOwner, notifyLeadTeam, releaseQueuedMessages, verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, probeGreenApiConnection };
+module.exports = { sendText, sendFileByUrl, alertOwner, notifyLeadTeam, releaseQueuedMessages, verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, probeGreenApiConnection, getGreenCreds, _tokenSourceVar };

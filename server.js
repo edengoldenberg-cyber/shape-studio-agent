@@ -21,7 +21,7 @@ process.on('uncaughtException', (err) => {
   logger.error('Uncaught exception — server will continue', { error: err.message, stack: err.stack });
 });
 
-const { verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, releaseQueuedMessages, sendText, sendFileByUrl, alertOwner, notifyLeadTeam, probeGreenApiConnection } = require('./services/whatsapp.service');
+const { verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, releaseQueuedMessages, sendText, sendFileByUrl, alertOwner, notifyLeadTeam, probeGreenApiConnection, getGreenCreds, _tokenSourceVar } = require('./services/whatsapp.service');
 const { fetchAndNormalizeLead } = require('./services/metaLeads');
 const { captureRawBody, verifyMetaSignature } = require('./middleware/security');
 const inbox = require('./utils/whatsapp_inbox');
@@ -2011,9 +2011,13 @@ app.post('/api/webhooks/meta', (req, res) => {
           waSent = true;
           logger.info('Lead welcome message sent via Green API', { phone: lead.phone });
         } catch (err) {
-          logger.warn('Lead welcome message dispatch failed — thread created without delivery', {
+          // Elevated to error so it's always visible in Railway logs even when
+          // the inbox thread IS created (the thread creation silences the failure
+          // from the UI perspective, making this easy to miss at warn level).
+          logger.error('Lead welcome message dispatch FAILED — thread created without WhatsApp delivery', {
             phone:  lead.phone,
             error:  err.message,
+            action: 'Check /api/debug/green-api for credential and URL diagnostics',
           });
         }
 
@@ -2493,6 +2497,66 @@ app.post('/api/whatsapp/threads/:phone/send', jsonBody, async (req, res) => {
     logger.error('Thread send error', { phone, error: err.message });
     res.status(500).json({ error: err.message });
   }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// GREEN API DIAGNOSTICS — /api/debug/green-api
+// ══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/debug/green-api — live credential and connectivity diagnostic.
+// Hit this endpoint to verify exactly what credentials are in use, what URL
+// is being constructed, and whether the Green API instance is reachable and
+// authorized — without digging through Railway startup logs.
+app.get('/api/debug/green-api', async (_req, res) => {
+  const { host, instanceId, token } = getGreenCreds();
+  const tokenVar    = _tokenSourceVar();
+  const configured  = !!(host && instanceId && token);
+
+  const maskedToken = token && token.length >= 10
+    ? token.slice(0, 4) + '...' + token.slice(-4)
+    : token ? '(too short)' : null;
+
+  const sendUrl = configured
+    ? `https://${host}/waInstance${instanceId}/sendMessage/***TOKEN***`
+    : null;
+
+  const stateUrl = configured
+    ? `https://${host}/waInstance${instanceId}/getStateInstance/***TOKEN***`
+    : null;
+
+  // Run a live getStateInstance probe
+  let probe = null;
+  if (configured) {
+    try {
+      probe = await probeGreenApiConnection();
+    } catch (err) {
+      probe = { ok: false, error: err.message };
+    }
+  }
+
+  const domainWarning = host && /greenapi\.com/i.test(host) && !/green-api\.com/i.test(host)
+    ? 'Host uses "greenapi.com" — the real Green API domain is "green-api.com" (with hyphen). Update GREEN_API_URL.'
+    : null;
+
+  res.json({
+    configured,
+    host:          host          ?? 'NOT SET — set GREEN_API_URL',
+    instanceId:    instanceId    ?? 'NOT SET — set GREEN_API_ID_INSTANCE',
+    tokenVar:      tokenVar,
+    tokenMasked:   maskedToken   ?? 'NOT SET',
+    tokenLength:   token ? token.length : 0,
+    sendMessageUrl: sendUrl,
+    stateUrl,
+    domainWarning,
+    probe,
+    inboxThreads:  inbox.getThreads({ limit: 5 }).map(t => ({
+      phone:    t.phone,
+      name:     t.name,
+      messages: t.messages?.length ?? 0,
+      lastAt:   t.lastAt,
+    })),
+    ts: new Date(),
+  });
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
