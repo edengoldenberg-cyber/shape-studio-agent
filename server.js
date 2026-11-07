@@ -1397,8 +1397,35 @@ async function processInboundWAMessage(msg) {
     return null;
   }
 
-  // 0. Staff bypass — messages from Eden/Melanie are stored in the inbox for
-  //    visibility but are never processed through the lead/client pipeline.
+  // 0a. Reaction bypass — emoji reactions (👍, 🐔, etc.) must NEVER trigger an
+  //     automated AI reply.  Store in inbox for thread visibility, then exit.
+  if (msg.isReaction || msg.type === 'reaction') {
+    logger.info('Reaction event — logging to inbox, skipping AI pipeline', {
+      from: fromNorm, emoji: msg.reactionEmoji ?? null, reactedToId: msg.reactedToId ?? null,
+    });
+    const reactionEntry = inbox.push({
+      from:          fromNorm,
+      fromIsraeli,
+      name:          msg.name ?? null,
+      text:          msg.text ?? '[reaction]',
+      messageId:     msg.messageId,
+      timestamp:     msg.timestamp,
+      receivedAt:    new Date(),
+      mediaType:     'reaction',
+      mediaCaption:  null,
+      mediaId:       null,
+      clientMatch:   { found: false },
+      intent:        'reaction',
+      route:         'reaction_bypass',
+      barakReply:    null,
+      reactionEmoji: msg.reactionEmoji ?? null,
+      reactedToId:   msg.reactedToId   ?? null,
+    });
+    return { inboxEntry: reactionEntry, clientMatch: { found: false }, intent: 'reaction', route: 'reaction_bypass', barakReply: null };
+  }
+
+  // 0b. Staff bypass — messages from Eden/Melanie are stored in the inbox for
+  //     visibility but are never processed through the lead/client pipeline.
   if (isStaffPhone(fromNorm)) {
     logger.info('Inbound message from internal staff — bypassing pipeline', { from: fromNorm });
     const staffEntry = inbox.push({
@@ -2089,17 +2116,34 @@ app.post('/api/webhooks/meta', (req, res) => {
           lead = parseMetaLeadWebhook(body);
         } else {
           // ── Make.com / simplified format ────────────────────────────────────────
-          // Try every field-name variant Make or Meta Lead Ads forms might use.
-          const rawPhone = _firstStr(body, [
+          //
+          // Make.com forwards Meta Lead Ads data in two shapes depending on the module:
+          //   A. Flat:      { "phone": "0501234567", "full_name": "..." }
+          //   B. field_data: { "field_data": [{ "name": "phone_number", "values": ["..."] }] }
+          //
+          // We try both.  Flatten the field_data array into a plain map first so the
+          // same _firstStr helper works for both shapes.
+          const fdFlat = {};
+          if (Array.isArray(body.field_data)) {
+            for (const f of body.field_data) {
+              if (f?.name && f.values?.[0] != null) fdFlat[f.name] = String(f.values[0]);
+            }
+          }
+
+          const PHONE_KEYS = [
             'phone', 'phone_number', 'phoneNumber',
             'mobile', 'mobile_phone', 'mobilePhone',
             'cell', 'tel', 'telephone',
-          ]);
+          ];
+          const rawPhone =
+            _firstStr(body,   PHONE_KEYS) ??
+            _firstStr(fdFlat, PHONE_KEYS);
 
           if (!rawPhone) {
             logger.warn('Meta webhook: phone field not found in payload', {
-              receivedKeys: Object.keys(body).join(', '),
-              preview:      JSON.stringify(body).slice(0, 200),
+              receivedKeys:  Object.keys(body).join(', '),
+              fieldDataKeys: Object.keys(fdFlat).join(', ') || '(none)',
+              preview:       JSON.stringify(body).slice(0, 200),
             });
             return;
           }
@@ -2110,19 +2154,30 @@ app.post('/api/webhooks/meta', (req, res) => {
             return;
           }
 
-          // Combine first+last if full-name field is absent
-          const firstName = _firstStr(body, ['first_name', 'firstName', 'given_name']);
-          const lastName  = _firstStr(body, ['last_name',  'lastName',  'family_name']);
+          // Name: try flat body keys, then field_data map, then first+last split
+          const firstName =
+            _firstStr(body,   ['first_name', 'firstName', 'given_name']) ??
+            _firstStr(fdFlat, ['first_name', 'firstName', 'given_name']);
+          const lastName =
+            _firstStr(body,   ['last_name', 'lastName', 'family_name']) ??
+            _firstStr(fdFlat, ['last_name', 'lastName', 'family_name']);
           const name =
-            _firstStr(body, ['name', 'full_name', 'fullName', 'lead_name', 'leadName']) ??
+            _firstStr(body,   ['name', 'full_name', 'fullName', 'lead_name', 'leadName']) ??
+            _firstStr(fdFlat, ['full_name', 'name', 'fullName']) ??
             ([firstName, lastName].filter(Boolean).join(' ') || null);
 
           lead = {
             phone,
-            name:            name ?? null,
-            email:           _firstStr(body, ['email', 'email_address', 'emailAddress']) ?? null,
-            adCampaign:      _firstStr(body, ['adCampaign', 'ad_campaign', 'campaign', 'campaignName', 'campaign_name']) ?? null,
-            formId:          _firstStr(body, ['formId', 'form_id', 'form']) ?? null,
+            name:  name ?? null,
+            email:
+              _firstStr(body,   ['email', 'email_address', 'emailAddress']) ??
+              _firstStr(fdFlat, ['email', 'email_address']) ?? null,
+            adCampaign:
+              _firstStr(body,   ['adCampaign', 'ad_campaign', 'campaign', 'campaignName', 'campaign_name']) ??
+              _firstStr(fdFlat, ['ad_campaign', 'adCampaign', 'campaign']) ?? null,
+            formId:
+              _firstStr(body,   ['formId', 'form_id', 'form']) ??
+              _firstStr(fdFlat, ['form_id', 'formId']) ?? null,
             customQuestions: body.customQuestions ?? body.custom_questions ?? body.questions ?? null,
           };
         }
@@ -2162,47 +2217,61 @@ app.post('/api/webhooks/meta', (req, res) => {
         await notifyLeadTeam(lead, { formId: lead.formId, adCampaign: lead.adCampaign })
           .catch(err => logger.warn('notifyLeadTeam failed', { error: err.message }));
 
-        // ── Send a welcome WhatsApp directly to the lead ──────────────────────
-        // notifyLeadTeam only sends to staff phones — without this block the
-        // lead never appears in /api/whatsapp/threads because inbox._threads is
-        // only populated via inbox.pushOutbound / inbox.push, never via store.
+        // ── Trigger Barak's lead onboarding pipeline ─────────────────────────────
+        // Call leadAgent.handleInbound with a synthetic first-touch text so the
+        // AI generates a personalised greeting and dispatches it via Green API —
+        // the same code path as a real inbound WhatsApp message.
         //
-        // Design: attempt the actual Green API dispatch, but create the inbox
-        // thread entry regardless of whether the send succeeds.  If Green API
-        // is unreachable or returns 401, the thread still shows up in the live
-        // chat screen so the team can manually reply from the dashboard.
-        const givenName   = (lead.name ?? '').split(/\s+/)[0].trim() || null;
-        const welcomeText = `שלום${givenName ? ' ' + givenName : ''}! 🤸‍♀️ קיבלנו את פנייתך לשייפ סטודיו ונחזור אליך בהקדם. בינתיים, אם יש שאלות — אנחנו כאן! 😊`;
+        // Fallback: if leadAgent fails (OpenAI down, Green API misconfigured) we
+        // send a static acknowledgement so the lead is never left in silence.
+        const triggerText = `שלום, ראיתי את המודעה שלכם ואשמח לקבל פרטים נוספים על הסטודיו`;
+        let sentReply     = null;
 
-        let waSent = false;
         try {
-          await sendText(lead.phone, welcomeText, { bypassQuietHours: true });
-          waSent = true;
-          logger.info('Lead welcome message sent via Green API', { phone: lead.phone });
+          const result = await leadAgent.handleInbound({
+            from: lead.phone,
+            name: lead.name ?? null,
+            text: triggerText,
+          });
+          sentReply = result?.reply ?? null;
+
+          // The scoring function uses English keywords; Hebrew trigger text may
+          // score lower than a Meta lead deserves — restore the warmer baseline.
+          const currentScore = store.getLead(lead.phone)?.score ?? 0;
+          if (currentScore < 5) store.upsertLead(lead.phone, { score: 5, status: 'warm' });
+
+          logger.info('Barak lead pipeline activated for Meta lead', {
+            phone: lead.phone, replyPreview: sentReply?.slice(0, 60),
+          });
         } catch (err) {
-          // Elevated to error so it's always visible in Railway logs even when
-          // the inbox thread IS created (the thread creation silences the failure
-          // from the UI perspective, making this easy to miss at warn level).
-          logger.error('Lead welcome message dispatch FAILED — thread created without WhatsApp delivery', {
+          logger.error('leadAgent.handleInbound failed for Meta lead — sending fallback message', {
             phone:  lead.phone,
             error:  err.message,
-            action: 'Check /api/debug/green-api for credential and URL diagnostics',
+            action: 'Check OPENAI_API_KEY and Green API credentials in Railway Variables',
           });
+          // Static fallback so the lead gets at least an acknowledgement
+          const givenName   = (lead.name ?? '').split(/\s+/)[0].trim() || null;
+          const welcomeText = `שלום${givenName ? ' ' + givenName : ''}! 🤸‍♀️ קיבלנו את פנייתך לשייפ סטודיו ונחזור אליך בהקדם. בינתיים, אם יש שאלות — אנחנו כאן! 😊`;
+          try {
+            await sendText(lead.phone, welcomeText, { bypassQuietHours: true });
+            sentReply = welcomeText;
+          } catch (sendErr) {
+            logger.error('Fallback welcome message also failed', { phone: lead.phone, error: sendErr.message });
+          }
         }
 
-        // Always create the inbox thread entry — this is what populates the
-        // WhatsApp live chat screen for this lead.
+        // Always create an outbound inbox thread entry so the WhatsApp live chat
+        // screen shows this lead immediately regardless of delivery outcome.
         inbox.pushOutbound({
           phone:   lead.phone,
           name:    lead.name ?? null,
-          text:    welcomeText,
-          agentId: 'lead-agent',
+          text:    sentReply ?? '[AI reply sent]',
+          agentId: 'barak-meta',
         });
         store.logEvent('message_out', lead.phone, {
-          preview: welcomeText.slice(0, 80),
-          agent:   'lead-agent',
+          preview: (sentReply ?? '[AI reply]').slice(0, 80),
+          agent:   'barak',
           source:  'meta_lead',
-          sent:    waSent,
         });
         persist.saveInbox(inbox);
         // SSE fires so the WhatsApp live tab refreshes thread list immediately

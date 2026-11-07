@@ -583,6 +583,23 @@ function parseGreenApiWebhook(body) {
           text: '[איש קשר]', mediaType: 'contact', mediaCaption: null, mediaId: null,
         };
 
+      case 'reactionMessage': {
+        // Green API reaction: { reactionMessage: { messageId: "...", text: "👍" } }
+        // isReaction:true is the flag that processInboundWAMessage checks to skip AI routing.
+        const rxn = msgData.reactionMessage ?? {};
+        return {
+          from, name, messageId, timestamp,
+          type:          'reaction',
+          text:          rxn.text ? `[reaction: ${rxn.text}]` : '[reaction]',
+          mediaType:     'reaction',
+          mediaCaption:  null,
+          mediaId:       null,
+          reactionEmoji: rxn.text        ?? null,
+          reactedToId:   rxn.messageId   ?? null,
+          isReaction:    true,
+        };
+      }
+
       default:
         // extendedTextMessage (links with previews) — treat as plain text
         if (msgData.extendedTextMessageData?.text) {
