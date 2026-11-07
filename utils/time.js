@@ -11,12 +11,15 @@ function nowInIsrael() {
  * Quiet window: QUIET_START (inclusive) → midnight → QUIET_END (exclusive).
  */
 function isQuietHours() {
-  const hour = nowInIsrael().getHours();
-  if (QUIET_START > QUIET_END) {
-    // spans midnight: e.g. 22 → 08
-    return hour >= QUIET_START || hour < QUIET_END;
-  }
-  return hour >= QUIET_START && hour < QUIET_END;
+  // ── QUIET HOURS DISABLED FOR TESTING ──────────────────────────────────────
+  // Re-enable by removing this line and uncommenting the original logic below.
+  return false;
+
+  // const hour = nowInIsrael().getHours();
+  // if (QUIET_START > QUIET_END) {
+  //   return hour >= QUIET_START || hour < QUIET_END;
+  // }
+  // return hour >= QUIET_START && hour < QUIET_END;
 }
 
 /**

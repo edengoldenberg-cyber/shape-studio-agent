@@ -103,40 +103,40 @@ async function scheduleClassReminders(phone, firstName, className, classTime) {
 // ─── Message builders ─────────────────────────────────────────────────────────
 
 function day1Message(name) {
-  return `Hey ${name}! 🌟 How are you feeling after your first workout at Shape Studio? We'd love to hear about it — what did you think?`;
+  return `${name}, איך היה? 🌟 אשמח לשמוע מה חשבת על האימון הראשון — מה הרגשת?`;
 }
 
 function week1Message(name) {
-  return `${name}, one week in! 💪 You should be proud — getting started is the hardest part. How are you feeling? Any class you're especially loving so far?`;
+  return `${name}, שבוע ראשון מאחורינו! 💪 איך את/ה מרגיש/ה? יש שיעור שכבר אהבת במיוחד?`;
 }
 
 function week2Message(name) {
-  return `${name}, you've been with us for two weeks and we're already noticing it 🙌 Any classes you want to explore next? We'd love to help you mix it up if you're ready to try something new.`;
+  return `${name}, שבועיים בסטודיו — ממש שמחים לראות אותך פה 🙌 יש שיעור שהייתי רוצה לנסות בקרוב?`;
 }
 
 function month1Message(name) {
   return (
-    `${name}, one month at Shape Studio — that's a real milestone and we're genuinely proud of you! 🎉\n\n` +
-    `You've built a habit. Now let's talk about taking it further. Our team would love to connect and see how we can support your next chapter here. ` +
-    `Want to chat about what's next? 💫`
+    `${name}, חודש בShape Studio — זה אבן דרך אמיתית, כל הכבוד! 🎉\n\n` +
+    `בנית שגרה, וזה הכי חשוב. אשמח לשמוע מה עובד לך ואיך נוכל לתמוך בך בהמשך. ` +
+    `מה הצעד הבא שהיית רוצה לעשות? 💫`
   );
 }
 
 function winBackMessage(name) {
-  return `We've been missing you, ${name}! 🌟 Life gets busy — that's totally okay. Is everything alright? We'd love to have you back whenever you're ready. Want me to find a time that works this week?`;
+  return `${name}, חסרת לנו! 🌟 הבנו שהתעסוקה גוברת לפעמים — זה בסדר גמור. הכל בסדר? נשמח לראות אותך חוזר/ת כשנוח לך. רוצה שאמצא זמן מתאים השבוע?`;
 }
 
 function reminder24h(name, className, classTime) {
   const timeStr = classTime.toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Jerusalem' });
   return (
-    `Hi ${name}! Just a friendly reminder — you're booked for *${className}* tomorrow at *${timeStr}* at Shape Studio 🙌\n\n` +
-    `Reply ✅ to confirm or let me know if something came up. See you there!`
+    `${name}, תזכורת ידידותית — מחר יש לך *${className}* בשעה *${timeStr}* בShape Studio 🙌\n\n` +
+    `ענה/י ✅ לאישור, או שלח/י הודעה אם משהו השתנה. מחכים לך!`
   );
 }
 
 function reminder2h(name, className, classTime) {
   const timeStr = classTime.toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Jerusalem' });
-  return `${name}, today's the day! 💪 ${className} starts at *${timeStr}*. We're excited to have you — see you soon at Shape Studio!`;
+  return `${name}, היום זה היום! 💪 *${className}* מתחיל בשעה *${timeStr}*. מחכים לך בסטודיו!`;
 }
 
 // ─── Utils ────────────────────────────────────────────────────────────────────

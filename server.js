@@ -1,4 +1,4 @@
-require('dotenv').config();
+﻿require('dotenv').config();
 const path    = require('path');
 const fs      = require('fs');
 const express = require('express');
@@ -41,6 +41,7 @@ const calendarSvc                      = require('./services/calendar.service');
 const notifySvc                        = require('./services/notification.service');
 const greenApiSvc                      = require('./services/greenapi.service');
 const persist                          = require('./utils/persist');
+const studioAssets                     = require('./utils/studio_assets');
 
 // ── Staff configuration (hot-reloadable) ─────────────────────────────────────
 
@@ -64,12 +65,75 @@ function getScheduleImageUrl() {
   return base ? `${base}/schedule.png` : null;
 }
 
+/**
+ * Returns the best available timetable image URL (image 1):
+ *   1. Custom uploaded image served via /api/admin/timetable-image (from DATA_DIR)
+ *   2. Static schedule.png in public/ (legacy fallback)
+ * Returns null when neither is available.
+ */
+function getActiveTimetableUrl() {
+  const base = getBackendBase();
+  if (!base) return null;
+  const imgPath = studioAssets.getTimetableImagePath();
+  if (imgPath && fs.existsSync(imgPath)) return `${base}/api/admin/timetable-image`;
+  if (fs.existsSync(SCHEDULE_PNG_PATH))  return `${base}/schedule.png`;
+  return null;
+}
+
+/**
+ * Returns the URL for timetable image 2 if one has been uploaded, or null.
+ */
+function getActiveTimetable2Url() {
+  const base = getBackendBase();
+  if (!base) return null;
+  const imgPath = studioAssets.getTimetable2ImagePath();
+  if (imgPath && fs.existsSync(imgPath)) return `${base}/api/admin/timetable2-image`;
+  return null;
+}
+
 function loadStaffConfig() {
   try { return JSON.parse(fs.readFileSync(STAFF_CONFIG_PATH, 'utf8')); }
   catch { return { staff: [], default_assignee_id: null, appointment_duration_min: 30 }; }
 }
 
 let staffConfig = loadStaffConfig();
+
+// ── Known-members override list ───────────────────────────────────────────────
+// When Arbox lookup fails or is slow, staff can manually add phone numbers here
+// to guarantee they always route to Tomer (never to Barak's sales flow).
+// File: data/known_members.json  Format: { "phones": ["972XXXXXXXXX", ...] }
+const KNOWN_MEMBERS_PATH = path.join(__dirname, 'data/known_members.json');
+
+function loadKnownMembers() {
+  try { return new Set(JSON.parse(fs.readFileSync(KNOWN_MEMBERS_PATH, 'utf8')).phones ?? []); }
+  catch { return new Set(); }
+}
+
+// Checked on each inbound message — file is re-read so runtime edits take effect immediately.
+function isKnownMember(phone) {
+  if (!phone) return false;
+  const list = loadKnownMembers();
+  const norm = normalizeToE164(phone);
+  return list.has(phone) || (norm ? list.has(norm) : false);
+}
+
+// Auto-persist an Arbox-confirmed member to known_members.json.
+// Called once per confirmed member so future lookups survive Arbox timeouts.
+function _autoAddKnownMember(phone, name) {
+  try {
+    let data = { phones: [], names: {} };
+    try { data = JSON.parse(fs.readFileSync(KNOWN_MEMBERS_PATH, 'utf8')); } catch { /* fresh file */ }
+    const norm = normalizeToE164(phone) ?? phone;
+    if (!data.phones.includes(norm)) {
+      data.phones.push(norm);
+      if (name) data.names = { ...(data.names ?? {}), [norm]: name };
+      fs.writeFileSync(KNOWN_MEMBERS_PATH, JSON.stringify(data, null, 2), 'utf8');
+      logger.info('[known-members] Auto-added confirmed Arbox member', { phone: norm, name });
+    }
+  } catch (err) {
+    logger.warn('[known-members] Auto-add failed', { error: err.message });
+  }
+}
 
 function findStaff(id) {
   return staffConfig.staff?.find(s => s.id === id) ?? null;
@@ -362,6 +426,40 @@ app.get('/api/tomer/queue', (_req, res) => {
 });
 
 // POST /api/tomer/send-whatsapp — manual WhatsApp outreach stub (wires to service when configured)
+// GET /api/tomer/activity — Tomer's recent respond/silence decisions + known-members list
+app.get('/api/tomer/activity', (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit ?? '60', 10), 200);
+  const TOMER_TYPES = new Set([
+    'tomer_silent', 'tomer_responded', 're_engagement_sent',
+    'tomer_action_sent', 'tomer_birthday_sent', 'tomer_renewal_sent',
+  ]);
+
+  const events = store.getEvents({ limit: 500 })
+    .filter(e => TOMER_TYPES.has(e.type))
+    .slice(-limit)
+    .reverse();
+
+  let knownMembers = { phones: [], names: {} };
+  try { knownMembers = JSON.parse(fs.readFileSync(KNOWN_MEMBERS_PATH, 'utf8')); } catch { /* ignore */ }
+
+  res.json({
+    events,
+    stats: {
+      silenced:  events.filter(e => e.type === 'tomer_silent').length,
+      responded: events.filter(e => e.type === 'tomer_responded').length,
+      autoSent:  events.filter(e => e.type === 're_engagement_sent').length,
+    },
+    knownMembers: {
+      total: (knownMembers.phones ?? []).length,
+      list:  (knownMembers.phones ?? []).map(p => ({
+        phone: p,
+        name:  knownMembers.names?.[p] ?? null,
+      })),
+    },
+    checkedAt: new Date(),
+  });
+});
+
 app.post('/api/tomer/send-whatsapp', jsonBody, async (req, res) => {
   const { phone, message } = req.body ?? {};
   if (!phone || !message) return res.status(400).json({ error: 'phone and message required' });
@@ -500,12 +598,7 @@ app.post('/api/leads/webhook', jsonBody, async (req, res) => {
 
       logger.warn('Meta lead: could not resolve phone', { leadgenId, reason, fieldDataInPayload: (change?.field_data ?? []).length });
 
-      // Notify Eden + Melanie so they can look up the lead manually in Meta Leads Manager
-      alertOwner(
-        'ליד מטא — לא הצלחנו לשלוף טלפון',
-        `leadgen_id: ${leadgenId}\nForm: ${formId ?? '—'}\n\n${reason}\n\nחפש/י את הליד ידנית ב-Meta Leads Manager.`
-      ).catch(() => {});
-
+      // Logged to event store only — no WhatsApp alert (config issues shouldn't flood admin)
       store.logEvent('meta_lead_no_phone', null, { leadgenId, formId, reason });
       return;
     }
@@ -899,6 +992,50 @@ app.get('/api/barak/arbox-test', async (_req, res) => {
   res.json(result);
 });
 
+// ── Known-members override CRUD ───────────────────────────────────────────────
+// GET  /api/members/known          — list all manual overrides
+// POST /api/members/known          — add { phone } to the override list
+// DELETE /api/members/known/:phone — remove a phone from the list
+
+app.get('/api/members/known', (_req, res) => {
+  try {
+    const data = JSON.parse(fs.readFileSync(KNOWN_MEMBERS_PATH, 'utf8'));
+    res.json({ phones: data.phones ?? [], total: (data.phones ?? []).length });
+  } catch {
+    res.json({ phones: [], total: 0 });
+  }
+});
+
+app.post('/api/members/known', jsonBody, (req, res) => {
+  const { phone, name } = req.body ?? {};
+  if (!phone) return res.status(400).json({ error: 'phone required' });
+  try {
+    let data = { phones: [], names: {} };
+    try { data = JSON.parse(fs.readFileSync(KNOWN_MEMBERS_PATH, 'utf8')); } catch { /* fresh */ }
+    const norm = normalizeToE164(phone) ?? phone;
+    if (!data.phones.includes(norm)) data.phones.push(norm);
+    if (name) data.names = { ...(data.names ?? {}), [norm]: name };
+    fs.writeFileSync(KNOWN_MEMBERS_PATH, JSON.stringify(data, null, 2), 'utf8');
+    logger.info('[known-members] Added override', { phone: norm, name });
+    res.json({ ok: true, phone: norm, total: data.phones.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/members/known/:phone', (req, res) => {
+  try {
+    let data = { phones: [], names: {} };
+    try { data = JSON.parse(fs.readFileSync(KNOWN_MEMBERS_PATH, 'utf8')); } catch { /* fresh */ }
+    const norm = normalizeToE164(decodeURIComponent(req.params.phone)) ?? decodeURIComponent(req.params.phone);
+    data.phones = data.phones.filter(p => p !== norm);
+    fs.writeFileSync(KNOWN_MEMBERS_PATH, JSON.stringify(data, null, 2), 'utf8');
+    res.json({ ok: true, total: data.phones.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/barak/arbox-dashboard — live Arbox sync + member + revenue metrics
 app.get('/api/barak/arbox-dashboard', (_req, res) => {
   const all      = store.getAllLeads();
@@ -1095,7 +1232,7 @@ const INTENT_PATTERNS = {
   // subscription_query: questions about membership packages and what's included
   subscription_query: /מה זה כולל|כולל מה|מה כלול|מה נכלל|איזה שיעורים כלול|כמה כניסות|מנוי חודשי|מנויים|חבילה|חבילות|כמה עולה מנוי|מחיר מנוי|עלות מנוי|כמה עולה חבר|מנוי ב|מנוי ל/,
   // schedule_query covers both schedule listings AND instructor-specific questions
-  schedule_query:   /מערכת שעות|לוח שיעורים|מה יש|מתי יש|יש שיעור|יש מקום|מה קורה|סדר יום|מה הלוח|איזה שיעורים|מה התוכנית|מה הוא שיעור|מי מדריך|מי המדריך|מי מלמד|מי מנהל|מי נותן|באיזה שעה|בכמה|מה השעה|שיעור.{0,15}ב(יום|ערב|בוקר|צהריים)|ב(יום\s)?(ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת)/,
+  schedule_query:   /מערכת שעות|לוח שיעורים|מה יש|מתי יש|יש שיעור|יש מקום|מה קורה|סדר יום|מה הלוח|הלוח שלכם|הלוח שלך|שעות.*הסטודיו|שעות.*שלכם|שעות פעילות|לראות.*שעות|רוצה.*לוח|איזה שיעורים|מה התוכנית|מה הוא שיעור|מי מדריך|מי המדריך|מי מלמד|מי מנהל|מי נותן|באיזה שעה|בכמה|מה השעה|שיעור.{0,15}ב(יום|ערב|בוקר|צהריים)|ב(יום\s)?(ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת)/,
 };
 
 function detectSchedulingIntent(text) {
@@ -1114,7 +1251,7 @@ function detectSchedulingIntent(text) {
 // ── Timetable image detection ─────────────────────────────────────────────────
 
 // Keywords that mean "send me the full weekly timetable" (→ image).
-const TIMETABLE_IMAGE_RE = /מערכת שעות|מה יש השבוע|לוח.*שבוע|שבוע.*לוח|שלח[יה]?.*לוח|שלח[יה]?.*מערכת/;
+const TIMETABLE_IMAGE_RE = /מערכת שעות|מה יש השבוע|לוח.*שבוע|שבוע.*לוח|שלח[יה]?.*לוח|שלח[יה]?.*מערכת|הלוח שלכם|הלוח שלך|שעות.*הסטודיו|שעות.*שלכם|שעות.*שלך|שעות פעילות|לראות.*שעות|רוצה.*לוח|לוח שיעורים/i;
 // Day names that make a schedule query specific to one day (→ Arbox live, not image).
 const SPECIFIC_DAY_RE    = /היום|מחר|ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת/;
 
@@ -1349,6 +1486,27 @@ function isBriefAck(text) {
   return BRIEF_ACK_RE.some(p => p.test(t));
 }
 
+// ── Payment screenshot / confirmation detector ────────────────────────────────
+// Catches Bit/Paybox/bank-transfer screenshots and text confirmations.
+// These must NEVER trigger sales scripts — always ack + alert staff.
+const PAYMENT_RE = /\bbit\b|ביט|paybox|פייבוקס|העברה בנקאית|העברה.*בנק|בנק.*העברה|אישור תשלום|אישור.*תשלום|קבלה.*תשלום|שלחתי תשלום|שלחתי העברה|העברתי|ביצעתי העברה|שלמתי|תשלום עבר|הועבר|payment.*confirm|transfer.*confirm|שלחתי.*₪|₪.*שלחתי|\b\d{2,4}\s*₪|\b\d{2,4}\s*ש["״"]ח|שלחתי.*\d{2,4}\s*(שקל|ש["״"]ח)|הוראת קבע|חיוב.*כרטיס/i;
+
+function isPaymentMessage(msg) {
+  const text = (msg.mediaCaption ?? msg.text ?? '').trim();
+  // Any image with no meaningful caption is likely a screenshot → treat as payment candidate
+  if ((msg.type === 'image' || msg.mediaType === 'image') && (!text || text === '[תמונה]')) return true;
+  return PAYMENT_RE.test(text);
+}
+
+// ── Spam / irrelevant-message filter ─────────────────────────────────────────
+// Voting campaigns, chain messages, coupons etc. — silently logged, no AI reply.
+const SPAM_RE = /הצביע[וה]?|לצביע\b|הצבעה.*תחרות|תחרות.*הצבעה|הצבע.*קישור|chain\s*message|forward.*message|העבר.*לחברים|שרשרת הודעות|קופון חינם|קבל.*חינם.*לחץ|click.*here.*win|win.*free/i;
+
+function isSpamMessage(text) {
+  if (!text || text.trim().length < 5) return false;
+  return SPAM_RE.test(text);
+}
+
 /**
  * MessageId deduplication — prevents Green API double-delivery from running
  * the pipeline twice and sending duplicate replies.
@@ -1466,8 +1624,16 @@ async function processInboundWAMessage(msg) {
   // 2. Intent detection (only meaningful for text messages)
   const intent = msg.type === 'text' ? detectSchedulingIntent(msg.text) : 'general';
 
-  // ── Reschedule intent — lead asks to change an existing appointment ──────────
-  if (intent === 'reschedule') {
+  // ── Client identity — resolved HERE, before any early-return path ─────────────
+  // Must come before the reschedule / callback handlers so they can guard correctly.
+  const arboxConfirmedClient = clientMatch.found &&
+    (clientMatch.matchType === 'member' || clientMatch.role === 'aggregatorMember');
+  const cachedIsClient        = store.getLead(fromNorm)?.meta?.isClient === true;
+  const knownMemberOverride   = isKnownMember(fromNorm) || isKnownMember(fromIsraeli);
+  const isExistingClient      = arboxConfirmedClient || cachedIsClient || knownMemberOverride;
+
+  // ── Reschedule intent — LEADS ONLY (existing clients handled via Tomer path) ───
+  if (intent === 'reschedule' && !isExistingClient) {
     const existingApt = aptStore.getActiveByPhone(fromNorm);
     if (existingApt) {
       aptStore.update(existingApt.id, { status: 'rescheduled' });
@@ -1643,6 +1809,55 @@ async function processInboundWAMessage(msg) {
     };
   }
 
+  // ── Spam filter — silently discard off-topic messages ────────────────────────
+  if (msg.type === 'text' && isSpamMessage(msg.text)) {
+    logger.info('Spam/irrelevant message — skipping AI pipeline', { from: fromNorm, preview: msg.text?.slice(0, 60) });
+    store.logEvent('spam_filtered', fromNorm, { preview: msg.text?.slice(0, 60) });
+    const spamEntry = inbox.push({
+      from: fromNorm, fromIsraeli,
+      name: msg.name ?? null,
+      text: msg.text, messageId: msg.messageId, timestamp: msg.timestamp,
+      receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
+      clientMatch, intent: 'spam', route: 'spam_filtered', barakReply: null,
+    });
+    return { inboxEntry: spamEntry, clientMatch, intent: 'spam', route: 'spam_filtered', barakReply: null };
+  }
+
+  // ── Payment screenshot / confirmation — ack and alert staff ──────────────────
+  // Must fire before any agent routing so an existing member sending a Bit screenshot
+  // never ends up with Barak's "מאיזה אזור את?" as a reply.
+  if (isPaymentMessage(msg)) {
+    const senderName = msg.name ?? clientMatch.arboxName ?? fromIsraeli ?? fromNorm;
+    const paymentAck = `תודה רבה! קיבלנו את אישור התשלום ✅ הצוות שלנו יעדכן את המערכת בקרוב. לכל שאלה — אנחנו כאן 😊`;
+
+    if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
+      await sendText(fromNorm, paymentAck).catch(err =>
+        logger.warn('Payment ack send failed', { from: fromNorm, error: err.message })
+      );
+      _markReplied(fromNorm);
+    }
+
+    alertOwner(
+      `💳 אישור תשלום — ${senderName}`,
+      `*${senderName}* (${fromNorm}) שלח/ה ${msg.type === 'image' ? 'צילום מסך תשלום' : 'אישור תשלום'}.\n\n` +
+      (msg.text && msg.text !== '[תמונה]' ? `תוכן: ${msg.text.slice(0, 200)}` : '(תמונה ללא כיתוב)')
+    ).catch(() => {});
+
+    store.logEvent('payment_received', fromNorm, { type: msg.type, preview: msg.text?.slice(0, 80), senderName });
+    logger.info('Payment message detected — acked and alerted staff', { from: fromNorm, type: msg.type });
+
+    const pmtEntry = inbox.push({
+      from: fromNorm, fromIsraeli,
+      name: msg.name ?? clientMatch.arboxName ?? null,
+      text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
+      receivedAt: new Date(), mediaType: msg.type,
+      mediaCaption: msg.mediaCaption ?? null, mediaId: msg.mediaId ?? null,
+      clientMatch, intent: 'payment', route: 'payment_ack', barakReply: paymentAck,
+    });
+    persist.saveLeads(store);
+    return { inboxEntry: pmtEntry, clientMatch, intent: 'payment', route: 'payment_ack', barakReply: paymentAck };
+  }
+
   // 3. Routing decision — strict Barak / Tomer boundary
   //
   //   The primary split is ALWAYS membership status, never intent.
@@ -1657,19 +1872,29 @@ async function processInboundWAMessage(msg) {
   //   buildSchedulingReply is shared Arbox infrastructure used by both agents.
   //   The route label reflects the correct persona so the inbox attributes
   //   the reply to the right agent.
-  let route          = 'unhandled';
-  let barakReply     = null;
-  let timetableImgUrl = null;
+  let route            = 'unhandled';
+  let barakReply       = null;
+  let timetableImgUrl  = null;   // first timetable image URL (sent with caption)
+  let timetable2ImgUrl = null;   // second timetable image URL (sent as follow-up)
 
-  const isExistingClient = clientMatch.found && clientMatch.matchType === 'member';
   const isSchedulingMsg  = intent !== 'general';
 
   // ── Brief-ack + cooldown guard ───────────────────────────────────────────────
   const ackDetected  = isBriefAck(msg.text);
   const inCooldown   = _isInCooldown(fromNorm);
-  const skipAiReply  = ackDetected || inCooldown;
 
-  if (ackDetected)  logger.info('Brief ack — skipping AI reply', { from: fromNorm, text: msg.text?.slice(0, 20) });
+  // Exception: when Barak is waiting for a location confirmation, a brief "כן"
+  // must still reach the lead agent to update locationViable.
+  // Without this, "כן" gets swallowed and the location check repeats every turn.
+  const awaitingLocation = !isExistingClient && (() => {
+    const qd = store.getLead(fromNorm)?.meta?.qualData ?? {};
+    return qd.locationCheckAsked === true && qd.locationViable == null;
+  })();
+
+  const skipAiReply  = (ackDetected && !awaitingLocation) || inCooldown;
+
+  if (ackDetected && !awaitingLocation) logger.info('Brief ack — skipping AI reply', { from: fromNorm, text: msg.text?.slice(0, 20) });
+  if (awaitingLocation && ackDetected)  logger.info('Brief ack allowed — awaiting location confirmation', { from: fromNorm });
   if (inCooldown)   logger.warn('Reply cooldown — skipping AI reply', { from: fromNorm });
 
   if (skipAiReply) {
@@ -1686,13 +1911,13 @@ async function processInboundWAMessage(msg) {
 
     if (isSchedulingMsg) {
       // Scheduling query from an existing member: Tomer uses Arbox live data
-      const imgUrl = getScheduleImageUrl();
+      const timetableUrlTomer = getActiveTimetableUrl();
       if (intent === 'schedule_query'
           && isWeeklyTimetableQuery(msg.text)
-          && imgUrl
-          && fs.existsSync(SCHEDULE_PNG_PATH)) {
-        barakReply     = `הנה מערכת השעות העדכנית של Shape Studio! 🏋️‍♀️`;
-        timetableImgUrl = imgUrl;
+          && timetableUrlTomer) {
+        barakReply       = `הנה מערכת השעות העדכנית של Shape Studio! 🏋️‍♀️`;
+        timetableImgUrl  = timetableUrlTomer;
+        timetable2ImgUrl = getActiveTimetable2Url(); // second image (may be null)
       } else {
         try { barakReply = await buildSchedulingReply(intent, msg, clientMatch); } catch { /* non-fatal */ }
       }
@@ -1703,17 +1928,26 @@ async function processInboundWAMessage(msg) {
         );
       }
     } else if (msg.type === 'text' && msg.text?.trim()) {
-      // General support / retention message → Tomer AI
+      // Existing member general message → Tomer silence classifier (strict rules)
       try {
-        const tomerPrompt =
-          `הודעה נכנסת מחבר/ת סטודיו פעיל/ה.\n` +
-          `שם: ${msg.name ?? clientMatch.arboxName ?? 'לא ידוע'}\n` +
-          `הודעה: "${msg.text}"\n\n` +
-          `ענה בעברית בצורה אישית, חמה ותומכת — עד 3 משפטים.`;
-        barakReply = await tomerAgent.chat(tomerPrompt);
+        const result = await tomerAgent.handleInboundMember({
+          name:        msg.name,
+          text:        msg.text,
+          phone:       fromNorm,
+          clientMatch,
+        });
+        if (result.reply) barakReply = result.reply;
+        // result.reply === null → Tomer chose silence; no WhatsApp message is sent
+        logger.info('[tomer] Inbound decision', { decision: result.decision, reason: result.reason, from: fromNorm });
       } catch (err) {
-        logger.warn('Tomer general reply failed', { error: err.message, from: fromNorm });
+        logger.warn('Tomer inbound handler failed', { error: err.message, from: fromNorm });
       }
+    } else if (msg.type !== 'text' && msg.type !== 'reaction') {
+      // Non-text, non-payment media from an existing client (image, audio, document, etc.)
+      // — a warm holding reply so the person knows we received it.
+      barakReply = `תודה! קיבלנו את ההודעה 😊 הצוות שלנו יחזור אליך בהקדם.`;
+      // Logged to inbox only — no alertOwner (staff sees it in the dashboard)
+      store.logEvent('client_media_in', fromNorm, { type: msg.type, name: msg.name ?? clientMatch.arboxName });
     }
 
   } else {
@@ -1726,13 +1960,13 @@ async function processInboundWAMessage(msg) {
 
     if (isSchedulingMsg) {
       // Scheduling query from a lead: Barak uses Arbox live data
-      const imgUrl = getScheduleImageUrl();
+      const timetableUrlBarak = getActiveTimetableUrl();
       if (intent === 'schedule_query'
           && isWeeklyTimetableQuery(msg.text)
-          && imgUrl
-          && fs.existsSync(SCHEDULE_PNG_PATH)) {
-        barakReply     = `הנה מערכת השעות העדכנית של Shape Studio! 🏋️‍♀️`;
-        timetableImgUrl = imgUrl;
+          && timetableUrlBarak) {
+        barakReply       = `הנה מערכת השעות העדכנית של Shape Studio! 🏋️‍♀️`;
+        timetableImgUrl  = timetableUrlBarak;
+        timetable2ImgUrl = getActiveTimetable2Url(); // second image (may be null)
       } else {
         try { barakReply = await buildSchedulingReply(intent, msg, clientMatch); } catch { /* non-fatal */ }
       }
@@ -1775,30 +2009,59 @@ async function processInboundWAMessage(msg) {
     barakReply,
   });
 
-  // 5. Lead store upsert + global event log
-  const existing = store.getLead(fromNorm) ?? {};
-  store.upsertLead(fromNorm, {
-    name:         msg.name ?? clientMatch.arboxName ?? existing.name,
-    messageCount: (existing.messageCount ?? 0) + 1,
-    arboxSynced:  clientMatch.found,
-    arboxId:      clientMatch.arboxId ?? existing.arboxId,
-    meta: {
-      ...(existing.meta ?? {}),
-      isClient:   isExistingClient,
-      lastIntent: intent,
-      source:     'whatsapp_live',
-    },
-  });
+  // 5. Store — strict bifurcation: existing clients NEVER create lead records
+  if (isExistingClient) {
+    // ── Existing client path ──────────────────────────────────────────────────
+    // 5a. Self-healing cache: persist Arbox-confirmed members to known_members.json
+    //     so future lookups work even when Arbox API is down.
+    if (arboxConfirmedClient) {
+      _autoAddKnownMember(fromNorm, clientMatch.arboxName ?? msg.name);
+    }
 
-  store.logEvent('message_in', fromNorm, {
-    preview:     (msg.text ?? '').slice(0, 80),
-    intent,
-    route,
-    inboxId:     inboxEntry.id,
-    clientFound: clientMatch.found,
-    clientName:  clientMatch.arboxName,
-    source:      'whatsapp_live',
-  });
+    // 5b. Destroy any stale lead record that was created before we identified them
+    //     as an existing client (e.g. from a previous session where Arbox timed out).
+    if (store.getLead(fromNorm)) {
+      store.deleteLead(fromNorm);
+      logger.info('[pipeline] Removed stale lead record for confirmed member', { from: fromNorm });
+    }
+
+    // 5c. Log with a client-specific event type — never pollutes the leads feed
+    store.logEvent('client_message_in', fromNorm, {
+      preview:    (msg.text ?? '').slice(0, 80),
+      intent,
+      route,
+      inboxId:    inboxEntry.id,
+      clientName: clientMatch.arboxName ?? msg.name,
+      source:     'whatsapp_live',
+    });
+
+  } else {
+    // ── Lead path ─────────────────────────────────────────────────────────────
+    // 5a. Create / update the lead record — only for real leads / unknown senders
+    const existing = store.getLead(fromNorm) ?? {};
+    store.upsertLead(fromNorm, {
+      name:         msg.name ?? clientMatch.arboxName ?? existing.name,
+      messageCount: (existing.messageCount ?? 0) + 1,
+      arboxSynced:  clientMatch.found,
+      arboxId:      clientMatch.arboxId ?? existing.arboxId,
+      meta: {
+        ...(existing.meta ?? {}),
+        lastIntent: intent,
+        source:     'whatsapp_live',
+      },
+    });
+
+    // 5b. Log to the leads event feed
+    store.logEvent('message_in', fromNorm, {
+      preview:     (msg.text ?? '').slice(0, 80),
+      intent,
+      route,
+      inboxId:     inboxEntry.id,
+      clientFound: clientMatch.found,
+      clientName:  clientMatch.arboxName,
+      source:      'whatsapp_live',
+    });
+  }
 
   logger.info('WA pipeline processed', {
     from:    fromNorm,
@@ -1811,11 +2074,21 @@ async function processInboundWAMessage(msg) {
   // 6. Auto-reply when configured and Barak has a draft
   if (barakReply && process.env.WHATSAPP_AUTO_REPLY === 'true') {
     if (timetableImgUrl) {
-      // Send the weekly timetable image; fall back to text if the image send fails
+      // Send timetable image 1 (with caption), then image 2 if available, then a follow-up question.
+      const timetableFollowUp = `ראית משהו שמתאים לך? יספר/י לי איזה יום ושעה בדרך כלל עובדים לך 😊`;
       sendFileByUrl(fromNorm, timetableImgUrl, 'schedule.png', barakReply)
-        .then(() => {
+        .then(async () => {
           store.logEvent('timetable_image_sent', fromNorm, { imageUrl: timetableImgUrl });
-          _markReplied(fromNorm); // start cooldown window
+          _markReplied(fromNorm);
+          if (timetable2ImgUrl) {
+            await sendFileByUrl(fromNorm, timetable2ImgUrl, 'schedule2.png', '')
+              .then(() => store.logEvent('timetable2_image_sent', fromNorm, { imageUrl: timetable2ImgUrl }))
+              .catch(err => logger.warn('Timetable2 image send failed', { from: fromNorm, error: err.message }));
+          }
+          // Follow-up question after all images — always sent so the conversation doesn't stall
+          await sendText(fromNorm, timetableFollowUp)
+            .then(() => store.logEvent('timetable_followup_sent', fromNorm, { preview: timetableFollowUp.slice(0, 60) }))
+            .catch(err => logger.warn('Timetable follow-up send failed', { from: fromNorm, error: err.message }));
         })
         .catch(err => {
           logger.warn('Timetable image send failed — falling back to text reply', { from: fromNorm, error: err.message });
@@ -2706,6 +2979,106 @@ app.post('/api/admin/sync-agent-knowledge', async (_req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
+// STUDIO ASSETS API — Waze URL, timetable link (editable from dashboard)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/admin/studio-assets — return current Waze + timetable settings
+app.get('/api/admin/studio-assets', (_req, res) => {
+  res.json({ ok: true, ...studioAssets.getAssets() });
+});
+
+// POST /api/admin/studio-assets — save updated text values (wazeUrl, timetableUrl)
+app.post('/api/admin/studio-assets', jsonBody, (req, res) => {
+  try {
+    const saved = studioAssets.saveAssets(req.body);
+    store.logEvent('studio_assets_updated', null, { wazeSet: !!saved.wazeUrl, timetableSet: !!saved.timetableUrl });
+    res.json({ ok: true, ...saved });
+  } catch (err) {
+    logger.error('[admin] studio-assets save failed', { error: err.message });
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// POST /api/admin/studio-assets/timetable — upload timetable image as base64 JSON
+// Body: { imageData: "data:image/jpeg;base64,..." }
+// No multer needed — uses a generous JSON body limit for image payloads.
+const largeJsonBody = express.json({ limit: '10mb' });
+
+app.post('/api/admin/studio-assets/timetable', largeJsonBody, (req, res) => {
+  try {
+    const { imageData } = req.body ?? {};
+    if (!imageData) return res.status(400).json({ ok: false, error: 'imageData required' });
+
+    const match = imageData.match(/^data:image\/([a-zA-Z0-9+]+);base64,(.+)$/);
+    if (!match) return res.status(400).json({ ok: false, error: 'invalid base64 image format' });
+
+    const [, mime, b64] = match;
+    // Map common MIME subtypes to safe file extensions
+    const extMap = { jpeg: 'jpg', jpg: 'jpg', png: 'png', webp: 'webp', gif: 'gif' };
+    const ext    = extMap[mime.toLowerCase()] ?? 'jpg';
+    const buffer = Buffer.from(b64, 'base64');
+
+    const result = studioAssets.saveTimetableImage(buffer, ext);
+    store.logEvent('timetable_image_uploaded', null, { sizeKb: Math.round(buffer.length / 1024), ext });
+    logger.info('[admin] Timetable image uploaded', { sizeKb: Math.round(buffer.length / 1024), ext });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    logger.error('[admin] timetable image upload failed', { error: err.message });
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// GET /api/admin/timetable-image — serve timetable image 1 from DATA_DIR
+app.get('/api/admin/timetable-image', (_req, res) => {
+  const imgPath = studioAssets.getTimetableImagePath();
+  if (!imgPath) return res.status(404).json({ ok: false, error: 'No timetable image uploaded' });
+  if (!fs.existsSync(imgPath)) return res.status(404).json({ ok: false, error: 'Timetable image file not found' });
+
+  const ext     = imgPath.split('.').pop() ?? 'jpg';
+  const mimeMap = { jpg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif' };
+  res.setHeader('Content-Type', mimeMap[ext] ?? 'image/jpeg');
+  res.setHeader('Cache-Control', 'no-cache');
+  fs.createReadStream(imgPath).pipe(res);
+});
+
+// POST /api/admin/studio-assets/timetable2 — upload second timetable image as base64
+app.post('/api/admin/studio-assets/timetable2', largeJsonBody, (req, res) => {
+  try {
+    const { imageData } = req.body ?? {};
+    if (!imageData) return res.status(400).json({ ok: false, error: 'imageData required' });
+
+    const match = imageData.match(/^data:image\/([a-zA-Z0-9+]+);base64,(.+)$/);
+    if (!match) return res.status(400).json({ ok: false, error: 'invalid base64 image format' });
+
+    const [, mime, b64] = match;
+    const extMap = { jpeg: 'jpg', jpg: 'jpg', png: 'png', webp: 'webp', gif: 'gif' };
+    const ext    = extMap[mime.toLowerCase()] ?? 'jpg';
+    const buffer = Buffer.from(b64, 'base64');
+
+    const result = studioAssets.saveTimetable2Image(buffer, ext);
+    store.logEvent('timetable2_image_uploaded', null, { sizeKb: Math.round(buffer.length / 1024), ext });
+    logger.info('[admin] Timetable2 image uploaded', { sizeKb: Math.round(buffer.length / 1024), ext });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    logger.error('[admin] timetable2 image upload failed', { error: err.message });
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// GET /api/admin/timetable2-image — serve timetable image 2 from DATA_DIR
+app.get('/api/admin/timetable2-image', (_req, res) => {
+  const imgPath = studioAssets.getTimetable2ImagePath();
+  if (!imgPath) return res.status(404).json({ ok: false, error: 'No timetable2 image uploaded' });
+  if (!fs.existsSync(imgPath)) return res.status(404).json({ ok: false, error: 'Timetable2 image file not found' });
+
+  const ext     = imgPath.split('.').pop() ?? 'jpg';
+  const mimeMap = { jpg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif' };
+  res.setHeader('Content-Type', mimeMap[ext] ?? 'image/jpeg');
+  res.setHeader('Cache-Control', 'no-cache');
+  fs.createReadStream(imgPath).pipe(res);
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
 // STAFF MANAGEMENT API
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -3015,15 +3388,42 @@ process.on('SIGTERM', () => {
 app.listen(PORT, () => {
   logger.info(`Shape Studio Agent running — http://localhost:${PORT}`);
 
-  // ── Persistence: hydrate in-memory stores from disk snapshots ──────────────
+  // ── Persistence: guarantee DATA_DIR exists, then hydrate stores ─────────────
+  //
+  // Proactively create the directory NOW — not lazily on first write.
+  // This guarantees all subsequent loadLeads / loadInbox calls and the
+  // 60-second periodic save can never fail because the directory is missing.
+  //
+  // Railway setup required (one-time):
+  //   1. Add a Volume mounted at /data  (Railway dashboard → Service → Volumes)
+  //   2. Add a Variable:  DATA_DIR=/data
+  //
+  // persist.DATA_DIR === studioAssets.DATA_DIR because both resolve:
+  //   process.env.DATA_DIR  ?? path.join(__dirname, '../data')
+  // so a single Volume covers leads, inbox, studio_assets.json and timetable.jpg.
+  try {
+    fs.mkdirSync(persist.DATA_DIR, { recursive: true });
+  } catch (mkErr) {
+    logger.error('[startup] Could not create DATA_DIR — writes may fail', {
+      dir: persist.DATA_DIR, error: mkErr.message,
+    });
+  }
+
+  // Log the storage configuration so Railway logs immediately confirm the state
+  const dataFiles = (() => {
+    try { return fs.readdirSync(persist.DATA_DIR); } catch { return []; }
+  })();
+  logger.info('[data] Storage directory ready', {
+    path:        persist.DATA_DIR,
+    volume:      process.env.DATA_DIR
+      ? '✅ Railway Volume active — data survives deploys'
+      : '⚠️  local ./data — ephemeral on Railway (set DATA_DIR=/data + mount Volume)',
+    dirsMatch:   persist.DATA_DIR === studioAssets.DATA_DIR,
+    existingFiles: dataFiles.filter(f => !f.endsWith('.tmp')),
+  });
+
   persist.loadLeads(store);
   persist.loadInbox(inbox);
-  logger.info('[persist] Data directory', {
-    path:   persist.DATA_DIR,
-    volume: process.env.DATA_DIR
-      ? '✅ Railway Volume (DATA_DIR env override — data survives deploys)'
-      : '⚠️  local ./data (ephemeral on deploy — set DATA_DIR=/data + mount a Volume)',
-  });
 
   // ── Periodic save: flush both stores to disk every 60 seconds ──────────────
   setInterval(() => persist.saveAll(store, inbox), 60_000).unref();
@@ -3054,3 +3454,4 @@ app.listen(PORT, () => {
 });
 
 module.exports = app;
+

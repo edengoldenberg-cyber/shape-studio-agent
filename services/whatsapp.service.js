@@ -167,7 +167,7 @@ async function sendText(to, text, { bypassQuietHours = false } = {}) {
     logger.info('Quiet hours active — queuing message', { to });
     quietQueue.push({ to, text, queuedAt: new Date() });
     // Send an immediate acknowledgement
-    await _dispatch(to, `Hey! Got your message 🙂 I'll get back to you first thing in the morning. Have a great evening!`);
+    await _dispatch(to, `קיבלנו את הודעתך 🙂 נחזור אליך מחר בבוקר. ערב טוב!`);
     return { queued: true, releaseAt: nextMorningRelease() };
   }
   return _dispatch(to, text);
@@ -204,7 +204,7 @@ async function releaseQueuedMessages() {
 
   while (quietQueue.length > 0) {
     const { to, text } = quietQueue.shift();
-    const morning = `Good morning ☀️ Hope your day is off to a great start!\n\n${text}`;
+    const morning = `בוקר טוב ☀️\n\n${text}`;
     await _dispatch(to, morning);
   }
 }

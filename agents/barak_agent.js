@@ -124,15 +124,40 @@ async function lookupClient(phoneOrName) {
   const query = (phoneOrName ?? '').trim();
   if (!query) return { error: 'שם או טלפון נדרש' };
 
-  const normQuery = query.replace(/\s|\+/g, '').toLowerCase();
-  const isPhone   = /^[0-9+\s\-]{7,}$/.test(query);
+  // Strip all punctuation so "050-123-4567", "+9720501234567", "050 123 4567"
+  // all normalise to the same digit string before comparison.
+  const stripPhone = (s) => (s ?? '').replace(/[\s\+\-\.\(\)]/g, '');
+
+  // Normalise to phone CORE: remove leading zeros, then remove Israeli country code 972.
+  // "0501234567" → "501234567"
+  // "972501234567" → "501234567"
+  // "+972501234567" → "501234567"  (+ already stripped by stripPhone)
+  // null / "" → "" (will be caught by length guard)
+  const phoneCore = (n) => {
+    let s = n.replace(/^0+/, '');       // drop leading zeros
+    if (s.startsWith('972')) s = s.slice(3); // drop country code
+    return s;
+  };
+
+  const normQuery = stripPhone(query).toLowerCase();
+  const qCore     = phoneCore(normQuery);
+  const isPhone   = /^[0-9]{7,}$/.test(normQuery);
 
   const [members, leads] = await Promise.all([
     arbox.getMembers({ limit: 500 }).catch(() => []),
     arbox.getLeads({ limit: 500 }).catch(() => []),
   ]);
 
-  const matchPhone = (p) => (p ?? '').replace(/\s|\+/g, '').includes(normQuery);
+  // EXACT core match — avoids the false-positive from substring matching.
+  // Root-cause fix: `'anyPhone'.includes('')` is always true,
+  // so a null/empty Arbox phone was matching every incoming number.
+  const matchPhone = (p) => {
+    const np = stripPhone(p ?? '');
+    if (np.length < 7) return false;   // null / empty / garbage phones never match
+    const npCore = phoneCore(np);
+    if (npCore.length < 7) return false; // still need a meaningful number after normalisation
+    return npCore === qCore;
+  };
   const matchName  = (fn, ln) =>
     [(fn ?? ''), (ln ?? ''), `${fn ?? ''} ${ln ?? ''}`]
       .some(s => s.toLowerCase().includes(normQuery));

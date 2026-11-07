@@ -333,6 +333,7 @@
                 <button class="subnav-btn" data-tseg="renewals">💳 חידוש מנוי <span class="seg-badge" id="badge-renewals">—</span></button>
                 <button class="subnav-btn" data-tseg="birthdays">🎉 ימי הולדת <span class="seg-badge" id="badge-birthdays">—</span></button>
                 <button class="subnav-btn" data-tseg="win_back">🔄 שימור חוזר <span class="seg-badge" id="badge-winback">—</span></button>
+                <button class="subnav-btn" data-tseg="activity">📊 פעילות וניטור <span class="seg-badge" id="badge-activity">—</span></button>
               </div>
               <button class="btn btn-secondary" id="btn-tomer-refresh" style="font-size:13px;padding:6px 14px">🔄 רענן</button>
             </div>
@@ -400,6 +401,51 @@
                   <tbody id="tseg-winback-tbody"><tr><td colspan="4" class="empty-state">לחץ "רענן" לטעינה</td></tr></tbody>
                 </table>
               </div>
+            </div>
+
+            <!-- ── Segment: Activity & Monitor ─────────────────────────── -->
+            <div id="tseg-activity" class="tseg-panel" style="display:none">
+              <div class="seg-desc-bar">פעולות תומר בזמן אמת — מתי ענה, מתי שתק, ורשימת לקוחות ידועים לעקיפת Arbox.</div>
+
+              <!-- Stats row -->
+              <div style="display:flex;gap:12px;padding:12px 20px 4px;flex-wrap:wrap">
+                <div class="arbox-ov-card" style="flex:1;min-width:90px;padding:12px 8px">
+                  <div class="arbox-ov-icon">🤫</div>
+                  <div class="arbox-ov-val" id="tact-silenced">—</div>
+                  <div class="arbox-ov-lbl">שתיקות</div>
+                </div>
+                <div class="arbox-ov-card" style="flex:1;min-width:90px;padding:12px 8px">
+                  <div class="arbox-ov-icon">💬</div>
+                  <div class="arbox-ov-val" id="tact-responded">—</div>
+                  <div class="arbox-ov-lbl">תשובות</div>
+                </div>
+                <div class="arbox-ov-card" style="flex:1;min-width:90px;padding:12px 8px">
+                  <div class="arbox-ov-icon">📤</div>
+                  <div class="arbox-ov-val" id="tact-auto">—</div>
+                  <div class="arbox-ov-lbl">אוטו׳</div>
+                </div>
+              </div>
+
+              <!-- Known Members -->
+              <h4 style="margin:12px 20px 6px;font-size:13px;color:var(--warm)">👥 לקוחות ידועים (עוקפי Arbox)</h4>
+              <div style="margin:0 20px 10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+                <input type="text" id="km-phone-input" class="field-input" placeholder="972501234567" style="width:155px;font-size:12px"/>
+                <input type="text" id="km-name-input"  class="field-input" placeholder="שם (אופציונלי)" style="width:140px;font-size:12px"/>
+                <button class="btn btn-primary" id="btn-km-add" style="font-size:12px;padding:6px 14px">+ הוסף</button>
+              </div>
+              <div id="km-list-wrap" style="margin:0 20px 16px;min-height:24px">
+                <div id="km-list" style="font-size:12px;color:var(--muted)">טוען...</div>
+              </div>
+
+              <!-- Activity Feed -->
+              <h4 style="margin:4px 20px 6px;font-size:13px;color:var(--warm)">📋 יומן פעילות תומר</h4>
+              <div class="table-wrapper">
+                <table class="leads-table">
+                  <thead><tr><th>זמן</th><th>שולח/ת</th><th>החלטה</th><th>סיבה</th><th>תצוגה מקדימה</th></tr></thead>
+                  <tbody id="tact-feed-tbody"><tr><td colspan="5" class="empty-state">לחץ "רענן" לטעינה</td></tr></tbody>
+                </table>
+              </div>
+              <div class="panel-footer"><span class="refresh-tag" id="tact-updated"></span></div>
             </div>
 
           </div><!-- /panel -->
@@ -946,6 +992,7 @@
         <button class="kn-sv-btn active" data-knview="staff">👩‍🏫 צוות ומומחיות</button>
         <button class="kn-sv-btn"        data-knview="packages">💳 מנויים ומחירים</button>
         <button class="kn-sv-btn"        data-knview="verify">✅ אימות ידע</button>
+        <button class="kn-sv-btn"        data-knview="assets">🗺️ נכסי סטודיו</button>
       </nav>
 
       <!-- VIEW: Staff Directory -->
@@ -1015,6 +1062,123 @@
               </tbody>
             </table>
           </div>
+        </div>
+      </div>
+
+      <!-- VIEW: Studio Assets — Waze URL + timetable link -->
+      <div id="kn-view-assets" style="display:none">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>🗺️ נכסי סטודיו — ניווט ולוח שעות</h2>
+            <button class="btn btn-primary" id="btn-save-assets" style="font-size:12px;padding:6px 14px">💾 שמור שינויים</button>
+          </div>
+          <div class="knowledge-hint">
+            ברק ישלוף ערכים אלה אוטומטית כשלקוח מבקש ניווט או לוח שעות — ללא צורך לעדכן קוד.
+            שינויים נכנסים לתוקף <strong>מיד</strong> בהודעת הווטסאפ הבאה.
+          </div>
+
+          <div style="display:flex;flex-direction:column;gap:20px;padding:16px 0">
+
+            <!-- Waze URL field -->
+            <div style="display:flex;flex-direction:column;gap:6px">
+              <label style="font-weight:600;font-size:13px">🗺️ קישור ניווט Waze</label>
+              <input
+                class="kn-edit-input"
+                id="asset-waze-url"
+                type="url"
+                placeholder="https://waze.com/ul?q=דרך השדה 12 פרדס חנה-כרכור&navigate=yes"
+                style="width:100%;max-width:620px;font-size:12px"
+              />
+              <div style="font-size:11px;color:var(--muted)">
+                ברק ישלח קישור זה כשלקוח שואל "איך מגיעים?" —
+                <a id="asset-waze-preview" href="#" target="_blank" rel="noopener" style="color:var(--accent)">בדוק קישור ↗</a>
+              </div>
+            </div>
+
+            <!-- Timetable image upload -->
+            <div style="display:flex;flex-direction:column;gap:8px">
+              <label style="font-weight:600;font-size:13px">📅 תמונת מערכת שעות</label>
+
+              <!-- Current image preview (shown when image is uploaded) -->
+              <div id="timetable-current-wrap" style="display:none">
+                <img
+                  id="timetable-preview"
+                  src=""
+                  alt="תצוגה מקדימה של מערכת השעות"
+                  style="max-width:320px;max-height:220px;border-radius:8px;border:1px solid var(--border);display:block"
+                />
+              </div>
+
+              <!-- Upload status -->
+              <div id="timetable-upload-status" style="font-size:12px;color:var(--muted)">
+                לא הועלתה תמונה
+              </div>
+
+              <!-- File picker (styled as button) -->
+              <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+                <label
+                  id="timetable-file-label"
+                  style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:7px 14px;font-size:12px;font-weight:500"
+                >
+                  📷 בחר תמונה מהגלריה
+                  <input type="file" id="asset-timetable-file" accept="image/*" style="display:none" />
+                </label>
+                <span id="timetable-file-name" style="font-size:12px;color:var(--muted)"></span>
+                <span id="timetable-upload-spinner" style="font-size:12px;display:none">⏳ מעלה...</span>
+              </div>
+              <div style="font-size:11px;color:var(--muted)">
+                ברק ישלח תמונה זו <strong>ישירות בוואטסאפ</strong> כשלקוח מבקש לוח שיעורים.
+              </div>
+
+              <!-- Optional URL fallback -->
+              <div style="font-size:11px;color:var(--muted);margin-top:4px">— או: הזן קישור חיצוני (אם אין תמונה מועלת) —</div>
+              <input
+                class="kn-edit-input"
+                id="asset-timetable-url"
+                type="url"
+                placeholder="https://... (URL לתמונה חיצונית — אופציונלי)"
+                style="width:100%;max-width:620px;font-size:12px"
+              />
+            </div>
+
+            <!-- ─── Timetable image 2 ──────────────────────────────────────── -->
+            <div style="display:flex;flex-direction:column;gap:8px;margin-top:8px;padding-top:16px;border-top:1px solid var(--border)">
+              <label style="font-weight:600;font-size:13px">📅 תמונת מערכת שעות נוספת (תמונה 2)</label>
+
+              <!-- Current image 2 preview -->
+              <div id="timetable2-current-wrap" style="display:none">
+                <img
+                  id="timetable2-preview"
+                  src=""
+                  alt="תצוגה מקדימה של מערכת שעות 2"
+                  style="max-width:320px;max-height:220px;border-radius:8px;border:1px solid var(--border);display:block"
+                />
+              </div>
+
+              <!-- Upload status 2 -->
+              <div id="timetable2-upload-status" style="font-size:12px;color:var(--muted)">
+                לא הועלתה תמונה
+              </div>
+
+              <!-- File picker 2 -->
+              <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+                <label
+                  style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:7px 14px;font-size:12px;font-weight:500"
+                >
+                  📷 בחר תמונה מהגלריה
+                  <input type="file" id="asset-timetable2-file" accept="image/*" style="display:none" />
+                </label>
+                <span id="timetable2-file-name" style="font-size:12px;color:var(--muted)"></span>
+                <span id="timetable2-upload-spinner" style="font-size:12px;display:none">⏳ מעלה...</span>
+              </div>
+              <div style="font-size:11px;color:var(--muted)">
+                ברק ישלח תמונה זו <strong>מיד אחרי התמונה הראשונה</strong> כשלקוח מבקש לוח שיעורים.
+              </div>
+            </div>
+
+          </div>
+
+          <div id="assets-save-status" style="font-size:12px;color:var(--success);display:none;margin-top:4px"></div>
         </div>
       </div>
 

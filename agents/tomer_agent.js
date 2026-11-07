@@ -17,6 +17,71 @@ const TOMER_PROMPT = BUSINESS_CONTEXT + '\n\n---\n\n' + fs.readFileSync(
 
 let tomerHistory = [];
 
+// ── Inbound message classification ───────────────────────────────────────────
+// Decides whether Tomer should reply or stay completely silent.
+
+// Brief social responses that need no reply
+const SILENCE_RE = /^(תודה( רבה)?|תנקיו|thanks?|ok[ay]?|אוקיי?|סבבה?|בסדר( גמור)?|קיבלתי|הבנתי|ברור|מעולה|נהדר|מצוין|חמוד|מגניב|יופי|שמעתי|פה|כאן|ביי|bye|ciao|😊|👍|🙏|❤️|✅|🙂|😁|💪|🎉)\.?!*$/iu;
+
+// Short chitchat with no studio context
+const CHITCHAT_RE = /^(היי|hey|hi|hola|מה שלומך|מה נשמע|מה קורה|תהיה טוב|יהיה בסדר|בהצלחה|להתראות)!*$/iu;
+
+// Keywords that signal the member actually needs something from the studio
+const ACTIONABLE_RE = /ביטול|לבטל|לשנות|שעה|שיעור|לוח|מנוי|חידוש|תשלום|כניסה|להגיע|מגיע[ה]?|להירשם|בעיה|שאלה|עזרה|אימון|להצטרף|לקבוע|תיאום|סיום|הארכה|הפסקה|חזרה|חסרתי|לא הגעתי/i;
+
+function classifyMemberMessage(text) {
+  if (!text || !text.trim()) return { decision: 'silence', reason: 'empty' };
+  const t = text.trim();
+  if (t.length <= 25 && SILENCE_RE.test(t))  return { decision: 'silence', reason: 'brief-ack' };
+  if (t.length <= 50 && CHITCHAT_RE.test(t)) return { decision: 'silence', reason: 'chitchat' };
+  if (t.length <= 70 && !ACTIONABLE_RE.test(t)) return { decision: 'silence', reason: 'no-action-needed' };
+  return { decision: 'respond', reason: 'actionable' };
+}
+
+/**
+ * Handle an inbound message from a verified existing studio member.
+ * Returns { reply: string|null, decision, reason }.
+ * reply===null → Tomer chose silence; caller must NOT send any WhatsApp message.
+ */
+async function handleInboundMember({ name, text, phone, clientMatch }) {
+  const memberName = name ?? clientMatch?.arboxName ?? 'חבר/ת';
+  const { decision, reason } = classifyMemberMessage(text ?? '');
+
+  store.logEvent(
+    decision === 'silence' ? 'tomer_silent' : 'tomer_responded',
+    phone ?? null,
+    { decision, reason, preview: (text ?? '').slice(0, 60), senderName: memberName }
+  );
+
+  if (decision === 'silence') {
+    logger.info('[tomer] Silent on member message', { reason, preview: (text ?? '').slice(0, 40) });
+    return { reply: null, decision: 'silence', reason };
+  }
+
+  const supportPrompt =
+    `הודעה נכנסת מחבר/ת סטודיו פעיל/ה: "${text}"\n` +
+    `שם: ${memberName}\n\n` +
+    `ענה בעברית — 1-2 משפטים מקסימום, חם ולעניין. ` +
+    `אם ההודעה לא מצריכה תגובה (שיחת חולין, תודה, אוקיי וכד') — ענה SILENCE. ` +
+    `אסור לשאול על מטרות כושר, להציע מכירות, או לשלוח שאלות פתיחה.`;
+
+  let aiReply;
+  try {
+    aiReply = await chat(supportPrompt);
+  } catch (err) {
+    logger.error('[tomer] handleInboundMember AI error', { error: err.message });
+    return { reply: null, decision: 'silence', reason: 'ai-error' };
+  }
+
+  if (!aiReply || /^SILENCE$/i.test(aiReply.trim())) {
+    store.logEvent('tomer_silent', phone ?? null, { decision: 'ai-silence', reason: 'ai-decided', senderName: memberName });
+    return { reply: null, decision: 'silence', reason: 'ai-decided' };
+  }
+
+  logger.info('[tomer] Responded to member message', { preview: aiReply.slice(0, 60) });
+  return { reply: aiReply, decision: 'respond', reason };
+}
+
 // ── Chat interface ─────────────────────────────────────────────────────────────
 
 async function chat(userMessage) {
@@ -214,4 +279,4 @@ function daysSince(date) {
 
 function clearHistory() { tomerHistory = []; }
 
-module.exports = { chat, runDailyChecks, clearHistory };
+module.exports = { chat, runDailyChecks, clearHistory, handleInboundMember, classifyMemberMessage };

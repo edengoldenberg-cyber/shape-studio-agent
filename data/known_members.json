@@ -1,0 +1,5 @@
+{
+  "_note": "Add phone numbers of members not recognized by Arbox (E.164: 972XXXXXXXXX or Israeli: 05XXXXXXXX). Use POST /api/members/known to add via API.",
+  "phones": [],
+  "names": {}
+}

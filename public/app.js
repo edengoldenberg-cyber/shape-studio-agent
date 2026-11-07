@@ -557,6 +557,7 @@ function _setBadge(id, count, extraClass) {
 }
 
 function _renderTomerSeg(seg) {
+  if (seg === 'activity') { loadTomerActivity(); return; }
   if (!_tomerSegs) return;
   switch (seg) {
     case 'onboarding': _renderOnboarding(_tomerSegs.onboarding?.members ?? []); break;
@@ -566,6 +567,86 @@ function _renderTomerSeg(seg) {
     case 'win_back':   _renderWinBack(_tomerSegs.winBack?.members      ?? []); break;
   }
 }
+
+/* Tomer Activity & Monitor ─────────────────────────────────────────────────*/
+function _setElText(id, val) { const el = document.getElementById(id); if (el) el.textContent = val; }
+
+async function loadTomerActivity() {
+  try {
+    const data = await fetch('/api/tomer/activity').then(r => r.json());
+    _setElText('tact-silenced',  data.stats?.silenced  ?? '—');
+    _setElText('tact-responded', data.stats?.responded ?? '—');
+    _setElText('tact-auto',      data.stats?.autoSent  ?? '—');
+    _setBadge('badge-activity', (data.stats?.responded ?? 0) + (data.stats?.autoSent ?? 0));
+    _renderKnownMembers(data.knownMembers ?? { list: [] });
+    _renderActivityFeed(data.events ?? []);
+    const upEl = document.getElementById('tact-updated');
+    if (upEl) upEl.textContent = 'עודכן: ' + now();
+  } catch (err) {
+    console.error('loadTomerActivity', err);
+    toast('❌ שגיאה בטעינת פעילות תומר: ' + err.message);
+  }
+}
+
+function _renderKnownMembers(km) {
+  const wrap = document.getElementById('km-list');
+  if (!wrap) return;
+  if (!km.list || !km.list.length) {
+    wrap.innerHTML = '<span style="color:var(--muted);font-size:12px">אין לקוחות ידועים מוגדרים</span>';
+    return;
+  }
+  wrap.innerHTML = km.list.map(m =>
+    `<span style="display:inline-flex;align-items:center;gap:4px;background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:3px 10px;margin:3px;font-size:12px">
+       ${esc(m.name ?? m.phone)}
+       <button onclick="removeKnownMember('${esc(m.phone)}')" style="border:none;background:none;cursor:pointer;color:var(--muted);font-size:11px;padding:0 2px" title="הסר">✕</button>
+     </span>`
+  ).join('');
+}
+
+function _renderActivityFeed(events) {
+  const tbody = document.getElementById('tact-feed-tbody');
+  if (!tbody) return;
+  if (!events.length) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty-state">אין פעילות עדיין</td></tr>';
+    return;
+  }
+  const DEC = {
+    tomer_silent:     '<span style="color:var(--muted);font-size:11px">🤫 שתיקה</span>',
+    tomer_responded:  '<span style="color:#10b981;font-size:11px">💬 תשובה</span>',
+    're_engagement_sent': '<span style="color:#f59e0b;font-size:11px">📤 אוטו׳</span>',
+    tomer_action_sent:'<span style="color:#f59e0b;font-size:11px">📤 אוטו׳</span>',
+  };
+  tbody.innerHTML = events.slice(0, 50).map(e => {
+    const ts     = e.ts ? new Date(e.ts).toLocaleTimeString('he-IL',{hour:'2-digit',minute:'2-digit'}) : '—';
+    const dec    = DEC[e.type] ?? `<span style="font-size:11px">${esc(e.type)}</span>`;
+    const sender = esc(e.data?.senderName ?? e.phone ?? '—');
+    const reason = esc(e.data?.reason ?? '—');
+    const prev   = esc((e.data?.preview ?? '').slice(0, 50));
+    return `<tr><td style="font-size:11px;color:var(--muted)">${ts}</td><td>${sender}</td><td>${dec}</td><td style="font-size:11px;color:var(--muted)">${reason}</td><td style="font-size:11px">${prev}</td></tr>`;
+  }).join('');
+}
+
+async function removeKnownMember(phone) {
+  if (!confirm(`הסר ${phone} מרשימת הלקוחות הידועים?`)) return;
+  try {
+    await fetch(`/api/members/known/${encodeURIComponent(phone)}`, { method: 'DELETE' });
+    await loadTomerActivity();
+    toast('✅ הוסר מהרשימה');
+  } catch (err) { toast(`❌ ${err.message}`); }
+}
+
+document.getElementById('btn-km-add')?.addEventListener('click', async () => {
+  const phone = document.getElementById('km-phone-input')?.value?.trim();
+  const name  = document.getElementById('km-name-input')?.value?.trim() || null;
+  if (!phone) { toast('נדרש מספר טלפון'); return; }
+  try {
+    await post('/api/members/known', { phone, name });
+    document.getElementById('km-phone-input').value = '';
+    document.getElementById('km-name-input').value  = '';
+    await loadTomerActivity();
+    toast('✅ נוסף לרשימת הלקוחות הידועים');
+  } catch (err) { toast(`❌ ${err.message}`); }
+});
 
 // ── Render helpers ────────────────────────────────────────────────────────────
 
@@ -2263,6 +2344,7 @@ async function runWaSimulate() {
    ══════════════════════════════════════════════════════════════════════════════ */
 
 let knowledgeData   = null;   // cached raw data from /api/admin/knowledge
+let studioAssetsData = null;  // cached raw data from /api/admin/studio-assets
 let activeKnView    = 'staff';
 
 // ── Sub-nav wiring ────────────────────────────────────────────────────────────
@@ -2276,23 +2358,169 @@ document.querySelectorAll('.kn-sv-btn').forEach(btn => {
 });
 
 function showKnView(view) {
-  ['staff','packages','verify'].forEach(v => {
+  ['staff', 'packages', 'verify', 'assets'].forEach(v => {
     const el = document.getElementById(`kn-view-${v}`);
     if (el) el.style.display = v === view ? '' : 'none';
   });
+  // Lazy-load assets data the first time the panel is opened
+  if (view === 'assets' && !studioAssetsData) loadStudioAssets();
 }
 
 // ── Load knowledge from server ────────────────────────────────────────────────
 async function loadKnowledge(force = false) {
   if (knowledgeData && !force) { renderKnowledge(knowledgeData); return; }
   try {
-    const d = await fetch('/api/admin/knowledge').then(r => r.json());
+    // Fetch knowledge + studio assets in parallel; asset failures are non-fatal
+    const [d] = await Promise.all([
+      fetch('/api/admin/knowledge').then(r => r.json()),
+      loadStudioAssets(),
+    ]);
     knowledgeData = d;
     renderKnowledge(d);
   } catch (err) {
     toast(`❌ שגיאה בטעינת ידע: ${err.message}`);
   }
 }
+
+// ── Studio Assets ─────────────────────────────────────────────────────────────
+async function loadStudioAssets() {
+  try {
+    const d = await fetch('/api/admin/studio-assets').then(r => r.json());
+    if (!d.ok) return;
+    studioAssetsData = d;
+    renderStudioAssets(d);
+  } catch { /* non-fatal — panel may not be visible yet */ }
+}
+
+function renderStudioAssets(d) {
+  // Waze URL field
+  const wazeEl    = document.getElementById('asset-waze-url');
+  const previewEl = document.getElementById('asset-waze-preview');
+  if (wazeEl) wazeEl.value = d.wazeUrl ?? '';
+  if (previewEl) previewEl.href = d.wazeUrl || '#';
+
+  // Timetable URL field (optional fallback)
+  const timetableUrlEl = document.getElementById('asset-timetable-url');
+  if (timetableUrlEl) timetableUrlEl.value = d.timetableUrl ?? '';
+
+  // Helper: render one timetable image block
+  function renderTimetableBlock(uploaded, apiPath, wrapId, imgId, statusId) {
+    const wrap   = document.getElementById(wrapId);
+    const img    = document.getElementById(imgId);
+    const status = document.getElementById(statusId);
+    if (uploaded) {
+      if (img)    { img.src = `${apiPath}?t=${Date.now()}`; img.style.display = 'block'; }
+      if (wrap)   wrap.style.display = '';
+      if (status) { status.textContent = '✅ תמונה מועלת — ברק ישלח אותה ישירות'; status.style.color = 'var(--success, #22c55e)'; }
+    } else {
+      if (wrap)   wrap.style.display = 'none';
+      if (status) { status.textContent = 'לא הועלתה תמונה'; status.style.color = 'var(--muted, #888)'; }
+    }
+  }
+
+  renderTimetableBlock(d.timetableImageUploaded,  '/api/admin/timetable-image',  'timetable-current-wrap',  'timetable-preview',  'timetable-upload-status');
+  renderTimetableBlock(d.timetable2ImageUploaded, '/api/admin/timetable2-image', 'timetable2-current-wrap', 'timetable2-preview', 'timetable2-upload-status');
+}
+
+// Update Waze preview link as the user types
+document.getElementById('asset-waze-url')?.addEventListener('input', e => {
+  const preview = document.getElementById('asset-waze-preview');
+  if (preview) preview.href = e.target.value.trim() || '#';
+});
+
+// Timetable file picker — auto-upload on selection
+document.getElementById('asset-timetable-file')?.addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  const nameEl    = document.getElementById('timetable-file-name');
+  const spinner   = document.getElementById('timetable-upload-spinner');
+  const statusEl  = document.getElementById('timetable-upload-status');
+  const previewImg = document.getElementById('timetable-preview');
+  const previewWrap = document.getElementById('timetable-current-wrap');
+
+  if (nameEl)  nameEl.textContent  = file.name;
+  if (spinner) spinner.style.display = '';
+
+  const reader = new FileReader();
+  reader.onload = async (ev) => {
+    // Show local preview immediately
+    if (previewImg) { previewImg.src = ev.target.result; previewImg.style.display = 'block'; }
+    if (previewWrap) previewWrap.style.display = '';
+
+    try {
+      const d = await post('/api/admin/studio-assets/timetable', { imageData: ev.target.result });
+      if (!d.ok) throw new Error(d.error ?? 'unknown error');
+      toast('✅ מערכת שעות הועלתה — ברק ישלח אותה ישירות');
+      if (statusEl) { statusEl.textContent = '✅ תמונה מועלת — ברק ישלח אותה ישירות'; statusEl.style.color = 'var(--success, #22c55e)'; }
+      // Refresh server data
+      const fresh = await fetch('/api/admin/studio-assets').then(r => r.json());
+      if (fresh.ok) studioAssetsData = fresh;
+    } catch (err) {
+      toast(`❌ שגיאה בהעלאה: ${err.message}`);
+      if (statusEl) { statusEl.textContent = `❌ ${err.message}`; statusEl.style.color = 'var(--hot, #ef4444)'; }
+    } finally {
+      if (spinner) spinner.style.display = 'none';
+    }
+  };
+  reader.readAsDataURL(file);
+});
+
+// Timetable 2 file picker — same pattern as timetable 1
+document.getElementById('asset-timetable2-file')?.addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  const nameEl    = document.getElementById('timetable2-file-name');
+  const spinner   = document.getElementById('timetable2-upload-spinner');
+  const statusEl  = document.getElementById('timetable2-upload-status');
+  const previewImg  = document.getElementById('timetable2-preview');
+  const previewWrap = document.getElementById('timetable2-current-wrap');
+
+  if (nameEl)  nameEl.textContent  = file.name;
+  if (spinner) spinner.style.display = '';
+
+  const reader = new FileReader();
+  reader.onload = async (ev) => {
+    if (previewImg) { previewImg.src = ev.target.result; previewImg.style.display = 'block'; }
+    if (previewWrap) previewWrap.style.display = '';
+    try {
+      const d = await post('/api/admin/studio-assets/timetable2', { imageData: ev.target.result });
+      if (!d.ok) throw new Error(d.error ?? 'unknown error');
+      toast('✅ תמונת מערכת שעות 2 הועלתה');
+      if (statusEl) { statusEl.textContent = '✅ תמונה מועלת — ברק ישלח אותה ישירות'; statusEl.style.color = 'var(--success, #22c55e)'; }
+      const fresh = await fetch('/api/admin/studio-assets').then(r => r.json());
+      if (fresh.ok) studioAssetsData = fresh;
+    } catch (err) {
+      toast(`❌ שגיאה בהעלאה: ${err.message}`);
+      if (statusEl) { statusEl.textContent = `❌ ${err.message}`; statusEl.style.color = 'var(--hot, #ef4444)'; }
+    } finally {
+      if (spinner) spinner.style.display = 'none';
+    }
+  };
+  reader.readAsDataURL(file);
+});
+
+// Save assets button (saves Waze URL + timetable URL text fields)
+document.getElementById('btn-save-assets')?.addEventListener('click', async () => {
+  const wazeUrl      = document.getElementById('asset-waze-url')?.value.trim()      ?? '';
+  const timetableUrl = document.getElementById('asset-timetable-url')?.value.trim() ?? '';
+  const btn      = document.getElementById('btn-save-assets');
+  const statusEl = document.getElementById('assets-save-status');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ שומר...'; }
+  try {
+    const d = await post('/api/admin/studio-assets', { wazeUrl, timetableUrl });
+    if (!d.ok) throw new Error(d.error ?? 'unknown error');
+    studioAssetsData = d;
+    renderStudioAssets(d);
+    toast('✅ נכסים נשמרו — ברק ישתמש בהם מיד');
+    if (statusEl) { statusEl.textContent = `✅ נשמר — ${new Date().toLocaleTimeString('he-IL')}`; statusEl.style.display = ''; }
+  } catch (err) {
+    toast(`❌ שגיאה בשמירה: ${err.message}`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '💾 שמור שינויים'; }
+  }
+});
 
 function renderKnowledge(d) {
   renderStaffTable(d.staff?.instructors ?? []);
