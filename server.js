@@ -1992,6 +1992,48 @@ app.post('/api/webhooks/meta', (req, res) => {
 
         await notifyLeadTeam(lead, { formId: lead.formId, adCampaign: lead.adCampaign })
           .catch(err => logger.warn('notifyLeadTeam failed', { error: err.message }));
+
+        // ── Send a welcome WhatsApp directly to the lead ──────────────────────
+        // notifyLeadTeam only sends to staff phones — without this block the
+        // lead never appears in /api/whatsapp/threads because inbox._threads is
+        // only populated via inbox.pushOutbound / inbox.push, never via store.
+        //
+        // Design: attempt the actual Green API dispatch, but create the inbox
+        // thread entry regardless of whether the send succeeds.  If Green API
+        // is unreachable or returns 401, the thread still shows up in the live
+        // chat screen so the team can manually reply from the dashboard.
+        const givenName   = (lead.name ?? '').split(/\s+/)[0].trim() || null;
+        const welcomeText = `שלום${givenName ? ' ' + givenName : ''}! 🤸‍♀️ קיבלנו את פנייתך לשייפ סטודיו ונחזור אליך בהקדם. בינתיים, אם יש שאלות — אנחנו כאן! 😊`;
+
+        let waSent = false;
+        try {
+          await sendText(lead.phone, welcomeText, { bypassQuietHours: true });
+          waSent = true;
+          logger.info('Lead welcome message sent via Green API', { phone: lead.phone });
+        } catch (err) {
+          logger.warn('Lead welcome message dispatch failed — thread created without delivery', {
+            phone:  lead.phone,
+            error:  err.message,
+          });
+        }
+
+        // Always create the inbox thread entry — this is what populates the
+        // WhatsApp live chat screen for this lead.
+        inbox.pushOutbound({
+          phone:   lead.phone,
+          name:    lead.name ?? null,
+          text:    welcomeText,
+          agentId: 'lead-agent',
+        });
+        store.logEvent('message_out', lead.phone, {
+          preview: welcomeText.slice(0, 80),
+          agent:   'lead-agent',
+          source:  'meta_lead',
+          sent:    waSent,
+        });
+        persist.saveInbox(inbox);
+        // SSE fires so the WhatsApp live tab refreshes thread list immediately
+        broadcastSse('message', { phone: lead.phone, name: lead.name ?? null, direction: 'out' });
       } catch (err) {
         logger.error('Meta webhook async processing error', { error: err.message, phone: lead?.phone });
       }
