@@ -1616,24 +1616,28 @@ async function processInboundWAMessage(msg) {
     };
   }
 
-  // 3. Routing decision
+  // 3. Routing decision — strict Barak / Tomer boundary
+  //
+  //   The primary split is ALWAYS membership status, never intent.
+  //   Checking intent first (old code) let scheduling queries bypass the split,
+  //   sending a member's "מה יש מחר?" to Barak's branch.
+  //
+  //   New tree:
+  //     brief-ack / cooldown → acknowledged (no agent called)
+  //     isExistingClient     → TOMER  exclusively (scheduling + general)
+  //     !isExistingClient    → BARAK  exclusively (scheduling + general)
+  //
+  //   buildSchedulingReply is shared Arbox infrastructure used by both agents.
+  //   The route label reflects the correct persona so the inbox attributes
+  //   the reply to the right agent.
   let route          = 'unhandled';
   let barakReply     = null;
-  let timetableImgUrl = null; // set when we want to send schedule.png instead of text
+  let timetableImgUrl = null;
 
   const isExistingClient = clientMatch.found && clientMatch.matchType === 'member';
   const isSchedulingMsg  = intent !== 'general';
 
   // ── Brief-ack + cooldown guard ───────────────────────────────────────────────
-  // Brief acks ("תודה", "אוקיי", 👍, etc.) don't warrant an AI reply — the
-  // agent firing a paragraph back after a one-word social closing is the main
-  // source of the out-of-context spam reported for Liat's "תודה" message.
-  //
-  // Cooldown prevents the system from double-sending if two webhooks arrive
-  // close together for the same phone (e.g. Green API retry + race condition).
-  //
-  // Scheduling intents bypass both guards — a user saying "תודה" is not a
-  // scheduling message so intent !== 'general' will never be true for it.
   const ackDetected  = isBriefAck(msg.text);
   const inCooldown   = _isInCooldown(fromNorm);
   const skipAiReply  = ackDetected || inCooldown;
@@ -1641,40 +1645,78 @@ async function processInboundWAMessage(msg) {
   if (ackDetected)  logger.info('Brief ack — skipping AI reply', { from: fromNorm, text: msg.text?.slice(0, 20) });
   if (inCooldown)   logger.warn('Reply cooldown — skipping AI reply', { from: fromNorm });
 
-  if (isSchedulingMsg) {
+  if (skipAiReply) {
+    // Message stored in inbox (step 4); neither agent is invoked.
+    route = 'acknowledged';
+
+  } else if (isExistingClient) {
+    // ════════════════════════════════════════════════════════════════════════
+    // TOMER — Customer Support & Retention
+    // Handles ALL messages from verified active Arbox members.
+    // Barak never sees these messages.
+    // ════════════════════════════════════════════════════════════════════════
+    route = 'tomer';
+
+    if (isSchedulingMsg) {
+      // Scheduling query from an existing member: Tomer uses Arbox live data
+      const imgUrl = getScheduleImageUrl();
+      if (intent === 'schedule_query'
+          && isWeeklyTimetableQuery(msg.text)
+          && imgUrl
+          && fs.existsSync(SCHEDULE_PNG_PATH)) {
+        barakReply     = `הנה מערכת השעות העדכנית של Shape Studio! 🏋️‍♀️`;
+        timetableImgUrl = imgUrl;
+      } else {
+        try { barakReply = await buildSchedulingReply(intent, msg, clientMatch); } catch { /* non-fatal */ }
+      }
+      if (intent === 'representative') {
+        const clientName = msg.name ?? clientMatch.arboxName ?? fromIsraeli ?? fromNorm;
+        notifySvc.notifyRepresentativeRequest(fromNorm, clientName).catch(err =>
+          logger.warn('Representative request staff alert failed', { error: err.message })
+        );
+      }
+    } else if (msg.type === 'text' && msg.text?.trim()) {
+      // General support / retention message → Tomer AI
+      try {
+        const tomerPrompt =
+          `הודעה נכנסת מחבר/ת סטודיו פעיל/ה.\n` +
+          `שם: ${msg.name ?? clientMatch.arboxName ?? 'לא ידוע'}\n` +
+          `הודעה: "${msg.text}"\n\n` +
+          `ענה בעברית בצורה אישית, חמה ותומכת — עד 3 משפטים.`;
+        barakReply = await tomerAgent.chat(tomerPrompt);
+      } catch (err) {
+        logger.warn('Tomer general reply failed', { error: err.message, from: fromNorm });
+      }
+    }
+
+  } else {
+    // ════════════════════════════════════════════════════════════════════════
+    // BARAK — Sales & Lead Onboarding
+    // Handles ALL messages from new leads and unknown senders.
+    // Tomer never sees these messages.
+    // ════════════════════════════════════════════════════════════════════════
     route = 'barak';
 
-    // ── Static timetable image ────────────────────────────────────────────────
-    // When the user asks for the weekly timetable and schedule.png exists,
-    // send the image instead of a live Arbox text listing.
-    const imgUrl = getScheduleImageUrl();
-    if (intent === 'schedule_query'
-        && isWeeklyTimetableQuery(msg.text)
-        && imgUrl
-        && fs.existsSync(SCHEDULE_PNG_PATH)) {
-      barakReply     = `הנה מערכת השעות העדכנית של Shape Studio! 🏋️‍♀️`;
-      timetableImgUrl = imgUrl;
+    if (isSchedulingMsg) {
+      // Scheduling query from a lead: Barak uses Arbox live data
+      const imgUrl = getScheduleImageUrl();
+      if (intent === 'schedule_query'
+          && isWeeklyTimetableQuery(msg.text)
+          && imgUrl
+          && fs.existsSync(SCHEDULE_PNG_PATH)) {
+        barakReply     = `הנה מערכת השעות העדכנית של Shape Studio! 🏋️‍♀️`;
+        timetableImgUrl = imgUrl;
+      } else {
+        try { barakReply = await buildSchedulingReply(intent, msg, clientMatch); } catch { /* non-fatal */ }
+      }
+      if (intent === 'representative') {
+        const clientName = msg.name ?? fromIsraeli ?? fromNorm;
+        notifySvc.notifyRepresentativeRequest(fromNorm, clientName).catch(err =>
+          logger.warn('Representative request staff alert failed', { error: err.message })
+        );
+      }
     } else {
-      // Regular scheduling text reply via Arbox / Barak
-      try { barakReply = await buildSchedulingReply(intent, msg, clientMatch); } catch { /* non-fatal */ }
-    }
-
-    // Alert staff immediately when a rep is requested — they need to know someone
-    // wants a human right now, before the follow-up appointment is booked.
-    if (intent === 'representative') {
-      const clientName = msg.name ?? clientMatch.arboxName ?? fromIsraeli ?? fromNorm;
-      notifySvc.notifyRepresentativeRequest(fromNorm, clientName).catch(err =>
-        logger.warn('Representative request staff alert failed', { error: err.message })
-      );
-    }
-  } else if (!isExistingClient) {
-    // Unknown sender or known lead → lead qualification pipeline
-    if (skipAiReply) {
-      route = 'acknowledged';
-      // Message is logged in inbox (step 4) but lead_agent is NOT invoked —
-      // avoids sending a generic AI reply to a brief social closing.
-    } else {
-      route = 'lead_agent';
+      // General / sales qualification → lead_agent (Barak's AI persona)
       try {
         await leadAgent.handleInbound({
           from: fromNorm,
@@ -1683,28 +1725,7 @@ async function processInboundWAMessage(msg) {
         });
         _markReplied(fromNorm); // cooldown: lead_agent sends its own reply via sendText
       } catch (err) {
-        logger.error('Lead agent error in WA pipeline', { error: err.message, from: fromNorm });
-      }
-    }
-  } else {
-    // Existing client, non-scheduling general message → Tomer handles retention context
-    if (skipAiReply) {
-      route = 'acknowledged';
-      // Message is logged in inbox (step 4) but Tomer is NOT invoked —
-      // avoids the "היי ליאת! אני שמח לשמוע..." paragraph after "תודה".
-    } else {
-      route = 'tomer';
-      if (msg.type === 'text' && msg.text?.trim()) {
-        try {
-          const tomerPrompt =
-            `הודעה נכנסת מחבר/ת סטודיו פעיל/ה.\n` +
-            `שם: ${msg.name ?? clientMatch.arboxName ?? 'לא ידוע'}\n` +
-            `הודעה: "${msg.text}"\n\n` +
-            `ענה בעברית בצורה אישית, חמה ותומכת — עד 3 משפטים.`;
-          barakReply = await tomerAgent.chat(tomerPrompt);
-        } catch (err) {
-          logger.warn('Tomer general reply failed', { error: err.message, from: fromNorm });
-        }
+        logger.error('Barak (lead_agent) error in WA pipeline', { error: err.message, from: fromNorm });
       }
     }
   }
