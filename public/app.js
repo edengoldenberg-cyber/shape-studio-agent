@@ -1735,15 +1735,25 @@ function connectWaSSE() {
     waSSE.onmessage = (e) => {
       try {
         const data = JSON.parse(e.data);
+
         if (data.event === 'message') {
           loadWaThreads(false);
           if (waActivePhone && waActivePhone === data.phone) loadActiveThread(data.phone);
         }
+
         if (data.event === 'sync_complete') {
           // Green API sync finished (startup or manual) — refresh thread list
           loadWaThreads(!waActivePhone); // auto-select first only if nothing open
           const dot = document.getElementById('wa-sse-dot');
           if (dot) dot.title = `מסונכרן — ${data.messages ?? 0} הודעות מ-${data.chats ?? 0} שיחות`;
+        }
+
+        if (data.event === 'new_lead') {
+          // A Meta Ads lead just landed in the CRM — refresh all lead panels instantly
+          // without waiting for the 5-second polling interval.
+          loadBarakPanel();
+          loadMayaStats();
+          loadAgentFeed();
         }
       } catch {}
     };

@@ -1825,6 +1825,66 @@ app.post('/api/whatsapp/simulate', jsonBody, async (req, res) => {
 // WEBHOOK STUBS — Meta Lead Ads & WhatsApp (testing / production-ready)
 // ══════════════════════════════════════════════════════════════════════════════
 
+// ── Meta webhook helpers ──────────────────────────────────────────────────────
+
+/**
+ * Return the first non-empty trimmed string found in `obj` by trying each key
+ * in `keys` in order.  Handles null, undefined, and blank-string values.
+ */
+function _firstStr(obj, keys) {
+  for (const k of keys) {
+    const v = obj[k];
+    if (v != null && String(v).trim() !== '') return String(v).trim();
+  }
+  return null;
+}
+
+/**
+ * Parse a raw request body string into a plain object.
+ * Handles three formats that Make.com or Meta may send:
+ *   1. Standard JSON object             {"phone":"…"}
+ *   2. Double-encoded JSON string       "\"{\\"phone\\":\\"…\\"}\""
+ *      (Make's jsonString mode sometimes wraps the value in an extra layer)
+ *   3. URL-encoded form data            phone=…&name=…
+ */
+function _parseRawBody(raw) {
+  if (!raw) return null;
+  const s = raw.trim();
+  if (!s) return null;
+
+  // Attempt 1 — JSON (handles both normal and double-encoded)
+  try {
+    const parsed = JSON.parse(s);
+    // If the outer value is a string, Make double-encoded the payload — re-parse
+    if (typeof parsed === 'string') {
+      try { return JSON.parse(parsed); } catch { return null; }
+    }
+    if (parsed && typeof parsed === 'object') return parsed;
+  } catch { /* fall through */ }
+
+  // Attempt 2 — URL-encoded form data (application/x-www-form-urlencoded)
+  try {
+    const params = new URLSearchParams(s);
+    const obj = Object.fromEntries(params.entries());
+    if (Object.keys(obj).length) return obj;
+  } catch { /* fall through */ }
+
+  return null;
+}
+
+/**
+ * Normalise any phone string into Israel E.164-without-+ format (972XXXXXXXXX).
+ * Strips every non-digit character, then prefixes 972 if needed.
+ */
+function _normPhone(raw) {
+  if (!raw) return null;
+  const d = String(raw).replace(/\D/g, '');
+  if (!d) return null;
+  if (d.startsWith('972')) return d;
+  if (d.startsWith('0'))   return '972' + d.slice(1);
+  return '972' + d;
+}
+
 // POST /api/webhooks/meta — Meta Lead Ads ingestion (Make.com → Railway)
 //
 // CRITICAL: respond BEFORE body parsing. express.json() (jsonBody) buffers the
@@ -1842,38 +1902,64 @@ app.post('/api/webhooks/meta', (req, res) => {
   req.on('end', () => {
     // ── 3. All parsing and heavy work run after the response is fully sent ───────
     setImmediate(async () => {
-      let body;
-      try {
-        body = JSON.parse(Buffer.concat(chunks).toString());
-      } catch {
-        logger.warn('Meta webhook: body is not valid JSON — ignoring');
+      const rawStr = Buffer.concat(chunks).toString();
+      const body   = _parseRawBody(rawStr);
+
+      if (!body) {
+        logger.warn('Meta webhook: unparseable body', {
+          contentType: req.headers['content-type'],
+          preview:     rawStr.slice(0, 150),
+        });
         return;
       }
 
       let lead = null;
       try {
         if (body?.entry) {
-          // Native Meta webhook format (direct subscription)
+          // ── Native Meta webhook format (direct Lead Ads subscription) ──────────
           lead = parseMetaLeadWebhook(body);
         } else {
-          // Make.com simplified format: { name, phone, email, adCampaign, formId, customQuestions }
-          const { name, phone, email, adCampaign, formId, customQuestions } = body ?? {};
-          if (!phone) {
-            logger.warn('Meta webhook: phone missing in payload');
+          // ── Make.com / simplified format ────────────────────────────────────────
+          // Try every field-name variant Make or Meta Lead Ads forms might use.
+          const rawPhone = _firstStr(body, [
+            'phone', 'phone_number', 'phoneNumber',
+            'mobile', 'mobile_phone', 'mobilePhone',
+            'cell', 'tel', 'telephone',
+          ]);
+
+          if (!rawPhone) {
+            logger.warn('Meta webhook: phone field not found in payload', {
+              receivedKeys: Object.keys(body).join(', '),
+              preview:      JSON.stringify(body).slice(0, 200),
+            });
             return;
           }
-          const cleaned = String(phone).replace(/[\s\-+()]/g, '').replace(/^972/, '').replace(/^0/, '972').replace(/^(?!972)/, '972');
+
+          const phone = _normPhone(rawPhone);
+          if (!phone) {
+            logger.warn('Meta webhook: phone normalisation returned null', { rawPhone });
+            return;
+          }
+
+          // Combine first+last if full-name field is absent
+          const firstName = _firstStr(body, ['first_name', 'firstName', 'given_name']);
+          const lastName  = _firstStr(body, ['last_name',  'lastName',  'family_name']);
+          const name =
+            _firstStr(body, ['name', 'full_name', 'fullName', 'lead_name', 'leadName']) ??
+            ([firstName, lastName].filter(Boolean).join(' ') || null);
+
           lead = {
-            phone:           cleaned,
-            name:            name           ?? null,
-            email:           email          ?? null,
-            adCampaign:      adCampaign     ?? null,
-            formId:          formId         ?? null,
-            customQuestions: customQuestions ?? null,
+            phone,
+            name:            name ?? null,
+            email:           _firstStr(body, ['email', 'email_address', 'emailAddress']) ?? null,
+            adCampaign:      _firstStr(body, ['adCampaign', 'ad_campaign', 'campaign', 'campaignName', 'campaign_name']) ?? null,
+            formId:          _firstStr(body, ['formId', 'form_id', 'form']) ?? null,
+            customQuestions: body.customQuestions ?? body.custom_questions ?? body.questions ?? null,
           };
         }
+
         if (!lead?.phone) {
-          logger.warn('Meta webhook: could not resolve phone from payload');
+          logger.warn('Meta webhook: lead.phone is empty after extraction');
           return;
         }
       } catch (err) {
@@ -1900,6 +1986,9 @@ app.post('/api/webhooks/meta', (req, res) => {
 
         // Persist immediately so this lead survives a crash or restart
         persist.saveLeads(store);
+
+        // Broadcast SSE so connected dashboards refresh their lead panels instantly
+        broadcastSse('new_lead', { phone: lead.phone, name: lead.name, source: 'meta_ads' });
 
         await notifyLeadTeam(lead, { formId: lead.formId, adCampaign: lead.adCampaign })
           .catch(err => logger.warn('notifyLeadTeam failed', { error: err.message }));
