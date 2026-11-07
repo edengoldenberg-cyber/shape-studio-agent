@@ -40,6 +40,7 @@ const aptStore                         = require('./utils/appointment_store');
 const calendarSvc                      = require('./services/calendar.service');
 const notifySvc                        = require('./services/notification.service');
 const greenApiSvc                      = require('./services/greenapi.service');
+const persist                          = require('./utils/persist');
 
 // ── Staff configuration (hot-reloadable) ─────────────────────────────────────
 
@@ -1739,7 +1740,13 @@ app.post('/api/green-api/webhook', express.json({ limit: '1mb' }), async (req, r
 
   // Route through the full CRM pipeline — same logic as /api/whatsapp/webhook
   processInboundWAMessage(msg)
-    .then(r => r && broadcastSse('message', { phone: r.inboxEntry.from, name: r.inboxEntry.name ?? null }))
+    .then(r => {
+      if (!r) return;
+      broadcastSse('message', { phone: r.inboxEntry.from, name: r.inboxEntry.name ?? null });
+      // Persist inbox + leads immediately so the live chat survives a restart
+      persist.saveInbox(inbox);
+      persist.saveLeads(store);
+    })
     .catch(err => logger.error('WA pipeline error (Green API)', { error: err.message, from: msg.from }));
 });
 
@@ -1885,6 +1892,9 @@ app.post('/api/webhooks/meta', (req, res) => {
         store.logEvent('meta_lead_webhook', lead.phone, { name: lead.name, source: 'meta_ads' });
         automations.recordExecution('rule-008', { phone: lead.phone, name: lead.name });
         logger.info('Meta webhook lead captured', { phone: lead.phone, name: lead.name, formId: lead.formId });
+
+        // Persist immediately so this lead survives a crash or restart
+        persist.saveLeads(store);
 
         await notifyLeadTeam(lead, { formId: lead.formId, adCampaign: lead.adCampaign })
           .catch(err => logger.warn('notifyLeadTeam failed', { error: err.message }));
@@ -2411,9 +2421,33 @@ app.post('/api/whatsapp/sync-green', jsonBody, async (req, res) => {
   }
 });
 
+// ── SIGTERM — save state before Railway kills the container ───────────────────
+// Railway sends SIGTERM ~10s before hard-killing the process on each deploy.
+// Writing snapshots here means a new deploy picks them back up immediately.
+process.on('SIGTERM', () => {
+  logger.info('[shutdown] SIGTERM received — flushing snapshots to disk');
+  persist.saveAll(store, inbox);
+  logger.info('[shutdown] Flush complete');
+  process.exit(0);
+});
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   logger.info(`Shape Studio Agent running — http://localhost:${PORT}`);
+
+  // ── Persistence: hydrate in-memory stores from disk snapshots ──────────────
+  persist.loadLeads(store);
+  persist.loadInbox(inbox);
+  logger.info('[persist] Data directory', {
+    path:   persist.DATA_DIR,
+    volume: process.env.DATA_DIR
+      ? '✅ Railway Volume (DATA_DIR env override — data survives deploys)'
+      : '⚠️  local ./data (ephemeral on deploy — set DATA_DIR=/data + mount a Volume)',
+  });
+
+  // ── Periodic save: flush both stores to disk every 60 seconds ──────────────
+  setInterval(() => persist.saveAll(store, inbox), 60_000).unref();
+
   initWorkers(store);
 
   // Probe Green API credentials immediately at startup so Railway logs show

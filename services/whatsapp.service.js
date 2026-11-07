@@ -42,8 +42,12 @@ function getAdminPhones() {
 //   Host (both conventions):    GREEN_API_URL           GREEN_API_HOST
 //
 // Set at least one pair on Railway — both are tried at runtime.
+// Host is sanitised: strip any accidental https:// prefix so Railway variables
+// like "https://1103.api.green-api.com" don't produce a double-protocol URL
+// (https://https://...) that causes ENOTFOUND at DNS resolution.
 function getGreenCreds() {
-  const host       = process.env.GREEN_API_URL          ?? process.env.GREEN_API_HOST ?? null;
+  const rawHost    = process.env.GREEN_API_URL ?? process.env.GREEN_API_HOST ?? null;
+  const host       = rawHost ? rawHost.replace(/^https?:\/\//, '').replace(/\/$/, '') : null;
   const instanceId = process.env.GREEN_API_ID_INSTANCE  ?? process.env.GREEN_API_INSTANCE_ID ?? null;
   const token      = process.env.GREEN_API_TOKEN_INSTANCE ?? process.env.GREEN_API_TOKEN ?? null;
   return { host, instanceId, token };
