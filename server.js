@@ -1961,12 +1961,16 @@ async function processInboundWAMessage(msg) {
     if (isSchedulingMsg) {
       // Scheduling query from a lead: Barak uses Arbox live data
       const timetableUrlBarak = getActiveTimetableUrl();
-      if (intent === 'schedule_query'
-          && isWeeklyTimetableQuery(msg.text)
-          && timetableUrlBarak) {
-        barakReply       = `הנה מערכת השעות העדכנית של Shape Studio! 🏋️‍♀️`;
-        timetableImgUrl  = timetableUrlBarak;
-        timetable2ImgUrl = getActiveTimetable2Url(); // second image (may be null)
+      if (intent === 'schedule_query' && isWeeklyTimetableQuery(msg.text)) {
+        if (timetableUrlBarak) {
+          // Image available — send it
+          barakReply       = `הנה מערכת השעות העדכנית של Shape Studio! 🏋️‍♀️`;
+          timetableImgUrl  = timetableUrlBarak;
+          timetable2ImgUrl = getActiveTimetable2Url();
+        } else {
+          // No image uploaded — give a helpful overview, don't show a single-day dump
+          barakReply = `יש לנו שיעורים כל ימות השבוע — פילאטיס מכשירים (Reformer), Barre, אימון כוח, יוגה, Kangoo ועוד 🏋️‍♀️\nאיזה יום ושעה בדרך כלל עובדים לך?`;
+        }
       } else {
         try { barakReply = await buildSchedulingReply(intent, msg, clientMatch); } catch { /* non-fatal */ }
       }

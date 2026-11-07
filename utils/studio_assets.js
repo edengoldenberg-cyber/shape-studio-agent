@@ -25,7 +25,7 @@ const DATA_DIR = (process.env.DATA_DIR ?? path.join(__dirname, '../data')).repla
 const FILE     = path.join(DATA_DIR, 'studio_assets.json');
 
 const DEFAULTS = {
-  wazeUrl: 'https://waze.com/ul?q=%D7%93%D7%A8%D7%9A+%D7%94%D7%A9%D7%93%D7%94+12%2C+%D7%A4%D7%A8%D7%93%D7%A1+%D7%97%D7%A0%D7%94-%D7%9B%D7%A8%D7%9B%D7%95%D7%A8&navigate=yes',
+  wazeUrl: 'https://waze.com/ul?q=דרך+השדה+12,+פרדס+חנה-כרכור&navigate=yes',
   timetableUrl:           '',
   timetableImageExt:      '',
   timetableImageUploaded: false,
