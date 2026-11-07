@@ -1320,11 +1320,82 @@ async function buildSchedulingReply(intent, msg, clientMatch) {
   return null;
 }
 
+// ── Inbound-message guard helpers ────────────────────────────────────────────
+
+/**
+ * Brief-acknowledgement detector.
+ * Returns true for short social closings that don't require an AI reply.
+ * Checks are intentionally tight: message must be ≤ 20 chars AND match a
+ * known Hebrew/English acknowledgement pattern.  Longer messages that happen
+ * to contain "תודה" (e.g. "תודה, מה השעות שלכם?") pass through normally.
+ */
+const BRIEF_ACK_RE = [
+  /^(תודה( רבה)?|תנקיו|טאנקיו?|thanks?|thank you|thx|ty)\.?!*$/i,
+  /^(אוקיי?|אוקי|ok[ay]?|k)\.?!*$/i,
+  /^(סבבה?|סבב)\.?!*$/i,
+  /^(בסדר( גמור)?)\.?!*$/i,
+  /^(כן|לא|אה|אממ?)\.?!*$/i,
+  /^(מעולה|נהדר|מצוין|מדהים|חמוד|מגניב|יופי)\.?!*$/i,
+  /^(קיבלתי|הבנתי|ברור|ממש|ביי|שלום|bye|ciao)\.?!*$/i,
+  /^(good|great|nice|perfect|cool|fine|sure|awesome)\.?!*$/i,
+  /^(שמעתי|פה|כאן|אני פה)\.?!*$/i,
+  /^[👍🙏❤️😊🙂😁💪✅👌🤩🥰😍]+$/u,
+];
+
+function isBriefAck(text) {
+  if (!text) return false;
+  const t = text.trim();
+  if (t.length > 20) return false;
+  return BRIEF_ACK_RE.some(p => p.test(t));
+}
+
+/**
+ * MessageId deduplication — prevents Green API double-delivery from running
+ * the pipeline twice and sending duplicate replies.
+ * Keeps a sliding window of ids seen in the last 10 minutes.
+ */
+const _seenInbound   = new Map(); // idMessage → timestamp
+const INBOUND_TTL_MS = 10 * 60 * 1000;
+
+function _isDuplicateInbound(messageId) {
+  if (!messageId) return false;
+  const now = Date.now();
+  for (const [id, ts] of _seenInbound) if (now - ts > INBOUND_TTL_MS) _seenInbound.delete(id);
+  if (_seenInbound.has(messageId)) return true;
+  _seenInbound.set(messageId, now);
+  return false;
+}
+
+/**
+ * Per-phone reply cooldown — if the system sent a reply to this number within
+ * the last 10 seconds, skip the next AI call.
+ * Protects against race conditions where two webhooks from the same burst
+ * both pass the messageId check (different IDs, same user) and both fire.
+ */
+const _lastReplied    = new Map(); // phone → timestamp
+const REPLY_COOLDOWN  = 10_000; // 10 seconds
+
+function _isInCooldown(phone) {
+  const ts = _lastReplied.get(phone);
+  return !!(ts && Date.now() - ts < REPLY_COOLDOWN);
+}
+function _markReplied(phone) {
+  _lastReplied.set(phone, Date.now());
+}
+
 // ── Internal processor (shared by webhook + simulate) ─────────────────────────
 
 async function processInboundWAMessage(msg) {
   const fromNorm    = normalizeToE164(msg.from);
   const fromIsraeli = e164ToIsraeli(fromNorm);
+
+  // ── Deduplication: skip if Green API already delivered this messageId ────────
+  if (_isDuplicateInbound(msg.messageId)) {
+    logger.warn('processInboundWAMessage: duplicate messageId — skipping', {
+      from: fromNorm, messageId: msg.messageId,
+    });
+    return null;
+  }
 
   // 0. Staff bypass — messages from Eden/Melanie are stored in the inbox for
   //    visibility but are never processed through the lead/client pipeline.
@@ -1553,6 +1624,23 @@ async function processInboundWAMessage(msg) {
   const isExistingClient = clientMatch.found && clientMatch.matchType === 'member';
   const isSchedulingMsg  = intent !== 'general';
 
+  // ── Brief-ack + cooldown guard ───────────────────────────────────────────────
+  // Brief acks ("תודה", "אוקיי", 👍, etc.) don't warrant an AI reply — the
+  // agent firing a paragraph back after a one-word social closing is the main
+  // source of the out-of-context spam reported for Liat's "תודה" message.
+  //
+  // Cooldown prevents the system from double-sending if two webhooks arrive
+  // close together for the same phone (e.g. Green API retry + race condition).
+  //
+  // Scheduling intents bypass both guards — a user saying "תודה" is not a
+  // scheduling message so intent !== 'general' will never be true for it.
+  const ackDetected  = isBriefAck(msg.text);
+  const inCooldown   = _isInCooldown(fromNorm);
+  const skipAiReply  = ackDetected || inCooldown;
+
+  if (ackDetected)  logger.info('Brief ack — skipping AI reply', { from: fromNorm, text: msg.text?.slice(0, 20) });
+  if (inCooldown)   logger.warn('Reply cooldown — skipping AI reply', { from: fromNorm });
+
   if (isSchedulingMsg) {
     route = 'barak';
 
@@ -1580,31 +1668,43 @@ async function processInboundWAMessage(msg) {
       );
     }
   } else if (!isExistingClient) {
-    // Unknown sender or known lead → lead qualification pipeline (lead_agent sends its own reply)
-    route = 'lead_agent';
-    try {
-      await leadAgent.handleInbound({
-        from: fromNorm,
-        name: msg.name,
-        text: msg.text ?? '',
-      });
-    } catch (err) {
-      logger.error('Lead agent error in WA pipeline', { error: err.message, from: fromNorm });
+    // Unknown sender or known lead → lead qualification pipeline
+    if (skipAiReply) {
+      route = 'acknowledged';
+      // Message is logged in inbox (step 4) but lead_agent is NOT invoked —
+      // avoids sending a generic AI reply to a brief social closing.
+    } else {
+      route = 'lead_agent';
+      try {
+        await leadAgent.handleInbound({
+          from: fromNorm,
+          name: msg.name,
+          text: msg.text ?? '',
+        });
+        _markReplied(fromNorm); // cooldown: lead_agent sends its own reply via sendText
+      } catch (err) {
+        logger.error('Lead agent error in WA pipeline', { error: err.message, from: fromNorm });
+      }
     }
   } else {
     // Existing client, non-scheduling general message → Tomer handles retention context
-    // (Barak handles scheduling; Tomer handles ongoing engagement and check-ins)
-    route = 'tomer';
-    if (msg.type === 'text' && msg.text?.trim()) {
-      try {
-        const tomerPrompt =
-          `הודעה נכנסת מחבר/ת סטודיו פעיל/ה.\n` +
-          `שם: ${msg.name ?? clientMatch.arboxName ?? 'לא ידוע'}\n` +
-          `הודעה: "${msg.text}"\n\n` +
-          `ענה בעברית בצורה אישית, חמה ותומכת — עד 3 משפטים.`;
-        barakReply = await tomerAgent.chat(tomerPrompt);
-      } catch (err) {
-        logger.warn('Tomer general reply failed', { error: err.message, from: fromNorm });
+    if (skipAiReply) {
+      route = 'acknowledged';
+      // Message is logged in inbox (step 4) but Tomer is NOT invoked —
+      // avoids the "היי ליאת! אני שמח לשמוע..." paragraph after "תודה".
+    } else {
+      route = 'tomer';
+      if (msg.type === 'text' && msg.text?.trim()) {
+        try {
+          const tomerPrompt =
+            `הודעה נכנסת מחבר/ת סטודיו פעיל/ה.\n` +
+            `שם: ${msg.name ?? clientMatch.arboxName ?? 'לא ידוע'}\n` +
+            `הודעה: "${msg.text}"\n\n` +
+            `ענה בעברית בצורה אישית, חמה ותומכת — עד 3 משפטים.`;
+          barakReply = await tomerAgent.chat(tomerPrompt);
+        } catch (err) {
+          logger.warn('Tomer general reply failed', { error: err.message, from: fromNorm });
+        }
       }
     }
   }
@@ -1665,7 +1765,10 @@ async function processInboundWAMessage(msg) {
     if (timetableImgUrl) {
       // Send the weekly timetable image; fall back to text if the image send fails
       sendFileByUrl(fromNorm, timetableImgUrl, 'schedule.png', barakReply)
-        .then(() => store.logEvent('timetable_image_sent', fromNorm, { imageUrl: timetableImgUrl }))
+        .then(() => {
+          store.logEvent('timetable_image_sent', fromNorm, { imageUrl: timetableImgUrl });
+          _markReplied(fromNorm); // start cooldown window
+        })
         .catch(err => {
           logger.warn('Timetable image send failed — falling back to text reply', { from: fromNorm, error: err.message });
           sendText(fromNorm, barakReply).catch(() => {});
@@ -1673,6 +1776,7 @@ async function processInboundWAMessage(msg) {
     } else {
       try {
         await sendText(fromNorm, barakReply);
+        _markReplied(fromNorm); // start cooldown window so a quick follow-up doesn't double-fire
         store.logEvent('message_out', fromNorm, {
           preview: barakReply.slice(0, 80),
           agent:   'barak',
