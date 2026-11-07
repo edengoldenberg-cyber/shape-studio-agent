@@ -1739,6 +1739,12 @@ function connectWaSSE() {
           loadWaThreads(false);
           if (waActivePhone && waActivePhone === data.phone) loadActiveThread(data.phone);
         }
+        if (data.event === 'sync_complete') {
+          // Green API sync finished (startup or manual) — refresh thread list
+          loadWaThreads(!waActivePhone); // auto-select first only if nothing open
+          const dot = document.getElementById('wa-sse-dot');
+          if (dot) dot.title = `מסונכרן — ${data.messages ?? 0} הודעות מ-${data.chats ?? 0} שיחות`;
+        }
       } catch {}
     };
     waSSE.onerror = () => {
@@ -1967,6 +1973,39 @@ async function sendWaReply() {
 
 // ── Event wiring ──────────────────────────────────────────────────────────────
 document.getElementById('btn-wa-refresh')?.addEventListener('click', () => loadWaThreads(false));
+
+// ── Green API history sync ────────────────────────────────────────────────────
+document.getElementById('btn-sync-green')?.addEventListener('click', async () => {
+  const btn = document.getElementById('btn-sync-green');
+  if (!btn) return;
+
+  // Check status first to show a helpful message if not configured
+  try {
+    const status = await fetch('/api/whatsapp/sync-green').then(r => r.json());
+    if (!status.configured) {
+      toast('⚠️ Green API לא מוגדר — הגדר GREEN_API_URL / INSTANCE_ID / TOKEN');
+      return;
+    }
+  } catch { /* non-fatal — proceed to sync */ }
+
+  btn.disabled  = true;
+  btn.textContent = '⏳';
+  btn.title       = 'מסנכרן...';
+
+  try {
+    const d = await post('/api/whatsapp/sync-green', {});
+    if (!d.ok) throw new Error(d.reason ?? 'Sync failed');
+
+    toast(`✅ Green API: ${d.messages} הודעות סונכרנו מ-${d.chats} שיחות`);
+    await loadWaThreads(!waActivePhone); // auto-select if nothing open yet
+  } catch (err) {
+    toast(`❌ Green API סנכרון נכשל — ${err.message}`);
+  } finally {
+    btn.disabled    = false;
+    btn.textContent = '📲';
+    btn.title       = 'סנכרן היסטוריה מ-Green API';
+  }
+});
 
 document.getElementById('btn-wa-read-all')?.addEventListener('click', async () => {
   await fetch('/api/whatsapp/inbox/read-all', { method: 'POST' });

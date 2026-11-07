@@ -2277,3 +2277,8 @@ input:checked + .toggle-slider::before { transform: translateX(16px); }
 }
 .wa-sim-toggle-btn:hover { background: var(--primary-dim); color: var(--primary); }
 .wa-sim-expanded .wa-sim-body { padding: 16px 20px 20px; border-top: 1px solid var(--border); }
+
+/* Green API sync button — subtle green tint to distinguish from generic refresh */
+.wa-sync-green-btn { color: #16a34a !important; }
+.wa-sync-green-btn:hover { background: #dcfce7 !important; color: #15803d !important; }
+.wa-sync-green-btn:disabled { opacity: .5; cursor: default; }

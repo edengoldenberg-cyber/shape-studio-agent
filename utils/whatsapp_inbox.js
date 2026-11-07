@@ -20,9 +20,11 @@ const MAX_MESSAGES = 300;
 
 class WhatsAppInbox {
   constructor() {
-    this._msgs    = [];         // flat ring buffer (all existing endpoints still work)
-    this._unread  = 0;          // global unread count
-    this._threads = new Map();  // phone → thread object
+    this._msgs       = [];          // flat ring buffer (all existing endpoints still work)
+    this._unread     = 0;           // global unread count
+    this._threads    = new Map();   // phone → thread object
+    this._seenIds    = new Set();   // idMessage deduplication for history sync
+    this._lastSync   = null;        // last greenapi sync result
   }
 
   // ── Internal ────────────────────────────────────────────────────────────────
@@ -191,10 +193,72 @@ class WhatsAppInbox {
     };
   }
 
+  // ── History sync ────────────────────────────────────────────────────────────
+
+  /**
+   * Load a single pre-parsed history message into the thread store.
+   * Called by greenapi.service syncToInbox() — does NOT touch the flat ring
+   * buffer or increment global unread (history messages are already "seen").
+   *
+   * @param {{ phone, direction, text, timestamp, mediaType, idMessage, senderName, agentId }}
+   * @returns {boolean} true if added, false if duplicate or invalid
+   */
+  loadMessage({ phone, direction, text, timestamp, mediaType, idMessage, senderName, agentId }) {
+    if (!phone || text === undefined || text === null) return false;
+
+    // Deduplication — skip if we've already loaded this message ID
+    if (idMessage) {
+      if (this._seenIds.has(idMessage)) return false;
+      this._seenIds.add(idMessage);
+    }
+
+    const thread = this._getOrCreateThread(phone, senderName, null);
+
+    const msgObj = {
+      id:          idMessage ?? `hist-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      direction:   direction ?? 'in',
+      text:        String(text),
+      timestamp:   timestamp instanceof Date ? timestamp : new Date(timestamp ?? Date.now()),
+      mediaType:   mediaType   ?? null,
+      agentId:     direction === 'out' ? (agentId ?? 'green-api') : null,
+      intent:      null,
+      route:       null,
+      clientMatch: null,
+    };
+
+    thread.messages.push(msgObj);
+
+    // Keep messages in chronological order
+    thread.messages.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+    // Update thread summary to reflect the most recent message
+    const last = thread.messages[thread.messages.length - 1];
+    thread.lastText = (last.text ?? '').slice(0, 60);
+    thread.lastAt   = last.timestamp;
+
+    return true;
+  }
+
+  /** Store the result metadata from the last Green API sync. */
+  recordSyncResult(result) {
+    this._lastSync = { ...result, recordedAt: new Date() };
+  }
+
+  /** Return last sync metadata for the status endpoint. */
+  getSyncStatus() {
+    return {
+      lastSync:    this._lastSync,
+      seenIds:     this._seenIds.size,
+      threadCount: this._threads.size,
+    };
+  }
+
   clear() {
     this._msgs    = [];
     this._unread  = 0;
     this._threads = new Map();
+    this._seenIds = new Set();
+    this._lastSync = null;
   }
 }
 

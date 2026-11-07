@@ -1,24 +1,117 @@
 require('dotenv').config();
-const axios = require('axios');
+const axios  = require('axios');
+const path   = require('path');
+const fs     = require('fs');
 const logger = require('../utils/logger');
 const { isQuietHours, nextMorningRelease } = require('../utils/time');
 
-// Evaluated lazily — fails loudly at call-time if credentials are missing, not silently at boot.
-// GREEN_API_URL  : host portion only, e.g. "1103.api.green-api.com"
-// GREEN_API_INSTANCE_ID : numeric instance ID shown in your Green API console
-// GREEN_API_TOKEN       : API token shown in your Green API console
-const SEND_URL = () => {
-  const host       = process.env.GREEN_API_URL;
-  const instanceId = process.env.GREEN_API_INSTANCE_ID;
-  const token      = process.env.GREEN_API_TOKEN;
-  if (!host || !instanceId || !token) {
-    throw new Error('Green API credentials not configured (GREEN_API_URL / GREEN_API_INSTANCE_ID / GREEN_API_TOKEN)');
+// ── Admin phone resolution ────────────────────────────────────────────────────
+// Returns de-duplicated E.164 phone list of all active staff who have phones,
+// merged with any explicit NOTIFY_PHONES / STUDIO_OWNER_PHONE env overrides.
+// Placeholder values that must never be treated as real phone numbers
+const PHONE_PLACEHOLDERS = new Set(['REPLACE_ME', '972XXXXXXXXX', 'XXXXXXXXXX', '']);
+
+function isRealPhone(p) {
+  return !!(p && !PHONE_PLACEHOLDERS.has(p) && /^[0-9]{7,15}$/.test(p));
+}
+
+function getAdminPhones() {
+  const envPhones = (process.env.NOTIFY_PHONES ?? process.env.STUDIO_OWNER_PHONE ?? '')
+    .split(',')
+    .map(p => p.trim().replace(/^\+/, ''))
+    .filter(isRealPhone);
+  try {
+    const cfg = JSON.parse(
+      fs.readFileSync(path.join(__dirname, '../data/staff_config.json'), 'utf8')
+    );
+    const cfgPhones = (cfg.staff ?? [])
+      .filter(s => s.active && isRealPhone(s.phone))
+      .map(s => s.phone);
+    return [...new Set([...cfgPhones, ...envPhones])];
+  } catch {
+    return envPhones;
   }
-  return `https://${host}/waInstance${instanceId}/sendMessage/${token}`;
-};
+}
+
+// ── Green API credential resolution ──────────────────────────────────────────
+// Accepts BOTH naming conventions so Railway variables work regardless of which
+// name was used when they were created:
+//
+//   Official Green API names:   GREEN_API_ID_INSTANCE  GREEN_API_TOKEN_INSTANCE
+//   Alternative names (legacy): GREEN_API_INSTANCE_ID  GREEN_API_TOKEN
+//   Host (both conventions):    GREEN_API_URL           GREEN_API_HOST
+//
+// Set at least one pair on Railway — both are tried at runtime.
+function getGreenCreds() {
+  const host       = process.env.GREEN_API_URL          ?? process.env.GREEN_API_HOST ?? null;
+  const instanceId = process.env.GREEN_API_ID_INSTANCE  ?? process.env.GREEN_API_INSTANCE_ID ?? null;
+  const token      = process.env.GREEN_API_TOKEN_INSTANCE ?? process.env.GREEN_API_TOKEN ?? null;
+  return { host, instanceId, token };
+}
+
+function buildSendUrl(method = 'sendMessage') {
+  const { host, instanceId, token } = getGreenCreds();
+  if (!host || !instanceId || !token) {
+    const missing = [
+      !host       && 'GREEN_API_URL (or GREEN_API_HOST)',
+      !instanceId && 'GREEN_API_ID_INSTANCE (or GREEN_API_INSTANCE_ID)',
+      !token      && 'GREEN_API_TOKEN_INSTANCE (or GREEN_API_TOKEN)',
+    ].filter(Boolean).join(', ');
+    throw new Error(`Green API credentials missing on Railway: ${missing}`);
+  }
+  return `https://${host}/waInstance${instanceId}/${method}/${token}`;
+}
+
+// Keep the old name so existing callers inside this file still work.
+const SEND_URL = () => buildSendUrl('sendMessage');
 
 // Green API uses auth-in-URL; no Authorization header needed.
 const HEADERS = { 'Content-Type': 'application/json' };
+
+/**
+ * Probe the Green API instance state and log the result.
+ * Call this at server startup so Railway logs immediately show whether
+ * the credentials are correct and the WhatsApp instance is authorized.
+ */
+async function probeGreenApiConnection() {
+  const { host, instanceId, token } = getGreenCreds();
+
+  if (!host || !instanceId || !token) {
+    logger.error('[Green API] Credentials NOT configured — WhatsApp sending is disabled', {
+      GREEN_API_URL:              process.env.GREEN_API_URL          ? 'SET' : 'MISSING',
+      GREEN_API_HOST:             process.env.GREEN_API_HOST         ? 'SET' : 'MISSING',
+      GREEN_API_ID_INSTANCE:      process.env.GREEN_API_ID_INSTANCE  ? 'SET' : 'MISSING',
+      GREEN_API_INSTANCE_ID:      process.env.GREEN_API_INSTANCE_ID  ? 'SET' : 'MISSING',
+      GREEN_API_TOKEN_INSTANCE:   process.env.GREEN_API_TOKEN_INSTANCE ? 'SET' : 'MISSING',
+      GREEN_API_TOKEN:            process.env.GREEN_API_TOKEN        ? 'SET' : 'MISSING',
+    });
+    return { ok: false, reason: 'credentials missing' };
+  }
+
+  // Log the masked endpoint so the URL construction is visible in logs
+  const maskedToken = token.slice(0, 6) + '...' + token.slice(-4);
+  const probeUrl    = `https://${host}/waInstance${instanceId}/getStateInstance/${maskedToken}`;
+  logger.info('[Green API] Probing connection', { endpoint: probeUrl, instanceId });
+
+  try {
+    const { data } = await axios.get(
+      `https://${host}/waInstance${instanceId}/getStateInstance/${token}`,
+      { timeout: 8000 }
+    );
+    const state = data?.stateInstance ?? 'unknown';
+    if (state === 'authorized') {
+      logger.info('[Green API] ✅ Instance authorized — WhatsApp sending is ACTIVE', { instanceId, state });
+    } else {
+      logger.warn('[Green API] ⚠️ Instance NOT authorized — messages will fail', { instanceId, state });
+    }
+    return { ok: state === 'authorized', state };
+  } catch (err) {
+    const status = err.response?.status;
+    const body   = err.response?.data;
+    logger.error('[Green API] Probe failed', { instanceId, httpStatus: status, response: body, error: err.message });
+    return { ok: false, reason: err.message };
+  }
+}
 
 // Convert a plain E.164 phone (972XXXXXXXXX) to Green API chat ID format (972XXXXXXXXX@c.us).
 // Idempotent — already-formatted IDs pass through unchanged.
@@ -46,16 +139,25 @@ async function sendText(to, text, { bypassQuietHours = false } = {}) {
 }
 
 /**
- * Alert the studio owner — always sent immediately, quiet hours do NOT apply.
+ * Alert all admin/staff phones about a system event.
+ * Sends to every active staff member with a phone in staff_config.json,
+ * plus any STUDIO_OWNER_PHONE / NOTIFY_PHONES env overrides.
+ * Quiet hours do NOT apply to alerts.
  */
 async function alertOwner(subject, body) {
-  const ownerPhone = process.env.STUDIO_OWNER_PHONE;
-  if (!ownerPhone) {
-    logger.error('STUDIO_OWNER_PHONE not configured — cannot send owner alert');
+  const phones = getAdminPhones();
+  if (!phones.length) {
+    logger.error('alertOwner: no admin phones configured (staff_config.json or STUDIO_OWNER_PHONE)');
     return;
   }
   const message = `🚨 *Shape Studio Agent Alert*\n\n*${subject}*\n\n${body}`;
-  return _dispatch(ownerPhone, message);
+  await Promise.allSettled(
+    phones.map(phone =>
+      _dispatch(phone, message).catch(err =>
+        logger.warn('alertOwner: dispatch failed', { phone, error: err.message })
+      )
+    )
+  );
 }
 
 /**
@@ -73,16 +175,68 @@ async function releaseQueuedMessages() {
 }
 
 async function _dispatch(to, text) {
+  const chatId = toChatId(to);
+  let url;
   try {
-    const payload = {
-      chatId:  toChatId(to),
-      message: text,
-    };
-    const { data } = await axios.post(SEND_URL(), payload, { headers: HEADERS });
-    logger.debug('WhatsApp message sent via Green API', { to, idMessage: data?.idMessage });
+    url = SEND_URL(); // throws clearly if credentials are missing
+  } catch (credErr) {
+    logger.error('[Green API] Cannot send — credentials error', { to, chatId, error: credErr.message });
+    throw credErr;
+  }
+
+  try {
+    const payload = { chatId, message: text };
+    const { data } = await axios.post(url, payload, { headers: HEADERS, timeout: 15000 });
+    logger.debug('[Green API] Message sent', { to, chatId, idMessage: data?.idMessage });
     return data;
   } catch (err) {
-    logger.error('WhatsApp send failed', { to, error: err.response?.data ?? err.message });
+    // Log the full HTTP error so Railway shows exactly what Green API returned
+    const httpStatus   = err.response?.status;
+    const responseBody = err.response?.data;
+    const { host, instanceId } = getGreenCreds();
+    const maskedUrl = url?.replace(/\/[^/]{20,}$/, '/***TOKEN***') ?? url;
+
+    logger.error('[Green API] Send failed', {
+      to,
+      chatId,
+      httpStatus,
+      responseBody,
+      endpoint:    maskedUrl,
+      instanceId,
+      networkError: !err.response ? err.message : undefined,
+    });
+    throw err;
+  }
+}
+
+/**
+ * Send a file (image, PDF, etc.) by public URL using Green API's sendFileByUrl endpoint.
+ * The URL must be publicly reachable by Green API's servers.
+ *
+ * @param {string} to       — E.164 phone number (972XXXXXXXXX)
+ * @param {string} fileUrl  — Publicly accessible URL of the file
+ * @param {string} fileName — Filename shown in WhatsApp (e.g. "schedule.png")
+ * @param {string} [caption]— Optional caption text beneath the file
+ */
+async function sendFileByUrl(to, fileUrl, fileName, caption = '') {
+  const url = buildSendUrl('sendFileByUrl'); // uses same dual-name credential resolution
+  try {
+    const { data } = await axios.post(url, {
+      chatId:   toChatId(to),
+      urlFile:  fileUrl,
+      fileName: fileName ?? 'file',
+      caption:  caption,
+    }, { headers: HEADERS, timeout: 20000 });
+    logger.debug('[Green API] File sent', { to, fileName, idMessage: data?.idMessage });
+    return data;
+  } catch (err) {
+    logger.error('[Green API] sendFileByUrl failed', {
+      to,
+      fileName,
+      httpStatus:   err.response?.status,
+      responseBody: err.response?.data,
+      error:        err.message,
+    });
     throw err;
   }
 }
@@ -231,13 +385,10 @@ function parseInboundRich(body) {
  * Quiet hours do NOT apply — leads are time-sensitive.
  */
 async function notifyLeadTeam(lead, { formId, adId } = {}) {
-  const phones = (process.env.NOTIFY_PHONES ?? process.env.STUDIO_OWNER_PHONE ?? '')
-    .split(',')
-    .map(p => p.trim().replace(/^\+/, ''))
-    .filter(Boolean);
+  const phones = getAdminPhones();
 
   if (!phones.length) {
-    logger.warn('notifyLeadTeam: no phones configured (NOTIFY_PHONES / STUDIO_OWNER_PHONE)');
+    logger.warn('notifyLeadTeam: no admin phones in staff_config.json or env vars');
     return;
   }
 
@@ -392,4 +543,4 @@ function parseGreenApiWebhook(body) {
   }
 }
 
-module.exports = { sendText, alertOwner, notifyLeadTeam, releaseQueuedMessages, verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook };
+module.exports = { sendText, sendFileByUrl, alertOwner, notifyLeadTeam, releaseQueuedMessages, verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, probeGreenApiConnection };

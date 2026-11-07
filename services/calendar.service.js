@@ -58,6 +58,10 @@ function buildICS(apt, staff) {
   const end   = new Date(start.getTime() + (apt.durationMin || 30) * 60_000);
   const stamp = new Date();
 
+  // fmt produces RFC 5545 UTC format: "20261107T130000Z"
+  // toISOString() already appends Z so we never add TZID — mixing TZID with
+  // a Z suffix is an RFC 5545 violation that iOS rejects and other clients
+  // interpret inconsistently. Pure UTC (Z) is accepted by every client.
   const fmt = (d) => d.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
 
   const summary = `שיחת ייעוץ — ${apt.leadName ?? apt.leadPhone}`;
@@ -79,9 +83,9 @@ function buildICS(apt, staff) {
     'CALSCALE:GREGORIAN',
     'METHOD:REQUEST',
     'BEGIN:VEVENT',
-    `DTSTART;TZID=Asia/Jerusalem:${fmt(start)}`,
-    `DTEND;TZID=Asia/Jerusalem:${fmt(end)}`,
-    `DTSTAMP:${fmt(stamp)}Z`,
+    `DTSTART:${fmt(start)}`,           // UTC — toISOString() already has Z
+    `DTEND:${fmt(end)}`,               // UTC — no TZID to avoid Z+TZID conflict
+    `DTSTAMP:${fmt(stamp)}`,           // fmt already includes Z; no extra Z needed
     `UID:${apt.id}@shape-studio-agent`,
     `SUMMARY:${summary}`,
     `DESCRIPTION:${desc}`,

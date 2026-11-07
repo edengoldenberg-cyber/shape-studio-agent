@@ -5,7 +5,23 @@ const express = require('express');
 const cron    = require('node-cron');
 const logger  = require('./utils/logger');
 
-const { verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, releaseQueuedMessages, sendText, alertOwner, notifyLeadTeam } = require('./services/whatsapp.service');
+// ── Global error handlers ─────────────────────────────────────────────────────
+// node-cron v3 emits 'task-failed' on the internal Task EventEmitter but nothing
+// listens for it, so async cron errors would vanish silently. These handlers
+// surface them before they can be swallowed.
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('Unhandled Promise rejection', {
+    reason: reason instanceof Error ? reason.message : String(reason),
+    stack:  reason instanceof Error ? reason.stack   : undefined,
+  });
+  // Do NOT re-throw — a crash would kill all in-flight requests on Railway.
+});
+
+process.on('uncaughtException', (err) => {
+  logger.error('Uncaught exception — server will continue', { error: err.message, stack: err.stack });
+});
+
+const { verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, releaseQueuedMessages, sendText, sendFileByUrl, alertOwner, notifyLeadTeam, probeGreenApiConnection } = require('./services/whatsapp.service');
 const { fetchAndNormalizeLead } = require('./services/metaLeads');
 const { captureRawBody, verifyMetaSignature } = require('./middleware/security');
 const inbox = require('./utils/whatsapp_inbox');
@@ -23,10 +39,29 @@ const automations                      = require('./utils/automation_store');
 const aptStore                         = require('./utils/appointment_store');
 const calendarSvc                      = require('./services/calendar.service');
 const notifySvc                        = require('./services/notification.service');
+const greenApiSvc                      = require('./services/greenapi.service');
 
 // ── Staff configuration (hot-reloadable) ─────────────────────────────────────
 
-const STAFF_CONFIG_PATH = path.join(__dirname, 'data/staff_config.json');
+const STAFF_CONFIG_PATH  = path.join(__dirname, 'data/staff_config.json');
+const SCHEDULE_PNG_PATH  = path.join(__dirname, 'public', 'schedule.png');
+
+/**
+ * Resolve the publicly reachable base URL of this server.
+ * Priority: BACKEND_URL env var → RAILWAY_PUBLIC_DOMAIN env var → null.
+ * Returns null when neither is set (e.g. plain localhost dev without ngrok).
+ */
+function getBackendBase() {
+  if (process.env.BACKEND_URL) return process.env.BACKEND_URL.replace(/\/$/, '');
+  if (process.env.RAILWAY_PUBLIC_DOMAIN) return `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`;
+  return null;
+}
+
+/** Publicly accessible URL for schedule.png — requires BACKEND_URL or RAILWAY_PUBLIC_DOMAIN. */
+function getScheduleImageUrl() {
+  const base = getBackendBase();
+  return base ? `${base}/schedule.png` : null;
+}
 
 function loadStaffConfig() {
   try { return JSON.parse(fs.readFileSync(STAFF_CONFIG_PATH, 'utf8')); }
@@ -42,6 +77,16 @@ function defaultStaff() {
   return findStaff(staffConfig.default_assignee_id) ??
          staffConfig.staff?.find(s => s.active) ??
          null;
+}
+
+/**
+ * Returns true when a phone belongs to a configured staff member.
+ * Used to skip the lead/client pipeline for inbound messages from Eden/Melanie.
+ */
+function isStaffPhone(phone) {
+  if (!phone) return false;
+  const norm = normalizeToE164(phone);
+  return (staffConfig.staff ?? []).some(s => s.phone && normalizeToE164(s.phone) === norm);
 }
 
 const app         = express();
@@ -413,17 +458,17 @@ app.get(['/leads/webhook', '/webhooks/leads', '/webhook/leads'], (req, res) => {
   app.handle(req, res);
 });
 
-// POST /api/leads/webhook — Meta Lead Ads inbound (new courier recruitment lead)
+// POST /api/leads/webhook — Meta Lead Ads inbound
 app.post('/api/leads/webhook', jsonBody, async (req, res) => {
-  res.sendStatus(200);                    // Meta requires 200 within 5s
+  res.sendStatus(200); // Meta requires 200 within 5s — processing happens below
 
   try {
-    // Meta sends only a leadgen_id in the webhook payload.
-    // Actual field values (name, phone, area…) must be fetched from Graph API.
+    // Meta sends only a leadgen_id. The full lead data must be fetched separately
+    // from the Graph API using META_PAGE_ACCESS_TOKEN.
     const change    = req.body?.entry?.[0]?.changes?.[0]?.value;
     const leadgenId = change?.leadgen_id;
-    const formId    = change?.form_id  ?? null;
-    const adId      = change?.ad_id    ?? null;
+    const formId    = change?.form_id ?? null;
+    const adId      = change?.ad_id   ?? null;
 
     if (!leadgenId) {
       logger.debug('Meta leads webhook: no leadgen_id — skipping', { body: req.body });
@@ -432,25 +477,49 @@ app.post('/api/leads/webhook', jsonBody, async (req, res) => {
 
     logger.info('Meta lead webhook received', { leadgenId, formId });
 
-    // Try Graph API first; fall back to whatever the webhook body contains
-    const lead = await fetchAndNormalizeLead(leadgenId).catch(() => null)
-                 ?? parseMetaLeadWebhook(req.body);
+    // ── Attempt 1: Graph API (requires META_PAGE_ACCESS_TOKEN) ───────────────
+    const graphLead = await fetchAndNormalizeLead(leadgenId).catch(err => {
+      logger.warn('fetchAndNormalizeLead threw unexpectedly', { leadgenId, error: err.message });
+      return null;
+    });
 
+    // ── Attempt 2: field_data embedded in the webhook body ───────────────────
+    // Meta's testing tool and some configurations include field_data directly.
+    // Production webhooks almost never do, but we try anyway.
+    const payloadLead = parseMetaLeadWebhook(req.body);
+
+    const lead = graphLead ?? payloadLead;
+
+    // ── No phone resolved — alert admins so the lead is never silently lost ──
     if (!lead?.phone) {
-      logger.warn('Meta lead: could not resolve phone — no Graph token or empty form?', { leadgenId });
+      const tokenConfigured = isConfigured('META_PAGE_ACCESS_TOKEN');
+      const reason = tokenConfigured
+        ? 'Graph API returned no phone field — verify form field names include "phone_number" or "phone"'
+        : 'META_PAGE_ACCESS_TOKEN is not configured on Railway — set a valid Page Access Token';
+
+      logger.warn('Meta lead: could not resolve phone', { leadgenId, reason, fieldDataInPayload: (change?.field_data ?? []).length });
+
+      // Notify Eden + Melanie so they can look up the lead manually in Meta Leads Manager
+      alertOwner(
+        'ליד מטא — לא הצלחנו לשלוף טלפון',
+        `leadgen_id: ${leadgenId}\nForm: ${formId ?? '—'}\n\n${reason}\n\nחפש/י את הליד ידנית ב-Meta Leads Manager.`
+      ).catch(() => {});
+
+      store.logEvent('meta_lead_no_phone', null, { leadgenId, formId, reason });
       return;
     }
 
+    // ── Lead resolved — store and notify ─────────────────────────────────────
     store.upsertLead(lead.phone, {
       name:   lead.name,
       status: 'new',
       score:  5,
-      meta:   { source: 'meta_ads', formId: lead.formId ?? formId, adId: lead.adId ?? adId },
+      meta:   { source: 'meta_ads', leadgenId, formId: lead.formId ?? formId, adId: lead.adId ?? adId },
     });
-    store.logEvent('meta_lead_webhook', lead.phone, { name: lead.name, source: 'meta_ads' });
-    logger.info('Meta lead captured', { phone: lead.phone, name: lead.name });
+    store.logEvent('meta_lead_webhook', lead.phone, { name: lead.name, leadgenId, source: 'meta_ads' });
+    logger.info('Meta lead captured', { phone: lead.phone, name: lead.name, leadgenId });
 
-    // Notify team via WhatsApp immediately (bypass quiet hours — leads are time-sensitive)
+    // WhatsApp notification to Eden + Melanie — bypasses quiet hours
     notifyLeadTeam(lead, { formId: lead.formId ?? formId, adId: lead.adId ?? adId })
       .catch(err => logger.warn('Lead team WhatsApp notification failed', { error: err.message }));
 
@@ -504,7 +573,11 @@ function isConfigured(...keys) {
 
 cron.schedule('30 8 * * *', async () => {
   logger.info('Cron: releasing quiet-hours queue');
-  await releaseQueuedMessages();
+  try {
+    await releaseQueuedMessages();
+  } catch (err) {
+    logger.error('Cron: releaseQueuedMessages failed', { error: err.message });
+  }
 }, { timezone: 'Asia/Jerusalem' });
 
 cron.schedule('0 9 * * *', async () => {
@@ -1021,7 +1094,7 @@ const INTENT_PATTERNS = {
   // subscription_query: questions about membership packages and what's included
   subscription_query: /מה זה כולל|כולל מה|מה כלול|מה נכלל|איזה שיעורים כלול|כמה כניסות|מנוי חודשי|מנויים|חבילה|חבילות|כמה עולה מנוי|מחיר מנוי|עלות מנוי|כמה עולה חבר|מנוי ב|מנוי ל/,
   // schedule_query covers both schedule listings AND instructor-specific questions
-  schedule_query:   /לוח שיעורים|מה יש|מתי יש|יש שיעור|יש מקום|מה קורה|סדר יום|מה הלוח|איזה שיעורים|מה התוכנית|מה הוא שיעור|מי מדריך|מי המדריך|מי מלמד|מי מנהל|מי נותן|באיזה שעה|בכמה|מה השעה|שיעור.{0,15}ב(יום|ערב|בוקר|צהריים)|ב(יום\s)?(ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת)/,
+  schedule_query:   /מערכת שעות|לוח שיעורים|מה יש|מתי יש|יש שיעור|יש מקום|מה קורה|סדר יום|מה הלוח|איזה שיעורים|מה התוכנית|מה הוא שיעור|מי מדריך|מי המדריך|מי מלמד|מי מנהל|מי נותן|באיזה שעה|בכמה|מה השעה|שיעור.{0,15}ב(יום|ערב|בוקר|צהריים)|ב(יום\s)?(ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת)/,
 };
 
 function detectSchedulingIntent(text) {
@@ -1035,6 +1108,25 @@ function detectSchedulingIntent(text) {
   if (INTENT_PATTERNS.subscription_query.test(text)) return 'subscription_query';
   if (INTENT_PATTERNS.schedule_query.test(text))     return 'schedule_query';
   return 'general';
+}
+
+// ── Timetable image detection ─────────────────────────────────────────────────
+
+// Keywords that mean "send me the full weekly timetable" (→ image).
+const TIMETABLE_IMAGE_RE = /מערכת שעות|מה יש השבוע|לוח.*שבוע|שבוע.*לוח|שלח[יה]?.*לוח|שלח[יה]?.*מערכת/;
+// Day names that make a schedule query specific to one day (→ Arbox live, not image).
+const SPECIFIC_DAY_RE    = /היום|מחר|ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת/;
+
+/**
+ * Returns true when the user wants the full weekly timetable image rather
+ * than a live per-day answer from Arbox.
+ */
+function isWeeklyTimetableQuery(text) {
+  if (!text) return false;
+  if (TIMETABLE_IMAGE_RE.test(text)) return true;
+  // "לוח שיעורים" alone with no specific day → image
+  if (/לוח שיעורים/.test(text) && !SPECIFIC_DAY_RE.test(text)) return true;
+  return false;
 }
 
 // ── Barak scheduling draft reply ──────────────────────────────────────────────
@@ -1233,6 +1325,28 @@ async function processInboundWAMessage(msg) {
   const fromNorm    = normalizeToE164(msg.from);
   const fromIsraeli = e164ToIsraeli(fromNorm);
 
+  // 0. Staff bypass — messages from Eden/Melanie are stored in the inbox for
+  //    visibility but are never processed through the lead/client pipeline.
+  if (isStaffPhone(fromNorm)) {
+    logger.info('Inbound message from internal staff — bypassing pipeline', { from: fromNorm });
+    const staffEntry = inbox.push({
+      from: fromNorm, fromIsraeli,
+      name: msg.name ?? null,
+      text: msg.text ?? '',
+      messageId: msg.messageId,
+      timestamp: msg.timestamp,
+      receivedAt: new Date(),
+      mediaType: msg.type,
+      mediaCaption: msg.mediaCaption ?? null,
+      mediaId: msg.mediaId ?? null,
+      clientMatch: { found: false, matchType: 'staff', arboxName: null, arboxId: null, isActive: true, role: 'staff' },
+      intent: 'staff',
+      route:  'staff_bypass',
+      barakReply: null,
+    });
+    return { inboxEntry: staffEntry, clientMatch: { found: false }, intent: 'staff', route: 'staff_bypass', barakReply: null };
+  }
+
   // 1. Arbox client lookup
   let clientMatch = { found: false, matchType: null, arboxName: null, arboxId: null, isActive: false, role: null };
   try {
@@ -1367,8 +1481,10 @@ async function processInboundWAMessage(msg) {
 
         if (icsContent) aptIcsCache.set(apt.id, icsContent);
 
-        const backendBase = process.env.BACKEND_URL || 'https://shape-studio-agent-production.up.railway.app';
-        const icsUrl      = icsContent ? `${backendBase}/api/calendar/appointment/${apt.id}.ics` : null;
+        const backendBase = getBackendBase();
+        const icsUrl      = (icsContent && backendBase)
+          ? `${backendBase}/api/calendar/appointment/${apt.id}.ics`
+          : null;
 
         if (isReschedule) {
           // Notify all active staff: "rescheduled — was X, now Y"
@@ -1429,16 +1545,39 @@ async function processInboundWAMessage(msg) {
   }
 
   // 3. Routing decision
-  let route     = 'unhandled';
-  let barakReply = null;
+  let route          = 'unhandled';
+  let barakReply     = null;
+  let timetableImgUrl = null; // set when we want to send schedule.png instead of text
 
   const isExistingClient = clientMatch.found && clientMatch.matchType === 'member';
   const isSchedulingMsg  = intent !== 'general';
 
   if (isSchedulingMsg) {
-    // Scheduling intents always go to Barak regardless of client status
     route = 'barak';
-    try { barakReply = await buildSchedulingReply(intent, msg, clientMatch); } catch { /* non-fatal */ }
+
+    // ── Static timetable image ────────────────────────────────────────────────
+    // When the user asks for the weekly timetable and schedule.png exists,
+    // send the image instead of a live Arbox text listing.
+    const imgUrl = getScheduleImageUrl();
+    if (intent === 'schedule_query'
+        && isWeeklyTimetableQuery(msg.text)
+        && imgUrl
+        && fs.existsSync(SCHEDULE_PNG_PATH)) {
+      barakReply     = `הנה מערכת השעות העדכנית של Shape Studio! 🏋️‍♀️`;
+      timetableImgUrl = imgUrl;
+    } else {
+      // Regular scheduling text reply via Arbox / Barak
+      try { barakReply = await buildSchedulingReply(intent, msg, clientMatch); } catch { /* non-fatal */ }
+    }
+
+    // Alert staff immediately when a rep is requested — they need to know someone
+    // wants a human right now, before the follow-up appointment is booked.
+    if (intent === 'representative') {
+      const clientName = msg.name ?? clientMatch.arboxName ?? fromIsraeli ?? fromNorm;
+      notifySvc.notifyRepresentativeRequest(fromNorm, clientName).catch(err =>
+        logger.warn('Representative request staff alert failed', { error: err.message })
+      );
+    }
   } else if (!isExistingClient) {
     // Unknown sender or known lead → lead qualification pipeline (lead_agent sends its own reply)
     route = 'lead_agent';
@@ -1522,15 +1661,25 @@ async function processInboundWAMessage(msg) {
 
   // 6. Auto-reply when configured and Barak has a draft
   if (barakReply && process.env.WHATSAPP_AUTO_REPLY === 'true') {
-    try {
-      await sendText(fromNorm, barakReply);
-      store.logEvent('message_out', fromNorm, {
-        preview: barakReply.slice(0, 80),
-        agent:   'barak',
-        source:  'auto_reply',
-      });
-    } catch (err) {
-      logger.warn('WA auto-reply failed', { from: fromNorm, error: err.message });
+    if (timetableImgUrl) {
+      // Send the weekly timetable image; fall back to text if the image send fails
+      sendFileByUrl(fromNorm, timetableImgUrl, 'schedule.png', barakReply)
+        .then(() => store.logEvent('timetable_image_sent', fromNorm, { imageUrl: timetableImgUrl }))
+        .catch(err => {
+          logger.warn('Timetable image send failed — falling back to text reply', { from: fromNorm, error: err.message });
+          sendText(fromNorm, barakReply).catch(() => {});
+        });
+    } else {
+      try {
+        await sendText(fromNorm, barakReply);
+        store.logEvent('message_out', fromNorm, {
+          preview: barakReply.slice(0, 80),
+          agent:   'barak',
+          source:  'auto_reply',
+        });
+      } catch (err) {
+        logger.warn('WA auto-reply failed', { from: fromNorm, error: err.message });
+      }
     }
   }
 
@@ -1664,33 +1813,64 @@ app.post('/api/whatsapp/simulate', jsonBody, async (req, res) => {
 // WEBHOOK STUBS — Meta Lead Ads & WhatsApp (testing / production-ready)
 // ══════════════════════════════════════════════════════════════════════════════
 
-// POST /api/webhooks/meta — flexible Meta Lead Ads stub (easier for testing than /api/leads/webhook)
-app.post('/api/webhooks/meta', jsonBody, async (req, res) => {
+// POST /api/webhooks/meta — Meta Lead Ads ingestion (Make.com → Railway)
+// Responds 200 immediately; all storage and WhatsApp processing run asynchronously
+// to prevent Make from timing out while the WhatsApp API call is in flight.
+app.post('/api/webhooks/meta', jsonBody, (req, res) => {
+  // ── 1. Parse lead synchronously (pure CPU — no I/O) ──────────────────────────
+  let lead = null;
   try {
-    // Accept both strict Meta format and a simplified test format { name, phone, adCampaign }
-    let lead = null;
     if (req.body?.entry) {
+      // Native Meta webhook format (direct subscription)
       lead = parseMetaLeadWebhook(req.body);
     } else {
-      const { name, phone, adCampaign, adId } = req.body ?? {};
-      if (!phone) return;
-      const cleaned = String(phone).replace(/[\s\-+()]/g, '').replace(/^0/, '972');
-      lead = { phone: cleaned, name: name ?? null, formId: adCampaign ?? 'test', adId: adId ?? null };
+      // Make.com simplified format: { name, phone, email, adCampaign, formId, customQuestions }
+      const { name, phone, email, adCampaign, formId, customQuestions } = req.body ?? {};
+      if (!phone) return res.status(400).json({ error: 'phone required' });
+      const cleaned = String(phone).replace(/[\s\-+()]/g, '').replace(/^972/, '').replace(/^0/, '972').replace(/^(?!972)/, '972');
+      lead = {
+        phone:           cleaned,
+        name:            name           ?? null,
+        email:           email          ?? null,
+        adCampaign:      adCampaign     ?? null,
+        formId:          formId         ?? null,
+        customQuestions: customQuestions ?? null,
+      };
     }
-    if (!lead?.phone) return;
-
-    store.upsertLead(lead.phone, {
-      name: lead.name, status: 'new', score: 5,
-      meta: { source: 'meta_ads', formId: lead.formId, adId: lead.adId },
-    });
-    store.logEvent('meta_lead_webhook', lead.phone, { name: lead.name, source: 'meta_ads' });
-    automations.recordExecution('rule-008', { phone: lead.phone, name: lead.name });
-    logger.info('Meta webhook (stub) lead captured', { phone: lead.phone, name: lead.name });
-    return res.json({ ok: true, captured: true, phone: lead.phone, name: lead.name, ts: new Date() });
+    if (!lead?.phone) return res.status(400).json({ error: 'could not resolve phone from payload' });
   } catch (err) {
-    logger.error('Meta webhook stub error', { error: err.message });
-    res.status(500).json({ error: err.message });
+    logger.error('Meta webhook payload parse error', { error: err.message });
+    return res.status(400).json({ error: 'invalid payload' });
   }
+
+  // ── 2. Respond to Make immediately — before any async I/O ────────────────────
+  res.status(200).json({ success: true, message: 'Lead received', phone: lead.phone, ts: new Date() });
+
+  // ── 3. All heavy work runs after the response is flushed ─────────────────────
+  setImmediate(async () => {
+    try {
+      store.upsertLead(lead.phone, {
+        name:   lead.name,
+        email:  lead.email,
+        status: 'new',
+        score:  5,
+        meta: {
+          source:          'meta_ads',
+          formId:          lead.formId,
+          adCampaign:      lead.adCampaign,
+          customQuestions: lead.customQuestions,
+        },
+      });
+      store.logEvent('meta_lead_webhook', lead.phone, { name: lead.name, source: 'meta_ads' });
+      automations.recordExecution('rule-008', { phone: lead.phone, name: lead.name });
+      logger.info('Meta webhook lead captured', { phone: lead.phone, name: lead.name, formId: lead.formId });
+
+      await notifyLeadTeam(lead, { formId: lead.formId, adCampaign: lead.adCampaign })
+        .catch(err => logger.warn('notifyLeadTeam failed', { error: err.message }));
+    } catch (err) {
+      logger.error('Meta webhook async processing error', { error: err.message, phone: lead.phone });
+    }
+  });
 });
 
 // POST /api/webhooks/whatsapp — WhatsApp inbound simulation stub
@@ -2061,8 +2241,12 @@ app.get('/api/calendar/appointment/:id.ics', async (req, res) => {
     return res.status(422).send('Calendar event could not be generated (appointment time not yet parsed)');
   }
 
+  // "inline" disposition lets iOS/Android open the file directly in the
+  // calendar app. "attachment" forces a download which mobile calendars
+  // may not auto-handle. The filename is kept human-readable.
   res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
-  res.setHeader('Content-Disposition', `attachment; filename="appointment-${id.slice(0,8)}.ics"`);
+  res.setHeader('Content-Disposition', 'inline; filename="shape-studio-appointment.ics"');
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
   res.send(ics);
 });
 
@@ -2143,10 +2327,90 @@ app.post('/api/whatsapp/threads/:phone/send', jsonBody, async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+// GREEN API HISTORY SYNC
+// ══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/whatsapp/sync-green — status check (no actual sync)
+app.get('/api/whatsapp/sync-green', (_req, res) => {
+  const status = inbox.getSyncStatus();
+  res.json({
+    configured:   greenApiSvc.isConfigured(),
+    lastSync:     status.lastSync,
+    seenMessages: status.seenIds,
+    threads:      status.threadCount,
+    ts: new Date(),
+  });
+});
+
+// POST /api/whatsapp/sync-green — trigger a full history sync
+// Body (all optional): { minutes, perChatCount, deepHistory }
+app.post('/api/whatsapp/sync-green', jsonBody, async (req, res) => {
+  if (!greenApiSvc.isConfigured()) {
+    return res.status(503).json({
+      ok:     false,
+      reason: 'Green API credentials not configured (GREEN_API_URL / GREEN_API_INSTANCE_ID / GREEN_API_TOKEN)',
+    });
+  }
+
+  const { minutes, perChatCount, deepHistory } = req.body ?? {};
+  logger.info('Green API sync triggered via dashboard', { minutes, perChatCount, deepHistory });
+
+  // Run sync (can take several seconds for many chats)
+  try {
+    const result = await greenApiSvc.syncToInbox(inbox, {
+      ...(minutes       != null && { minutes:      parseInt(minutes,       10) }),
+      ...(perChatCount  != null && { perChatCount: parseInt(perChatCount,  10) }),
+      ...(deepHistory   != null && { deepHistory:  Boolean(deepHistory)        }),
+    });
+
+    if (!result.ok) {
+      return res.status(502).json(result);
+    }
+
+    // Broadcast SSE so all dashboard clients refresh their thread lists
+    broadcastSse('sync_complete', {
+      source:   'manual',
+      chats:    result.chats,
+      messages: result.messages,
+    });
+
+    store.logEvent('green_api_sync', null, {
+      chats:    result.chats,
+      messages: result.messages,
+      skipped:  result.skipped,
+      errors:   result.errors,
+    });
+
+    res.json(result);
+  } catch (err) {
+    logger.error('Green API sync error', { error: err.message });
+    res.status(500).json({ ok: false, reason: err.message });
+  }
+});
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   logger.info(`Shape Studio Agent running — http://localhost:${PORT}`);
   initWorkers(store);
+
+  // Probe Green API credentials immediately at startup so Railway logs show
+  // whether WhatsApp sending will work before the first real message arrives.
+  probeGreenApiConnection().catch(() => {}); // errors already logged inside
+
+  // Auto-populate inbox from Green API history on every cold start
+  if (greenApiSvc.isConfigured()) {
+    setTimeout(async () => {
+      try {
+        logger.info('[startup] Auto-syncing Green API history...');
+        const result = await greenApiSvc.syncToInbox(inbox);
+        logger.info('[startup] Green API sync complete', result);
+        broadcastSse('sync_complete', { source: 'startup', chats: result.chats, messages: result.messages });
+      } catch (err) {
+        logger.warn('[startup] Green API auto-sync failed', { error: err.message });
+      }
+    }, 2000); // 2s delay so the server is fully accepting connections first
+  }
 });
 
 module.exports = app;

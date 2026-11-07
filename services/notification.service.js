@@ -90,6 +90,8 @@ function formatTime(scheduledAt, rawTime) {
 
 /**
  * Send a WhatsApp message to every active staff member who has a phone.
+ * Always bypasses quiet hours — outbound alerts to staff must never be queued
+ * or trigger the "Got your message" ack that is meant for inbound client messages.
  * Returns the count of successful sends.
  */
 async function broadcastToStaff(message) {
@@ -97,7 +99,7 @@ async function broadcastToStaff(message) {
   let sent = 0;
   for (const member of recipients) {
     try {
-      await sendText(member.phone, message);
+      await sendText(member.phone, message, { bypassQuietHours: true });
       sent++;
     } catch (err) {
       logger.warn('[notify] broadcastToStaff failed', { staffId: member.id, error: err.message });
@@ -266,6 +268,41 @@ async function alertEden(message) {
   }
 }
 
+/**
+ * Immediate alert to ALL active staff when a client asks for a human representative.
+ * Fires as soon as the intent is detected — before the appointment is booked —
+ * so the team knows someone needs personal attention right now.
+ */
+async function notifyRepresentativeRequest(leadPhone, leadName) {
+  const displayPhone = String(leadPhone).startsWith('972')
+    ? '0' + String(leadPhone).slice(3)
+    : leadPhone;
+
+  const msg = [
+    `🙋 *נציג התבקש!*`,
+    ``,
+    `👤 ${leadName ?? 'לקוח/ה לא מזוהה'}`,
+    `📱 ${displayPhone}`,
+    `💬 WhatsApp: ${waLink(leadPhone)}`,
+    ``,
+    `הלקוח/ה מבקש/ת לדבר עם נציג — הבוט ביקש/ה זמן מועדף לשיחה.`,
+    `בקרוב תקבלו הודעה עם השעה המועדפת.`,
+  ].join('\n');
+
+  const sent = await broadcastToStaff(msg);
+  logger.info('[notify] Representative request alert sent', { leadPhone, waRecipients: sent });
+}
+
+/**
+ * Send the daily end-of-day summary report via WhatsApp to all active staff.
+ * Called by the 20:00 cron worker in scheduler.js.
+ */
+async function sendDailySummaryToAdmins(summaryText) {
+  const sent = await broadcastToStaff(summaryText);
+  logger.info('[notify] Daily summary sent', { waRecipients: sent });
+  return sent;
+}
+
 module.exports = {
   notifyStaffCallbackConfirmed,
   sendStaffReminder,
@@ -273,4 +310,6 @@ module.exports = {
   sendLeadConfirmation,
   notifyStaffRescheduled,
   alertEden,
+  notifyRepresentativeRequest,
+  sendDailySummaryToAdmins,
 };

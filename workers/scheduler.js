@@ -4,14 +4,17 @@
  * Autonomous background workers for Shape Studio multi-agent OS.
  *
  * Workers:
- *   Tomer   — retention scan every 4 hours (0,4,8,12,16,20:00 IL)
- *   Barak   — CRM ingestion check every hour
- *   Maya    — daily executive briefing at 08:00 IL
+ *   Tomer        — retention scan every 4 hours (0,4,8,12,16,20:00 IL)
+ *   Barak        — CRM ingestion check every hour
+ *   Maya         — daily executive briefing logged at 08:00 IL
+ *   EveningReport— end-of-day WhatsApp summary to Eden + Melanie at 20:00 IL
  */
 
 const cron        = require('node-cron');
 const logger      = require('../utils/logger');
 const automations = require('../utils/automation_store');
+const aptStore    = require('../utils/appointment_store');
+const { sendDailySummaryToAdmins } = require('../services/notification.service');
 
 // Business constants from business_context.md
 const STUDIO_NAME   = 'Shape Studio';
@@ -22,9 +25,10 @@ const TRIAL_CLASSES = ['Reformer Pilates', 'Pilates Barre', 'Strength Training',
 // ── Tomer: Automated Retention & Follow-up Loop (every 4 hours) ──────────────
 
 function startTomerRetentionLoop(store) {
-  cron.schedule('0 0,4,8,12,16,20 * * *', () => runTomerScan(store), {
-    timezone: 'Asia/Jerusalem',
-  });
+  cron.schedule('0 0,4,8,12,16,20 * * *', async () => {
+    try { await runTomerScan(store); }
+    catch (err) { logger.error('Worker[Tomer]: unhandled error', { error: err.message }); }
+  }, { timezone: 'Asia/Jerusalem' });
   logger.info('Worker[Tomer]: retention loop scheduled — runs every 4h at 0,4,8,12,16,20:00 IL');
 }
 
@@ -115,9 +119,10 @@ function buildMemberMessage(member, daysSince) {
 // ── Barak: Lead Ingestion & CRM Sync Worker (hourly) ─────────────────────────
 
 function startBarakIngestionWorker(store) {
-  cron.schedule('0 * * * *', () => runBarakIngestion(store), {
-    timezone: 'Asia/Jerusalem',
-  });
+  cron.schedule('0 * * * *', async () => {
+    try { await runBarakIngestion(store); }
+    catch (err) { logger.error('Worker[Barak]: unhandled error', { error: err.message }); }
+  }, { timezone: 'Asia/Jerusalem' });
   logger.info('Worker[Barak]: CRM ingestion worker scheduled — runs every hour');
 }
 
@@ -192,10 +197,10 @@ async function runBarakIngestion(store) {
 // ── Maya: Daily Executive Briefing (08:00 IL) ────────────────────────────────
 
 function startMayaDailyBriefing(store) {
-  // Daily at 08:00 — after existing 07:30 queue-release and before 09:00 retention cron
-  cron.schedule('0 8 * * *', () => runMayaBriefing(store), {
-    timezone: 'Asia/Jerusalem',
-  });
+  cron.schedule('0 8 * * *', async () => {
+    try { await runMayaBriefing(store); }
+    catch (err) { logger.error('Worker[Maya]: unhandled error', { error: err.message }); }
+  }, { timezone: 'Asia/Jerusalem' });
   logger.info('Worker[Maya]: daily briefing scheduled — runs daily at 08:00 IL');
 }
 
@@ -258,18 +263,104 @@ async function runMayaBriefing(store) {
   logger.info('Worker[Maya]: daily briefing logged', { headline });
 }
 
+// ── Evening Report: end-of-day WhatsApp summary to Eden + Melanie (20:00 IL) ──
+
+function startEveningReport(store) {
+  cron.schedule('0 20 * * *', async () => {
+    try { await runEveningReport(store); }
+    catch (err) { logger.error('Worker[EveningReport]: unhandled error', { error: err.message }); }
+  }, { timezone: 'Asia/Jerusalem' });
+  logger.info('Worker[EveningReport]: daily WhatsApp summary scheduled — runs at 20:00 IL');
+}
+
+async function runEveningReport(store) {
+  if (!automations.isWorkerEnabled('evening-report')) {
+    logger.info('Worker[EveningReport]: disabled — skipping');
+    return { skipped: true };
+  }
+  automations.touchWorker('evening-report');
+  logger.info('Worker[EveningReport]: compiling end-of-day report');
+
+  try {
+    const stats  = store.getDailyStats();
+    const health = store.getSystemHealth();
+    const members = store.getMemberStats();
+
+    // ── Today section ─────────────────────────────────────────────────────────
+    const today  = new Date(); today.setHours(0, 0, 0, 0);
+    const allApts  = aptStore.getAll();
+    const aptsToday      = allApts.filter(a => new Date(a.createdAt) >= today);
+    const aptsCompleted  = aptsToday.filter(a => a.status === 'completed').length;
+    const aptsNoShow     = aptsToday.filter(a => a.status === 'no_show').length;
+    const aptsCreated    = aptsToday.length;
+
+    // ── Pending section ───────────────────────────────────────────────────────
+    const aptsConfirmed    = allApts.filter(a => a.status === 'confirmed').length;
+    const dormantLeads     = store.getDormantLeads(3).length;
+    const inactiveMembers  = store.getInactiveMembers(14).length;
+    const callbacksPending = store.getAllLeads().filter(l => l.meta?.awaitingCallbackTime).length;
+
+    const convRate = stats.introOffersSent > 0
+      ? Math.round(((stats.introsRedeemed ?? 0) / stats.introOffersSent) * 100)
+      : 0;
+
+    const dateHe = new Date().toLocaleDateString('he-IL', {
+      timeZone: 'Asia/Jerusalem', weekday: 'long', day: 'numeric', month: 'long',
+    });
+
+    // ── Build WhatsApp message ────────────────────────────────────────────────
+    const lines = [
+      `📊 *סיכום יומי — Shape Studio*`,
+      `${dateHe}`,
+      ``,
+      `✅ *בוצע היום:*`,
+      `• ${stats.newLeadsToday ?? 0} לידים חדשים נקלטו`,
+      `• ${stats.messagesIn    ?? 0} הודעות WhatsApp נכנסות`,
+      `• ${aptsCreated} שיחות ייעוץ נקבעו`,
+      aptsCompleted > 0 ? `• ${aptsCompleted} שיחות הושלמו` : null,
+      aptsNoShow    > 0 ? `• ${aptsNoShow} שיחות שלא נוצלו (no-show)` : null,
+      stats.bookingsToday > 0 ? `• ${stats.bookingsToday} ניסיונות הוזמנו` : null,
+      ``,
+      `⏳ *ממתין לטיפול:*`,
+      callbacksPending > 0 ? `• ${callbacksPending} בקשות שיחה ממתינות לאישור זמן` : null,
+      aptsConfirmed    > 0 ? `• ${aptsConfirmed} פגישות מאושרות שטרם הושלמו` : null,
+      dormantLeads     > 0 ? `• ${dormantLeads} לידים ללא מענה (3+ ימים)` : null,
+      inactiveMembers  > 0 ? `• ${inactiveMembers} חברות לא הגיעו 14+ ימים` : null,
+      health.crisisActive > 0 ? `• 🚨 ${health.crisisActive} לידים במשבר — נדרש טיפול אנושי` : null,
+      ``,
+      `📈 *מצב כללי:*`,
+      `• ${stats.totalLeads ?? 0} לידים סה"כ | ${stats.hotLeadsTotal ?? 0} חמים`,
+      `• המרה: ${convRate}% | ציון ממוצע: ${health.avgScore ?? 0}`,
+      members.total > 0 ? `• ${members.active ?? 0} חברות פעילות | ${members.atRisk ?? 0} בסיכון` : null,
+    ].filter(l => l !== null).join('\n');
+
+    await sendDailySummaryToAdmins(lines);
+
+    store.logEvent('evening_report_sent', null, {
+      agent: 'scheduler', newLeads: stats.newLeadsToday, apts: aptsCreated,
+      pending: callbacksPending + aptsConfirmed,
+    });
+    logger.info('Worker[EveningReport]: report sent', { aptsCreated, dormantLeads, callbacksPending });
+    return { ok: true, aptsCreated, dormantLeads, callbacksPending };
+  } catch (err) {
+    logger.error('Worker[EveningReport]: failed', { error: err.message });
+    return { ok: false, error: err.message };
+  }
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 function initWorkers(store) {
   startTomerRetentionLoop(store);
   startBarakIngestionWorker(store);
   startMayaDailyBriefing(store);
+  startEveningReport(store);
 
   // Appointment reminders + no-show detection (every 15 min)
   const { initAppointmentWorker } = require('./appointment_worker');
   initAppointmentWorker(store);
 
-  logger.info('Workers: all 4 autonomous workers initialized and running');
+  logger.info('Workers: all 5 autonomous workers initialized and running');
 
   // Run Barak ingestion immediately on boot for instant health check
   setImmediate(() => runBarakIngestion(store));
@@ -280,4 +371,5 @@ module.exports = {
   runTomerScan,
   runBarakIngestion,
   runMayaBriefing,
+  runEveningReport,
 };

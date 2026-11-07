@@ -7,23 +7,25 @@
       "id": "eden",
       "name_he": "עדן",
       "name_en": "Eden Goldenberg",
-      "phone": "972535716559",
-      "email": "",
+      "phone": "972547598919",
+      "email": "edengoldenberg@gmail.com",
       "role": "owner",
       "active": true,
       "is_default_assignee": true,
+      "notify_all_events": true,
       "classes": ["Strength Training", "אימון כח"],
-      "note": "מנהל הסטודיו"
+      "note": "מנהלת הסטודיו"
     },
     {
       "id": "melanie",
       "name_he": "מלאני",
       "name_en": "Melanie Mendoza",
-      "phone": "",
+      "phone": "972526632123",
       "email": "",
       "role": "instructor",
       "active": true,
       "is_default_assignee": false,
+      "notify_all_events": true,
       "classes": ["Reformer Pilates", "פילאטיס מכשירים"],
       "note": "Reformer Pilates specialist"
     },
@@ -36,6 +38,7 @@
       "role": "instructor",
       "active": true,
       "is_default_assignee": false,
+      "notify_all_events": false,
       "classes": ["Concept Toning", "עיצוב חיטוב"],
       "note": ""
     }

@@ -96,6 +96,16 @@ const DEFAULT_WORKERS = [
     lastRun:  null,
     runCount: 0,
   },
+  {
+    id: 'evening-report',
+    name:     'סיכום ערב — WhatsApp לצוות',
+    nameEn:   'Evening WhatsApp Report',
+    schedule: 'יומי 20:00',
+    agent:    'scheduler',
+    enabled:  true,
+    lastRun:  null,
+    runCount: 0,
+  },
 ];
 
 class AutomationStore {
