@@ -1704,7 +1704,12 @@ app.post('/api/whatsapp/webhook', captureRawBody, verifyMetaSignature, async (re
   logger.info('WA webhook inbound', { from: msg.from, type: msg.type, preview: msg.text?.slice(0, 60) });
 
   processInboundWAMessage(msg)
-    .then(r => r && broadcastSse('message', { phone: r.inboxEntry.from, name: r.inboxEntry.name ?? null }))
+    .then(r => {
+      if (!r) return;
+      broadcastSse('message', { phone: r.inboxEntry.from, name: r.inboxEntry.name ?? null });
+      persist.saveInbox(inbox);
+      persist.saveLeads(store);
+    })
     .catch(err => logger.error('WA pipeline error', { error: err.message, from: msg.from }));
 });
 
@@ -2454,13 +2459,17 @@ app.listen(PORT, () => {
   // whether WhatsApp sending will work before the first real message arrives.
   probeGreenApiConnection().catch(() => {}); // errors already logged inside
 
-  // Auto-populate inbox from Green API history on every cold start
+  // Auto-populate inbox from Green API history on every cold start.
+  // After sync, persist immediately so threads survive a restart before the
+  // 60s periodic save fires, and broadcast SSE so any connected dashboard
+  // clients (now connected at boot via connectWaSSE()) refresh their list.
   if (greenApiSvc.isConfigured()) {
     setTimeout(async () => {
       try {
         logger.info('[startup] Auto-syncing Green API history...');
         const result = await greenApiSvc.syncToInbox(inbox);
         logger.info('[startup] Green API sync complete', result);
+        persist.saveInbox(inbox);   // persist immediately — don't wait 60s
         broadcastSse('sync_complete', { source: 'startup', chats: result.chats, messages: result.messages });
       } catch (err) {
         logger.warn('[startup] Green API auto-sync failed', { error: err.message });

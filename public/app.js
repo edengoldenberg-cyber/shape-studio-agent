@@ -2345,6 +2345,17 @@ pingServer();
 loadMayaStats();
 loadAgentFeed();
 loadBarakPanel();
+
+// Connect SSE immediately at boot — not just when the WhatsApp tab is opened.
+// Without this the server's startup sync_complete event (fired 2s after cold start)
+// is broadcast to zero clients and the thread list stays empty until the user
+// manually clicks the WhatsApp tab.
+connectWaSSE();
+
+// Pre-fetch threads in the background so the WhatsApp tab shows real data
+// the moment it is clicked instead of an empty list.
+loadWaThreads(false);
+
 refreshTimer = setInterval(() => {
   const active = document.querySelector('.tab-btn.active')?.dataset?.tab;
   if (active === 'maya' || active === 'barak') loadBarakPanel();
