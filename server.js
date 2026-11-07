@@ -1232,7 +1232,7 @@ const INTENT_PATTERNS = {
   // subscription_query: questions about membership packages and what's included
   subscription_query: /מה זה כולל|כולל מה|מה כלול|מה נכלל|איזה שיעורים כלול|כמה כניסות|מנוי חודשי|מנויים|חבילה|חבילות|כמה עולה מנוי|מחיר מנוי|עלות מנוי|כמה עולה חבר|מנוי ב|מנוי ל/,
   // schedule_query covers both schedule listings AND instructor-specific questions
-  schedule_query:   /מערכת שעות|לוח שיעורים|מה יש|מתי יש|יש שיעור|יש מקום|מה קורה|סדר יום|מה הלוח|הלוח שלכם|הלוח שלך|שעות.*הסטודיו|שעות.*שלכם|שעות פעילות|לראות.*שעות|רוצה.*לוח|איזה שיעורים|מה התוכנית|מה הוא שיעור|מי מדריך|מי המדריך|מי מלמד|מי מנהל|מי נותן|באיזה שעה|בכמה|מה השעה|שיעור.{0,15}ב(יום|ערב|בוקר|צהריים)|ב(יום\s)?(ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת)/,
+  schedule_query:   /מערכת שעות|לוח שיעורים|מה יש|מתי יש|יש שיעור|יש מקום|מה קורה|סדר יום|מה הלוח|הלוח שלכם|הלוח שלך|שעות.*הסטודיו|שעות.*שלכם|שעות פעילות|שעות פתיחה|מתי פתוח|מתי פתוחים|לראות.*שעות|רוצה.*לוח|איזה שיעורים|מה התוכנית|מה הוא שיעור|מי מדריך|מי המדריך|מי מלמד|מי מנהל|מי נותן|באיזה שעה|בכמה|מה השעה|שיעור.{0,15}ב(יום|ערב|בוקר|צהריים)|ב(יום\s)?(ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת)|יש לכם.*תמונה|שלח.*תמונה.*לוח|תמונה.*לוח|לוח.*תמונה|יש תמונה/,
 };
 
 function detectSchedulingIntent(text) {
@@ -1251,7 +1251,7 @@ function detectSchedulingIntent(text) {
 // ── Timetable image detection ─────────────────────────────────────────────────
 
 // Keywords that mean "send me the full weekly timetable" (→ image).
-const TIMETABLE_IMAGE_RE = /מערכת שעות|מה יש השבוע|לוח.*שבוע|שבוע.*לוח|שלח[יה]?.*לוח|שלח[יה]?.*מערכת|הלוח שלכם|הלוח שלך|שעות.*הסטודיו|שעות.*שלכם|שעות.*שלך|שעות פעילות|לראות.*שעות|רוצה.*לוח|לוח שיעורים/i;
+const TIMETABLE_IMAGE_RE = /מערכת שעות|מה יש השבוע|לוח.*שבוע|שבוע.*לוח|שלח[יה]?.*לוח|שלח[יה]?.*מערכת|הלוח שלכם|הלוח שלך|שעות.*הסטודיו|שעות.*שלכם|שעות.*שלך|שעות פעילות|שעות פתיחה|מתי פתוח|לראות.*שעות|רוצה.*לוח|לוח שיעורים|יש לכם.*תמונה|שלח.*תמונה.*לוח|תמונה.*לוח|לוח.*תמונה|יש תמונה/i;
 // Day names that make a schedule query specific to one day (→ Arbox live, not image).
 const SPECIFIC_DAY_RE    = /היום|מחר|ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת/;
 
@@ -1983,12 +1983,33 @@ async function processInboundWAMessage(msg) {
     } else {
       // General / sales qualification → lead_agent (Barak's AI persona)
       try {
-        await leadAgent.handleInbound({
+        const leadResult = await leadAgent.handleInbound({
           from: fromNorm,
           name: msg.name,
           text: msg.text ?? '',
         });
         _markReplied(fromNorm); // cooldown: lead_agent sends its own reply via sendText
+
+        // If the AI promised to send the schedule image, actually send it.
+        // lead_agent already sent the text reply; now append the image + follow-up.
+        if (leadResult?.reply && /שולח לך את המערכת|שולחת את המערכת/.test(leadResult.reply)) {
+          const timetableUrlFromLeadAgent = getActiveTimetableUrl();
+          if (timetableUrlFromLeadAgent) {
+            const followUp = `ראית משהו שמתאים לך? יספר/י לי איזה יום ושעה בדרך כלל עובדים לך 😊`;
+            sendFileByUrl(fromNorm, timetableUrlFromLeadAgent, 'schedule.png', '')
+              .then(async () => {
+                store.logEvent('timetable_image_sent', fromNorm, { imageUrl: timetableUrlFromLeadAgent, via: 'lead_agent' });
+                const t2 = getActiveTimetable2Url();
+                if (t2) {
+                  await sendFileByUrl(fromNorm, t2, 'schedule2.png', '')
+                    .catch(err => logger.warn('Timetable2 follow-on send failed', { from: fromNorm, error: err.message }));
+                }
+                await sendText(fromNorm, followUp)
+                  .catch(err => logger.warn('Timetable follow-up send failed', { from: fromNorm, error: err.message }));
+              })
+              .catch(err => logger.warn('Timetable image send failed after lead_agent reply', { from: fromNorm, error: err.message }));
+          }
+        }
       } catch (err) {
         logger.error('Barak (lead_agent) error in WA pipeline', { error: err.message, from: fromNorm });
       }
