@@ -145,6 +145,49 @@ function _autoAddKnownMember(phone, name) {
 }
 
 /**
+ * Synchronous self-cleaning pass: remove every lead record whose phone is
+ * now confirmed as a member in PhoneRegistry.
+ *
+ * Uses only phoneRegistry.isMember() — zero Arbox API calls, zero I/O.
+ * The registry must already be initialised before calling this.
+ *
+ * Called from two places:
+ *   • Startup: immediately after persist.loadLeads() catches stale records
+ *     that were written before the person became a member.
+ *   • 15-min cron: catches conversions that occurred since the last daily
+ *     09:15 detectAndMarkConversions run.
+ *
+ * Returns the count of deleted records so callers can decide whether to
+ * persist and broadcast.
+ *
+ * @param {'startup'|'cron_15min'|string} source - label for logs/events
+ * @returns {number}
+ */
+function _purgeKnownMembersFromLeadStore(source = 'unknown') {
+  const leads = store.getAllLeads();
+  if (!leads.length) return 0;
+
+  let purged = 0;
+  for (const lead of leads) {
+    if (!lead.phone) continue;
+    if (!phoneRegistry.isMember(lead.phone)) continue;
+
+    store.deleteLead(lead.phone);
+    store.logEvent('member_purged_from_leads', lead.phone, {
+      name: lead.name ?? null,
+      source,
+    });
+    logger.info('[lead-purge] Confirmed member removed from lead store', {
+      phone: lead.phone,
+      name:  lead.name ?? '(unknown)',
+      source,
+    });
+    purged++;
+  }
+  return purged;
+}
+
+/**
  * Proactively seed the member cache from Arbox.
  * Called on startup and every 15 minutes via cron.
  * Non-blocking — always call fire-and-forget with .catch()
@@ -690,11 +733,21 @@ function isConfigured(...keys) {
 // The crons below maintain the LEGACY member_cache and known_members.json layers
 // for backward compatibility. PhoneRegistry is the primary identity gate.
 
-// ── Member cache: proactive seeding every 15 minutes (legacy layer) ───────────
+// ── Member cache: proactive seeding + lead purge every 15 minutes ────────────
 cron.schedule('*/15 * * * *', async () => {
   try {
     const result = await seedMemberCache();
     if (result?.seeded > 0) logger.info('Cron: member cache refreshed', result);
+
+    // After seeding the legacy cache, purge any leads the registry now confirms
+    // as members. The registry's own 60s interval may have refreshed it since the
+    // last pass, so this catches conversions that happened within the last hour.
+    const purged = _purgeKnownMembersFromLeadStore('cron_15min');
+    if (purged > 0) {
+      persist.saveLeads(store);
+      broadcastSse('leads_updated', { purged, source: 'cron_15min' });
+      logger.info('Cron: purged converted member records', { purged });
+    }
   } catch (err) {
     logger.warn('Cron: member cache seed failed', { error: err.message });
   }
@@ -3843,6 +3896,20 @@ app.listen(PORT, async () => {
 
   persist.loadLeads(store);
   persist.loadInbox(inbox);
+
+  // ── Startup purge: remove stale lead records for phones now in the registry ──
+  // phoneRegistry is already warm from the await above — zero extra Arbox calls.
+  // This is the fix for the "Orly" class of bug: a person who was a prospect
+  // before joining has a lead record in leads_persist.json. Without this pass,
+  // that record reappears on every deploy and lingers until the 09:15 daily cron.
+  {
+    const startupPurged = _purgeKnownMembersFromLeadStore('startup');
+    if (startupPurged > 0) {
+      persist.saveLeads(store);
+      broadcastSse('leads_updated', { purged: startupPurged, source: 'startup' });
+      logger.info('[startup] Purged stale member-lead records', { purged: startupPurged });
+    }
+  }
 
   // ── Periodic save: flush both stores to disk every 60 seconds ──────────────
   setInterval(() => persist.saveAll(store, inbox), 60_000).unref();
