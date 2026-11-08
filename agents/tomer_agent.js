@@ -122,10 +122,29 @@ async function runDailyChecks() {
   const leads  = store.getAllLeads();
   const result = { reEngaged: 0, introFollowUps: 0, skipped: 0, errors: 0 };
 
+  // Load member identity guards (lazy requires to avoid circular deps at module load).
+  // memberCache.isKnownMemberFile reads known_members.json directly — no server.js closure needed.
+  let memberCache, isMemberPhoneSync;
+  try {
+    memberCache       = require('../utils/member_cache');
+    isMemberPhoneSync = require('../utils/conversion_detector').isMemberPhoneSync;
+  } catch { /* non-fatal — guards are best-effort if modules unavailable */ }
+
   for (const lead of leads) {
     try {
       if (lead.status === 'crisis')             { result.skipped++; continue; }
       if (!lead.phone)                          { result.skipped++; continue; }
+
+      // Guard: never re-engage a lead that has silently converted to an Arbox member.
+      // Checks both the in-process cache (< 1ms) AND known_members.json (< 2ms).
+      if (memberCache && isMemberPhoneSync) {
+        const isNowMember = isMemberPhoneSync(lead.phone, memberCache, memberCache.isKnownMemberFile);
+        if (isNowMember) {
+          logger.info('[tomer] Skipping re-engagement — lead is a confirmed member', { phone: lead.phone });
+          result.skipped++;
+          continue;
+        }
+      }
 
       const dormantDays    = daysSince(lead.lastActivity);
       const lastEngDays    = daysSince(lead.lastReEngagementAt);

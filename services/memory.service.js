@@ -17,7 +17,9 @@ function _loadAll() {
 }
 
 function _saveAll(map) {
-  fs.writeFileSync(PROFILES_PATH, JSON.stringify(map, null, 2), 'utf8');
+  const tmp = PROFILES_PATH + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(map, null, 2), 'utf8');
+  fs.renameSync(tmp, PROFILES_PATH);
 }
 
 // ─── Blank profile factory ─────────────────────────────────────────────────────

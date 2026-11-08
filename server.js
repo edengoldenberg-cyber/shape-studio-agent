@@ -42,6 +42,8 @@ const notifySvc                        = require('./services/notification.servic
 const greenApiSvc                      = require('./services/greenapi.service');
 const persist                          = require('./utils/persist');
 const studioAssets                     = require('./utils/studio_assets');
+const memberCache                      = require('./utils/member_cache');
+const { detectAndMarkConversions, isMemberPhoneSync } = require('./utils/conversion_detector');
 
 // ── Staff configuration (hot-reloadable) ─────────────────────────────────────
 
@@ -133,6 +135,18 @@ function _autoAddKnownMember(phone, name) {
   } catch (err) {
     logger.warn('[known-members] Auto-add failed', { error: err.message });
   }
+}
+
+/**
+ * Proactively seed the member cache from Arbox.
+ * Called on startup and every 15 minutes via cron.
+ * Non-blocking — always call fire-and-forget with .catch()
+ */
+async function seedMemberCache() {
+  return memberCache.seedFromArbox({
+    normalizeToE164,
+    _autoAddKnownMember,
+  }).catch(err => logger.warn('[server] seedMemberCache failed', { error: err.message }));
 }
 
 function findStaff(id) {
@@ -665,6 +679,38 @@ function isConfigured(...keys) {
 
 // ── Cron jobs ─────────────────────────────────────────────────────────────────
 
+// ── Member cache: proactive seeding every 15 minutes ─────────────────────────
+// Ensures known_members.json and the in-process cache are warm before any
+// member's first contact, eliminating the "first-message-during-outage" gap.
+cron.schedule('*/15 * * * *', async () => {
+  try {
+    const result = await seedMemberCache();
+    if (result?.seeded > 0) logger.info('Cron: member cache refreshed', result);
+  } catch (err) {
+    logger.warn('Cron: member cache seed failed', { error: err.message });
+  }
+}, { timezone: 'Asia/Jerusalem' });
+
+// ── Conversion detector: runs before Tomer's re-engagement pass ───────────────
+// Cross-references lead_store against Arbox to catch leads that have converted
+// to members in Arbox without the system being notified.  Removes them from
+// lead_store so Tomer's cron never sends a cold re-engagement to a paying member.
+cron.schedule('15 9 * * *', async () => {
+  logger.info('Cron: running conversion detector');
+  try {
+    const result = await detectAndMarkConversions(store, memberCache, normalizeToE164, _autoAddKnownMember);
+    if (result.converted > 0) {
+      logger.info('Cron: conversion detector found new members', result);
+      alertOwner(
+        '🔄 Conversions Detected',
+        `${result.converted} ליד(ים) זוהו כחברים פעילים ב-Arbox והוסרו מתור השימור.`
+      ).catch(() => {});
+    }
+  } catch (err) {
+    logger.error('Cron: conversion detector failed', { error: err.message });
+  }
+}, { timezone: 'Asia/Jerusalem' });
+
 cron.schedule('30 8 * * *', async () => {
   logger.info('Cron: releasing quiet-hours queue');
   try {
@@ -1016,11 +1062,55 @@ app.post('/api/members/known', jsonBody, (req, res) => {
     if (!data.phones.includes(norm)) data.phones.push(norm);
     if (name) data.names = { ...(data.names ?? {}), [norm]: name };
     fs.writeFileSync(KNOWN_MEMBERS_PATH, JSON.stringify(data, null, 2), 'utf8');
+    // Also stamp the in-process cache so Tomer's guard picks this up immediately
+    // without waiting for the next 15-min Arbox seed cycle.
+    memberCache.markConfirmed(norm, { name: name ?? null, role: 'client', source: 'manual_known_members' });
     logger.info('[known-members] Added override', { phone: norm, name });
     res.json({ ok: true, phone: norm, total: data.phones.length });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// POST /api/members/mark-converted — manually convert a lead to member
+// Use when Eden enrolls a lead in Arbox and wants the system to know immediately
+// (before the next 15-min Arbox seed cycle picks it up).
+app.post('/api/members/mark-converted', jsonBody, async (req, res) => {
+  const { phone, name } = req.body ?? {};
+  if (!phone) return res.status(400).json({ error: 'phone required' });
+  const norm = normalizeToE164(phone) ?? phone;
+  try {
+    // 1. Stamp in-process cache (instantly blocks Barak on next message)
+    memberCache.markConfirmed(norm, { name: name ?? null, role: 'client', source: 'manual_conversion' });
+
+    // 2. Stamp known_members.json (survives restarts)
+    _autoAddKnownMember(norm, name ?? null);
+
+    // 3. Remove from lead_store (stops Tomer's re-engagement queue)
+    const existing = store.getLead(norm);
+    if (existing) {
+      store.deleteLead(norm);
+      store.logEvent('lead_converted_manual', norm, { name: name ?? existing.name, triggeredBy: 'api' });
+      logger.info('[conversion] Manual conversion applied', { phone: norm, name: name ?? existing.name });
+    }
+
+    res.json({ ok: true, phone: norm, name: name ?? null, cached: true, leadRemoved: !!existing });
+  } catch (err) {
+    logger.error('[conversion] mark-converted failed', { phone: norm, error: err.message });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/members/invalidate — remove a phone from the member cache
+// Use when a membership is cancelled and the person may re-enter the funnel.
+app.post('/api/members/invalidate', jsonBody, (req, res) => {
+  const { phone } = req.body ?? {};
+  if (!phone) return res.status(400).json({ error: 'phone required' });
+  const norm = normalizeToE164(phone) ?? phone;
+  memberCache.invalidate(norm);
+  store.logEvent('member_cache_invalidated', norm, { triggeredBy: 'api' });
+  logger.info('[conversion] Member cache entry invalidated', { phone: norm });
+  res.json({ ok: true, phone: norm });
 });
 
 app.delete('/api/members/known/:phone', (req, res) => {
@@ -1604,62 +1694,97 @@ async function processInboundWAMessage(msg) {
     return { inboxEntry: staffEntry, clientMatch: { found: false }, intent: 'staff', route: 'staff_bypass', barakReply: null };
   }
 
-  // 1. Arbox client lookup
-  //    Failure is non-fatal for routing (we fall back to cached data) but IS logged
-  //    so Railway logs surface Arbox API outages rather than hiding them.
+  // 1. Four-tier member identity resolution
+  //
+  //   Tier 1 (fastest): in-process memberCache — sub-millisecond, no I/O.
+  //     If fresh (< 5 min), skip the Arbox lookup entirely.
+  //     If confirmed (< 24 hr), skip the lookup and use cached identity.
+  //
+  //   Tier 2: known_members.json file — < 2ms disk read.
+  //     Populated proactively by the 15-min seed cron and reactively on every
+  //     successful Arbox confirmation.
+  //
+  //   Tier 3: Live Arbox lookup — only fires when both caches miss (genuine
+  //     first-contact or entry older than 24hr).
+  //     On hit: seeds Tier 1 + Tier 2 so future messages are instant.
+  //
+  //   Tier 4 (degraded): Arbox is unreachable AND no cache record exists.
+  //     Cannot determine member vs. lead — sends a neutral hold message and
+  //     alerts staff. Never runs Barak's qualification funnel. This is
+  //     intentionally conservative: a false silence is safer than a false sale.
+
   let clientMatch = { found: false, matchType: null, arboxName: null, arboxId: null, isActive: false, role: null };
   let arboxLookupFailed = false;
-  try {
-    const lookup = await barakAgent.lookupClient(fromIsraeli ?? fromNorm ?? '');
-    if (lookup.total > 0) {
-      const best = lookup.results[0];
+
+  const tier1Fresh     = memberCache.isFresh(fromNorm);
+  const tier1Confirmed = !tier1Fresh && memberCache.isConfirmed(fromNorm);
+  const tier2File      = !tier1Fresh && !tier1Confirmed && (isKnownMember(fromNorm) || isKnownMember(fromIsraeli));
+
+  const skipArboxLookup = tier1Fresh || tier1Confirmed || tier2File;
+
+  if (skipArboxLookup) {
+    // Satisfy the clientMatch shape from cache so downstream code stays intact
+    const cached = memberCache.getEntry(fromNorm);
+    if (cached) {
       clientMatch = {
         found:     true,
-        matchType: best.type,
-        arboxName: best.name,
-        arboxId:   String(best.user_id ?? ''),
-        isActive:  best.active ?? false,
-        role:      best.role ?? null,
+        matchType: 'member',
+        arboxName: cached.name ?? null,
+        arboxId:   null,   // not needed after routing decision
+        isActive:  true,
+        role:      cached.role ?? 'client',
       };
+    } else if (tier2File) {
+      // known_members.json hit but no in-process entry — backfill the cache so the
+      // next message is sub-millisecond instead of incurring another disk read.
+      memberCache.markConfirmed(fromNorm, { source: 'known_members_backfill' });
+      clientMatch = { found: true, matchType: 'member', arboxName: null, arboxId: null, isActive: true, role: 'client' };
     }
-  } catch (lookupErr) {
-    arboxLookupFailed = true;
-    logger.warn('[pipeline] Arbox lookup failed — falling back to cached member data', {
-      from: fromNorm,
-      error: lookupErr.message,
-    });
-    // If Arbox is down, cached data (known_members.json + lead_store.isClient) becomes
-    // the sole source of truth for routing.  This is handled by knownMemberOverride and
-    // cachedIsClient below — no active member should reach Barak's lead funnel.
+  } else {
+    // Tier 3: live Arbox lookup — only reaches here on genuine cache miss
+    try {
+      const lookup = await barakAgent.lookupClient(fromIsraeli ?? fromNorm ?? '');
+      if (lookup.total > 0) {
+        const best = lookup.results[0];
+        clientMatch = {
+          found:     true,
+          matchType: best.type,
+          arboxName: best.name,
+          arboxId:   String(best.user_id ?? ''),
+          isActive:  best.active ?? false,
+          role:      best.role ?? null,
+        };
+        // Seed Tier 1 + Tier 2 immediately so the next message is cache-fast
+        if (best.type === 'member' || best.role === 'aggregatorMember') {
+          memberCache.markConfirmed(fromNorm, { name: best.name, role: best.role ?? 'client', source: 'arbox_live' });
+          _autoAddKnownMember(fromNorm, best.name ?? msg.name);
+        }
+      }
+    } catch (lookupErr) {
+      arboxLookupFailed = true;
+      logger.warn('[pipeline] Arbox lookup failed — falling back to cached member data', {
+        from: fromNorm, error: lookupErr.message, tier1Confirmed, tier2File,
+      });
+    }
   }
 
   // 2. Intent detection (only meaningful for text messages)
   const intent = msg.type === 'text' ? detectSchedulingIntent(msg.text) : 'general';
 
   // ── Client identity — resolved HERE, before any early-return path ─────────────
-  // Must come before the reschedule / callback handlers so they can guard correctly.
-  // Three-tier member detection — evaluated in priority order:
+  // Four-tier resolution (see lookup block above for full commentary).
   //
-  //   Tier 1: arboxConfirmedClient — live Arbox API says this phone is a member.
-  //            Most reliable, but unavailable when Arbox is down (arboxLookupFailed).
+  //   Tier 1a — memberCache.isFresh    → skipArboxLookup=true, clientMatch already set
+  //   Tier 1b — memberCache.isConfirmed → skipArboxLookup=true, clientMatch already set
+  //   Tier 2  — known_members.json     → skipArboxLookup=true, clientMatch already set
+  //   Tier 3  — Live Arbox             → clientMatch set above if lookup succeeded
   //
-  //   Tier 2: cachedIsClient — lead_store meta.isClient flag written at conversion.
-  //            NOTE: this flag is written but the lead record is deleted in step 5b,
-  //            so this tier is effectively unreachable.  The correct fallback is Tier 3.
-  //            Kept for forward-compatibility if the architecture changes.
-  //
-  //   Tier 3: knownMemberOverride — known_members.json file, populated by
-  //            _autoAddKnownMember on every Tier-1 confirmation.  Survives Arbox outages
-  //            and Railway deploys as long as a Volume is mounted at DATA_DIR.
-  //
-  // aggregatorMember (ClassPass/Gympass) is treated as an existing client for routing —
-  // they go to Tomer, not Barak.  Tomer can surface the direct-membership offer if relevant.
+  // aggregatorMember (ClassPass/Gympass) is treated as an existing client for routing.
   const arboxConfirmedClient = clientMatch.found &&
     (clientMatch.matchType === 'member' || clientMatch.role === 'aggregatorMember');
-  const isAggregator = clientMatch.found && clientMatch.role === 'aggregatorMember';
-  const cachedIsClient        = store.getLead(fromNorm)?.meta?.isClient === true;
-  const knownMemberOverride   = isKnownMember(fromNorm) || isKnownMember(fromIsraeli);
-  const isExistingClient      = arboxConfirmedClient || cachedIsClient || knownMemberOverride;
+  const isAggregator          = clientMatch.found && clientMatch.role === 'aggregatorMember';
+  const inProcessConfirmed    = tier1Fresh || tier1Confirmed;
+  const isExistingClient      = arboxConfirmedClient || inProcessConfirmed || tier2File;
 
   // ── Reschedule intent — LEADS ONLY (existing clients handled via Tomer path) ───
   if (intent === 'reschedule' && !isExistingClient) {
@@ -1887,6 +2012,46 @@ async function processInboundWAMessage(msg) {
     return { inboxEntry: pmtEntry, clientMatch, intent: 'payment', route: 'payment_ack', barakReply: paymentAck };
   }
 
+  // 2b. Tier-4 degraded-mode guard.
+  //     If Arbox is unreachable AND neither cache tier confirmed this phone,
+  //     we cannot safely determine member vs. lead.
+  //     Policy: send a neutral hold message + alert staff. Never run Barak's
+  //     qualification funnel. A false silence costs one message delay; a false
+  //     sales pitch to a paying member costs trust.
+  //
+  //     Gate: only on first contact (no lead record yet) during an Arbox outage.
+  //     Existing leads in the funnel can continue — they're confirmed non-members.
+  if (arboxLookupFailed && !isExistingClient && !store.getLead(fromNorm)) {
+    logger.warn('[pipeline] TIER-4 DEGRADED MODE — Arbox down, identity unverifiable', { from: fromNorm });
+
+    const holdMsg = `קיבלנו את הודעתך! הצוות שלנו ייצור איתך קשר בהקדם 😊`;
+
+    if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
+      await sendText(fromNorm, holdMsg).catch(() => {});
+    }
+
+    alertOwner(
+      `⚠️ Arbox Outage — Identity Unverifiable`,
+      `Phone: ${fromNorm}\nMessage: "${(msg.text ?? '').slice(0, 100)}"\n\n` +
+      `Arbox was unreachable. Could not confirm member vs. lead.\n` +
+      `Sent holding message. Please verify manually and follow up.`
+    ).catch(() => {});
+
+    store.logEvent('arbox_outage_held', fromNorm, {
+      preview: (msg.text ?? '').slice(0, 80), reason: 'tier4_degraded',
+    });
+
+    const holdEntry = inbox.push({
+      from: fromNorm, fromIsraeli, name: msg.name ?? null,
+      text: msg.text ?? '', messageId: msg.messageId,
+      timestamp: msg.timestamp, receivedAt: new Date(),
+      mediaType: msg.type, mediaCaption: null, mediaId: null,
+      clientMatch, intent, route: 'arbox_outage_hold', barakReply: holdMsg,
+    });
+
+    return { inboxEntry: holdEntry, clientMatch, intent, route: 'arbox_outage_hold', barakReply: holdMsg };
+  }
+
   // 3. Routing decision — strict Barak / Tomer boundary
   //
   //   The primary split is ALWAYS membership status, never intent.
@@ -2073,21 +2238,19 @@ async function processInboundWAMessage(msg) {
       _autoAddKnownMember(fromNorm, clientMatch.arboxName ?? msg.name);
     }
 
-    // 5b. Destroy or convert any stale lead record.
-    //     If a lead record exists for this phone, write meta.isClient=true BEFORE
-    //     deleting it so cachedIsClient will catch them if Arbox is down next time.
-    //     Then delete the lead record so Barak never qualifies them again.
+    // 5b. Remove any stale lead record for this confirmed member.
+    //     memberCache + known_members.json are now the durable protection layers
+    //     (populated in step 5a and in step 1 tier-3 seeding).
+    //     The old meta.isClient flag is no longer read by routing — deleted for clarity.
     {
       const staleRecord = store.getLead(fromNorm);
       if (staleRecord) {
-        // Write isClient marker — survives as a lead_store fallback even when Arbox is down
-        store.upsertLead(fromNorm, {
-          meta: { ...(staleRecord.meta ?? {}), isClient: true, clientSince: new Date().toISOString() },
-          status: 'converted',
-        });
-        // Also persist to known_members.json for the fastest lookup path
         _autoAddKnownMember(fromNorm, clientMatch.arboxName ?? msg.name ?? staleRecord.name);
         store.deleteLead(fromNorm);
+        store.logEvent('lead_converted_reactive', fromNorm, {
+          name: clientMatch.arboxName ?? msg.name ?? staleRecord.name,
+          source: 'pipeline_step5b',
+        });
         logger.info('[pipeline] Stale lead converted to member and removed', { from: fromNorm });
       }
     }
@@ -3635,6 +3798,16 @@ app.listen(PORT, () => {
   setInterval(() => persist.saveAll(store, inbox), 60_000).unref();
 
   initWorkers(store);
+
+  // ── Member cache: seed from Arbox on startup (non-blocking) ─────────────────
+  // Primes known_members.json and the in-process cache before any message arrives.
+  // If Arbox is unreachable at boot, the cache loads from member_cache.json (file)
+  // and the 15-min cron will retry.
+  setTimeout(() => {
+    seedMemberCache().then(r => {
+      if (r?.seeded >= 0) logger.info('[startup] Member cache seeded', r);
+    }).catch(() => {});
+  }, 5_000);  // 5s delay so other startup I/O completes first
 
   // Probe Green API credentials immediately at startup so Railway logs show
   // whether WhatsApp sending will work before the first real message arrives.
