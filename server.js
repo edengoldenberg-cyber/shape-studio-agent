@@ -282,11 +282,32 @@ app.post('/webhook/whatsapp', captureRawBody, verifyMetaSignature, async (req, r
 const jsonBody = express.json();
 
 // GET /api/leads — all leads (history stripped, phone masked)
+// Runtime member filter: confirmed members are stripped from every response.
+// Also reactively purges any members found — so the first dashboard open after
+// a failed startup purge permanently cleans the store without a manual step.
 app.get('/api/leads', (_req, res) => {
-  const leads = store.getAllLeads().map(({ history, ...l }) => ({
-    ...l,
-    phone: maskPhone(l.phone),
-  }));
+  const allLeads = store.getAllLeads();
+
+  // Identify any leads that are now confirmed members in PhoneRegistry.
+  // isMember() is synchronous O(1) — safe to call in a request handler.
+  const memberLeads = allLeads.filter(l => l.phone && phoneRegistry.isMember(l.phone));
+
+  // Reactively purge and persist so the stale record never reappears.
+  if (memberLeads.length > 0) {
+    for (const l of memberLeads) {
+      store.deleteLead(l.phone);
+      store.logEvent('reactive_purge_on_api_read', l.phone, { name: l.name ?? null });
+      logger.info('[api/leads] Reactive purge — confirmed member removed from lead store', {
+        phone: l.phone, name: l.name,
+      });
+    }
+    persist.saveLeads(store);
+  }
+
+  const leads = allLeads
+    .filter(l => !l.phone || !phoneRegistry.isMember(l.phone))
+    .map(({ history, ...l }) => ({ ...l, phone: maskPhone(l.phone) }));
+
   res.json(leads);
 });
 
