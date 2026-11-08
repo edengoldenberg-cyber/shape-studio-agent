@@ -1,0 +1,17 @@
+# nixpacks.toml — bypass mise by supplying Node.js directly from the Nix store.
+#
+# Root cause: when no pinned version file is present and engines.node is a range
+# (>=18.0.0), Nixpacks calls mise to resolve the best match.  mise is fetched at
+# build time from GitHub releases — that download is what produces the 504.
+#
+# Fix: declare nodejs_20 as a Nix package so Nixpacks never needs mise at all.
+# Node 20 LTS satisfies the >=18.0.0 engines constraint.
+
+[phases.setup]
+nixPkgs = ["nodejs_20"]
+
+[phases.install]
+cmds = ["npm ci --omit=dev"]
+
+[start]
+cmd = "node server.js"
