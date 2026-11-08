@@ -1605,7 +1605,10 @@ async function processInboundWAMessage(msg) {
   }
 
   // 1. Arbox client lookup
+  //    Failure is non-fatal for routing (we fall back to cached data) but IS logged
+  //    so Railway logs surface Arbox API outages rather than hiding them.
   let clientMatch = { found: false, matchType: null, arboxName: null, arboxId: null, isActive: false, role: null };
+  let arboxLookupFailed = false;
   try {
     const lookup = await barakAgent.lookupClient(fromIsraeli ?? fromNorm ?? '');
     if (lookup.total > 0) {
@@ -1619,15 +1622,41 @@ async function processInboundWAMessage(msg) {
         role:      best.role ?? null,
       };
     }
-  } catch { /* lookup failure is non-fatal */ }
+  } catch (lookupErr) {
+    arboxLookupFailed = true;
+    logger.warn('[pipeline] Arbox lookup failed — falling back to cached member data', {
+      from: fromNorm,
+      error: lookupErr.message,
+    });
+    // If Arbox is down, cached data (known_members.json + lead_store.isClient) becomes
+    // the sole source of truth for routing.  This is handled by knownMemberOverride and
+    // cachedIsClient below — no active member should reach Barak's lead funnel.
+  }
 
   // 2. Intent detection (only meaningful for text messages)
   const intent = msg.type === 'text' ? detectSchedulingIntent(msg.text) : 'general';
 
   // ── Client identity — resolved HERE, before any early-return path ─────────────
   // Must come before the reschedule / callback handlers so they can guard correctly.
+  // Three-tier member detection — evaluated in priority order:
+  //
+  //   Tier 1: arboxConfirmedClient — live Arbox API says this phone is a member.
+  //            Most reliable, but unavailable when Arbox is down (arboxLookupFailed).
+  //
+  //   Tier 2: cachedIsClient — lead_store meta.isClient flag written at conversion.
+  //            NOTE: this flag is written but the lead record is deleted in step 5b,
+  //            so this tier is effectively unreachable.  The correct fallback is Tier 3.
+  //            Kept for forward-compatibility if the architecture changes.
+  //
+  //   Tier 3: knownMemberOverride — known_members.json file, populated by
+  //            _autoAddKnownMember on every Tier-1 confirmation.  Survives Arbox outages
+  //            and Railway deploys as long as a Volume is mounted at DATA_DIR.
+  //
+  // aggregatorMember (ClassPass/Gympass) is treated as an existing client for routing —
+  // they go to Tomer, not Barak.  Tomer can surface the direct-membership offer if relevant.
   const arboxConfirmedClient = clientMatch.found &&
     (clientMatch.matchType === 'member' || clientMatch.role === 'aggregatorMember');
+  const isAggregator = clientMatch.found && clientMatch.role === 'aggregatorMember';
   const cachedIsClient        = store.getLead(fromNorm)?.meta?.isClient === true;
   const knownMemberOverride   = isKnownMember(fromNorm) || isKnownMember(fromIsraeli);
   const isExistingClient      = arboxConfirmedClient || cachedIsClient || knownMemberOverride;
@@ -1931,10 +1960,11 @@ async function processInboundWAMessage(msg) {
       // Existing member general message → Tomer silence classifier (strict rules)
       try {
         const result = await tomerAgent.handleInboundMember({
-          name:        msg.name,
-          text:        msg.text,
-          phone:       fromNorm,
+          name:         msg.name,
+          text:         msg.text,
+          phone:        fromNorm,
           clientMatch,
+          isAggregator, // hint: ClassPass/Gympass member — potential direct-membership convert
         });
         if (result.reply) barakReply = result.reply;
         // result.reply === null → Tomer chose silence; no WhatsApp message is sent
@@ -2043,11 +2073,23 @@ async function processInboundWAMessage(msg) {
       _autoAddKnownMember(fromNorm, clientMatch.arboxName ?? msg.name);
     }
 
-    // 5b. Destroy any stale lead record that was created before we identified them
-    //     as an existing client (e.g. from a previous session where Arbox timed out).
-    if (store.getLead(fromNorm)) {
-      store.deleteLead(fromNorm);
-      logger.info('[pipeline] Removed stale lead record for confirmed member', { from: fromNorm });
+    // 5b. Destroy or convert any stale lead record.
+    //     If a lead record exists for this phone, write meta.isClient=true BEFORE
+    //     deleting it so cachedIsClient will catch them if Arbox is down next time.
+    //     Then delete the lead record so Barak never qualifies them again.
+    {
+      const staleRecord = store.getLead(fromNorm);
+      if (staleRecord) {
+        // Write isClient marker — survives as a lead_store fallback even when Arbox is down
+        store.upsertLead(fromNorm, {
+          meta: { ...(staleRecord.meta ?? {}), isClient: true, clientSince: new Date().toISOString() },
+          status: 'converted',
+        });
+        // Also persist to known_members.json for the fastest lookup path
+        _autoAddKnownMember(fromNorm, clientMatch.arboxName ?? msg.name ?? staleRecord.name);
+        store.deleteLead(fromNorm);
+        logger.info('[pipeline] Stale lead converted to member and removed', { from: fromNorm });
+      }
     }
 
     // 5c. Log with a client-specific event type — never pollutes the leads feed

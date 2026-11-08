@@ -8,7 +8,9 @@ const { sendText, alertOwner } = require('../services/whatsapp.service');
 const { tryDeterministicWazeReply } = require('./deterministic_reply');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const studioAssets = require('../utils/studio_assets');
+const studioAssets  = require('../utils/studio_assets');
+const memoryService = require('../services/memory.service');
+const handoffService = require('../services/handoff.service');
 
 const SYSTEM_PROMPT = fs.readFileSync(
   path.join(__dirname, '../prompts/system_prompt.md'),
@@ -50,6 +52,32 @@ function buildAssetContext() {
   ].filter(Boolean).join('\n');
 
   return [wazeRule, '', scheduleRule].join('\n');
+}
+
+// ── Language rule builder ─────────────────────────────────────────────────────
+//
+// Returns the LANGUAGE instruction block for the Turn 1 minimal prompt.
+// When an Arabic dialect has been detected on this message, the rule
+// overrides the default Hebrew-only constraint.
+function _buildLanguageRule(qualData) {
+  if (qualData?.dialect === 'arabic_script') {
+    return [
+      `LANGUAGE — ABSOLUTE RULE: The lead is writing in Arabic. Respond ENTIRELY in Arabic.`,
+      `Use warm Levantine/Palestinian dialect. Maintain the same qualification flow.`,
+      `Never switch to Hebrew unless the lead does first.`,
+    ].join('\n');
+  }
+  if (qualData?.dialect === 'arabic_hebrew') {
+    return [
+      `LANGUAGE — ABSOLUTE RULE: Respond in Hebrew only.`,
+      `The lead uses Arabic-influenced slang. Match their warm, casual register.`,
+      `Zero corporate tone. Short, natural sentences. No "נשמח לעמוד לרשותך".`,
+    ].join('\n');
+  }
+  return [
+    `LANGUAGE — ABSOLUTE RULE: Respond ONLY in Hebrew. Not a single English word in the reply.`,
+    `This is an Israeli studio (Pardes Hanna). Every message must be natural, warm, conversational Hebrew.`,
+  ].join('\n');
 }
 
 // ── Location viability detection ──────────────────────────────────────────────
@@ -103,6 +131,18 @@ const CALL_PROPOSAL_RE =
 const NAME_ASK_RE =
   /איך קוראים לך|מה שמך|מה השם שלך|ואיך קוראים|קוראים לך\?|שמך\?/;
 
+// ── Pricing objection detection ───────────────────────────────────────────────
+// Triggered when a lead signals price is a concern.  Sets qualData.pricingObjection
+// so the stage context can inject category-repositioning framing.
+const PRICE_OBJECTION_RE =
+  /יקר\b|יקרה\b|יקר לי|יקר מדי|יקר מאוד|לא שווה|ראיתי.*זול|זול יותר|מחיר גבוה|לא יכול.*להרשות|לא יכולה.*להרשות|יש.*מקומות.*יותר|מקומות.*יותר זולים|כמה.*מחיר.*כי|מה.*יקר|לא מתאים לתקציב|אין לי תקציב/i;
+
+// ── Arabic dialect detection ───────────────────────────────────────────────────
+// ARABIC_SCRIPT_RE: any Arabic Unicode character → respond fully in Arabic.
+// ARABIC_HEBREW_RE: 2+ Hebrew-script Arabic markers → respond in warm Hebrew only.
+const ARABIC_SCRIPT_RE      = /[؀-ۿ]/;
+const ARABIC_HEBREW_MARKERS = /חביבי|יאללה|אהלן|ואלה|אינשאללה|מרחבא|שלונכ|סאחבי|בדי[^ג]|שו[\s,!?]|מניח|כיפו/ig;
+
 // ── Post-processor: enforce output invariants after every AI reply ────────────
 //
 // Guarantees that the AI output satisfies operational rules regardless of
@@ -121,11 +161,27 @@ function postProcessReply(reply, qualData, assets) {
     'שולח לך את המערכת עכשיו 📅 ');
   if (afterStrip !== out) { ppChanges.push('hallucination_stripped'); out = afterStrip; }
 
-  // 2. If the reply mentions the studio address but the Waze link is absent, inject it
+  // 2. If the reply mentions the studio address/city but the Waze link is absent, inject it.
+  //
+  //    Two-tier approach:
+  //    (a) If the specific street address is present → insert link immediately after it.
+  //    (b) If only "פרדס חנה" is present (but not the street address) → append the
+  //        full address + link at the end.  This fixes the mismatch where addressPresent
+  //        detected "פרדס חנה" but the replace regex only looked for "דרך השדה 12".
+  //
+  //    Uses a literal string replacement via a replacer function to avoid $-sequence
+  //    interpretation in the replacement string (e.g. a wazeUrl containing $1 or $&).
   const addressPresent  = /דרך השדה 12|פרדס חנה/.test(out);
   const wazeLinkPresent = /waze\.com|waze:\/\//.test(out);
   if (addressPresent && !wazeLinkPresent && assets?.wazeUrl) {
-    out = out.replace(/(דרך השדה 12[^.\n!?]*)/, `$1\n${assets.wazeUrl}`);
+    if (/דרך השדה 12/.test(out)) {
+      // Insert link on a new line immediately after the street address occurrence.
+      // The replacer function avoids $-sequence interpretation entirely.
+      out = out.replace(/(דרך השדה 12[^.\n!?]*)/, (match) => `${match}\n${assets.wazeUrl}`);
+    } else {
+      // AI wrote "פרדס חנה" but not the full street address — append both.
+      out = out.trimEnd() + `\n\nדרך השדה 12, פרדס חנה-כרכור 🗺️\n${assets.wazeUrl}`;
+    }
     ppChanges.push('waze_injected');
   }
 
@@ -183,10 +239,14 @@ function buildTurnSystemPrompt(completedTurns, qualData, name, from, msgCount) {
       `── STEP 2: CHOOSE YOUR REPLY PATTERN ──`,
       ``,
       `CASE A — They gave BOTH location AND a fitness interest:`,
-      `  → Sentence 1: Engage with their specific interest (e.g. "פילאטיס מכשירים אצלנו זה סטודיו בוטיק עם 8 מקומות ברפורמר 🙏")`,
-      `  → Sentence 2 (optional): Address their location naturally (e.g. "מחדרה יש לנו לא מעט חברות — 15 דקות נסיעה")`,
-      `  → End with ONE question going deeper: what they want to achieve, their experience level, or what matters to them`,
-      `  → Example: "פילאטיס מכשירים אצלנו זה מה שהרבה מחפשים — סטודיו בוטיק עם 8 מקומות ברפורמר 🙏 מה מביא אותך אליו — חיזוק, יציבה, שיקום?"`,
+      `  → Sentence 1: Engage with their SPECIFIC interest — make it feel personal, not promotional`,
+      `     For Reformer: lead with the BENEFIT, not the number. "הרפורמר אצלנו זה שיעורים של 8 אנשים — מדריכ/ת שמכיר/ה אותך לפי שם ומתקדמת איתך."`,
+      `     NOT: "סטודיו בוטיק עם 8 מקומות ברפורמר" ← the number sounds like a limitation`,
+      `  → Sentence 2 (optional, only if relevant): Address their location naturally`,
+      `     "מחדרה יש לנו חברות שמגיעות כל שבוע — 15 דקות נסיעה."`,
+      `  → End with ONE sharp, specific question about what they want to achieve`,
+      `  → Example for Reformer: "הרפורמר אצלנו זה שיעורים אישיים בתוך קבוצה קטנה — ממש שונה ממכון. מה מביא אותך אליו — חיזוק, יציבה, שיקום?"`,
+      `  → Example for Strength: "אימוני הכוח שלנו הם פונקציונליים — לא עוד מכונות. מה הכיוון שחיפשת — עיצוב גוף, חוזק, עצמאות תנועתית?"`,
       ``,
       `CASE B — They gave ONLY their location:`,
       `  → Acknowledge location warmly (1 sentence), then ask about their fitness interest`,
@@ -195,8 +255,12 @@ function buildTurnSystemPrompt(completedTurns, qualData, name, from, msgCount) {
       `  → Engage with that interest specifically (1 sentence), then ask where they're from`,
       ``,
       `CASE D — Minimal message ("שלום", "היי", "אשמח לפרטים", just a greeting):`,
-      `  → Short warm (non-cliché) response + ONE combined question about area AND what they're looking for`,
-      `  → Example: "שלום! מאיזה אזור את/ה, ומה מחפשים — פילאטיס, כוח, יוגה?"`,
+      `  → 1 warm, natural sentence (NOT a cliché opener) + ONE combined question`,
+      `  → The question should feel like a person asking, NOT a dropdown list`,
+      `  → Good: "שלום! מאיזה אזור את/ה ומה מחפשים?"`,
+      `  → Good: "היי! מה מחפשים, ומאיזה אזור?"`,
+      `  → BAD: "שלום! מאיזה אזור את/ה, ומה מחפשים — פילאטיס, כוח, יוגה?" ← the list makes it feel like a form`,
+      `  → BAD: any opener that starts with "שמחים", "ברוכים", "כיף", "איזה כיף"`,
       ``,
       `── HARD PROHIBITIONS ──`,
       `  ✗ FORBIDDEN openers — these sound like a bad chatbot, never use them:`,
@@ -216,13 +280,14 @@ function buildTurnSystemPrompt(completedTurns, qualData, name, from, msgCount) {
       `Phone: ${from}.`,
       ``,
       buildAssetContext(),
-      `LANGUAGE — ABSOLUTE RULE: Respond ONLY in Hebrew. Not a single English word in the reply.`,
-      `This is an Israeli studio (Pardes Hanna). Every message must be natural, warm, conversational Hebrew.`,
+      _buildLanguageRule(qualData),
     ].join('\n');
   }
 
-  // Turn 2+: full system prompt + live asset URLs + fresh stage context suffix
-  return `${SYSTEM_PROMPT}\n\n${buildAssetContext()}\n\n---\n\n## Current Turn Instruction\n\n${buildStageContext(completedTurns, qualData, msgCount)}`;
+  // Turn 2+: full system prompt + live asset URLs + optional memory block + fresh stage context
+  const memBlock = memoryService.buildMemoryInjection(from, qualData);
+  const memSection = memBlock ? `\n\n${memBlock}` : '';
+  return `${SYSTEM_PROMPT}\n\n${buildAssetContext()}${memSection}\n\n---\n\n## Current Turn Instruction\n\n${buildStageContext(completedTurns, qualData, msgCount)}`;
 }
 
 // Universal rules injected into every stage context.
@@ -269,6 +334,32 @@ function buildStageContext(completedTurns, qualData, msgCount) {
       `Close warmly in one sentence and leave the door open for the future.`,
       `Example: "מבין/ה לגמרי — אם זה ישתנה בעתיד תמיד ברוכ/ה לפנות! 😊"`,
       `FORBIDDEN: call proposal, class info, pricing, any next steps.`,
+    ].join('\n');
+  }
+
+  // ── PRICING OBJECTION OVERRIDE ──────────────────────────────────────────────
+  // When pricingObjection is set and hasn't been handled yet, inject Category
+  // Repositioning guidance directly into the stage context.
+  if (qualData.pricingObjection && !qualData.pricingObjectionHandled) {
+    return [
+      UNIVERSAL_STAGE_RULES,
+      ``,
+      knownSection,
+      ``,
+      `PRICING OBJECTION — CATEGORY REPOSITIONING REQUIRED. Reply #${msgCount + 1}.`,
+      `The lead signalled price concern. Do NOT argue the number or deflect.`,
+      ``,
+      `STEP 1 — Validate + Reframe (say this or close equivalent):`,
+      `"את/ה צודק/ת שכדאי להשוות. מה שאנחנו עושים שונה במהותו: כיתות של עד 8 אנשים`,
+      `על ציוד Reformer מקצועי, עם מדריך/ה שרואה אותך בכל תנועה — לא 30 אנשים בחדר."`,
+      ``,
+      `STEP 2 — Anchor on frequency before any price: ask "כמה פעמים בשבוע?"`,
+      ``,
+      `STEP 3 — Redirect to call as a fit-check (not a sales push):`,
+      `"כדי לראות מה מתאים בדיוק לתקציב ולמטרות שלך — נוח לך שיחה קצרה של 5 דקות?"`,
+      ``,
+      `FORBIDDEN: exact NIS amounts / naming competitors / "אין לי מידע על מחירים".`,
+      `Max 3 sentences. End with the frequency question OR the call proposal.`,
     ].join('\n');
   }
 
@@ -423,7 +514,11 @@ const CRISIS_PATTERNS = [
   /\b(cancel\s*(my\s*)?(membership|subscription)|leaving|quitting|done with|refund|money back)\b/i,
   /\b(help me|emergency|I can't|struggling|upset)\b/i,
   // Hebrew additions
-  /\b(פציעה|כאב|נפלתי|רופא|בית חולים)\b/i,
+  // NOTE: "כאב" alone is NOT a crisis trigger — many leads mention back/knee pain as
+  //       their fitness motivation.  Only escalate when כאב co-occurs with acute/medical
+  //       language (hospital, doctor, fell, serious).
+  /(?:פציעה|נפלתי|בית חולים|רופא).*(?:כאב|בעיה)|(?:כאב).*(?:חמור|חד|נורא|אסור לי|אסור|לא יכול|רופא|בית חולים)/i,
+  /\b(נפלתי|בית חולים)\b/i,
   /\b(כועס|עורך דין|תלונה|הונאה)\b/i,
   /\b(ביטול מנוי|עוזב|עוזבת|החזר כספי)\b/i,
   /\b(עזרה|חירום)\b/i,
@@ -739,6 +834,46 @@ async function handleInbound({ from, name, text }) {
     }
   }
 
+  // 3g. Arabic dialect detection — runs on every message, sticky once set.
+  //     arabic_script takes priority (full Arabic response required).
+  //     arabic_hebrew = Hebrew-script Arabic slang → warm Hebrew, no corporate tone.
+  {
+    const prevDialect = getQualData(from).dialect;
+    if (!prevDialect) {
+      if (ARABIC_SCRIPT_RE.test(text)) {
+        setQualData(from, { dialect: 'arabic_script' });
+        logger.info('[lead_agent] Arabic script detected', { from });
+      } else {
+        const hebrewArabicMatches = (text.match(ARABIC_HEBREW_MARKERS) || []).length;
+        if (hebrewArabicMatches >= 2) {
+          setQualData(from, { dialect: 'arabic_hebrew' });
+          logger.info('[lead_agent] Hebrew-script Arabic dialect detected', { from });
+        }
+      }
+    } else if (prevDialect !== 'arabic_script' && ARABIC_SCRIPT_RE.test(text)) {
+      // Upgrade to full Arabic if they switch to Arabic script mid-conversation
+      setQualData(from, { dialect: 'arabic_script' });
+    }
+  }
+
+  // 3h. Pricing objection detection — wire up the PRICE_OBJECTION_RE that was
+  //     previously defined but never applied to qualData.
+  if (!getQualData(from).pricingObjection && PRICE_OBJECTION_RE.test(text)) {
+    setQualData(from, { pricingObjection: true });
+    logger.info('[lead_agent] Pricing objection detected', { from });
+  }
+
+  // 3i. Mark the pricing objection as handled once the AI replies with a redirect.
+  //     (The CALL_PROPOSAL_RE already fires when the AI proposes the call; we reuse
+  //     that signal to avoid re-injecting the repositioning block on every turn.)
+  //     This is set after the AI reply is generated — see the state-flags block below.
+
+  // 3j. Touch the persistent memory session counter on the very first message
+  //     of a new conversation (completedTurns counts user messages in history).
+  if (completedTurns === 0) {
+    memoryService.touchSession(from);
+  }
+
   // 4. Build the system prompt for this specific turn.
   //    freshQualData is read AFTER all step-3 mutations so the stage context
   //    always reflects the current state (including locationCheckAsked).
@@ -820,6 +955,12 @@ async function handleInbound({ from, name, text }) {
       setQualData(from, { callProposed: true });
     }
 
+    // pricingObjectionHandled: set once the call proposal has been delivered after
+    // a pricing objection, so the repositioning block stops re-injecting.
+    if (freshQualData.pricingObjection && !freshQualData.pricingObjectionHandled && CALL_PROPOSAL_RE.test(reply)) {
+      setQualData(from, { pricingObjectionHandled: true });
+    }
+
     // Save only user/assistant pairs — no system messages in history
     history.push({ role: 'user', content: text });
     history.push({ role: 'assistant', content: reply });
@@ -859,22 +1000,32 @@ async function handleInbound({ from, name, text }) {
     return { reply: null, score, status };
   }
 
-  // 9. Trigger brief generation (fire-and-forget) when entering Stage 3 for
-  //    the first time, or when a call time is captured on this turn.
+  // 9. Fire-and-forget brief + memory pipeline when entering Stage 3 or when a
+  //    call time is captured on this turn.
   //
   //    Gates:
-  //    • locationViable !== false  — never alert the team for a lead who said the
-  //                                  distance is a problem
-  //    • !locationCheckNeeded      — don't alert while travel feasibility is still
-  //                                  pending (lead hasn't answered yet)
+  //    • locationViable !== false  — never alert for leads who said distance is a problem
+  //    • !locationCheckNeeded      — don't alert while travel feasibility is pending
   const latestQualData      = getQualData(from);
   const locationOk          = latestQualData.locationViable !== false && !latestQualData.locationCheckNeeded;
   const callTimeCapturedNow = !qualData.callTimeGiven && !!latestQualData.callTimeGiven && locationOk;
   const enteringStage3      = completedTurns >= 3 && !latestQualData.briefGeneratedAt && locationOk;
 
   if (enteringStage3 || callTimeCapturedNow) {
-    generateLeadBrief(from, history, latestQualData.callTimeGiven ?? null, { alertTeam: callTimeCapturedNow })
-      .catch(err => logger.warn('[lead_agent] Brief generation error', { from, error: err.message }));
+    // Always persist the JSON brief for the dashboard (no WhatsApp alert here)
+    generateLeadBrief(from, history, latestQualData.callTimeGiven ?? null, { alertTeam: false })
+      .catch(err => logger.warn('[lead_agent] JSON brief error', { from, error: err.message }));
+  }
+
+  if (callTimeCapturedNow) {
+    // Send the rich hand-off brief to the owner only when a call time is confirmed
+    const lead = store.getLead(from);
+    handoffService.generateHandoffBrief(from, lead?.name ?? from, history, latestQualData)
+      .catch(err => logger.warn('[lead_agent] Handoff brief error', { from, error: err.message }));
+
+    // Save a persistent session summary to the memory store
+    memoryService.generateAndSaveSessionSummary(from, history, latestQualData)
+      .catch(err => logger.warn('[lead_agent] Session summary error', { from, error: err.message }));
   }
 
   return { reply, score, status };
