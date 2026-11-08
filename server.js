@@ -23,6 +23,12 @@ process.on('uncaughtException', (err) => {
 
 const { verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, releaseQueuedMessages, sendText, sendFileByUrl, alertOwner, notifyLeadTeam, probeGreenApiConnection, getGreenCreds, _tokenSourceVar } = require('./services/whatsapp.service');
 const { SCHEDULE_TIMETABLE_RE: _SCHEDULE_RE } = require('./agents/deterministic_reply');
+const phoneRegistry = require('./utils/phone_registry');
+// conversation_fsm is imported for future wiring into processInboundWAMessage.
+// Currently the pipeline uses the existing isExistingClient / 4-tier routing path.
+// getFsmState() is not yet called in the message pipeline — it is a structural module
+// available for the next integration step (replace isExistingClient tree with FSM dispatch).
+const { getState: getFsmState } = require('./utils/conversation_fsm'); // eslint-disable-line no-unused-vars
 const { fetchAndNormalizeLead } = require('./services/metaLeads');
 const { captureRawBody, verifyMetaSignature } = require('./middleware/security');
 const inbox = require('./utils/whatsapp_inbox');
@@ -680,9 +686,11 @@ function isConfigured(...keys) {
 
 // ── Cron jobs ─────────────────────────────────────────────────────────────────
 
-// ── Member cache: proactive seeding every 15 minutes ─────────────────────────
-// Ensures known_members.json and the in-process cache are warm before any
-// member's first contact, eliminating the "first-message-during-outage" gap.
+// NOTE: PhoneRegistry has its OWN internal 60-second interval (started in init()).
+// The crons below maintain the LEGACY member_cache and known_members.json layers
+// for backward compatibility. PhoneRegistry is the primary identity gate.
+
+// ── Member cache: proactive seeding every 15 minutes (legacy layer) ───────────
 cron.schedule('*/15 * * * *', async () => {
   try {
     const result = await seedMemberCache();
@@ -1296,10 +1304,11 @@ app.get('/api/barak/reports/hot-leads', (_req, res) => {
 
 function normalizeToE164(phone) {
   if (!phone) return null;
-  const s = String(phone).replace(/[\s\-\.\(\)]/g, '');
-  if (s.startsWith('+')) return s.slice(1);   // +972XXXXXXXX → 972XXXXXXXX
-  if (s.startsWith('972')) return s;
-  if (s.startsWith('0'))   return '972' + s.slice(1);
+  const s = String(phone).replace(/[\s\-\.\(\)\+]/g, ''); // strip +, spaces, dashes, dots, parens
+  if (s.startsWith('00972')) return s.slice(2);            // 00972XXXXXXXXX → 972XXXXXXXXX
+  if (s.startsWith('972'))   return s;                     // already E164
+  if (s.startsWith('0'))     return '972' + s.slice(1);    // 05X → 972 5X
+  if (s.length === 9)        return '972' + s;             // 5XXXXXXXX → 972 5XXXXXXXX
   return s;
 }
 
@@ -1673,6 +1682,20 @@ async function processInboundWAMessage(msg) {
       reactedToId:   msg.reactedToId   ?? null,
     });
     return { inboxEntry: reactionEntry, clientMatch: { found: false }, intent: 'reaction', route: 'reaction_bypass', barakReply: null };
+  }
+
+  // ── REGISTRY GATE: synchronous O(1) identity check ───────────────────────────
+  // This runs before ANY async work. isMember() is a plain Set.has() — no I/O,
+  // no TTL math, no Arbox call.
+  // On hit: pre-seeds memberCache so the 4-tier lookup immediately classifies
+  // this phone as a confirmed member (tier1Fresh=true), which sets isExistingClient=true
+  // and routes to Tomer. We do NOT return early here — we let the existing pipeline
+  // proceed with a guaranteed memberCache hit so inbox logging, SSE, and persist
+  // all run normally. The routing outcome is now deterministic: isExistingClient=true.
+  const _registryHit = phoneRegistry.isMember(fromNorm) || phoneRegistry.isMember(fromIsraeli);
+  if (_registryHit) {
+    logger.info('[registry-gate] MEMBER confirmed — pre-seeding cache for guaranteed Tomer routing', { from: fromNorm });
+    memberCache.markConfirmed(fromNorm, { source: 'phone_registry', name: msg.name ?? null, role: 'client' });
   }
 
   // 0b. Staff bypass — messages from Eden/Melanie are stored in the inbox for
@@ -3770,7 +3793,11 @@ process.on('SIGTERM', () => {
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
+// The callback MUST be async so that `await phoneRegistry.init()` is valid.
+// Note: app.listen() opens the port synchronously before the callback fires.
+// The ~1-2s init window is covered by Gate 1 (memberCache) and Gate 2 (operational
+// interceptor) in lead_agent.js — both fire even when the registry is warming up.
+app.listen(PORT, async () => {
   logger.info(`Shape Studio Agent running — http://localhost:${PORT}`);
 
   // ── Persistence: guarantee DATA_DIR exists, then hydrate stores ─────────────
@@ -3807,6 +3834,13 @@ app.listen(PORT, () => {
     existingFiles: dataFiles.filter(f => !f.endsWith('.tmp')),
   });
 
+  // ── PhoneRegistry: load FIRST, before anything else ────────────────────────
+  // Minimises the warm-up window between port-open and first real message.
+  // 10s timeout — if Arbox is unreachable at deploy time, the registry starts
+  // empty; Gate 1 (memberCache) and Gate 2 (operational interceptor) remain
+  // active as independent safety layers throughout the warm-up window.
+  await phoneRegistry.init({ timeoutMs: 10_000 });
+
   persist.loadLeads(store);
   persist.loadInbox(inbox);
 
@@ -3815,15 +3849,11 @@ app.listen(PORT, () => {
 
   initWorkers(store);
 
-  // ── Member cache: seed from Arbox on startup (non-blocking) ─────────────────
-  // Primes known_members.json and the in-process cache before any message arrives.
-  // If Arbox is unreachable at boot, the cache loads from member_cache.json (file)
-  // and the 15-min cron will retry.
-  setTimeout(() => {
-    seedMemberCache().then(r => {
-      if (r?.seeded >= 0) logger.info('[startup] Member cache seeded', r);
-    }).catch(() => {});
-  }, 5_000);  // 5s delay so other startup I/O completes first
+  // Also seed the legacy member_cache for backward compatibility with any code
+  // that still calls memberCache.isConfirmed() directly.
+  seedMemberCache().then(r => {
+    if (r?.seeded >= 0) logger.info('[startup] Legacy member cache seeded', r);
+  }).catch(() => {});
 
   // Probe Green API credentials immediately at startup so Railway logs show
   // whether WhatsApp sending will work before the first real message arrives.
