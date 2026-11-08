@@ -71,4 +71,55 @@ function tryDeterministicWazeReply(text, assets) {
   return { reply, type: 'waze_deterministic' };
 }
 
-module.exports = { tryDeterministicWazeReply, WAZE_REQUEST_RE };
+// ── Schedule / timetable request interceptor ─────────────────────────────────
+//
+// The LLM occasionally ignores the MANDATORY SCHEDULE RULE and either dumps a
+// class list or says "אין לי תמונה". This deterministic handler fires first so
+// the response is always consistent with the mandated scripted phrase.
+//
+// Matches messages that are asking for the full weekly timetable or schedule image.
+// Day-specific queries (e.g. "מה יש ביום שני?") are intentionally excluded — those
+// should go to the AI for a live Arbox lookup answer.
+
+const SCHEDULE_TIMETABLE_RE = /מערכת שעות|לוח שיעורים|לוח.*שבוע|שבוע.*לוח|שלח[יה]?.*לוח|שלח[יה]?.*מערכת|הלוח שלכם|הלוח שלך|שעות.*הסטודיו|שעות.*שלכם|שעות.*שלך|שעות פעילות|שעות פתיחה|מתי פתוח[ים]?|לראות.*שעות|רוצה.*לוח|יש לכם.*תמונה.*לוח|יש תמונה|תמונה.*לוח|לוח.*תמונה|אפשר.*לראות.*לוח|לראות.*מערכת|שלח.*מערכת|רוצה.*מערכת|מה יש.*השבוע|השבוע.*לוח/i;
+
+const SPECIFIC_DAY_RE = /היום|מחר|ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת/;
+
+/**
+ * Returns a deterministic schedule reply if the message is requesting the full
+ * timetable/schedule (not a day-specific query). Returns null to fall through to AI.
+ *
+ * @param {string} text   - raw inbound message text
+ * @param {object} assets - result of studioAssets.getAssets()
+ * @returns {{ reply: string, type: string } | null}
+ */
+function tryDeterministicScheduleReply(text, assets) {
+  if (!text) return null;
+  if (!SCHEDULE_TIMETABLE_RE.test(text)) return null;
+  // Day-specific queries need live Arbox data — let the AI handle them
+  if (SPECIFIC_DAY_RE.test(text)) return null;
+
+  // Mirror the Waze pattern: only promise the image when we can actually deliver it.
+  // When timetableUrl is null, return an honest conversational nudge instead of
+  // "שולח לך את המערכת עכשיו" — a phrase that server.js cannot fulfil without a URL.
+  if (assets?.timetableUrl) {
+    return {
+      reply: `שולח לך את המערכת עכשיו 📅\nאחרי שתראה/י — ספר/י לי איזה יום ושעה בדרך כלל עובדים לך 😊`,
+      type:  'schedule_deterministic',
+    };
+  }
+
+  // No image configured — honest fallback that keeps the conversation moving
+  // without making a promise we cannot keep.
+  return {
+    reply: `הלוח שלנו משתנה תדיר 😊 ספר/י לי איזה יום ושעה בדרך כלל עובדים לך — ואמצא לך מה יש.`,
+    type:  'schedule_deterministic_no_image',
+  };
+}
+
+module.exports = {
+  tryDeterministicWazeReply,
+  WAZE_REQUEST_RE,
+  tryDeterministicScheduleReply,
+  SCHEDULE_TIMETABLE_RE,
+};

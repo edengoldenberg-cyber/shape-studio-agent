@@ -5,12 +5,14 @@ const OpenAI  = require('openai');
 const logger  = require('../utils/logger');
 const store   = require('../utils/lead_store');
 const { sendText, alertOwner } = require('../services/whatsapp.service');
-const { tryDeterministicWazeReply } = require('./deterministic_reply');
+const { tryDeterministicWazeReply, tryDeterministicScheduleReply } = require('./deterministic_reply');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const studioAssets  = require('../utils/studio_assets');
 const memoryService = require('../services/memory.service');
 const handoffService = require('../services/handoff.service');
+const memberCache   = require('../utils/member_cache');
+const { checkOperationalIntent } = require('../utils/operational_interceptor');
 
 const SYSTEM_PROMPT = fs.readFileSync(
   path.join(__dirname, '../prompts/system_prompt.md'),
@@ -185,10 +187,53 @@ function postProcessReply(reply, qualData, assets) {
     ppChanges.push('waze_injected');
   }
 
-  // 3. Ensure the reply ends with a question mark
-  //    Exceptions: call time confirmed, or lead explicitly closed (locationViable=false)
+  // 2.5 Gate 3 — Conversational Hygiene Guard.
+  //     Hard-strips AI-generated re-asks for data that is already confirmed.
+  //     Runs before the question-enforcement block so we don't re-add what we just removed.
+
+  // Never re-ask for name when it's already confirmed
+  if (qualData.confirmedName && NAME_ASK_RE.test(out)) {
+    // Strip the sentence containing the name question
+    const stripped = out.replace(/[^.!?\n]*(?:איך קוראים לך|מה שמך|מה השם שלך|ואיך קוראים|קוראים לך\?|שמך\?)[^.!?\n]*[.!?\n]?/gi, '').trim();
+    if (stripped.length >= 10) {
+      out = stripped;
+      ppChanges.push('gate3_name_reasked_stripped');
+    }
+  }
+
+  // Never re-propose a callback time after it's already been confirmed
+  if (qualData.callTimeGiven && /באיזו\s+שעה|מתי\s+נוח|מה\s+שעה\s+נוח/.test(out)) {
+    const stripped = out.replace(/[^.!?\n]*(?:באיזו\s+שעה|מתי\s+נוח|מה\s+שעה\s+נוח)[^.!?\n]*[.!?\n]?/gi, '').trim();
+    if (stripped.length >= 10) {
+      out = stripped;
+      ppChanges.push('gate3_callback_loop_stripped');
+    }
+  }
+
+  // 3. Question enforcement / stripping.
+  //
+  //    CLOSE state (callTimeGiven or locationViable=false):
+  //      Strip any trailing question the AI generated. The conversation is done.
+  //      A question after a confirmed callback undoes the closing.
+  //
+  //    Open state:
+  //      Append a fallback question if the reply has no question mark.
   const isClose = !!(qualData.callTimeGiven || qualData.locationViable === false);
-  if (!isClose) {
+  if (isClose) {
+    // Strip the last sentence if it ends with a question mark.
+    // Pattern: optional whitespace, then [any text][?], capturing everything before it.
+    // We use a greedy match from the last '?' backward to avoid stripping mid-reply questions.
+    // [\s\S] after the ? allows for trailing emoji, whitespace, or any Unicode char
+    // that the AI adds after the question mark (e.g. "באיזו שעה נוח לך? 😊").
+    const stripped = out.replace(/\s*[^.!?\n]{1,120}\?[\s\S]{0,10}$/u, '').trim();
+    if (stripped.length >= 15) {
+      // Replacement produced a sensible confirmation — use it
+      if (stripped !== out) ppChanges.push('close_question_stripped');
+      out = stripped;
+    }
+    // If stripping left something too short or empty, keep the original
+    // (the prompt-level fix in Fix 1A should prevent the AI from generating one)
+  } else {
     const trimmed = out.trimEnd();
     if (!/[?？]/.test(trimmed.slice(-3))) {
       const fallbackQ = qualData.callProposed
@@ -396,6 +441,14 @@ function buildStageContext(completedTurns, qualData, msgCount) {
     : 'Location not yet confirmed.';
 
   if (completedTurns === 1) {
+    // Determine what the lead already expressed so we know what to ask next
+    const hasGoalOrInterest = !!(qualData.fitnessInterest || qualData.goal);
+    const goalKnown = qualData.goal
+      ? `"${qualData.goal}" (goal — natural language)`
+      : qualData.fitnessInterest
+        ? `"${qualData.fitnessInterest}" (specific class interest)`
+        : null;
+
     return [
       UNIVERSAL_STAGE_RULES,
       ``,
@@ -403,19 +456,29 @@ function buildStageContext(completedTurns, qualData, msgCount) {
       ``,
       `TURN 2 — DEEPER DISCOVERY. Reply #${msgCount + 1}.`,
       locNote,
-      `CRITICAL: READ "כבר ידוע" ABOVE before writing anything. Never ask about something already listed there.`,
-      `  • If the lead ALREADY mentioned a fitness interest or class (see "כבר ידוע" above):`,
-      `    DO NOT ask "what are you looking for" — they answered it. Instead:`,
-      `    Acknowledge their interest warmly (1 sentence), then ask ONE deeper question:`,
-      `    their goal (חיזוק? יציבה? שיקום?), experience level, or what they specifically want to achieve.`,
-      `  • If NO fitness interest appears above:`,
-      `    Acknowledge location warmly (1 sentence), then ask ONE open question about their goal.`,
+      ``,
+      `CRITICAL: READ "כבר ידוע" ABOVE before writing anything. Never ask about something already there.`,
+      hasGoalOrInterest
+        ? [
+            `  → The lead ALREADY expressed their fitness intent: ${goalKnown}.`,
+            `     DO NOT ask "what are you looking for" or "what brought you here" — they answered it.`,
+            `     Instead: Acknowledge warmly (1 sentence), then ask ONE DEEPER question:`,
+            `     their experience level, specific pain point, or what they've tried before.`,
+          ].join('\n')
+        : [
+            `  → No fitness goal or interest captured yet.`,
+            `     Acknowledge location warmly (1 sentence), then ask ONE open question about their goal.`,
+            `     Good: "מה הכי חשוב לך להשיג מהאימונים?"`,
+          ].join('\n'),
+      ``,
       `MANDATORY: Your reply MUST end with a question mark. No dead-ends.`,
       `Max 3 sentences. No pricing. No class list. Do not use their name.`,
     ].join('\n');
   }
 
   if (completedTurns === 2) {
+    const hasGoalOrInterest = !!(qualData.fitnessInterest || qualData.goal);
+
     return [
       UNIVERSAL_STAGE_RULES,
       ``,
@@ -425,11 +488,18 @@ function buildStageContext(completedTurns, qualData, msgCount) {
       `If the lead's last message was a location confirmation ("כן", "אין בעיה", "בסדר"):`,
       `  Acknowledge in ONE short phrase (e.g., "מצוין! 💪") then IMMEDIATELY ask about their goal.`,
       `  Do NOT send a reply that is ONLY the acknowledgement — always follow with the goal question.`,
-      `Otherwise, look at conversation history:`,
-      `  • If fitness GOAL has NOT been shared yet → acknowledge briefly, ask ONE goal question.`,
-      `  • If goal WAS shared → acknowledge it, ask ONE question about workout style or experience level.`,
-      `  • If you mention a class name → your closing question MUST validate relevance:`,
-      `    "האם סגנון כזה מתאים למה שחיפשת?" Never just name-drop the class.`,
+      `Otherwise:`,
+      hasGoalOrInterest
+        ? [
+            `  → Goal/interest already in "כבר ידוע" above. DO NOT re-ask it.`,
+            `     Acknowledge it warmly (1 sentence), then ask ONE question about:`,
+            `     workout style, experience level, or what they've tried before.`,
+            `  → If you mention a class name: close with "האם סגנון כזה מתאים למה שחיפשת?"`,
+          ].join('\n')
+        : [
+            `  → Goal not yet captured → ask ONE focused goal question.`,
+            `     Good: "מה הכי חשוב לך — חיזוק? גמישות? שיקום?"`,
+          ].join('\n'),
       `MANDATORY: Your reply MUST end with a question mark. No dead-ends.`,
       `Max 3 sentences. No pricing. No trial offer. Do not use their name.`,
     ].join('\n');
@@ -438,10 +508,20 @@ function buildStageContext(completedTurns, qualData, msgCount) {
   if (completedTurns >= 3) {
     if (qualData.callTimeGiven) {
       return [
-        `CLOSE — CONFIRM CALL. Reply #${msgCount + 1}.`,
-        `Call time given: "${qualData.callTimeGiven}".`,
-        `Confirm warmly. Tell them to expect the team's call. Thank them briefly.`,
-        `Max 2 sentences. No questions unless they raised something new.`,
+        `CLOSE — CONVERSATION IS FINISHED. Reply #${msgCount + 1}.`,
+        `Call time confirmed: "${qualData.callTimeGiven}".`,
+        ``,
+        `THIS OVERRIDES ALL OTHER RULES INCLUDING THE UNIVERSAL QUESTION RULE.`,
+        `Write exactly 1–2 sentences: a warm confirmation + tell them to expect the team's call.`,
+        ``,
+        `HARD STOP — FORBIDDEN IN THIS REPLY:`,
+        `  ✗ Any question mark (?)`,
+        `  ✗ Any forward proposal ("מתי נוח לך", "באיזו שעה", "האם...")`,
+        `  ✗ Any class information, pricing, or new topics`,
+        `  ✗ Asking for the call time again (it was already captured)`,
+        ``,
+        `CORRECT example: "מצויין! הצוות שלנו יצור איתך קשר ב${qualData.callTimeGiven}. מחכים לשיחה 😊"`,
+        `WRONG example: "...הצוות יצור קשר. באיזו שעה נוח לך?" ← FORBIDDEN, never do this.`,
       ].join('\n');
     }
 
@@ -668,8 +748,20 @@ function _loadKnownMemberPhones() {
 }
 
 function _isKnownMemberPhone(phone) {
+  if (!phone) return false;
+
+  // Normalize consistently with server.js normalizeToE164
+  const s    = String(phone).replace(/[\s\-\.\(\)]/g, '').replace(/^\+/, '');
+  const norm = s.startsWith('972')   ? s
+             : s.startsWith('00972') ? '972' + s.slice(5)
+             : s.startsWith('0')     ? '972' + s.slice(1)
+             : s;
+
+  // Tier 1 — in-process memberCache: authoritative real-time source (seeded every 15 min from Arbox)
+  if (memberCache.isConfirmed(norm) || memberCache.isConfirmed(phone)) return true;
+
+  // Tier 2 — known_members.json: durable file-backed fallback that survives cache expiry
   const list = _loadKnownMemberPhones();
-  const norm = phone.startsWith('972') ? phone : '972' + phone.replace(/^0/, '');
   return list.has(phone) || list.has(norm);
 }
 
@@ -680,11 +772,42 @@ function _isKnownMemberPhone(phone) {
  * Returns { reply, score, status }.
  */
 async function handleInbound({ from, name, text }) {
-  // ── HARD BLOCK: prevent known members from reaching the lead qualification flow
+  // ── GATE 1: Member Firewall ───────────────────────────────────────────────────
+  // Checks memberCache (in-process, seeded every 15 min from Arbox) first,
+  // then known_members.json. Both must miss before we continue.
   if (_isKnownMemberPhone(from)) {
-    logger.warn('[lead_agent] BLOCKED — known member reached lead flow; removing stale record', { from });
+    logger.warn('[lead_agent] GATE 1 BLOCKED — known member reached lead flow; removing stale record', { from });
     store.deleteLead(from);
     return { reply: null, score: 0, status: 'member' };
+  }
+
+  // ── GATE 2: Operational Intent Interceptor ────────────────────────────────────
+  // Belt-and-suspenders against members who slip past Gate 1 (expired cache,
+  // phone-format mismatch, Arbox outage). Deterministic regex — cannot fail.
+  // Accusatory patterns ("ביטלת לי"), possessives ("האימון שלי"), absence
+  // notifications ("לא אהיה ביום רביעי"), membership ops, and complaints
+  // all fire here before ANY sales logic runs.
+  const opCheck = checkOperationalIntent(text);
+  if (opCheck.blocked) {
+    logger.warn('[lead_agent] GATE 2 BLOCKED — operational intent intercepted, aborting sales pipeline', {
+      from, intent: opCheck.intent, preview: text.slice(0, 80),
+    });
+    try {
+      await sendText(from, opCheck.holdResponse);
+    } catch (sendErr) {
+      logger.error('[lead_agent] Gate 2 hold-response send failed', { from, error: sendErr.message });
+    }
+    await alertOwner(
+      `🛑 Operational message intercepted — ${name ?? from}`,
+      `*Contact:* ${name ?? from}\n*Phone:* ${from}\n` +
+      `*Intent:* ${opCheck.intent}\n*Message:* "${text.slice(0, 200)}"\n\n` +
+      `Please follow up directly — this person may be an existing member.`
+    ).catch(() => {});
+    store.logEvent('operational_intercepted', from, {
+      intent: opCheck.intent, preview: text.slice(0, 80),
+    });
+    clearSession(from);
+    return { reply: opCheck.holdResponse, score: 0, status: 'member_operational' };
   }
 
   store.logEvent('message_in', from, { name, preview: text.slice(0, 80) });
@@ -825,12 +948,30 @@ async function handleInbound({ from, name, text }) {
 
   // 3f. Fitness interest capture — save first mention of a specific class/activity so we
   //     never re-ask what they're looking for.
+  //
+  //     TWO complementary detectors:
+  //       FITNESS_RE — specific class names (Reformer, Barre, etc.) → sets fitnessInterest
+  //       GOAL_RE    — natural-language fitness goals ("לחזק", "ירידה במשקל", etc.) → sets goal
+  //
+  //     Both feed the knownSection so the stage context never loops back to discovery
+  //     when the lead already expressed their intent in everyday language.
   if (!getQualData(from).fitnessInterest) {
     const FITNESS_RE = /פילאטיס מכשירים|reformer|pilates barre|barre|strength|אימון כח|אימון כוח|כוח|יוגה|yoga|kangoo|קנגו|all in|toning|עיצוב|חיטוב|ashtanga|פילאטיס/i;
     const fitnessMatch = text.match(FITNESS_RE);
     if (fitnessMatch) {
       setQualData(from, { fitnessInterest: fitnessMatch[0] });
       logger.info('[lead_agent] Fitness interest captured', { from, interest: fitnessMatch[0] });
+    }
+  }
+
+  if (!getQualData(from).goal) {
+    // GOAL_RE matches natural-language fitness goals that don't name a specific class.
+    // Captures the first matching phrase so the knownSection can display it.
+    const GOAL_RE = /לחזק|חיזוק|להתחזק|ירידה.*במשקל|לרדת.*במשקל|לרזות|לעצב.*גוף|עיצוב.*גוף|שיקום|שיקומי|גמישות|לשפר.*גמישות|יציבה|לשפר.*יציבה|כאב.*גב|כאבי.*גב|לחזור.*כושר|להחזיר.*כושר|לשפר.*כושר|כושר.*כללי|להיות.*פעיל|להרגיש.*טוב|אחרי.*לידה|אחרי.*הריון|לידה|לנוח.*גוף|גוף.*בריא|להיות.*בריא|קרדיו|סיבולת|אנרגיה|להוריד.*משקל|לעלות.*שריר|שריר|כוח.*פונקציונל/i;
+    const goalMatch = text.match(GOAL_RE);
+    if (goalMatch) {
+      setQualData(from, { goal: goalMatch[0] });
+      logger.info('[lead_agent] Fitness goal captured', { from, goal: goalMatch[0] });
     }
   }
 
@@ -879,12 +1020,15 @@ async function handleInbound({ from, name, text }) {
   //    always reflects the current state (including locationCheckAsked).
   const freshQualData    = getQualData(from);
 
-  // ── Deterministic pre-interceptor ────────────────────────────────────────────
-  // Fires BEFORE OpenAI for operations that must be guaranteed 100%:
-  // Waze/address requests — LLM is unreliable due to token truncation and
-  // attention dilution in long system prompts.
+  // ── Deterministic pre-interceptors ───────────────────────────────────────────
+  // Fire BEFORE OpenAI for operations that must be guaranteed 100% regardless of
+  // model attention. Currently handles:
+  //   • Waze/address requests — LLM omits URLs or percent-encodes Hebrew characters
+  //   • Schedule/timetable requests — LLM ignores MANDATORY SCHEDULE RULE and dumps class list
   const assets = studioAssets.getAssets();
-  const deterministicResult = tryDeterministicWazeReply(text, assets);
+  const deterministicResult =
+    tryDeterministicWazeReply(text, assets) ??
+    tryDeterministicScheduleReply(text, assets);
   if (deterministicResult) {
     _lastDebugCtx = { path: 'deterministic', type: deterministicResult.type, postProcess: { changes: [], clean: true } };
     logger.info('[lead_agent] Deterministic interceptor fired', { from, type: deterministicResult.type });

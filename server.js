@@ -22,6 +22,7 @@ process.on('uncaughtException', (err) => {
 });
 
 const { verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, releaseQueuedMessages, sendText, sendFileByUrl, alertOwner, notifyLeadTeam, probeGreenApiConnection, getGreenCreds, _tokenSourceVar } = require('./services/whatsapp.service');
+const { SCHEDULE_TIMETABLE_RE: _SCHEDULE_RE } = require('./agents/deterministic_reply');
 const { fetchAndNormalizeLead } = require('./services/metaLeads');
 const { captureRawBody, verifyMetaSignature } = require('./middleware/security');
 const inbox = require('./utils/whatsapp_inbox');
@@ -1321,8 +1322,11 @@ const INTENT_PATTERNS = {
   specialist_query: /שיקומ|rehab|rehabilit|מדריכ.{0,5}שיקומ|אחרי לידה|לאחר לידה|בהריון|pre.?natal|post.?natal|מדריכ.{0,10}מוסמכ|קורס.{0,10}מדריכ|מתמחה ב|מתמחה עם/,
   // subscription_query: questions about membership packages and what's included
   subscription_query: /מה זה כולל|כולל מה|מה כלול|מה נכלל|איזה שיעורים כלול|כמה כניסות|מנוי חודשי|מנויים|חבילה|חבילות|כמה עולה מנוי|מחיר מנוי|עלות מנוי|כמה עולה חבר|מנוי ב|מנוי ל/,
-  // schedule_query covers both schedule listings AND instructor-specific questions
-  schedule_query:   /מערכת שעות|לוח שיעורים|מה יש|מתי יש|יש שיעור|יש מקום|מה קורה|סדר יום|מה הלוח|הלוח שלכם|הלוח שלך|שעות.*הסטודיו|שעות.*שלכם|שעות פעילות|שעות פתיחה|מתי פתוח|מתי פתוחים|לראות.*שעות|רוצה.*לוח|איזה שיעורים|מה התוכנית|מה הוא שיעור|מי מדריך|מי המדריך|מי מלמד|מי מנהל|מי נותן|באיזה שעה|בכמה|מה השעה|שיעור.{0,15}ב(יום|ערב|בוקר|צהריים)|ב(יום\s)?(ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת)|יש לכם.*תמונה|שלח.*תמונה.*לוח|תמונה.*לוח|לוח.*תמונה|יש תמונה/,
+  // schedule_query covers both schedule listings AND instructor-specific questions.
+  // Keep in sync with SCHEDULE_TIMETABLE_RE in deterministic_reply.js — any phrase
+  // that matches that regex but not this one will route through lead_agent instead
+  // of the scheduling pipeline's null-URL fallback.
+  schedule_query:   /מערכת שעות|לוח שיעורים|מה יש|מתי יש|יש שיעור|יש מקום|מה קורה|סדר יום|מה הלוח|הלוח שלכם|הלוח שלך|שעות.*הסטודיו|שעות.*שלכם|שעות פעילות|שעות פתיחה|מתי פתוח|מתי פתוחים|לראות.*שעות|רוצה.*לוח|איזה שיעורים|מה התוכנית|מה הוא שיעור|מי מדריך|מי המדריך|מי מלמד|מי מנהל|מי נותן|באיזה שעה|בכמה|מה השעה|שיעור.{0,15}ב(יום|ערב|בוקר|צהריים)|ב(יום\s)?(ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת)|יש לכם.*תמונה|שלח.*תמונה.*לוח|תמונה.*לוח|לוח.*תמונה|יש תמונה|שלח.*מערכת|רוצה.*מערכת|לראות.*מערכת|לוח.*שבוע|שבוע.*לוח|אפשר.*לראות.*לוח/,
 };
 
 function detectSchedulingIntent(text) {
@@ -1340,21 +1344,20 @@ function detectSchedulingIntent(text) {
 
 // ── Timetable image detection ─────────────────────────────────────────────────
 
-// Keywords that mean "send me the full weekly timetable" (→ image).
-const TIMETABLE_IMAGE_RE = /מערכת שעות|מה יש השבוע|לוח.*שבוע|שבוע.*לוח|שלח[יה]?.*לוח|שלח[יה]?.*מערכת|הלוח שלכם|הלוח שלך|שעות.*הסטודיו|שעות.*שלכם|שעות.*שלך|שעות פעילות|שעות פתיחה|מתי פתוח|לראות.*שעות|רוצה.*לוח|לוח שיעורים|יש לכם.*תמונה|שלח.*תמונה.*לוח|תמונה.*לוח|לוח.*תמונה|יש תמונה/i;
 // Day names that make a schedule query specific to one day (→ Arbox live, not image).
-const SPECIFIC_DAY_RE    = /היום|מחר|ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת/;
+const SPECIFIC_DAY_RE = /היום|מחר|ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת/;
 
 /**
  * Returns true when the user wants the full weekly timetable image rather
  * than a live per-day answer from Arbox.
+ * Uses the authoritative SCHEDULE_TIMETABLE_RE from deterministic_reply.js
+ * (imported as _SCHEDULE_RE) so the two layers stay in sync automatically.
  */
 function isWeeklyTimetableQuery(text) {
   if (!text) return false;
-  if (TIMETABLE_IMAGE_RE.test(text)) return true;
-  // "לוח שיעורים" alone with no specific day → image
-  if (/לוח שיעורים/.test(text) && !SPECIFIC_DAY_RE.test(text)) return true;
-  return false;
+  if (!_SCHEDULE_RE.test(text)) return false;
+  // Day-specific queries need live Arbox data, not the image
+  return !SPECIFIC_DAY_RE.test(text);
 }
 
 // ── Barak scheduling draft reply ──────────────────────────────────────────────
@@ -2019,9 +2022,18 @@ async function processInboundWAMessage(msg) {
   //     qualification funnel. A false silence costs one message delay; a false
   //     sales pitch to a paying member costs trust.
   //
-  //     Gate: only on first contact (no lead record yet) during an Arbox outage.
-  //     Existing leads in the funnel can continue — they're confirmed non-members.
-  if (arboxLookupFailed && !isExistingClient && !store.getLead(fromNorm)) {
+  //     Stale-record exception: a lead record is NOT proof of cold-lead status.
+  //     A contact may have converted to a member after their last sales interaction.
+  //     We only let an existing record bypass Tier-4 if it shows recent activity
+  //     (last 7 days) — meaning they were confirmed as a cold lead very recently.
+  //     Old stale records (> 7 days since last activity) are treated as unknown.
+  const _tier4ActiveLead = (() => {
+    const rec = store.getLead(fromNorm);
+    if (!rec) return false;
+    const lastTs = rec.lastActivity ? new Date(rec.lastActivity).getTime() : 0;
+    return Date.now() - lastTs < 7 * 24 * 60 * 60 * 1000; // active in last 7 days
+  })();
+  if (arboxLookupFailed && !isExistingClient && !_tier4ActiveLead) {
     logger.warn('[pipeline] TIER-4 DEGRADED MODE — Arbox down, identity unverifiable', { from: fromNorm });
 
     const holdMsg = `קיבלנו את הודעתך! הצוות שלנו ייצור איתך קשר בהקדם 😊`;
@@ -2163,8 +2175,12 @@ async function processInboundWAMessage(msg) {
           timetableImgUrl  = timetableUrlBarak;
           timetable2ImgUrl = getActiveTimetable2Url();
         } else {
-          // No image uploaded — give a helpful overview, don't show a single-day dump
-          barakReply = `יש לנו שיעורים כל ימות השבוע — פילאטיס מכשירים (Reformer), Barre, אימון כוח, יוגה, Kangoo ועוד 🏋️‍♀️\nאיזה יום ושעה בדרך כלל עובדים לך?`;
+          // No schedule image uploaded yet.
+          // "שולח לך את המערכת" is a broken promise when timetableImgUrl is null —
+          // the lead reads "sending you the schedule" but nothing arrives.
+          // Honest fallback: invite them to tell us their preferred day/time so the
+          // conversation advances without claiming an image was sent.
+          barakReply = `הלוח שלנו משתנה לעיתים — הכי קל להגיד לי איזה יום ושעה בדרך כלל עובדים לך, ואמצא לך מה מתאים 😊`;
         }
       } else {
         try { barakReply = await buildSchedulingReply(intent, msg, clientMatch); } catch { /* non-fatal */ }
