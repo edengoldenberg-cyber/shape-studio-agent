@@ -3421,6 +3421,123 @@ app.post('/api/whatsapp/sync-green', jsonBody, async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+// LOCAL DEMO SIMULATOR  —  /demo  &  /api/demo/*
+// A sandboxed pipeline that uses real lead_agent logic but intercepts all
+// WhatsApp sends (demo phones 972000000001–972000000009 never reach Green API).
+// ══════════════════════════════════════════════════════════════════════════════
+
+const DEMO_PHONES     = Array.from({ length: 9 }, (_, i) => `97200000000${i + 1}`);
+const DEFAULT_DEMO_PH = DEMO_PHONES[0];
+const demoCapture     = require('./utils/demo_capture');
+
+// GET /demo → serve the simulator HTML
+app.get('/demo', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'demo.html'));
+});
+
+// Helper: snapshot the full state for a demo phone
+function demoLeadSnapshot(phone) {
+  const lead = store.getLead(phone);
+  if (!lead) return { exists: false, phone };
+  const qd   = lead.meta?.qualData ?? {};
+  const hist = (lead.history ?? []).filter(m => m.role !== 'system');
+  const completedTurns = hist.filter(m => m.role === 'user').length;
+  const recentEvents   = store.getEvents({ phone, limit: 20 });
+
+  return {
+    exists:        true,
+    phone,
+    name:          lead.name ?? null,
+    score:         lead.score   ?? 0,
+    status:        lead.status  ?? 'new',
+    messageCount:  lead.messageCount ?? 0,
+    completedTurns,
+    arboxSynced:   lead.arboxSynced ?? false,
+    qualData: {
+      location:            qd.location            ?? null,
+      locationViable:      qd.locationViable      ?? null,
+      locationCheckNeeded: qd.locationCheckNeeded ?? false,
+      locationNearby:      qd.locationNearby      ?? null,
+      locationCheckAsked:  qd.locationCheckAsked  ?? false,
+      fitnessInterest:     qd.fitnessInterest     ?? null,
+      goal:                qd.goal                ?? null,
+      workoutStyle:        qd.workoutStyle        ?? null,
+      nameAsked:           qd.nameAsked           ?? false,
+      confirmedName:       qd.confirmedName       ?? null,
+      callProposed:        qd.callProposed        ?? false,
+      callTimeGiven:       qd.callTimeGiven        ?? null,
+      briefGeneratedAt:    qd.briefGeneratedAt    ?? null,
+    },
+    history: hist.slice(-10).map(m => ({ role: m.role, text: m.content.slice(0, 200) })),
+    recentEvents: recentEvents.map(e => ({ ts: e.ts, type: e.type, data: e.data })),
+  };
+}
+
+// POST /api/demo/chat — send a test message through the real pipeline
+app.post('/api/demo/chat', express.json(), async (req, res) => {
+  const { message, phone = DEFAULT_DEMO_PH, name = 'Test Lead' } = req.body ?? {};
+  if (!message?.trim()) return res.status(400).json({ error: 'message required' });
+  if (!DEMO_PHONES.includes(phone)) return res.status(400).json({ error: 'invalid demo phone — use 972000000001..9' });
+
+  const stateBefore = demoLeadSnapshot(phone);
+
+  demoCapture.start();
+  let result;
+  try {
+    result = await leadAgent.handleInbound({ from: phone, name, text: message.trim() });
+  } catch (err) {
+    demoCapture.stop();
+    logger.error('[demo] handleInbound threw', { error: err.message });
+    return res.status(500).json({ error: err.message, capturedEvents: demoCapture.drain() });
+  }
+  demoCapture.stop();
+  const capturedEvents = demoCapture.drain();
+
+  const stateAfter = demoLeadSnapshot(phone);
+  const debug      = leadAgent.getLastDebugContext?.() ?? null;
+
+  res.json({
+    reply:          result?.reply ?? null,
+    score:          result?.score ?? stateAfter.score,
+    status:         result?.status ?? stateAfter.status,
+    stateBefore,
+    stateAfter,
+    debug,
+    capturedEvents,
+  });
+});
+
+// GET /api/demo/state?phone=... — full state snapshot
+app.get('/api/demo/state', (req, res) => {
+  const phone = req.query.phone ?? DEFAULT_DEMO_PH;
+  if (!DEMO_PHONES.includes(phone)) return res.status(400).json({ error: 'invalid demo phone' });
+  res.json(demoLeadSnapshot(phone));
+});
+
+// POST /api/demo/reset — wipe the session for a demo phone
+app.post('/api/demo/reset', express.json(), (req, res) => {
+  const { phone = DEFAULT_DEMO_PH } = req.body ?? {};
+  if (!DEMO_PHONES.includes(phone)) return res.status(400).json({ error: 'invalid demo phone' });
+  leadAgent.clearSession(phone);
+  res.json({ ok: true, phone, state: demoLeadSnapshot(phone) });
+});
+
+// POST /api/demo/flags — manually inject qualData flags for edge-case testing
+app.post('/api/demo/flags', express.json(), (req, res) => {
+  const { phone = DEFAULT_DEMO_PH, flags } = req.body ?? {};
+  if (!DEMO_PHONES.includes(phone)) return res.status(400).json({ error: 'invalid demo phone' });
+  if (!flags || typeof flags !== 'object') return res.status(400).json({ error: 'flags object required' });
+
+  const lead    = store.getLead(phone);
+  if (!lead) return res.status(404).json({ error: 'no session — send a message first' });
+
+  const meta    = lead.meta    ?? {};
+  const current = meta.qualData ?? {};
+  store.upsertLead(phone, { meta: { ...meta, qualData: { ...current, ...flags } } });
+  res.json({ ok: true, qualData: { ...current, ...flags } });
+});
+
 // ── SIGTERM — save state before Railway kills the container ───────────────────
 // Railway sends SIGTERM ~10s before hard-killing the process on each deploy.
 // Writing snapshots here means a new deploy picks them back up immediately.

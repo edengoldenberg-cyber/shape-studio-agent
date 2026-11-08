@@ -82,6 +82,14 @@ const TRAVEL_CONFIRM_RE =
 const TRAVEL_DECLINE_RE =
   /רחוק לי|רחוק מדי|לא שווה|לא מגיע\b|לא מגיעה\b|לא יכול\b|לא יכולה\b|לא ריאלי|לא אבוא|לא אסע|בעיה עם המרחק|לא כדאי|רחוק מדי עבורי|זה מרחק|לא נוח לי|לא מתאים לי|לא כל כך נוח/i;
 
+// ── Demo / testing debug capture ─────────────────────────────────────────────
+// Populated on every handleInbound call so the /demo simulator can display
+// exactly which code path fired and what postProcessReply transformed.
+// Never affects production behaviour — purely additive metadata.
+let _lastDebugCtx = null;
+function getLastDebugContext() { return _lastDebugCtx; }
+const demoCapture = require('../utils/demo_capture');
+
 // ── State-flag validation regexes ────────────────────────────────────────────
 //
 // callProposed and nameAsked are only stamped true when the AI's actual reply
@@ -104,22 +112,21 @@ const NAME_ASK_RE =
 function postProcessReply(reply, qualData, assets) {
   if (!reply) return reply;
   let out = reply;
+  const ppChanges = [];
 
   // 1. Strip "no image" hallucinations regardless of exact phrasing.
   //    Covers: "אין לי תמונה", "אין תמונות זמינות כרגע", "אין תמונה זמינה",
   //            "לא יש לי תמונה", "לא נמצאה תמונה", etc.
-  out = out.replace(/(?:אין|לא\s+יש|לא\s+נמצא)[^\n.!?]{0,25}תמונ[^\n.!?]*[.!?]?\s*/gi,
+  const afterStrip = out.replace(/(?:אין|לא\s+יש|לא\s+נמצא)[^\n.!?]{0,25}תמונ[^\n.!?]*[.!?]?\s*/gi,
     'שולח לך את המערכת עכשיו 📅 ');
+  if (afterStrip !== out) { ppChanges.push('hallucination_stripped'); out = afterStrip; }
 
   // 2. If the reply mentions the studio address but the Waze link is absent, inject it
   const addressPresent  = /דרך השדה 12|פרדס חנה/.test(out);
   const wazeLinkPresent = /waze\.com|waze:\/\//.test(out);
   if (addressPresent && !wazeLinkPresent && assets?.wazeUrl) {
-    // Insert the link on a new line immediately after the first address occurrence
-    out = out.replace(
-      /(דרך השדה 12[^.\n!?]*)/,
-      `$1\n${assets.wazeUrl}`
-    );
+    out = out.replace(/(דרך השדה 12[^.\n!?]*)/, `$1\n${assets.wazeUrl}`);
+    ppChanges.push('waze_injected');
   }
 
   // 3. Ensure the reply ends with a question mark
@@ -136,8 +143,12 @@ function postProcessReply(reply, qualData, assets) {
             ? ' מה מביא אותך לחפש סטודיו עכשיו?'
             : ' מאיזה אזור את/ה, ומה מחפשים?';
       out = trimmed + fallbackQ;
+      ppChanges.push('question_appended');
     }
   }
+
+  // Record for demo inspector
+  _lastDebugCtx = { ...(_lastDebugCtx ?? {}), postProcess: { changes: ppChanges, clean: ppChanges.length === 0 } };
 
   return out.trim();
 }
@@ -441,6 +452,7 @@ function setQualData(phone, updates) {
   const meta    = lead?.meta ?? {};
   const current = meta.qualData ?? {};
   store.upsertLead(phone, { meta: { ...meta, qualData: { ...current, ...updates } } });
+  demoCapture.record('qual_flag_changed', { updates, before: current });
 }
 
 // ── Lead brief generation ─────────────────────────────────────────────────────
@@ -506,6 +518,7 @@ async function generateLeadBrief(phone, history, callTimeGiven, { alertTeam = fa
   setQualData(phone, { briefGeneratedAt: new Date().toISOString() });
 
   logger.info('[lead_agent] Lead brief saved', { phone, location: brief.location, goal: brief.goal });
+  demoCapture.record('lead_brief_generated', { brief });
 
   // ── Notify the team with the structured brief ─────────────────────────────
   const name     = lead.name ?? phone;
@@ -738,8 +751,17 @@ async function handleInbound({ from, name, text }) {
   const assets = studioAssets.getAssets();
   const deterministicResult = tryDeterministicWazeReply(text, assets);
   if (deterministicResult) {
+    _lastDebugCtx = { path: 'deterministic', type: deterministicResult.type, postProcess: { changes: [], clean: true } };
     logger.info('[lead_agent] Deterministic interceptor fired', { from, type: deterministicResult.type });
-    await sendText(from, deterministicResult.reply);
+    try {
+      await sendText(from, deterministicResult.reply);
+    } catch (sendErr) {
+      logger.error('[lead_agent] sendText failed (deterministic path)', { from, error: sendErr.message });
+      alertOwner('⚠️ WhatsApp send failure — lead got no reply',
+        `Phone: ${from}\nMessage: "${text.slice(0, 100)}"\nError: ${sendErr.message}`
+      ).catch(() => {});
+      return { reply: null, score: 0, status: 'send_error' };
+    }
     store.logEvent('message_out',          from, { preview: deterministicResult.reply.slice(0, 80) });
     store.logEvent('deterministic_reply',  from, { type: deterministicResult.type });
     history.push({ role: 'user',      content: text });
@@ -761,6 +783,7 @@ async function handleInbound({ from, name, text }) {
   ];
 
   // 5. Generate AI reply
+  _lastDebugCtx = { path: 'openai', completedTurns, model: process.env.OPENAI_MODEL ?? 'gpt-4o', postProcess: { changes: [], clean: true } };
   let reply;
   try {
     const completion = await openai.chat.completions.create({
@@ -807,15 +830,34 @@ async function handleInbound({ from, name, text }) {
   }
 
   // 7. Score the lead (history already has user+assistant appended above)
-  const score  = scoreLeadFromHistory(history, freshQualData);
-  const status = score >= 8 ? 'hot' : score >= 5 ? 'warm' : 'cold';
+  const prevScore = store.getLead(from)?.score ?? 4;
+  const score     = scoreLeadFromHistory(history, freshQualData);
+  const status    = score >= 8 ? 'hot' : score >= 5 ? 'warm' : 'cold';
   store.upsertLead(from, { score, status });
   store.logEvent('score_update', from, { score, status });
   logger.info('[lead_agent] Score', { from, score, status });
+  if (score !== prevScore) demoCapture.record('score_changed', { previous: prevScore, current: score, status });
 
   // 8. Send reply
-  await sendText(from, reply);
-  store.logEvent('message_out', from, { preview: reply.slice(0, 80) });
+  //    sendText is outside the OpenAI try/catch because a WhatsApp API failure
+  //    is a different class of error from an OpenAI failure.  Wrapping it here
+  //    prevents a Green API outage or expired session from causing complete
+  //    silence — the owner is alerted so the conversation can be recovered.
+  try {
+    await sendText(from, reply);
+    store.logEvent('message_out', from, { preview: reply.slice(0, 80) });
+  } catch (sendErr) {
+    logger.error('[lead_agent] sendText failed — lead did not receive reply', {
+      from,
+      error:   sendErr.message,
+      preview: reply.slice(0, 80),
+    });
+    alertOwner(
+      '⚠️ WhatsApp send failure — lead got no reply',
+      `Phone: ${from}\nMessage: "${text.slice(0, 100)}"\nDraft reply: "${reply.slice(0, 200)}"\nError: ${sendErr.message}\n\nCheck Green API instance state.`
+    ).catch(() => {});
+    return { reply: null, score, status };
+  }
 
   // 9. Trigger brief generation (fire-and-forget) when entering Stage 3 for
   //    the first time, or when a call time is captured on this turn.
@@ -943,5 +985,5 @@ function clearSession(phone) {
   store.deleteLead(phone);
 }
 
-module.exports = { handleInbound, clearSession, generateLeadBrief, sendIntroOffer };
+module.exports = { handleInbound, clearSession, generateLeadBrief, sendIntroOffer, getLastDebugContext };
 

@@ -1,9 +1,10 @@
 require('dotenv').config();
-const axios  = require('axios');
-const path   = require('path');
-const fs     = require('fs');
-const logger = require('../utils/logger');
+const axios       = require('axios');
+const path        = require('path');
+const fs          = require('fs');
+const logger      = require('../utils/logger');
 const { isQuietHours, nextMorningRelease } = require('../utils/time');
+const demoCapture = require('../utils/demo_capture');
 
 // ── Admin phone resolution ────────────────────────────────────────────────────
 // Returns de-duplicated E.164 phone list of all active staff who have phones,
@@ -209,8 +210,28 @@ async function releaseQueuedMessages() {
   }
 }
 
+// ── Demo phone bypass ─────────────────────────────────────────────────────────
+// Phones in the range 972000000001–972000000009 are reserved for the local
+// simulator (/demo).  Messages to these numbers are silently swallowed so the
+// real Green API is never called during sandbox testing.
+const DEMO_PHONE_RE = /^97200000000[1-9]$/;
+function isDemoPhone(phone) {
+  return DEMO_PHONE_RE.test(String(phone).replace(/[^\d]/g, ''));
+}
+
 async function _dispatch(to, text) {
   const chatId = toChatId(to);
+
+  if (isDemoPhone(to) || demoCapture.isActive()) {
+    demoCapture.record('whatsapp_send', {
+      to:          isDemoPhone(to) ? to : '[owner/staff]',
+      preview:     text.slice(0, 400),
+      isDemoPhone: isDemoPhone(to),
+    });
+    logger.info('[Green API] DEMO — message intercepted (not sent)', { to: isDemoPhone(to) ? to : '***', preview: text.slice(0, 60) });
+    return { idMessage: `demo-${Date.now()}`, demo: true };
+  }
+
   let url;
   try {
     url = SEND_URL(); // throws clearly if credentials are missing
@@ -278,6 +299,16 @@ async function _dispatch(to, text) {
  * @param {string} [caption]— Optional caption text beneath the file
  */
 async function sendFileByUrl(to, fileUrl, fileName, caption = '') {
+  if (isDemoPhone(to) || demoCapture.isActive()) {
+    demoCapture.record('file_sent', {
+      to:       isDemoPhone(to) ? to : '[owner/staff]',
+      fileName,
+      fileUrl:  fileUrl.slice(0, 120),
+      caption:  caption.slice(0, 200),
+    });
+    logger.info('[Green API] DEMO — file send intercepted', { to: isDemoPhone(to) ? to : '***', fileName });
+    return { idMessage: `demo-file-${Date.now()}`, demo: true };
+  }
   const url = buildSendUrl('sendFileByUrl'); // uses same dual-name credential resolution
   try {
     const { data } = await axios.post(url, {

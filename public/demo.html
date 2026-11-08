@@ -1,0 +1,1079 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Barak — Ops Sandbox</title>
+<style>
+:root {
+  --wa-dark:   #075e54;
+  --wa-mid:    #128c7e;
+  --wa-light:  #25d366;
+  --wa-bg:     #e5ddd5;
+  --out-bg:    #dcf8c6;
+  --in-bg:     #ffffff;
+  --p-bg:      #0d1117;
+  --p-mid:     #161b22;
+  --p-card:    #21262d;
+  --p-border:  #30363d;
+  --accent:    #58a6ff;
+  --txt:       #c9d1d9;
+  --txt-dim:   #8b949e;
+  --green:     #3fb950;
+  --yellow:    #d29922;
+  --red:       #f85149;
+  --blue:      #58a6ff;
+  --purple:    #bc8cff;
+  --orange:    #e3b341;
+  --teal:      #39d353;
+  --cyan:      #56d364;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--p-bg); color: var(--txt); height: 100vh; overflow: hidden; display: flex; flex-direction: column; }
+
+/* ── TOP BAR ── */
+.topbar {
+  background: var(--wa-dark);
+  padding: 8px 16px;
+  display: flex; align-items: center; gap: 10px;
+  flex-shrink: 0;
+  box-shadow: 0 2px 8px rgba(0,0,0,.5);
+  z-index: 20;
+}
+.topbar-title { font-size: 15px; font-weight: 700; color: #fff; }
+.topbar-title span { color: var(--wa-light); }
+.topbar-sub { font-size: 11px; color: rgba(255,255,255,.5); }
+.sep { flex: 1; }
+.chip {
+  font-size: 11px; font-weight: 600; padding: 3px 10px;
+  border-radius: 10px; background: rgba(255,255,255,.12);
+  color: rgba(255,255,255,.8); letter-spacing: .3px;
+}
+
+select.phone-sel {
+  background: rgba(255,255,255,.1); border: 1px solid rgba(255,255,255,.2);
+  color: #fff; padding: 4px 10px; border-radius: 6px; font-size: 12px;
+  cursor: pointer; outline: none;
+}
+select.phone-sel option { background: var(--wa-dark); }
+
+.btn { padding: 5px 12px; border-radius: 5px; border: none; cursor: pointer; font-size: 12px; font-weight: 600; transition: opacity .15s; }
+.btn:hover { opacity: .82; }
+.btn-rst   { background: var(--red);    color: #fff; }
+.btn-inj   { background: #6e40c9;       color: #fff; }
+.btn-scr   { background: var(--wa-mid); color: #fff; }
+
+/* ── MAIN ── */
+.main { display: flex; flex: 1; overflow: hidden; }
+
+/* ── CHAT ── */
+.chat-wrap {
+  flex: 1 1 0; min-width: 300px;
+  display: flex; flex-direction: column;
+  background: var(--wa-bg);
+}
+.chat-hdr {
+  background: var(--wa-mid); color: #fff; padding: 9px 14px;
+  display: flex; align-items: center; gap: 10px; flex-shrink: 0;
+}
+.chat-av { width: 34px; height: 34px; border-radius: 50%; background: var(--wa-light); display: flex; align-items: center; justify-content: center; font-size: 16px; }
+.chat-hdr-name { font-size: 14px; font-weight: 600; }
+.chat-hdr-sub  { font-size: 11px; opacity: .7; }
+
+.chat-msgs { flex: 1; overflow-y: auto; padding: 12px 10px; display: flex; flex-direction: column; gap: 7px; }
+
+.row { display: flex; flex-direction: column; max-width: 72%; }
+.row.out { align-self: flex-end; align-items: flex-end; }
+.row.in  { align-self: flex-start; align-items: flex-start; }
+.row.sys { align-self: center; align-items: center; max-width: 90%; }
+
+.bubble {
+  padding: 8px 12px; border-radius: 10px;
+  font-size: 13.5px; line-height: 1.5;
+  word-break: break-word; white-space: pre-wrap;
+  direction: rtl; text-align: right;
+  box-shadow: 0 1px 2px rgba(0,0,0,.12);
+}
+.row.out .bubble { background: var(--out-bg); border-bottom-right-radius: 2px; color: #111; }
+.row.in  .bubble { background: var(--in-bg);  border-bottom-left-radius:  2px; color: #111; }
+.row.sys .bubble { background: rgba(0,0,0,.1); color: #555; font-size: 11.5px; padding: 3px 10px; border-radius: 20px; }
+
+.msg-lbl { font-size: 10.5px; color: #777; margin: 2px 4px 0; }
+
+.badges { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
+.badge { font-size: 9.5px; font-weight: 700; padding: 2px 7px; border-radius: 9px; letter-spacing: .3px; text-transform: uppercase; }
+.b-det   { background: #1565c0; color: #fff; }
+.b-ai    { background: #6a1b9a; color: #fff; }
+.b-waze  { background: #bf360c; color: #fff; }
+.b-hal   { background: #b71c1c; color: #fff; }
+.b-q     { background: #e65100; color: #fff; }
+.b-ok    { background: #2e7d32; color: #fff; }
+
+/* spinner */
+.spin { display: inline-block; width: 12px; height: 12px; border: 2px solid rgba(0,0,0,.2); border-top-color: #333; border-radius: 50%; animation: sp .6s linear infinite; vertical-align: middle; }
+@keyframes sp { to { transform: rotate(360deg); } }
+
+.chat-input-row {
+  background: #f0f0f0; padding: 9px 10px;
+  display: flex; gap: 7px; align-items: flex-end;
+  flex-shrink: 0; border-top: 1px solid #ddd;
+}
+.chat-ta {
+  flex: 1; resize: none; border: none; border-radius: 18px;
+  padding: 9px 14px; font-size: 13.5px; font-family: inherit;
+  outline: none; direction: rtl; min-height: 40px; max-height: 110px;
+  line-height: 1.4; background: #fff; color: #111;
+}
+.btn-send {
+  width: 40px; height: 40px; border-radius: 50%; border: none;
+  background: var(--wa-mid); color: #fff; font-size: 16px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+}
+.btn-send:hover { background: var(--wa-dark); }
+.btn-send:disabled { background: #bbb; cursor: not-allowed; }
+
+/* ── RIGHT PANEL ── */
+.rp {
+  flex: 0 0 430px;
+  background: var(--p-mid);
+  display: flex; flex-direction: column;
+  border-right: 1px solid var(--p-border);
+}
+
+/* Tabs */
+.tabs {
+  display: flex; flex-shrink: 0;
+  background: var(--p-bg);
+  border-bottom: 1px solid var(--p-border);
+}
+.tab {
+  flex: 1; padding: 9px 4px; font-size: 11.5px; font-weight: 600;
+  text-align: center; cursor: pointer; color: var(--txt-dim);
+  border-bottom: 2px solid transparent; transition: all .15s;
+  letter-spacing: .3px; white-space: nowrap;
+}
+.tab:hover  { color: var(--txt); }
+.tab.active { color: var(--blue); border-bottom-color: var(--blue); }
+
+.tab-pane { display: none; flex: 1; overflow-y: auto; flex-direction: column; }
+.tab-pane.active { display: flex; }
+
+/* ── STATE TAB ── */
+.sec { padding: 12px 14px; border-bottom: 1px solid var(--p-border); }
+.sec-title { font-size: 10px; font-weight: 700; letter-spacing: 1.2px; text-transform: uppercase; color: var(--txt-dim); margin-bottom: 10px; }
+
+/* score */
+.score-row { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.score-num { font-size: 26px; font-weight: 700; min-width: 36px; }
+.score-bar { flex: 1; height: 7px; background: rgba(255,255,255,.08); border-radius: 4px; overflow: hidden; }
+.score-fill { height: 100%; border-radius: 4px; transition: width .4s, background .4s; }
+.s-chip { padding: 2px 9px; border-radius: 10px; font-size: 11px; font-weight: 700; text-transform: uppercase; }
+.s-hot  { background: #bf360c; color: #fff; }
+.s-warm { background: #f9a825; color: #111; }
+.s-cold { background: #37474f; color: #ccc; }
+.s-new  { background: #263238; color: #90a4ae; }
+
+.meta-row { display: flex; gap: 14px; font-size: 11px; color: var(--txt-dim); flex-wrap: wrap; }
+.meta-row b { color: var(--txt); }
+
+/* flags table */
+.flags-tbl { width: 100%; border-collapse: collapse; font-size: 12px; }
+.flags-tbl tr { border-bottom: 1px solid rgba(255,255,255,.04); }
+.flags-tbl tr:last-child { border-bottom: none; }
+.flags-tbl td { padding: 5px 4px; vertical-align: middle; }
+.td-name { color: var(--txt-dim); font-size: 11px; width: 42%; font-family: monospace; }
+.td-val  { font-weight: 600; }
+.v-true  { color: var(--green); }
+.v-false { color: var(--txt-dim); }
+.v-null  { color: var(--txt-dim); font-style: italic; font-weight: 400; }
+.v-str   { color: #79c0ff; }
+.td-edit { width: 24px; text-align: center; }
+.edit-btn {
+  background: none; border: none; cursor: pointer; padding: 2px 4px;
+  color: var(--txt-dim); font-size: 12px; border-radius: 3px;
+  opacity: 0; transition: opacity .15s;
+}
+.flags-tbl tr:hover .edit-btn { opacity: 1; }
+.edit-btn:hover { color: var(--accent); background: rgba(88,166,255,.1); }
+
+.inline-edit { display: flex; gap: 5px; align-items: center; }
+.inline-edit input, .inline-edit select {
+  flex: 1; background: rgba(255,255,255,.07); border: 1px solid var(--p-border);
+  color: var(--txt); border-radius: 4px; padding: 3px 6px; font-size: 11px; outline: none;
+}
+.ie-save { background: var(--wa-mid); color: #fff; border: none; border-radius: 3px; padding: 3px 7px; cursor: pointer; font-size: 11px; }
+.ie-cancel { background: rgba(255,255,255,.08); color: var(--txt-dim); border: none; border-radius: 3px; padding: 3px 7px; cursor: pointer; font-size: 11px; }
+
+/* quick scenarios */
+.pills { display: flex; flex-wrap: wrap; gap: 5px; }
+.pill {
+  font-size: 11px; padding: 4px 10px; border-radius: 14px;
+  background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.1);
+  color: var(--txt); cursor: pointer; white-space: nowrap; transition: background .12s;
+}
+.pill:hover { background: rgba(255,255,255,.12); }
+
+/* ── OPS LOG TAB ── */
+.ops-toolbar {
+  padding: 8px 14px; display: flex; align-items: center; gap: 8px;
+  flex-shrink: 0; border-bottom: 1px solid var(--p-border);
+}
+.ops-count { font-size: 11px; color: var(--txt-dim); flex: 1; }
+.btn-clear { background: rgba(255,255,255,.07); color: var(--txt-dim); border: none; border-radius: 4px; padding: 3px 9px; cursor: pointer; font-size: 11px; }
+.btn-clear:hover { color: var(--txt); }
+
+.ops-list { flex: 1; overflow-y: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 7px; }
+
+.ops-card {
+  border-radius: 7px; padding: 9px 11px;
+  background: var(--p-card); border-left: 3px solid;
+  animation: fadeIn .2s ease;
+}
+@keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+
+.ops-card.c-alert  { border-color: var(--red); }
+.ops-card.c-score  { border-color: var(--blue); }
+.ops-card.c-flag   { border-color: #0097a7; }
+.ops-card.c-brief  { border-color: var(--purple); }
+.ops-card.c-call   { border-color: var(--green); }
+.ops-card.c-det    { border-color: var(--yellow); }
+.ops-card.c-send   { border-color: #546e7a; }
+.ops-card.c-file   { border-color: var(--orange); }
+
+.ops-hdr { display: flex; align-items: center; gap: 7px; margin-bottom: 5px; }
+.ops-icon { font-size: 14px; }
+.ops-label { font-size: 11.5px; font-weight: 700; color: var(--txt); }
+.ops-ts { font-size: 10px; color: var(--txt-dim); margin-right: auto; }
+
+.ops-body { font-size: 11px; color: var(--txt-dim); line-height: 1.6; }
+.ops-body .hi { color: var(--txt); font-weight: 600; }
+.ops-body pre {
+  background: rgba(0,0,0,.3); border-radius: 4px; padding: 6px 8px;
+  font-family: monospace; font-size: 10.5px; white-space: pre-wrap;
+  color: #adbac7; margin-top: 5px; max-height: 120px; overflow-y: auto;
+}
+.toggle-pre { background: none; border: none; color: var(--txt-dim); font-size: 10px; cursor: pointer; padding: 2px 0; }
+.toggle-pre:hover { color: var(--accent); }
+
+.ops-empty { text-align: center; color: var(--txt-dim); font-size: 12px; padding: 30px 0; }
+
+/* ── FLOW TAB ── */
+.flow-wrap { flex: 1; overflow-y: auto; padding: 14px 14px; }
+.flow-node {
+  display: flex; gap: 12px; align-items: flex-start;
+  margin-bottom: 4px; position: relative;
+}
+.flow-node:not(:last-child)::before {
+  content: ''; position: absolute;
+  left: 15px; top: 36px; bottom: -4px; width: 2px;
+  background: rgba(255,255,255,.08);
+}
+.flow-node.done::before { background: var(--green); opacity: .4; }
+.flow-node.active::before { background: var(--blue); opacity: .6; }
+
+.flow-dot {
+  width: 32px; height: 32px; border-radius: 50%; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 14px; border: 2px solid;
+  margin-top: 2px;
+}
+.flow-node.done   .flow-dot { background: rgba(63,185,80,.15); border-color: var(--green); }
+.flow-node.active .flow-dot { background: rgba(88,166,255,.2); border-color: var(--blue); animation: pulse 1.5s infinite; }
+.flow-node.pending .flow-dot { background: rgba(255,255,255,.04); border-color: rgba(255,255,255,.12); }
+@keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(88,166,255,.4); } 50% { box-shadow: 0 0 0 5px rgba(88,166,255,0); } }
+
+.flow-info { flex: 1; padding: 4px 0 12px; }
+.flow-name { font-size: 13px; font-weight: 600; }
+.flow-node.done   .flow-name { color: var(--green); }
+.flow-node.active .flow-name { color: var(--blue); }
+.flow-node.pending .flow-name { color: var(--txt-dim); }
+.flow-desc { font-size: 11px; color: var(--txt-dim); margin-top: 3px; line-height: 1.5; }
+.flow-data { font-size: 11px; color: #79c0ff; margin-top: 3px; font-family: monospace; }
+
+/* ── SCRIPT TAB ── */
+.script-wrap { flex: 1; overflow-y: auto; padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+.script-ta {
+  width: 100%; height: 150px; resize: vertical;
+  background: var(--p-card); border: 1px solid var(--p-border);
+  color: var(--txt); border-radius: 6px; padding: 10px 12px;
+  font-size: 12px; font-family: monospace; outline: none; direction: rtl;
+}
+.script-actions { display: flex; gap: 8px; }
+.btn-run  { background: var(--green); color: #000; font-size: 12px; font-weight: 700; padding: 7px 16px; border: none; border-radius: 5px; cursor: pointer; }
+.btn-run:disabled { background: #555; color: #888; cursor: not-allowed; }
+.btn-stop { background: var(--red); color: #fff; font-size: 12px; font-weight: 700; padding: 7px 16px; border: none; border-radius: 5px; cursor: pointer; display: none; }
+.script-progress { font-size: 11px; color: var(--txt-dim); }
+.script-results { display: flex; flex-direction: column; gap: 5px; }
+.script-row {
+  background: var(--p-card); border-radius: 5px; padding: 7px 10px;
+  display: grid; grid-template-columns: 1fr auto; gap: 6px; align-items: start;
+}
+.script-msg { font-size: 12px; color: var(--txt); font-family: monospace; direction: rtl; text-align: right; }
+.script-reply { font-size: 11px; color: var(--txt-dim); direction: rtl; text-align: right; margin-top: 3px; }
+.script-badge { font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 8px; white-space: nowrap; }
+.sc-pass { background: rgba(63,185,80,.2); color: var(--green); }
+.sc-fail { background: rgba(248,81,73,.2); color: var(--red); }
+
+/* ── MODAL ── */
+.overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 100; align-items: center; justify-content: center; }
+.overlay.open { display: flex; }
+.modal { background: var(--p-mid); border: 1px solid var(--p-border); border-radius: 10px; padding: 22px; width: 380px; max-width: 95vw; }
+.modal h3 { font-size: 14px; margin-bottom: 14px; }
+.m-row { display: flex; align-items: center; gap: 8px; margin-bottom: 9px; }
+.m-row label { width: 155px; font-size: 11px; color: var(--txt-dim); }
+.m-row input, .m-row select {
+  flex: 1; padding: 5px 7px; background: rgba(255,255,255,.07);
+  border: 1px solid var(--p-border); color: var(--txt); border-radius: 4px; font-size: 12px; outline: none;
+}
+.m-btns { display: flex; gap: 7px; justify-content: flex-end; margin-top: 14px; }
+.btn-cancel { background: rgba(255,255,255,.08); color: var(--txt-dim); padding: 6px 14px; }
+.btn-apply  { background: var(--wa-mid); color: #fff; padding: 6px 14px; }
+
+/* scrollbars */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,.12); border-radius: 2px; }
+</style>
+</head>
+<body>
+
+<!-- TOP BAR -->
+<div class="topbar">
+  <div>
+    <div class="topbar-title">🤖 Barak <span>Ops Sandbox</span></div>
+    <div class="topbar-sub">Full end-to-end simulation — no live WhatsApp</div>
+  </div>
+  <div class="sep"></div>
+  <span class="chip" id="stageChip">stage: —</span>
+  <select class="phone-sel" id="phoneSel">
+    <option value="972000000001">Lead #1  · 972000000001</option>
+    <option value="972000000002">Lead #2  · 972000000002</option>
+    <option value="972000000003">Lead #3  · 972000000003</option>
+    <option value="972000000004">Lead #4  · 972000000004</option>
+    <option value="972000000005">Lead #5  · 972000000005</option>
+  </select>
+  <button class="btn btn-inj" onclick="openModal()">⚙️ Inject Flags</button>
+  <button class="btn btn-rst" onclick="doReset()">🗑️ Reset</button>
+</div>
+
+<!-- MAIN -->
+<div class="main">
+
+<!-- CHAT -->
+<div class="chat-wrap">
+  <div class="chat-hdr">
+    <div class="chat-av">👤</div>
+    <div>
+      <div class="chat-hdr-name" id="chatName">Lead #1</div>
+      <div class="chat-hdr-sub">972000000001 · Sandbox</div>
+    </div>
+  </div>
+  <div class="chat-msgs" id="chatMsgs">
+    <div class="row sys"><div class="bubble">Session started — send a message to begin</div></div>
+  </div>
+  <div class="chat-input-row">
+    <textarea class="chat-ta" id="chatIn" placeholder="Type a message… (Enter = send)" rows="1"></textarea>
+    <button class="btn-send" id="sendBtn" onclick="doSend()">➤</button>
+  </div>
+</div>
+
+<!-- RIGHT PANEL -->
+<div class="rp">
+  <div class="tabs">
+    <div class="tab active" onclick="switchTab('state')">📋 State</div>
+    <div class="tab"        onclick="switchTab('ops')">⚡ Ops Log</div>
+    <div class="tab"        onclick="switchTab('flow')">🗺️ Flow</div>
+    <div class="tab"        onclick="switchTab('script')">▶ Script</div>
+  </div>
+
+  <!-- STATE TAB -->
+  <div class="tab-pane active" id="pane-state">
+
+    <div class="sec">
+      <div class="sec-title">Lead Overview</div>
+      <div class="score-row">
+        <div class="score-num" id="scoreNum">—</div>
+        <div class="score-bar"><div class="score-fill" id="scoreFill"></div></div>
+        <span class="s-chip s-new" id="statusChip">new</span>
+      </div>
+      <div class="meta-row">
+        <span>Turns: <b id="turnsNum">0</b></span>
+        <span>Msgs: <b id="msgsNum">0</b></span>
+        <span>Name: <b id="nameVal">—</b></span>
+      </div>
+    </div>
+
+    <div class="sec" style="flex:1;overflow-y:auto">
+      <div class="sec-title" style="display:flex;align-items:center;gap:8px">
+        Qualification State
+        <span style="font-size:10px;color:var(--txt-dim);font-weight:400;text-transform:none;letter-spacing:0">click ✏️ to edit inline</span>
+      </div>
+      <table class="flags-tbl" id="flagsTbl"></table>
+    </div>
+
+    <div class="sec">
+      <div class="sec-title">Quick Scenarios</div>
+      <div class="pills" id="pills"></div>
+    </div>
+
+  </div>
+
+  <!-- OPS LOG TAB -->
+  <div class="tab-pane" id="pane-ops">
+    <div class="ops-toolbar">
+      <span class="ops-count" id="opsCount">0 events</span>
+      <button class="btn-clear" onclick="clearOps()">Clear</button>
+    </div>
+    <div class="ops-list" id="opsList">
+      <div class="ops-empty" id="opsEmpty">No side-effects captured yet.<br>Send a message to see agent actions.</div>
+    </div>
+  </div>
+
+  <!-- FLOW TAB -->
+  <div class="tab-pane" id="pane-flow">
+    <div class="flow-wrap" id="flowWrap"></div>
+  </div>
+
+  <!-- SCRIPT TAB -->
+  <div class="tab-pane" id="pane-script">
+    <div class="script-wrap">
+      <div>
+        <div class="sec-title" style="margin-bottom:6px">Test Script (one message per line)</div>
+        <textarea class="script-ta" id="scriptTa" placeholder="שלום, אשמח לפרטים
+אני מחדרה
+מחפש פילאטיס מכשירים
+כן, בסדר לי להגיע
+חיזוק ויציבה
+נוח לי בוקרים
+אפשר ביום שלישי בבוקר?"></textarea>
+      </div>
+      <div class="script-actions">
+        <button class="btn-run"  id="runBtn"  onclick="runScript()">▶ Run Script</button>
+        <button class="btn-stop" id="stopBtn" onclick="stopScript()">■ Stop</button>
+        <span class="script-progress" id="scriptProg"></span>
+      </div>
+      <div class="script-results" id="scriptResults"></div>
+    </div>
+  </div>
+
+</div><!-- /rp -->
+</div><!-- /main -->
+
+<!-- INJECT FLAGS MODAL -->
+<div class="overlay" id="modal">
+  <div class="modal">
+    <h3>⚙️ Inject Qualification Flags</h3>
+    <div class="m-row"><label>location</label><input type="text" id="f_loc" placeholder="e.g. חדרה"></div>
+    <div class="m-row"><label>locationViable</label>
+      <select id="f_lv"><option value="">— unchanged —</option><option value="true">true</option><option value="false">false</option><option value="null">null (clear)</option></select>
+    </div>
+    <div class="m-row"><label>locationCheckNeeded</label>
+      <select id="f_lcn"><option value="">— unchanged —</option><option value="true">true</option><option value="false">false</option></select>
+    </div>
+    <div class="m-row"><label>fitnessInterest</label><input type="text" id="f_fi" placeholder="e.g. פילאטיס מכשירים"></div>
+    <div class="m-row"><label>nameAsked</label>
+      <select id="f_na"><option value="">— unchanged —</option><option value="true">true</option><option value="false">false</option></select>
+    </div>
+    <div class="m-row"><label>callProposed</label>
+      <select id="f_cp"><option value="">— unchanged —</option><option value="true">true</option><option value="false">false</option></select>
+    </div>
+    <div class="m-row"><label>callTimeGiven</label><input type="text" id="f_ct" placeholder="e.g. חמישי בצהריים"></div>
+    <div class="m-btns">
+      <button class="btn btn-cancel" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-apply"  onclick="applyFlags()">Apply</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── Global state ──────────────────────────────────────────────────────────────
+let phone    = '972000000001';
+let state    = null;
+let sending  = false;
+let opsLog   = [];       // accumulated capture events this session
+let scriptRunning = false;
+let scriptStop    = false;
+
+const SCENARIOS = [
+  ['👋', 'שלום, אשמח לפרטים'],
+  ['🏃', 'אני מחדרה מחפש פילאטיס מכשירים'],
+  ['📍', 'אני מתל אביב, מחפש יוגה'],
+  ['✅', 'כן, בסדר לי להגיע'],
+  ['🗺️', 'איפה אתם נמצאים?'],
+  ['📅', 'מה שעות הפעילות?'],
+  ['🖼️', 'יש לכם תמונה של הלוח?'],
+  ['💰', 'כמה עולה מנוי?'],
+  ['🎯', 'רוצה להתחיל — מה השלבים?'],
+  ['❌', 'זה רחוק מדי בשבילי'],
+  ['📞', 'חמישי בצהריים'],
+  ['🏋️', 'מחפש אימון כוח'],
+];
+
+const FLAG_DEFS = [
+  { k: 'location',            label: 'location',            type: 'str'  },
+  { k: 'locationViable',      label: 'locationViable',      type: 'bool3' },
+  { k: 'locationCheckNeeded', label: 'checkNeeded',         type: 'bool' },
+  { k: 'locationNearby',      label: 'locationNearby',      type: 'bool3' },
+  { k: 'locationCheckAsked',  label: 'checkAsked',          type: 'bool' },
+  { k: 'fitnessInterest',     label: 'fitnessInterest',     type: 'str'  },
+  { k: 'goal',                label: 'goal',                type: 'str'  },
+  { k: 'workoutStyle',        label: 'workoutStyle',        type: 'str'  },
+  { k: 'nameAsked',           label: 'nameAsked',           type: 'bool' },
+  { k: 'confirmedName',       label: 'confirmedName',       type: 'str'  },
+  { k: 'callProposed',        label: 'callProposed',        type: 'bool' },
+  { k: 'callTimeGiven',       label: 'callTimeGiven',       type: 'str'  },
+  { k: 'briefGeneratedAt',    label: 'briefDone',           type: 'str'  },
+];
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('phoneSel').addEventListener('change', e => {
+    phone = e.target.value;
+    const idx = e.target.selectedIndex + 1;
+    document.getElementById('chatName').textContent = `Lead #${idx}`;
+    clearChat(); clearOps(); fetchState();
+  });
+  document.getElementById('chatIn').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doSend(); }
+  });
+  document.getElementById('chatIn').addEventListener('input', function() {
+    this.style.height = 'auto';
+    this.style.height = Math.min(this.scrollHeight, 110) + 'px';
+  });
+
+  buildPills();
+  buildFlow(null);
+  fetchState();
+});
+
+// ── API ───────────────────────────────────────────────────────────────────────
+async function api(method, url, body) {
+  const r = await fetch('/api/demo' + url, {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    body: body != null ? JSON.stringify(body) : undefined,
+  });
+  if (!r.ok) { const e = await r.json().catch(() => ({ error: r.statusText })); throw new Error(e.error); }
+  return r.json();
+}
+
+async function fetchState() {
+  try {
+    const s = await api('GET', `/state?phone=${phone}`);
+    state = s;
+    renderState(s);
+    buildFlow(s);
+    updateStageChip(s);
+  } catch {}
+}
+
+// ── Send ──────────────────────────────────────────────────────────────────────
+async function doSend() {
+  const inp = document.getElementById('chatIn');
+  const txt = inp.value.trim();
+  if (!txt || sending) return;
+  inp.value = ''; inp.style.height = 'auto';
+  sending = true;
+  document.getElementById('sendBtn').disabled = true;
+
+  appendBubble('out', txt, null);
+  const tidx = appendTyping();
+
+  try {
+    const res = await api('POST', '/chat', { message: txt, phone, name: `Lead #${document.getElementById('phoneSel').selectedIndex + 1}` });
+    removeTyping(tidx);
+
+    if (res.reply) appendBubble('in', res.reply, res.debug);
+    else           appendBubble('sys', '⚠️ No reply returned (check server logs)', null);
+
+    state = res.stateAfter;
+    renderState(res.stateAfter);
+    buildFlow(res.stateAfter);
+    updateStageChip(res.stateAfter);
+
+    if (res.capturedEvents?.length) {
+      appendOpsEvents(res.capturedEvents);
+      // Switch to ops tab if something notable happened
+      const notable = res.capturedEvents.some(e => ['alert_owner','lead_brief_generated','score_changed'].includes(e.type));
+      if (notable) flashTab('ops');
+    }
+  } catch (err) {
+    removeTyping(tidx);
+    appendBubble('sys', '❌ Error: ' + err.message, null);
+  }
+
+  sending = false;
+  document.getElementById('sendBtn').disabled = false;
+  document.getElementById('chatIn').focus();
+}
+
+// ── Reset ─────────────────────────────────────────────────────────────────────
+async function doReset() {
+  if (!confirm('Reset session for this lead?')) return;
+  try {
+    await api('POST', '/reset', { phone });
+    clearChat(); clearOps();
+    state = null;
+    renderState(null);
+    buildFlow(null);
+    updateStageChip(null);
+    appendBubble('sys', '🗑️ Session reset', null);
+  } catch (err) { alert('Reset failed: ' + err.message); }
+}
+
+// ── Chat rendering ────────────────────────────────────────────────────────────
+function appendBubble(dir, text, debug) {
+  const wrap = document.getElementById('chatMsgs');
+  const row  = document.createElement('div');
+  row.className = 'row ' + dir;
+
+  const bbl = document.createElement('div');
+  bbl.className = 'bubble';
+  bbl.textContent = text;
+  row.appendChild(bbl);
+
+  if (dir !== 'sys') {
+    const lbl = document.createElement('div');
+    lbl.className = 'msg-lbl';
+    lbl.textContent = dir === 'out' ? 'You' : 'Barak';
+    row.appendChild(lbl);
+  }
+
+  if (dir === 'in' && debug) {
+    const bdg = makeBadges(debug);
+    if (bdg) row.appendChild(bdg);
+  }
+
+  wrap.appendChild(row);
+  wrap.scrollTop = wrap.scrollHeight;
+}
+
+function makeBadges(d) {
+  const wrap = document.createElement('div');
+  wrap.className = 'badges';
+  if (d.path === 'deterministic') wrap.appendChild(mkBadge('b-det', '⚡ deterministic'));
+  else if (d.path === 'openai')   wrap.appendChild(mkBadge('b-ai', '🤖 AI · turn ' + (d.completedTurns ?? 0)));
+  for (const c of (d.postProcess?.changes ?? [])) {
+    if (c === 'waze_injected')        wrap.appendChild(mkBadge('b-waze', '🗺️ waze injected'));
+    else if (c === 'hallucination_stripped') wrap.appendChild(mkBadge('b-hal', '🚫 halluc. stripped'));
+    else if (c === 'question_appended')      wrap.appendChild(mkBadge('b-q',   '❓ question added'));
+  }
+  if (!d.postProcess?.changes?.length && d.path === 'openai') wrap.appendChild(mkBadge('b-ok', '✓ clean'));
+  return wrap.children.length ? wrap : null;
+}
+
+function mkBadge(cls, txt) {
+  const b = document.createElement('span');
+  b.className = 'badge ' + cls;
+  b.textContent = txt;
+  return b;
+}
+
+function appendTyping() {
+  const id  = 'ty-' + Date.now();
+  const wrap = document.getElementById('chatMsgs');
+  const row  = document.createElement('div');
+  row.className = 'row in'; row.id = id;
+  row.innerHTML = `<div class="bubble" style="color:#999;font-style:italic">Barak is thinking <span class="spin"></span></div>`;
+  wrap.appendChild(row);
+  wrap.scrollTop = wrap.scrollHeight;
+  return id;
+}
+function removeTyping(id) { document.getElementById(id)?.remove(); }
+function clearChat() {
+  document.getElementById('chatMsgs').innerHTML =
+    `<div class="row sys"><div class="bubble">Session started — send a message to begin</div></div>`;
+}
+
+// ── State panel ───────────────────────────────────────────────────────────────
+function renderState(s) {
+  if (!s?.exists) {
+    document.getElementById('scoreNum').textContent   = '—';
+    document.getElementById('scoreFill').style.width  = '0%';
+    document.getElementById('statusChip').textContent = 'new';
+    document.getElementById('statusChip').className   = 's-chip s-new';
+    document.getElementById('turnsNum').textContent   = '0';
+    document.getElementById('msgsNum').textContent    = '0';
+    document.getElementById('nameVal').textContent    = '—';
+    renderFlagsTable({});
+    return;
+  }
+
+  const sc = s.score ?? 0;
+  document.getElementById('scoreNum').textContent = sc;
+  document.getElementById('scoreFill').style.width = (sc * 10) + '%';
+  document.getElementById('scoreFill').style.background =
+    sc >= 8 ? '#f85149' : sc >= 5 ? '#d29922' : '#58a6ff';
+
+  const chip = document.getElementById('statusChip');
+  chip.textContent = s.status;
+  chip.className   = 's-chip s-' + (s.status ?? 'new');
+
+  document.getElementById('turnsNum').textContent = s.completedTurns ?? 0;
+  document.getElementById('msgsNum').textContent  = s.messageCount   ?? 0;
+  document.getElementById('nameVal').textContent  = s.qualData?.confirmedName ?? s.name ?? '—';
+
+  renderFlagsTable(s.qualData ?? {});
+}
+
+function renderFlagsTable(qd) {
+  const tbl = document.getElementById('flagsTbl');
+  tbl.innerHTML = '';
+  for (const def of FLAG_DEFS) {
+    const val = qd[def.k];
+    const tr  = document.createElement('tr');
+    tr.id = 'row-' + def.k;
+
+    const tdN = document.createElement('td'); tdN.className = 'td-name'; tdN.textContent = def.label;
+    const tdV = document.createElement('td'); tdV.className = 'td-val'; tdV.id = 'val-' + def.k;
+    renderFlagValue(tdV, val);
+
+    const tdE = document.createElement('td'); tdE.className = 'td-edit';
+    const btn = document.createElement('button');
+    btn.className = 'edit-btn'; btn.textContent = '✏️'; btn.title = 'Edit inline';
+    btn.onclick = () => openInlineEdit(def, val);
+    tdE.appendChild(btn);
+
+    tr.append(tdN, tdV, tdE);
+    tbl.appendChild(tr);
+  }
+}
+
+function renderFlagValue(el, val) {
+  el.className = 'td-val';
+  if (val === null || val === undefined) { el.classList.add('v-null'); el.textContent = 'null'; }
+  else if (val === true)                 { el.classList.add('v-true');  el.textContent = '✓ true'; }
+  else if (val === false)                { el.classList.add('v-false'); el.textContent = '✗ false'; }
+  else { el.classList.add('v-str'); const s = String(val); el.textContent = s.length > 24 ? s.slice(0, 22) + '…' : s; el.title = s; }
+}
+
+// ── Inline flag editing ───────────────────────────────────────────────────────
+function openInlineEdit(def, currentVal) {
+  const tdV = document.getElementById('val-' + def.k);
+  if (tdV.querySelector('.inline-edit')) return; // already open
+
+  tdV.innerHTML = '';
+  const wrap = document.createElement('div');
+  wrap.className = 'inline-edit';
+
+  let inp;
+  if (def.type === 'bool') {
+    inp = document.createElement('select');
+    inp.innerHTML = `<option value="true" ${currentVal===true?'selected':''}>true</option><option value="false" ${currentVal===false?'selected':''}>false</option>`;
+  } else if (def.type === 'bool3') {
+    inp = document.createElement('select');
+    inp.innerHTML = `<option value="null" ${currentVal==null?'selected':''}>null</option><option value="true" ${currentVal===true?'selected':''}>true</option><option value="false" ${currentVal===false?'selected':''}>false</option>`;
+  } else {
+    inp = document.createElement('input');
+    inp.type = 'text'; inp.value = currentVal ?? '';
+  }
+
+  const save = document.createElement('button'); save.className = 'ie-save'; save.textContent = '✓';
+  const cancel = document.createElement('button'); cancel.className = 'ie-cancel'; cancel.textContent = '✕';
+
+  save.onclick = async () => {
+    let v = inp.tagName === 'SELECT' ? inp.value : inp.value.trim();
+    const flags = {};
+    if (inp.tagName === 'SELECT') {
+      flags[def.k] = v === 'true' ? true : v === 'false' ? false : null;
+    } else {
+      flags[def.k] = v || null;
+    }
+    try {
+      await api('POST', '/flags', { phone, flags });
+      await fetchState();
+    } catch (err) { alert('Failed: ' + err.message); }
+  };
+
+  cancel.onclick = () => {
+    renderFlagValue(tdV, currentVal);
+  };
+
+  inp.onkeydown = e => { if (e.key === 'Enter') save.click(); if (e.key === 'Escape') cancel.click(); };
+
+  wrap.append(inp, save, cancel);
+  tdV.appendChild(wrap);
+  inp.focus?.();
+}
+
+// ── Ops Log ───────────────────────────────────────────────────────────────────
+const OPS_META = {
+  alert_owner:         { icon: '🔔', label: 'Alert Owner',         cls: 'c-alert'  },
+  whatsapp_send:       { icon: '💬', label: 'WhatsApp Send',        cls: 'c-send'   },
+  file_sent:           { icon: '📎', label: 'File/Image Sent',      cls: 'c-file'   },
+  score_changed:       { icon: '📊', label: 'Score Changed',        cls: 'c-score'  },
+  qual_flag_changed:   { icon: '🏷️', label: 'Qual Flag Updated',   cls: 'c-flag'   },
+  lead_brief_generated:{ icon: '📋', label: 'Lead Brief Generated', cls: 'c-brief'  },
+  deterministic_reply: { icon: '⚡', label: 'Deterministic Reply',  cls: 'c-det'    },
+};
+
+function appendOpsEvents(events) {
+  for (const ev of events) opsLog.push(ev);
+  document.getElementById('opsEmpty').style.display = 'none';
+  document.getElementById('opsCount').textContent = opsLog.length + ' event' + (opsLog.length !== 1 ? 's' : '');
+
+  const list = document.getElementById('opsList');
+  for (const ev of events) {
+    const meta = OPS_META[ev.type] ?? { icon: '·', label: ev.type, cls: 'c-send' };
+    const card = document.createElement('div');
+    card.className = 'ops-card ' + meta.cls;
+
+    const ts = new Date(ev.ts).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    const hdr = `<div class="ops-hdr"><span class="ops-icon">${meta.icon}</span><span class="ops-label">${meta.label}</span><span class="ops-ts">${ts}</span></div>`;
+
+    let body = '';
+    const p  = ev.payload ?? {};
+
+    if (ev.type === 'score_changed') {
+      body = `Score: <span class="hi">${p.previous}</span> → <span class="hi">${p.current}</span> (${p.status})`;
+    } else if (ev.type === 'qual_flag_changed') {
+      const changed = Object.entries(p.updates ?? {}).map(([k,v]) => `<span class="hi">${k}</span> = ${JSON.stringify(v)}`).join(', ');
+      body = changed || '(no changes)';
+    } else if (ev.type === 'lead_brief_generated') {
+      const b = p.brief ?? {};
+      body = [
+        b.location     && `📍 ${b.location}`,
+        b.goal         && `🎯 ${b.goal}`,
+        b.workoutStyle && `💪 ${b.workoutStyle}`,
+        b.callTimeGiven && `📞 ${b.callTimeGiven}`,
+      ].filter(Boolean).join('  ·  ') || '(empty brief)';
+      if (p.brief) {
+        body += `<br><button class="toggle-pre" onclick="this.nextSibling.style.display=this.nextSibling.style.display==='none'?'block':'none'">Show full JSON ▾</button><pre style="display:none">${JSON.stringify(p.brief, null, 2)}</pre>`;
+      }
+    } else if (ev.type === 'whatsapp_send') {
+      body = `To: <span class="hi">${p.to}</span><br>${p.preview?.slice(0, 180) ?? ''}`;
+    } else if (ev.type === 'file_sent') {
+      body = `To: <span class="hi">${p.to}</span>  File: <span class="hi">${p.fileName}</span>`;
+    } else if (ev.type === 'alert_owner') {
+      body = p.preview ?? JSON.stringify(p).slice(0, 150);
+    } else {
+      body = JSON.stringify(p).slice(0, 150);
+    }
+
+    card.innerHTML = hdr + `<div class="ops-body">${body}</div>`;
+    list.appendChild(card);
+  }
+  list.scrollTop = list.scrollHeight;
+}
+
+function clearOps() {
+  opsLog = [];
+  document.getElementById('opsList').innerHTML = `<div class="ops-empty" id="opsEmpty">No side-effects captured yet.<br>Send a message to see agent actions.</div>`;
+  document.getElementById('opsCount').textContent = '0 events';
+}
+
+// ── Flow Visualiser ───────────────────────────────────────────────────────────
+const STAGES = [
+  { icon: '👋', name: 'First Contact',    desc: 'Lead sends first message; location & interest detected.',
+    done: s => s?.completedTurns > 0 || s?.messageCount > 0,
+    active: s => s?.messageCount > 0 && !s?.completedTurns,
+    data: s => s?.qualData?.fitnessInterest ? `interest: "${s.qualData.fitnessInterest}"` : '' },
+
+  { icon: '📍', name: 'Location Check',   desc: 'Barak asks if Pardes Hanna is accessible.',
+    done: s => s?.qualData?.locationViable != null,
+    active: s => s?.qualData?.locationCheckNeeded && s?.qualData?.locationViable == null,
+    data: s => s?.qualData?.location ? `"${s.qualData.location}" · viable: ${s?.qualData?.locationViable ?? '?'}` : '' },
+
+  { icon: '🎯', name: 'Goal Discovery',   desc: 'What does the lead want to achieve?',
+    done: s => !!s?.qualData?.goal || s?.completedTurns > 2,
+    active: s => s?.completedTurns === 1 && !s?.qualData?.goal,
+    data: s => s?.qualData?.goal ? `"${s.qualData.goal}"` : '' },
+
+  { icon: '💪', name: 'Style Exploration', desc: 'Training preferences, experience level.',
+    done: s => !!s?.qualData?.workoutStyle || s?.completedTurns > 3,
+    active: s => s?.completedTurns === 2 && !s?.qualData?.workoutStyle,
+    data: s => s?.qualData?.workoutStyle ? `"${s.qualData.workoutStyle}"` : '' },
+
+  { icon: '👤', name: 'Name Collection',  desc: 'Confirm the lead\'s first name.',
+    done: s => s?.qualData?.nameAsked === true,
+    active: s => s?.completedTurns >= 3 && !s?.qualData?.nameAsked && !s?.qualData?.callProposed,
+    data: s => s?.qualData?.confirmedName ? `"${s.qualData.confirmedName}"` : '' },
+
+  { icon: '📞', name: 'Call Proposal',    desc: 'Propose a 5-minute team callback.',
+    done: s => s?.qualData?.callProposed === true,
+    active: s => s?.qualData?.nameAsked && !s?.qualData?.callProposed,
+    data: () => '' },
+
+  { icon: '⏳', name: 'Awaiting Time',    desc: 'Lead to provide preferred callback time.',
+    done: s => !!s?.qualData?.callTimeGiven,
+    active: s => s?.qualData?.callProposed && !s?.qualData?.callTimeGiven,
+    data: () => '' },
+
+  { icon: '✅', name: 'Confirmed',         desc: 'Callback time locked, brief sent to team.',
+    done: s => !!s?.qualData?.callTimeGiven,
+    active: () => false,
+    data: s => s?.qualData?.callTimeGiven ? `"${s.qualData.callTimeGiven}"` : '' },
+];
+
+function buildFlow(s) {
+  const wrap = document.getElementById('flowWrap');
+  wrap.innerHTML = '';
+
+  for (const st of STAGES) {
+    const isDone   = st.done(s);
+    const isActive = !isDone && st.active(s);
+    const cls      = isDone ? 'done' : isActive ? 'active' : 'pending';
+    const icon     = isDone ? '✓' : (isActive ? st.icon : st.icon);
+    const data     = st.data(s);
+
+    const node = document.createElement('div');
+    node.className = 'flow-node ' + cls;
+    node.innerHTML = `
+      <div class="flow-dot">${icon}</div>
+      <div class="flow-info">
+        <div class="flow-name">${st.name}${isActive ? ' ◀ current' : ''}</div>
+        <div class="flow-desc">${st.desc}</div>
+        ${data ? `<div class="flow-data">${data}</div>` : ''}
+      </div>`;
+    wrap.appendChild(node);
+  }
+}
+
+function updateStageChip(s) {
+  if (!s?.exists) { document.getElementById('stageChip').textContent = 'stage: —'; return; }
+  for (const st of STAGES) {
+    if (!st.done(s) && st.active(s)) {
+      document.getElementById('stageChip').textContent = 'stage: ' + st.name;
+      return;
+    }
+  }
+  if (s.qualData?.callTimeGiven) document.getElementById('stageChip').textContent = 'stage: Confirmed ✅';
+  else document.getElementById('stageChip').textContent = 'stage: Turn ' + (s.completedTurns ?? 0);
+}
+
+// ── Script Runner ─────────────────────────────────────────────────────────────
+async function runScript() {
+  const lines = document.getElementById('scriptTa').value.split('\n').map(l => l.trim()).filter(Boolean);
+  if (!lines.length) return;
+
+  scriptRunning = true; scriptStop = false;
+  document.getElementById('runBtn').disabled = true;
+  document.getElementById('stopBtn').style.display = '';
+  document.getElementById('scriptResults').innerHTML = '';
+
+  for (let i = 0; i < lines.length; i++) {
+    if (scriptStop) break;
+    const msg = lines[i];
+    document.getElementById('scriptProg').textContent = `${i + 1}/${lines.length}: "${msg.slice(0, 40)}"`;
+
+    const row = document.createElement('div');
+    row.className = 'script-row';
+    const pLeft = document.createElement('div');
+    pLeft.innerHTML = `<div class="script-msg">${escHtml(msg)}</div><div class="script-reply" id="sr-${i}">…</div>`;
+    const pRight = document.createElement('div');
+    pRight.id = 'sb-' + i;
+    row.append(pLeft, pRight);
+    document.getElementById('scriptResults').appendChild(row);
+
+    try {
+      const res = await api('POST', '/chat', {
+        message: msg, phone,
+        name: `Script Run #${document.getElementById('phoneSel').selectedIndex + 1}`,
+      });
+      const reply = res.reply ?? null;
+      document.getElementById('sr-' + i).textContent = reply ? reply.slice(0, 120) : '(no reply)';
+      const badge = document.createElement('span');
+      badge.className = 'script-badge ' + (reply ? 'sc-pass' : 'sc-fail');
+      badge.textContent = reply ? '✓ reply' : '✗ silent';
+      document.getElementById('sb-' + i).appendChild(badge);
+
+      state = res.stateAfter;
+      renderState(res.stateAfter);
+      buildFlow(res.stateAfter);
+      updateStageChip(res.stateAfter);
+      if (res.capturedEvents?.length) appendOpsEvents(res.capturedEvents);
+
+      // also append to chat window
+      appendBubble('out', msg, null);
+      if (reply) appendBubble('in', reply, res.debug);
+
+      if (i < lines.length - 1) await sleep(1200);
+    } catch (err) {
+      document.getElementById('sr-' + i).textContent = 'Error: ' + err.message;
+      const badge = document.createElement('span');
+      badge.className = 'script-badge sc-fail'; badge.textContent = '✗ error';
+      document.getElementById('sb-' + i).appendChild(badge);
+    }
+  }
+
+  scriptRunning = false;
+  document.getElementById('runBtn').disabled = false;
+  document.getElementById('stopBtn').style.display = 'none';
+  document.getElementById('scriptProg').textContent = scriptStop ? 'Stopped.' : 'Done.';
+}
+
+function stopScript() { scriptStop = true; }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// ── Tabs ──────────────────────────────────────────────────────────────────────
+function switchTab(id) {
+  document.querySelectorAll('.tab').forEach((t, i) => {
+    const ids = ['state','ops','flow','script'];
+    t.classList.toggle('active', ids[i] === id);
+  });
+  document.querySelectorAll('.tab-pane').forEach(p => {
+    p.classList.toggle('active', p.id === 'pane-' + id);
+  });
+}
+
+function flashTab(id) {
+  const tabs = ['state','ops','flow','script'];
+  const tabEls = document.querySelectorAll('.tab');
+  const idx = tabs.indexOf(id);
+  if (idx < 0) return;
+  const el = tabEls[idx];
+  el.style.color = '#d29922';
+  setTimeout(() => { el.style.color = ''; }, 1200);
+}
+
+// ── Misc ──────────────────────────────────────────────────────────────────────
+function buildPills() {
+  const wrap = document.getElementById('pills');
+  for (const [icon, msg] of SCENARIOS) {
+    const p = document.createElement('button');
+    p.className = 'pill';
+    p.textContent = icon + ' ' + msg.slice(0, 24);
+    p.title = msg;
+    p.onclick = () => { document.getElementById('chatIn').value = msg; doSend(); };
+    wrap.appendChild(p);
+  }
+}
+
+// ── Modal ─────────────────────────────────────────────────────────────────────
+function openModal() {
+  const qd = state?.qualData ?? {};
+  document.getElementById('f_loc').value  = qd.location        ?? '';
+  document.getElementById('f_fi').value   = qd.fitnessInterest ?? '';
+  document.getElementById('f_ct').value   = qd.callTimeGiven   ?? '';
+  ['f_lv','f_lcn','f_na','f_cp'].forEach(id => document.getElementById(id).value = '');
+  document.getElementById('modal').classList.add('open');
+}
+function closeModal() { document.getElementById('modal').classList.remove('open'); }
+document.addEventListener('click', e => { if (e.target.id === 'modal') closeModal(); });
+
+async function applyFlags() {
+  const flags = {};
+  const str  = id => document.getElementById(id).value.trim();
+  const sel  = id => document.getElementById(id).value;
+  const bool = v => v === 'true' ? true : v === 'false' ? false : v === 'null' ? null : undefined;
+
+  const loc = str('f_loc'); if (loc !== '') flags.location = loc || null;
+  const lv  = bool(sel('f_lv'));  if (lv !== undefined) flags.locationViable = lv;
+  const lcn = bool(sel('f_lcn')); if (lcn !== undefined) flags.locationCheckNeeded = lcn;
+  const fi  = str('f_fi');  if (fi !== '') flags.fitnessInterest = fi || null;
+  const na  = bool(sel('f_na'));  if (na !== undefined) flags.nameAsked = na;
+  const cp  = bool(sel('f_cp'));  if (cp !== undefined) flags.callProposed = cp;
+  const ct  = str('f_ct');  if (ct !== '') flags.callTimeGiven = ct || null;
+
+  if (!Object.keys(flags).length) { closeModal(); return; }
+  try {
+    await api('POST', '/flags', { phone, flags });
+    closeModal();
+    await fetchState();
+    appendBubble('sys', '⚙️ Flags injected: ' + Object.keys(flags).join(', '), null);
+  } catch (err) { alert('Failed: ' + err.message); }
+}
+</script>
+</body>
+</html>
