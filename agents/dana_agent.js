@@ -26,7 +26,9 @@ const OUTPUT_FORMAT_PATH = path.join(SKILL_DIR, 'reference/output-format.md');
 const ESTIMATE_BIN     = path.join(SKILL_DIR, 'scripts/estimate.py');
 const CITE_CHECK_BIN   = path.join(SKILL_DIR, 'scripts/cite_check.py');
 const PYTHON_BIN       = process.env.PYTHON_BIN
-  ?? 'C:\\Users\\owner\\AppData\\Local\\Programs\\Python\\Python310\\python.exe';
+  ?? (process.platform === 'win32'
+    ? 'C:\\Users\\owner\\AppData\\Local\\Programs\\Python\\Python310\\python.exe'
+    : 'python3');
 
 // ── JSON Schema for blind scoring phase (OpenAI structured outputs) ───────────
 // Guarantees integer types for C1-C7 at API level — no floats, no strings.
@@ -297,15 +299,91 @@ function markStaleReports() {
   return { scanned, marked, alreadyMarked };
 }
 
+// ── principleCode repair ───────────────────────────────────────────────────────
+
+/**
+ * For a fix whose principleCode failed validation (e.g. "HOOK" instead of "HOOK-1"),
+ * attempt a bounded repair: match the prefix against sentChapterCodes.
+ *
+ * Rules:
+ *   - Exact match already valid → return unchanged.
+ *   - Prefix match in sentChapterCodes → take the lowest-numbered candidate.
+ *     (Lowest = most foundational; caller can inspect originalCode.)
+ *   - No prefix match → mark codeExcluded=true; fix is omitted from the review.
+ *     (Never silently remove; always set excludeReason.)
+ */
+function repairOrExcludeFix(fix, sentChapterCodes) {
+  if (fix.codeValid) return fix;
+
+  const code = fix.principleCode;
+  if (!code) return { ...fix, codeExcluded: true, excludeReason: 'principleCode missing' };
+
+  const prefixMatch = code.match(/^([A-Z]+)/);
+  if (!prefixMatch) return { ...fix, codeExcluded: true, excludeReason: `unparseable code "${code}"` };
+
+  const prefix     = prefixMatch[1];
+  const candidates = [...sentChapterCodes].filter(c => c.startsWith(prefix + '-')).sort();
+
+  if (candidates.length === 0) {
+    return {
+      ...fix,
+      codeExcluded:   true,
+      originalCode:   code,
+      excludeReason:  `"${prefix}" principles not in sent doctrine chapters — model referenced a chapter outside the sent set`,
+    };
+  }
+
+  // Bounded repair: use the lowest-numbered principle with the matching prefix
+  const repairedCode = candidates[0];
+  return {
+    ...fix,
+    principleCode:  repairedCode,
+    originalCode:   code,
+    codeRepaired:   true,
+    codeExcluded:   false,
+    codeValid:      true,
+    inGlobalMap:    true,
+    inSentChapters: true,
+    codeError:      null,
+  };
+}
+
 // ── cite_check.py runner ──────────────────────────────────────────────────────
 
 /**
- * Run cite_check.py against a review text to verify every attributed Mosseri
- * quote exists in the doctrine on the stated date.
- * Returns { passed, failures, output }.
- * Never throws — failures are logged as warnings and stored in the report.
+ * Run cite_check.py on the review text. Reports separately:
+ *   - citations_in_review: number of (מוסרי, DD.MM.YYYY: "...") patterns found
+ *   - cite_check_ran: whether Python ran successfully
+ *   - passed: only meaningful when citations_in_review > 0 and cite_check_ran
+ *   - failures: specific quote mismatches
+ *   - note: explains "not applicable" vs "passed"
+ *
+ * "passed:true with citations_in_review=0" is reported honestly as "not applicable".
+ * Never throws.
  */
-function runCiteCheck(reviewText) {
+function runCiteCheck(reviewText, fixes) {
+  // Count attributed Mosseri quotes in the review text
+  const citationsInReview = (reviewText?.match(/(?:מוסרי|Mosseri)[,،]?\s*\d{2}\.\d{2}\.\d{4}\s*:/g) ?? []).length;
+  const validFixCount     = (fixes ?? []).filter(f => f.codeValid && !f.codeExcluded).length;
+  const excludedFixes     = (fixes ?? []).filter(f => f.codeExcluded).map(f =>
+    `${f.originalCode ?? f.principleCode ?? '?'}: ${f.excludeReason}`
+  );
+
+  if (citationsInReview === 0) {
+    return {
+      recommendations_generated:  (fixes ?? []).length,
+      recommendations_code_valid:  validFixCount,
+      recommendations_excluded:    excludedFixes,
+      citations_in_review:         0,
+      cite_check_ran:              false,
+      cite_check_applicable:       false,
+      status:                      'not_applicable',
+      passed:                      null,  // null = not checked; true/false only when cite_check_applicable===true
+      failures:                    [],
+      note: 'No attributed Mosseri citations in review text — cite_check not applicable. Zero citations found, zero verified.',
+    };
+  }
+
   const tmpReview = path.join(os.tmpdir(), `mosseri_review_${Date.now()}.txt`);
   try {
     fs.writeFileSync(tmpReview, reviewText, 'utf8');
@@ -314,13 +392,38 @@ function runCiteCheck(reviewText) {
       [CITE_CHECK_BIN, DOCTRINE_PATH, '--review', tmpReview],
       { encoding: 'utf8', env: { ...process.env, PYTHONIOENCODING: 'utf-8' }, timeout: 15000 }
     );
-    logger.info('[dana] cite_check passed', { summary: output.trim().slice(0, 120) });
-    return { passed: true, failures: [], output: output.trim() };
+    logger.info('[dana] cite_check passed', { citations: citationsInReview, summary: output.trim().slice(0, 80) });
+    return {
+      recommendations_generated:  (fixes ?? []).length,
+      recommendations_code_valid:  validFixCount,
+      recommendations_excluded:    excludedFixes,
+      citations_in_review:         citationsInReview,
+      cite_check_ran:              true,
+      cite_check_applicable:       true,
+      passed:                      true,
+      failures:                    [],
+      output:                      output.trim(),
+    };
   } catch (err) {
-    const stderr = err.stderr ?? err.message ?? '';
+    const stderr   = err.stderr ?? err.message ?? '';
     const failures = stderr.split('\n').filter(l => l.includes('FAIL'));
-    logger.warn('[dana] cite_check failed', { failures, error: err.message?.slice(0, 150) });
-    return { passed: false, failures, output: stderr.trim().slice(0, 300) };
+    const pyMissing = err.code === 'ENOENT' || stderr.includes('No such file') || stderr.includes('not found');
+    if (pyMissing) {
+      logger.warn('[dana] cite_check: Python not available', { PYTHON_BIN });
+    } else {
+      logger.warn('[dana] cite_check: verification failed', { failures: failures.slice(0, 3) });
+    }
+    return {
+      recommendations_generated:  (fixes ?? []).length,
+      recommendations_code_valid:  validFixCount,
+      recommendations_excluded:    excludedFixes,
+      citations_in_review:         citationsInReview,
+      cite_check_ran:              !pyMissing,
+      cite_check_applicable:       true,
+      passed:                      failures.length === 0 && !pyMissing,
+      failures,
+      note:                        pyMissing ? 'Python not available on this platform — cite_check could not run' : undefined,
+    };
   } finally {
     try { fs.unlinkSync(tmpReview); } catch {}
   }
@@ -865,6 +968,68 @@ function getSkillStatus() {
   };
 }
 
+// ── Message builders (pure functions, exported for testing) ───────────────────
+
+/**
+ * Build the Phase 1 (blind scoring) system message.
+ * Contract: must NOT contain DANA_PROMPT, studio name, goal, audience, or previous scores.
+ * Naturally visible branding inside video frames is not controlled here.
+ */
+function buildBlindSystemMsg({ rubricText, doctrineChapters, audioLimitNote }) {
+  return [
+    'You are an anonymous Instagram content scorer applying the Mosseri readiness rubric.',
+    'You do not know who made this video, what studio it is for, or what the business goal is.',
+    'Score exactly as a complete stranger scrolling the Reels tab.',
+    'Apply the rubric criteria literally. Each criterion independently.',
+    '**All string fields (reasoning_C1 through reasoning_C7, what_works items) must be in Hebrew (עברית).**',
+    '',
+    audioLimitNote ?? '',
+    '',
+    rubricText ? `## Mosseri Readiness Rubric C1–C7\n\n${rubricText}` : '',
+    '',
+    doctrineChapters ? `## Relevant Doctrine (chapters for this format)\n\n${doctrineChapters}` : '',
+    '',
+    '## Scoring rules',
+    '- Each C1–C7 score: exact integer 0 through 5 per rubric. No decimals.',
+    '- reasoning_Cx: one sentence with specific evidence from frames or transcript.',
+    '- flags: only if clear evidence exists in frames/transcript.',
+    '- what_works: up to 3 specific strengths with evidence.',
+    '- Do NOT infer business context from video content to give higher scores.',
+  ].join('\n');
+}
+
+/**
+ * Build the Phase 2 (fix generation) system message.
+ * Contract: MUST include DANA_PROMPT (business context).
+ *           MUST NOT allow score overwrite (scores are locked in the user message, not here).
+ */
+function buildPhase2SystemMsg({ doctrineChapters, sentChapterNums, sentChapterCodes, audioLimitNote }) {
+  const validCodesList = [...sentChapterCodes].sort().join(', ');
+  return [
+    `אתה דנה, מנהלת התוכן הדיגיטלי של Shape Studio.`,
+    `ניקוד C1–C7 כבר בוצע בעין עיוורת (ללא הקשר עסקי). הציונים נעולים.`,
+    `תפקידך עכשיו: תרגמי ציונים לתיקונים ספציפיים ו-Shape-Studio-aware.`,
+    '',
+    DANA_PROMPT,
+    '',
+    audioLimitNote ?? '',
+    '',
+    doctrineChapters ? `## דוקטרינת מוסרי — פרקים רלוונטיים\n\n${doctrineChapters}` : '',
+    '',
+    `## קודי עקרון תקינים לניתוח זה (${sentChapterNums.join(',')})`,
+    `הקודים המלאים שזמינים: ${validCodesList}`,
+    'השתמשי **רק** בקודים שמופיעים ברשימה הזו, כולל הספרה (למשל HOOK-1, לא HOOK). קוד שלא מופיע = שגיאה.',
+    '',
+    '## כללי תיקונים',
+    '- principleCode: חייב להיות מהרשימה למעלה. לא להמציא קודים, לא לקצר קודים (HOOK-1 ולא HOOK).',
+    '- fixType "rewrite": currentText = ציטוט מדויק מהתמלול, suggestedRewrite = מוכן לשימוש, בקול היוצר.',
+    '- fixType "visual"/"structural": action = פעולה ספציפית, evidence = timestamp מפריים שנשלחו.',
+    '- אל תמציאי currentText אם אין ציטוט ממשי בתמלול.',
+    '- הציונים C1–C7 לא משתנים בשלב הזה. ציין אם ההקשר העסקי סותר משהו שהסרטון מאותת.',
+    '- אל תבטיחי חשיפה, צפיות, לידים או מכירות.',
+  ].join('\n');
+}
+
 // ── Video-file analysis (actual video upload pipeline) ────────────────────────
 
 /**
@@ -1064,25 +1229,7 @@ async function analyzeVideoFile({
   // This call intentionally omits the studio name, goal, and audience.
   progress('score', 'מנקד בעין עיוורת...');
 
-  const blindSystemMsg = [
-    'You are an anonymous Instagram content scorer applying the Mosseri readiness rubric.',
-    'You do not know who made this video, what studio it is for, or what the business goal is.',
-    'Score exactly as a complete stranger scrolling the Reels tab.',
-    'Apply the rubric criteria literally. Each criterion independently.',
-    '',
-    audioLimitNote,
-    '',
-    rubricText ? `## Mosseri Readiness Rubric C1–C7\n\n${rubricText}` : '',
-    '',
-    doctrineChapters ? `## Relevant Doctrine (chapters for this format)\n\n${doctrineChapters}` : '',
-    '',
-    '## Scoring rules',
-    '- Each C1–C7 score: exact integer 0 through 5 per rubric. No decimals.',
-    '- reasoning_Cx: one sentence with specific evidence from frames or transcript.',
-    '- flags: only if clear evidence exists in frames/transcript.',
-    '- what_works: up to 3 specific strengths with evidence.',
-    '- Do NOT infer business context from video content to give higher scores.',
-  ].join('\n');
+  const blindSystemMsg = buildBlindSystemMsg({ rubricText, doctrineChapters, audioLimitNote });
 
   const blindVideoContext = [
     `Video: ${meta.durationSec.toFixed(1)}s, ${meta.width}×${meta.height}, format=${effectiveFormat}`,
@@ -1132,25 +1279,7 @@ async function analyzeVideoFile({
   // Now that scores are locked, inject Shape Studio context for actionable fixes.
   progress('analyze', 'מייצרת המלצות ספציפיות...');
 
-  const phase2SystemMsg = [
-    `אתה דנה, מנהלת התוכן הדיגיטלי של Shape Studio.`,
-    `ניקוד C1–C7 כבר בוצע בעין עיוורת (ללא הקשר עסקי). הציונים נעולים.`,
-    `תפקידך עכשיו: תרגמי ציונים לתיקונים ספציפיים ו-Shape-Studio-aware.`,
-    '',
-    DANA_PROMPT,
-    '',
-    audioLimitNote,
-    '',
-    doctrineChapters ? `## דוקטרינת מוסרי — פרקים רלוונטיים\n\n${doctrineChapters}` : '',
-    '',
-    '## כללי תיקונים',
-    '- principleCode: חייב להיות מהפרקים שסופקו למעלה. לא להמציא קודים.',
-    '- fixType "rewrite": currentText = ציטוט מדויק מהתמלול, suggestedRewrite = מוכן לשימוש, בקול היוצר.',
-    '- fixType "visual"/"structural": action = פעולה ספציפית, evidence = timestamp מפריים שנשלחו.',
-    '- אל תמציאי currentText אם אין ציטוט ממשי בתמלול.',
-    '- הציונים C1–C7 לא משתנים בשלב הזה. ציין אם ההקשר העסקי סותר משהו שהסרטון מאותת.',
-    '- אל תבטיחי חשיפה, צפיות, לידים או מכירות.',
-  ].join('\n');
+  const phase2SystemMsg = buildPhase2SystemMsg({ doctrineChapters, sentChapterNums, sentChapterCodes, audioLimitNote });
 
   const fixSchemaSpec = [
     'החזירי JSON עם השדות הבאים:',
@@ -1223,23 +1352,24 @@ async function analyzeVideoFile({
   };
   gptData.mosseri_strengths = gptData.mosseri_strengths ?? blindData.what_works ?? [];
 
-  // ── Validate principleCode in fixes — two independent checks ────────────
-  // Check 1 (inGlobalMap):   code exists anywhere in the full doctrine.md (not hallucinated).
-  // Check 2 (inSentChapters): code is from the chapters that were sent to the model in this call.
-  // codeValid = both pass. These are stored separately in the fix for transparency.
+  // ── Validate + bounded-repair principleCode in fixes ────────────────────
+  // Step 1: validate (two checks: inGlobalMap, inSentChapters).
+  // Step 2: for invalid codes, attempt prefix repair from sentChapterCodes.
+  //         If repair is possible → mark codeRepaired=true.
+  //         If not → mark codeExcluded=true with excludeReason.
+  //         Never silently drop: excluded fixes are stored in report for transparency.
   const citeMapForValidation = getCitations();
-  const rawFixes       = gptData.mosseri_fixes ?? [];
-  const validatedFixes = validateFixCodes(rawFixes, citeMapForValidation, sentChapterCodes);
-  const invalidCodes   = validatedFixes.filter(f => !f.codeValid).map(f => ({
-    code:            f.principleCode ?? '(none)',
-    inGlobalMap:     f.inGlobalMap,
-    inSentChapters:  f.inSentChapters,
-    error:           f.codeError,
+  const rawFixes         = gptData.mosseri_fixes ?? [];
+  const afterValidation  = validateFixCodes(rawFixes, citeMapForValidation, sentChapterCodes);
+  const validatedFixes   = afterValidation.map(f => repairOrExcludeFix(f, sentChapterCodes));
+  const invalidCodes     = validatedFixes.filter(f => !f.codeValid && !f.codeExcluded).map(f => ({
+    code: f.principleCode ?? '(none)', inGlobalMap: f.inGlobalMap, inSentChapters: f.inSentChapters,
   }));
-  if (invalidCodes.length > 0) {
-    logger.warn('[dana] mosseri_fixes principleCode issues', { id, issues: invalidCodes });
-    // Keep all fixes — codeValid:false and separate flags make each failure visible.
-  }
+  const repairedCodes  = validatedFixes.filter(f => f.codeRepaired);
+  const excludedCodes  = validatedFixes.filter(f => f.codeExcluded);
+  if (repairedCodes.length > 0)  logger.info('[dana] fixes: codes repaired', { id, repaired: repairedCodes.map(f => `${f.originalCode}→${f.principleCode}`) });
+  if (excludedCodes.length > 0)  logger.warn('[dana] fixes: codes excluded', { id, excluded: excludedCodes.map(f => f.excludeReason) });
+  if (invalidCodes.length > 0)   logger.warn('[dana] fixes: codes invalid after repair', { id, issues: invalidCodes });
 
   // ── Mosseri scoring ───────────────────────────────────────────────────────
   progress('scoring', 'מחשב ציון מוסרי...');
@@ -1311,8 +1441,8 @@ async function analyzeVideoFile({
   });
 
   // ── cite_check.py — verify every attributed Mosseri quote in the review ──
-  const citeCheckResult = runCiteCheck(reviewText);
-  if (!citeCheckResult.passed) {
+  const citeCheckResult = runCiteCheck(reviewText, fixes);
+  if (citeCheckResult.cite_check_ran && !citeCheckResult.passed) {
     logger.warn('[dana] cite_check: quoted citations failed verification', {
       id, failures: citeCheckResult.failures.slice(0, 5),
     });
@@ -1354,6 +1484,10 @@ async function analyzeVideoFile({
     baseline_missing:   estimation.baseline_missing ?? true,
     scoreScaleValid:    true,
     scoring_phase:      'blind',   // Phase 1 had no business context
+    review_incomplete:  excludedCodes.length > 0,
+    review_incomplete_note: excludedCodes.length > 0
+      ? `${excludedCodes.length} המלצה${excludedCodes.length > 1 ? 'ות' : ''} לא הוצגה כי קוד העיקרון לא היה בפרקי הדוקטרינה שנשלחו לניתוח זה. הביקורת חלקית — ראה incomplete_recommendations.`
+      : null,
     sentDoctrineChapters: sentChapterNums,
     mosseri_scores:     mosseriScores,
     mosseri_flags:      mosseriFlags,
@@ -1364,7 +1498,15 @@ async function analyzeVideoFile({
 
     // Human-readable review text following output-format.md
     review_text:        reviewText,
-    cite_check:         { passed: citeCheckResult.passed, failures: citeCheckResult.failures },
+    cite_check:         citeCheckResult,
+
+    // Transparency: recommendations that could not be shown because their
+    // principleCode was not in the sent doctrine chapters and could not be repaired.
+    incomplete_recommendations: excludedCodes.map(f => ({
+      originalCode:  f.originalCode ?? f.principleCode,
+      explanation:   f.explanation,
+      excludeReason: f.excludeReason,
+    })),
 
     // Detailed review (from Phase 2)
     perceived_message:  gptData.perceived_message ?? '',
@@ -1470,4 +1612,9 @@ module.exports = {
   markStaleReports,
   // Exported for testing
   validateMosseriScores,
+  buildBlindSystemMsg,
+  buildPhase2SystemMsg,
+  validateFixCodes,
+  getChapterCodes,
+  repairOrExcludeFix,
 };
