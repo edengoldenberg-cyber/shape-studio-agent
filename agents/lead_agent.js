@@ -866,7 +866,22 @@ async function handleInbound({ from, name, text }) {
   // frustration → human handoff (may resume); opt-out → permanent silence.
   // We send ONE final confirmation, then mark opted_out in the persistent store.
   // opted_out is preserved across restarts via persist.saveLeads.
-  const OPT_OUT_RE = /^\s*STOP\s*$|\bהסר\s+אות[יה]\b|\bאל\s+תשלח[יו]?\s+לי\b|\bלא\s+רוצה\s+הודעות\b|\bהסר\s+מרשימה\b|\bUnsubscribe\b|\bHDR\b/i;
+  //
+  // NOTE: \b does NOT work with Hebrew (Hebrew chars are \W in JS Unicode).
+  //       Use space/punctuation anchors or rely on the whole-line ^ patterns.
+  // Regex literals avoid string-escaping issues that plague new RegExp() with Hebrew text.
+  // \b does NOT work with Hebrew characters (Hebrew is \W in JS Unicode ranges).
+  // Using start/end anchors and space-class anchors instead.
+  const _optOutPatterns = [
+    /^\s*STOP\s*$/i,
+    /^\s*unsubscribe\s*$/i,
+    /^\s*HDR\s*$/i,
+    /(?:^|[ ,.!?])(?:הסר|תסיר)[ו]?\s+אות[יה](?:$|[ ,.!?])/,
+    /(?:^|[ ,.!?])אל\s+תשלח[ו]?(?:\s+לי)?(?:\s+יותר)?(?:\s+הודעות)?(?:$|[ ,.!?])/,
+    /לא\s+רוצה\s+(?:לקבל\s+)?הודעות/,
+    /(?:^|[ ,.!?])הסר\s+מרשימה(?:$|[ ,.!?])/,
+  ];
+  const OPT_OUT_RE = { test: (t) => _optOutPatterns.some(p => p.test(t)) };
   if (OPT_OUT_RE.test(text)) {
     const existing = store.getLead(from) ?? {};
     if (existing.status !== 'opted_out') {
@@ -911,12 +926,14 @@ async function handleInbound({ from, name, text }) {
   if (qualData.callProposed && !qualData.callTimeGiven && TIME_PATTERN.test(text)) {
     const callTime = text.trim().slice(0, 80);
     setQualData(from, { callTimeGiven: callTime });
-    // Mark call_scheduled immediately so:
-    //   • Tomer's re-engagement worker skips this lead (getSendableLeads excludes it)
-    //   • Next message triggers call_scheduled_ack, not a sales turn
-    //   • Status persists across restarts via persist.saveLeads
+    // Mark callback_requested (NOT call_scheduled):
+    //   • Tomer/Barak workers skip this lead (getSendableLeads excludes callback_requested)
+    //   • This is the AI qualification path — team was alerted via handoffService but
+    //     no aptStore appointment was created. Use callback_requested to distinguish
+    //     from call_scheduled (which requires a real aptStore entry).
+    //   • Server.js stop-gate will send a soft ack, not "confirmed as agreed".
     store.upsertLead(from, {
-      status: 'call_scheduled',
+      status: 'callback_requested',
       meta: {
         ...(store.getLead(from)?.meta ?? {}),
         callbackTime:         callTime,
@@ -924,8 +941,8 @@ async function handleInbound({ from, name, text }) {
         awaitingCallbackTime: false,
       },
     });
-    store.logEvent('call_time_captured', from, { callTime });
-    logger.info('[lead_agent] Call time captured — status → call_scheduled', { from, callTime });
+    store.logEvent('call_time_captured', from, { callTime, statusSet: 'callback_requested' });
+    logger.info('[lead_agent] Call time captured — status → callback_requested', { from, callTime });
   }
 
   // 3b. Location detection — runs on every message so early mentions are caught.

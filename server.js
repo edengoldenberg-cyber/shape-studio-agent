@@ -2258,8 +2258,11 @@ async function processInboundWAMessage(msg) {
         durationMin:     staffConfig.appointment_duration_min ?? 30,
         assignedStaffId: assignedStaff?.id ?? 'eden',
       });
+      // aptStore entry created = real appointment → upgrade to call_scheduled.
+      // callback_requested (from AI flow) ≠ call_scheduled (confirmed aptStore entry).
+      store.upsertLead(fromNorm, { status: 'call_scheduled' });
       store.logEvent('appointment_created', fromNorm, { aptId: apt.id, rawTime, staff: apt.assignedStaffId });
-      logger.info('Appointment created', { phone: fromNorm, rawTime, aptId: apt.id });
+      logger.info('Appointment created — status → call_scheduled', { phone: fromNorm, rawTime, aptId: apt.id });
     }
 
     // ── Async: parse time + calendar + notify all staff ───────────────────────
@@ -2389,79 +2392,21 @@ async function processInboundWAMessage(msg) {
     return { inboxEntry: pmtEntry, clientMatch, intent: 'payment', route: 'payment_ack', barakReply: paymentAck };
   }
 
-  // 2b. Tier-4 degraded-mode guard.
-  //     If Arbox is unreachable AND neither cache tier confirmed this phone,
-  //     we cannot safely determine member vs. lead.
-  //     Policy: send a neutral hold message + alert staff. Never run Barak's
-  //     qualification funnel. A false silence costs one message delay; a false
-  //     sales pitch to a paying member costs trust.
+  // 2b. Lead stop-status gate — runs BEFORE Tier-4.
   //
-  //     Stale-record exception: a lead record is NOT proof of cold-lead status.
-  //     A contact may have converted to a member after their last sales interaction.
-  //     We only let an existing record bypass Tier-4 if it shows recent activity
-  //     (last 7 days) — meaning they were confirmed as a cold lead very recently.
-  //     Old stale records (> 7 days since last activity) are treated as unknown.
-  const _tier4ActiveLead = (() => {
-    const rec = store.getLead(fromNorm);
-    if (!rec) return false;
-    // Reclassified members must NEVER bypass Tier-4.
-    if (rec.status === 'converted_member') return false;
-    // Only bypass Tier-4 when Arbox RECENTLY confirmed this person is a cold lead.
-    // We require arboxColdLeadConfirmedAt (the timestamp set alongside the flag in Tier-3)
-    // to be < 2 hours old. An older flag is not proof of current cold-lead status:
-    // prior lead activity is not evidence the person has not since become a subscriber.
-    // Without the freshness window, a stale arboxConfirmedColdLead from a past session
-    // would route a misclassified member to Barak every time Arbox is unreachable.
-    const confirmedAt = rec.meta?.arboxColdLeadConfirmedAt;
-    if (!confirmedAt) return false;
-    return Date.now() - confirmedAt < 2 * 60 * 60 * 1000; // must be < 2 hours fresh
-  })();
-  if (arboxLookupFailed && !isExistingClient && !_tier4ActiveLead) {
-    logger.warn('[pipeline] TIER-4 DEGRADED MODE — Arbox down, identity unverifiable', { from: fromNorm });
-
-    const holdMsg = `קיבלנו את הודעתך! הצוות שלנו ייצור איתך קשר בהקדם 😊`;
-
-    if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
-      await sendText(fromNorm, holdMsg).catch(() => {});
-    }
-
-    alertOwner(
-      `⚠️ Arbox Outage — Identity Unverifiable`,
-      `Phone: ${fromNorm}\nMessage: "${(msg.text ?? '').slice(0, 100)}"\n\n` +
-      `Arbox was unreachable. Could not confirm member vs. lead.\n` +
-      `Sent holding message. Please verify manually and follow up.`
-    ).catch(() => {});
-
-    store.logEvent('arbox_outage_held', fromNorm, {
-      preview: (msg.text ?? '').slice(0, 80), reason: 'tier4_degraded',
-    });
-
-    const holdEntry = inbox.push({
-      from: fromNorm, fromIsraeli, name: msg.name ?? null,
-      text: msg.text ?? '', messageId: msg.messageId,
-      timestamp: msg.timestamp, receivedAt: new Date(),
-      mediaType: msg.type, mediaCaption: null, mediaId: null,
-      clientMatch, intent, route: 'arbox_outage_hold', barakReply: holdMsg,
-    });
-
-    return { inboxEntry: holdEntry, clientMatch, intent, route: 'arbox_outage_hold', barakReply: holdMsg };
-  }
-
-  // 2c. Lead stop-status gate: suppress automated replies for leads in terminal states.
+  //   ORDER IS INTENTIONAL: opted_out / human_owns must block even when Arbox is down.
+  //   A person who requested silence or is under human care must not receive an
+  //   arbox_outage_hold message just because the Arbox API was unreachable.
   //
-  //   opted_out     → person asked to stop receiving messages; always silent.
-  //   human_owns    → staff took over; bot stays out until released via /api/leads/release.
-  //   call_scheduled → callback already confirmed; no sales push; ack only if they write again.
+  //   Only applies to the Barak branch (!isExistingClient). Tomer handles verified members.
   //
-  //   These checks run before routing so ALL send paths (Barak AI, Tomer,
-  //   scheduling, deterministic) are blocked when the status requires silence.
-  //   Only applies to the Barak branch (!isExistingClient) — Tomer handles members.
+  //   call_scheduled / callback_requested: handled context-aware below — not an early return
+  //   because reschedule / schedule-query / opt-out must still be processed.
   if (!isExistingClient) {
-    const leadRec    = store.getLead(fromNorm);
-    const leadStatus = leadRec?.status;
+    const _stopRec    = store.getLead(fromNorm);
+    const _stopStatus = _stopRec?.status;
 
-    if (leadStatus === 'opted_out') {
-      // Opted-out: log, never reply. No confirmation (they want silence).
+    if (_stopStatus === 'opted_out') {
       store.logEvent('reply_suppressed_opted_out', fromNorm, { preview: (msg.text ?? '').slice(0, 60) });
       logger.info('[pipeline] Reply suppressed — opted_out', { from: fromNorm });
       const optEntry = inbox.push({
@@ -2470,11 +2415,11 @@ async function processInboundWAMessage(msg) {
         receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
         clientMatch, intent, route: 'opted_out_silent', barakReply: null,
       });
+      persist.saveInbox(inbox);
       return { inboxEntry: optEntry, clientMatch, intent, route: 'opted_out_silent', barakReply: null };
     }
 
-    if (leadStatus === 'human_owns') {
-      // Human owns: log, never send AI reply. Staff sees it in inbox.
+    if (_stopStatus === 'human_owns') {
       store.logEvent('reply_suppressed_human_owns', fromNorm, { preview: (msg.text ?? '').slice(0, 60) });
       logger.info('[pipeline] Reply suppressed — human_owns', { from: fromNorm });
       const hoEntry = inbox.push({
@@ -2487,23 +2432,120 @@ async function processInboundWAMessage(msg) {
       persist.saveInbox(inbox);
       return { inboxEntry: hoEntry, clientMatch, intent, route: 'human_owns_hold', barakReply: null };
     }
+  }
 
-    if (leadStatus === 'call_scheduled') {
-      // Call is confirmed — no new sales. Acknowledge only, do not reopen funnel.
-      const ackMsg = `קיבלנו! הצוות שלנו ייצור קשר כמוסכם. יש עוד שאלה? 😊`;
-      if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
-        await sendText(fromNorm, ackMsg).catch(() => {});
-        _markReplied(fromNorm);
+  // 2c. Tier-4 degraded-mode guard.
+  //     Arbox is unreachable AND neither cache tier confirmed this phone.
+  //     opted_out / human_owns are already handled above and will never reach here.
+  const _tier4ActiveLead = (() => {
+    const rec = store.getLead(fromNorm);
+    if (!rec) return false;
+    if (rec.status === 'converted_member') return false;
+    // Only bypass Tier-4 when Arbox RECENTLY confirmed cold-lead status (< 2 hours).
+    const confirmedAt = rec.meta?.arboxColdLeadConfirmedAt;
+    if (!confirmedAt) return false;
+    return Date.now() - confirmedAt < 2 * 60 * 60 * 1000;
+  })();
+  if (arboxLookupFailed && !isExistingClient && !_tier4ActiveLead) {
+    logger.warn('[pipeline] TIER-4 DEGRADED MODE — Arbox down, identity unverifiable', { from: fromNorm });
+    const holdMsg = `קיבלנו את הודעתך! הצוות שלנו ייצור איתך קשר בהקדם 😊`;
+    if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
+      await sendText(fromNorm, holdMsg).catch(() => {});
+    }
+    alertOwner(
+      `⚠️ Arbox Outage — Identity Unverifiable`,
+      `Phone: ${fromNorm}\nMessage: "${(msg.text ?? '').slice(0, 100)}"\n\nArbox was unreachable. Could not confirm member vs. lead.\nSent holding message. Please verify manually and follow up.`
+    ).catch(() => {});
+    store.logEvent('arbox_outage_held', fromNorm, { preview: (msg.text ?? '').slice(0, 80), reason: 'tier4_degraded' });
+    const holdEntry = inbox.push({
+      from: fromNorm, fromIsraeli, name: msg.name ?? null,
+      text: msg.text ?? '', messageId: msg.messageId,
+      timestamp: msg.timestamp, receivedAt: new Date(),
+      mediaType: msg.type, mediaCaption: null, mediaId: null,
+      clientMatch, intent, route: 'arbox_outage_hold', barakReply: holdMsg,
+    });
+    return { inboxEntry: holdEntry, clientMatch, intent, route: 'arbox_outage_hold', barakReply: holdMsg };
+  }
+
+  // 2d. Post-call stop-status gate: context-aware handling for call_scheduled / callback_requested.
+  //
+  //   These run AFTER Tier-4 (identity is confirmed enough to route) but BEFORE the main
+  //   AI pipeline. The correct response depends on what the person wrote:
+  //     • brief ack / emoji         → silent (no auto-reply, do not reopen sales)
+  //     • schedule query            → send schedule image (answer the question, no funnel)
+  //     • reschedule intent         → let the reschedule flow handle it (falls through)
+  //     • opt-out                   → handle as opt-out even from post-call status
+  //     • other text (new question) → alert staff, no bot reply (staff owns follow-through)
+  if (!isExistingClient) {
+    const _postCallRec    = store.getLead(fromNorm);
+    const _postCallStatus = _postCallRec?.status;
+
+    if (_postCallStatus === 'call_scheduled' || _postCallStatus === 'callback_requested') {
+      const msgText = (msg.text ?? '').trim();
+
+      // Always let opt-out fall through to lead_agent (which will set opted_out status)
+      // — do not early-return here; the opt-out handler in lead_agent.js needs to run.
+
+      // Reschedule intent → let the reschedule interception block handle it
+      if (intent === 'reschedule') {
+        // fall through to the standard reschedule path below
+      } else if (isBriefAck(msgText) || msg.type !== 'text') {
+        // Brief ack / emoji / non-text → silent. The sales phase is over.
+        store.logEvent('post_call_ack_silent', fromNorm, { status: _postCallStatus, preview: msgText.slice(0, 60) });
+        logger.info('[pipeline] Post-call ack silent', { from: fromNorm, status: _postCallStatus });
+        const silEntry = inbox.push({
+          from: fromNorm, fromIsraeli, name: msg.name ?? null,
+          text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
+          receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
+          clientMatch, intent, route: 'post_call_silent', barakReply: null,
+        });
+        return { inboxEntry: silEntry, clientMatch, intent, route: 'post_call_silent', barakReply: null };
+
+      } else if (intent === 'schedule_query') {
+        // Schedule query → answer request, no sales funnel.
+        const timetableUrl = getActiveTimetableUrl();
+        let postCallReply = null;
+        if (timetableUrl) {
+          postCallReply = `הנה מערכת השעות של Shape Studio! 🏋️‍♀️`;
+          if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
+            sendFileByUrl(fromNorm, timetableUrl, 'schedule.png', postCallReply)
+              .then(() => store.logEvent('timetable_image_sent', fromNorm, { status: _postCallStatus }))
+              .catch(() => sendText(fromNorm, postCallReply).catch(() => {}));
+          }
+        } else {
+          postCallReply = buildSchedulingReply(intent, msg, clientMatch).catch(() => null);
+          postCallReply = await postCallReply;
+          if (postCallReply && process.env.WHATSAPP_AUTO_REPLY === 'true') {
+            await sendText(fromNorm, postCallReply).catch(() => {});
+          }
+        }
+        store.logEvent('post_call_schedule_answered', fromNorm, { status: _postCallStatus });
+        const scEntry = inbox.push({
+          from: fromNorm, fromIsraeli, name: msg.name ?? null,
+          text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
+          receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
+          clientMatch, intent, route: 'post_call_schedule', barakReply: postCallReply,
+        });
+        return { inboxEntry: scEntry, clientMatch, intent, route: 'post_call_schedule', barakReply: postCallReply };
+
+      } else {
+        // New question or message after call completion → staff alert, no bot reply.
+        // Staff should follow up. Bot stays silent to avoid false promises.
+        alertOwner(
+          `📬 הודעה אחרי ${_postCallStatus === 'call_scheduled' ? 'תיאום' : 'בקשת חזרה'} — ${msg.name ?? fromNorm}`,
+          `*${msg.name ?? fromNorm}* (${fromNorm})\n*סטטוס:* ${_postCallStatus}\n*הודעה:* "${msgText.slice(0, 200)}"\n\nהאדם כתב אחרי שהתיאום הושלם. אנא בדוק ידנית.`
+        ).catch(() => {});
+        store.logEvent('post_call_staff_notified', fromNorm, { status: _postCallStatus, preview: msgText.slice(0, 80) });
+        logger.info('[pipeline] Post-call message — staff alerted, bot silent', { from: fromNorm, status: _postCallStatus });
+        const pcEntry = inbox.push({
+          from: fromNorm, fromIsraeli, name: msg.name ?? null,
+          text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
+          receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
+          clientMatch, intent, route: 'post_call_staff_hold', barakReply: null,
+        });
+        persist.saveInbox(inbox);
+        return { inboxEntry: pcEntry, clientMatch, intent, route: 'post_call_staff_hold', barakReply: null };
       }
-      store.logEvent('reply_call_scheduled_ack', fromNorm, { preview: (msg.text ?? '').slice(0, 60) });
-      logger.info('[pipeline] Call-scheduled ack — no sales reopen', { from: fromNorm });
-      const csEntry = inbox.push({
-        from: fromNorm, fromIsraeli, name: msg.name ?? null,
-        text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
-        receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
-        clientMatch, intent, route: 'call_scheduled_ack', barakReply: ackMsg,
-      });
-      return { inboxEntry: csEntry, clientMatch, intent, route: 'call_scheduled_ack', barakReply: ackMsg };
     }
   }
 
@@ -2765,6 +2807,26 @@ async function processInboundWAMessage(msg) {
   });
 
   // 6. Auto-reply when configured and Barak has a draft
+  //
+  // ── LATE REPLY SUPPRESSION (Fix 5) ──────────────────────────────────────────
+  // Status may have changed DURING async AI generation (concurrent human takeover,
+  // opt-out from a parallel message, or status update via API).
+  // Re-check just before sending so a reply generated before the status change
+  // is never delivered after it.
+  //
+  // Only applies to the Barak branch (!isExistingClient): Tomer has its own
+  // silence classifier and is unaffected by lead stop-statuses.
+  if (barakReply && !isExistingClient) {
+    const _lateStatus = store.getLead(fromNorm)?.status;
+    if (_lateStatus === 'opted_out' || _lateStatus === 'human_owns') {
+      logger.info('[pipeline] Late reply suppression — status changed during AI generation', {
+        from: fromNorm, status: _lateStatus,
+      });
+      store.logEvent('reply_suppressed_late', fromNorm, { status: _lateStatus });
+      barakReply = null;
+    }
+  }
+
   if (barakReply && process.env.WHATSAPP_AUTO_REPLY === 'true') {
     if (timetableImgUrl) {
       // Send timetable image 1 (with caption), then image 2 if available, then a follow-up question.

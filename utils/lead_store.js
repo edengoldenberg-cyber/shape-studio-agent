@@ -72,10 +72,29 @@ class LeadStore {
   reclassifyAsConvertedMember(phone, { name = null, source = 'unknown' } = {}) {
     const existing = this._leads.get(phone);
     if (!existing) return null;
+    // Never overwrite opted_out with converted_member: opted_out carries a communication
+    // preference that must survive even when membership is confirmed. The person is both
+    // a member AND wants no automated messages — both facts must be preserved.
+    // human_owns: staff may still be in a conversation; don't silently change ownership.
+    if (existing.status === 'opted_out' || existing.status === 'human_owns') {
+      // Stamp the member fact in meta without changing the stop-status.
+      const protected_ = {
+        ...existing,
+        name: name ?? existing.name,
+        meta: {
+          ...existing.meta,
+          convertedAt:     new Date().toISOString(),
+          convertedSource: source,
+          isConfirmedMember: true,
+        },
+      };
+      this._leads.set(phone, protected_);
+      return protected_;
+    }
     const updated = {
       ...existing,
       status: 'converted_member',
-      score:  0,          // zero out lead score so hot/warm queries never surface this
+      score:  0,
       lastActivity: new Date(),
       name: name ?? existing.name,
       meta: {
@@ -123,7 +142,11 @@ class LeadStore {
    * Use everywhere an automated message would fire without human review.
    */
   getSendableLeads() {
-    const SKIP = new Set(['converted_member', 'opted_out', 'human_owns', 'call_scheduled', 'escalated', 'crisis']);
+    // callback_requested: lead expressed time in AI flow, team was alerted, but no aptStore entry yet.
+    // call_scheduled: aptStore appointment exists — confirmed by real scheduling mechanism.
+    // Both must be excluded from automated re-engagement.
+    const SKIP = new Set(['converted_member', 'opted_out', 'human_owns',
+                          'call_scheduled', 'callback_requested', 'escalated', 'crisis']);
     return this.getAllLeads().filter(l => !SKIP.has(l.status));
   }
 
