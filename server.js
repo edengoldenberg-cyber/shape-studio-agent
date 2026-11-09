@@ -818,10 +818,37 @@ app.get('/api/dana/video-history/:id', (req, res) => {
   res.json(report);
 });
 
-// Skill status (Fix 5)
+// Skill status
 app.get('/api/dana/skill-status', (_req, res) => {
   try { res.json(danaAgent.getSkillStatus()); }
   catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Stale-report audit: mark old reports that used wrong 0-100 score scale.
+// GET returns current status; POST triggers a rescan.
+app.get('/api/dana/reports/audit', (_req, res) => {
+  try {
+    const history = danaAgent.getVideoHistory();
+    const stale   = history.filter(r => {
+      const full = danaAgent.getVideoReport(r.id);
+      return full?.scoreScaleInvalid === true;
+    });
+    res.json({
+      total:        history.length,
+      staleCount:   stale.length,
+      staleIds:     stale.map(r => r.id),
+      note:         stale.length > 0
+        ? `${stale.length} דוח/ות עם ציוני C1-C7 בסקאלה 0-100 שגויה. ציוניהם לא תקפים. הצע ניתוח מחדש.`
+        : 'כל הדוחות תקינים.',
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/dana/reports/audit', jsonBody, (_req, res) => {
+  try {
+    const result = danaAgent.markStaleReports();
+    res.json({ ...result, note: 'סריקה הושלמה. דוחות פגומים סומנו ב-scoreScaleInvalid: true.' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ── Barak routes ──────────────────────────────────────────────────────────────

@@ -52,7 +52,6 @@ function getCitations() {
     for (const match of doctrine.matchAll(/- \*\*([A-Z]+-\d+)\./g)) {
       const code = match[1];
       const start = match.index;
-      // Slice to the next principle or section heading
       const nextP = doctrine.indexOf('\n- **', start + 10);
       const nextS = doctrine.indexOf('\n## ', start);
       const end   = [nextP, nextS].filter(n => n > 0).sort((a, b) => a - b)[0] ?? start + 600;
@@ -64,6 +63,150 @@ function getCitations() {
     logger.warn('Could not load doctrine citations', { error: e.message });
   }
   return _citations;
+}
+
+// ── Doctrine chapter extractor ─────────────────────────────────────────────────
+
+// Format → chapter numbers to include (per SKILL.md "שלב 3").
+const DOCTRINE_CHAPTERS_BY_FORMAT = {
+  feed:     [1, 2, 3, 4, 5, 6, 16],
+  trial:    [1, 2, 3, 4, 5, 6, 8, 16],
+  carousel: [1, 4, 5, 6, 11, 16],
+  story:    [4, 13, 16],
+  caption:  [4, 5, 10, 16],
+  cover:    [2, 5, 16],
+};
+
+let _doctrineText = null;
+function _loadDoctrineText() {
+  if (_doctrineText) return _doctrineText;
+  try {
+    _doctrineText = fs.readFileSync(DOCTRINE_PATH, 'utf8');
+  } catch (e) {
+    logger.warn('[dana] doctrine.md not found', { error: e.message });
+    _doctrineText = '';
+  }
+  return _doctrineText;
+}
+
+/**
+ * Extract the specified chapters from doctrine.md.
+ * Returns the chapter text joined, with the doctrine preamble (first 17 lines) included.
+ */
+function extractDoctrineChapters(format) {
+  const doctrine = _loadDoctrineText();
+  if (!doctrine) return '';
+
+  const chapterNums = DOCTRINE_CHAPTERS_BY_FORMAT[format] ?? DOCTRINE_CHAPTERS_BY_FORMAT.feed;
+
+  // Split into chapters at "## N." headings
+  const sections = doctrine.split(/(?=^## \d+\.)/m);
+
+  // Always keep the preamble (section before first ##-numbered chapter)
+  const preamble = sections[0] ?? '';
+
+  const wanted = new Set(chapterNums);
+  const extracted = sections.filter(sec => {
+    const m = sec.match(/^## (\d+)\./m);
+    return m && wanted.has(Number(m[1]));
+  });
+
+  return (preamble.trim() + '\n\n' + extracted.join('\n')).trim();
+}
+
+// ── Score validator ────────────────────────────────────────────────────────────
+
+const SCORE_KEYS = ['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7'];
+
+/**
+ * Validate that mosseri_scores are all integers 0-5.
+ * Returns { valid: bool, errors: string[], fixed: object|null }.
+ * Does NOT silently clamp — if any value is out of range, valid=false.
+ */
+function validateMosseriScores(scores) {
+  if (!scores || typeof scores !== 'object') {
+    return { valid: false, errors: ['mosseri_scores is missing or not an object'], fixed: null };
+  }
+  const errors = [];
+  const fixed  = {};
+
+  for (const k of SCORE_KEYS) {
+    const raw = scores[k];
+    if (raw === null || raw === undefined) {
+      errors.push(`${k}: missing`);
+      fixed[k] = null;
+      continue;
+    }
+    const n = typeof raw === 'string' ? parseFloat(raw) : Number(raw);
+    if (!Number.isFinite(n)) {
+      errors.push(`${k}: not a number (got ${JSON.stringify(raw)})`);
+      fixed[k] = null;
+      continue;
+    }
+    if (n < 0 || n > 5) {
+      errors.push(`${k}: out of range 0-5 (got ${n}) — model used wrong scale`);
+      fixed[k] = null; // mark as unusable, not silently clamped
+      continue;
+    }
+    fixed[k] = Math.round(n); // accept 4.0 → 4, reject 85 → error above
+  }
+
+  return { valid: errors.length === 0, errors, fixed };
+}
+
+/**
+ * Validate principleCode values in a fixes array against the known citation map.
+ * Returns the array with an added `codeValid` field on each fix.
+ */
+function validateFixCodes(fixes, citeMap) {
+  if (!Array.isArray(fixes)) return [];
+  return fixes.map(fix => {
+    const code = fix.principleCode;
+    if (!code) return { ...fix, codeValid: false, codeError: 'principleCode missing' };
+    if (!citeMap[code]) return { ...fix, codeValid: false, codeError: `"${code}" not found in doctrine` };
+    return { ...fix, codeValid: true };
+  });
+}
+
+// ── Stale-report marker ────────────────────────────────────────────────────────
+
+/**
+ * Scan all saved reports and mark those produced before the scale fix
+ * (any report where any mosseri_score > 5).
+ * Does NOT modify scores — just sets scoreScaleInvalid: true.
+ * Returns a summary: { scanned, marked, alreadyMarked }.
+ */
+function markStaleReports() {
+  const videoSvcLocal = require('../services/video.service');
+  const videosDir = path.join(videoSvcLocal.DATA_DIR_FN(), 'videos');
+  if (!fs.existsSync(videosDir)) return { scanned: 0, marked: 0, alreadyMarked: 0 };
+
+  let scanned = 0, marked = 0, alreadyMarked = 0;
+
+  for (const id of fs.readdirSync(videosDir)) {
+    const reportPath = path.join(videosDir, id, 'report.json');
+    if (!fs.existsSync(reportPath)) continue;
+    scanned++;
+    try {
+      const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+      if (report.scoreScaleInvalid === true) { alreadyMarked++; continue; }
+
+      const scores = report.mosseri_scores ?? {};
+      const hasInvalidScale = Object.values(scores).some(v => typeof v === 'number' && v > 5);
+      if (!hasInvalidScale) continue;
+
+      report.scoreScaleInvalid = true;
+      report.scoreScaleNote    = 'ציונים C1-C7 בדוח זה הוחזרו בסקאלה 0-100 במקום 0-5. הציון לא תקף. ניתן לנתח מחדש.';
+      fs.writeFileSync(reportPath, JSON.stringify(report, null, 2), 'utf8');
+      marked++;
+      logger.warn('[dana] Stale report marked', { id, scores });
+    } catch (e) {
+      logger.warn('[dana] Could not check report', { id, error: e.message });
+    }
+  }
+
+  logger.info('[dana] Stale-report scan complete', { scanned, marked, alreadyMarked });
+  return { scanned, marked, alreadyMarked };
 }
 
 // ── Chat interface ─────────────────────────────────────────────────────────────
@@ -236,7 +379,17 @@ function runEstimate(scores, flags, format) {
       env:      { ...process.env, PYTHONIOENCODING: 'utf-8' },
       timeout:  12000,
     });
-    return JSON.parse(raw);
+    const result = JSON.parse(raw);
+    // estimate.py has personal-baseline strings even when calibrated=false.
+    // Without a real baseline.json, replace those with rubric-only phrasing.
+    if (!result.calibrated && result.share_direction) {
+      result.share_direction = result.share_direction
+        .replace('מעל הרגיל שלך', 'גבוה לפי המחוון')
+        .replace('בערך ברגיל שלך', 'בינוני לפי המחוון')
+        .replace('שיתוף חלש', 'שיתוף נמוך לפי המחוון');
+      result.baseline_missing = true;
+    }
+    return result;
   } catch (err) {
     logger.warn('estimate.py unavailable — using JS fallback', { error: err.message });
     return jsFallbackEstimate(scores, flags, format);
@@ -259,24 +412,27 @@ function jsFallbackEstimate(scores, flags, format) {
   const CALIBRATED = new Set(['feed', 'trial']);
   if (!CALIBRATED.has(format)) {
     return {
-      readiness: r,
-      verdict:   verdicts[vKey],
+      readiness:   r,
+      verdict:     verdicts[vKey],
       verdict_key: vKey,
-      note:      'אין הערכת חשיפה או שיתוף לפורמט הזה. רק ציון ותיקונים.',
-      accuracy:  'דיוק: חישוב JS פנימי (estimate.py לא זמין). הציון נכון, כיוון השיתוף לא מחושב.',
+      note:        'אין הערכת שיתוף לפורמט הזה. רק ציון ותיקונים.',
+      accuracy:    'דיוק: ציון לפי מחוון מוסרי בלבד. ללא כיול חשבון אישי.',
     };
   }
+  // No personal baseline — do not say "מעל הרגיל שלך" (implies personal data we don't have)
+  const shareDir = r >= 78 ? 'הציון מצביע על פוטנציאל שיתוף גבוה לפי המחוון'
+                 : r >= 60 ? 'הציון מצביע על פוטנציאל שיתוף בינוני לפי המחוון'
+                 :           'הציון מצביע על פוטנציאל שיתוף נמוך. זה התיקון הראשון.';
   return {
-    readiness:     r,
-    verdict:       verdicts[vKey],
-    verdict_key:   vKey,
-    share_direction: r >= 78 ? 'הציון מצביע על שיתוף מעל הרגיל שלך'
-                   : r >= 60 ? 'הציון מצביע על שיתוף בערך ברגיל שלך'
-                   :           'הציון מצביע על שיתוף חלש. זה התיקון הראשון',
-    reach_note:    'אי אפשר לנבא חשיפה מהציון. בבדיקה העיוורת הציון לא ניבא חשיפה בכלל.',
-    accuracy:      'דיוק: בבדיקה עיוורת על 16 רילס של יוצר אחד, הציון לא ניבא חשיפה (מתאם 0.00), ' +
-                   'אבל היה קשור לשיעור השיתוף (מתאם ספירמן בערך 0.5). מדגם קטן של חשבון אחד, ' +
-                   'ולכן כיוון השיתוף הוא רמז ולא תחזית, וחשיפה לא מנובאת בכלל.',
+    readiness:       r,
+    verdict:         verdicts[vKey],
+    verdict_key:     vKey,
+    share_direction: shareDir,
+    reach_note:      'אי אפשר לנבא חשיפה מהציון. בבדיקה עיוורת הציון לא ניבא חשיפה בכלל.',
+    accuracy:        'דיוק: בבדיקה עיוורת על 16 רילס (יוצר אחד), הציון לא ניבא חשיפה (מתאם 0.00) ' +
+                     'אבל היה קשור לשיעור שיתוף (ספירמן ~0.5). מדגם קטן — כיוון השיתוף הוא רמז, לא תחזית. ' +
+                     'ללא כיול אישי, ה-"רגיל שלך" לא ידוע.',
+    baseline_missing: true,
   };
 }
 
@@ -548,6 +704,21 @@ async function analyzeVideoFile({
 } = {}) {
   const effectiveAudience = audience?.trim() || getDefaultAudience();
 
+  // Load rubric for 0-5 scoring — without this the model defaults to 0-100 scale,
+  // which estimate.py clamps to 5 for every criterion, producing readiness=100 always.
+  let rubricText = '';
+  try {
+    rubricText = fs.readFileSync(RUBRIC_PATH, 'utf8');
+  } catch (e) {
+    logger.warn('[dana] rubric.md not found — scoring may use wrong scale', { error: e.message });
+  }
+
+  // Extract the doctrine chapters relevant to this format.
+  // For a reel in feed: chapters 1 (RANK), 2 (HOOK), 3 (WATCH), 4 (SEND), 5 (TEXT), 6 (ORIG), 16 (myths).
+  const doctrineChapters = extractDoctrineChapters(
+    organic_or_paid === 'paid' ? 'feed' : (format || 'feed')
+  );
+
   const progress = (stage, note) => {
     logger.info('[dana] Analysis progress', { id, stage, note });
     if (onProgress) onProgress(stage, note);
@@ -683,20 +854,44 @@ async function analyzeVideoFile({
   - תנועה ואנימציות בין פריימים
   - סנכרון מדויק בין שמע לתמונה`;
 
+  const skillRules = [
+    '## חוקים קשיחים של מסגרת מוסרי',
+    '1. **שפה:** עברית כברירת מחדל.',
+    '2. **כל תיקון נשען על עיקרון מהדוקטרינה עם principleCode תקין** (כגון HOOK-1, RANK-3, TEXT-1, SEND-1). תיקון בלי עיגון לא נכנס.',
+    '3. **מספרים רק מ-estimate.py.** לא מעגלים, לא "מרגישים". (הציון מחושב אוטומטית — אל תכניסי readiness בעצמך.)',
+    '4. **סתירה בין הדוקטרינה לנתוני הסרטון נאמרת בקול** — "הדוקטרינה אומרת X; בסרטון רואים Y".',
+    '5. **לא דורסים החלטות של היוצר** — מעירים, לא כופים שכתוב.',
+    '6. **השכתוב בקול של היוצר**, לא בקול גנרי.',
+    '7. **ביקורת בלבד** — לא מפרסמות, לא מתזמנות.',
+    '8. **מנקדים כמו זר מוחלט** — לפי המחוון, לפני שקוראים ההקשר העסקי. ההקשר (Shape Studio) נכנס רק בתיקונים.',
+    '9. **אין הבטחת מספר צפיות.** הציון לא ניבא חשיפה בבדיקה עיוורת.',
+  ].join('\n');
+
   const systemMsg = [
     `אתה דנה, מנהלת התוכן הדיגיטלי של Shape Studio.`,
     `אתה מנתחת סרטוני אינסטגרם לפני פרסום — ביקורת מקצועית, כנה, מנומקת.`,
     '',
     DANA_PROMPT,
     '',
+    skillRules,
+    '',
     audioLimitNote,
     '',
-    'כללי חובה:',
+    rubricText ? `## מחוון ניקוד מוסרי C1–C7\n\n${rubricText}` : '',
+    '',
+    doctrineChapters ? `## דוקטרינת מוסרי — עקרונות רלוונטיים לפורמט זה\n\n${doctrineChapters}` : '',
+    '',
+    '## כללי חובה לפלט JSON',
     '- אל תמציאי נתונים שאינם בסרטון (מחירים, עדויות, ציטוטים).',
-    '- unverified=true → אל תיתני ציון (score=null). אל תיתני ציון אפס כסימן "לא עובד".',
-    '- חותמות זמן בדוח חייבות להסתמך על: (א) timestamp של פריים שנשלח, (ב) timestamp מ-Whisper. אל תמציאי זמנים.',
-    '- ציונים מבוססים רק על מה שנראה/נשמע — לא על הנחות כלליות.',
-    '- אל תציגי את ציון מוסרי ככלי "רשמי" של אינסטגרם — זהו ניתוח לפי עקרונות שפירסם אדם מוסרי בפומבי.',
+    '- unverified=true → score=null. אסור ציון אפס כסימן "לא עובד".',
+    '- חותמות זמן חייבות להסתמך על timestamp של פריים שנשלח או timestamp מ-Whisper בלבד.',
+    '- ציונים מבוססים רק על מה שנראה/נשמע — לא הנחות.',
+    '- אל תציגי את הסקיל ככלי "רשמי" של אינסטגרם — זה ניתוח לפי עקרונות ציבוריים של אדם מוסרי.',
+    '- **mosseri_scores: כל ערך חייב להיות מספר שלם 0–5 בלבד לפי המחוון.** ערך > 5 הוא שגיאת סכמה.',
+    '- **mosseri_fixes: principleCode חייב להיות מהדוקטרינה שקיבלת (HOOK-1, RANK-5, TEXT-1, SEND-3, ORIG-4, WATCH-1 וכד׳).**',
+    '- fixType="rewrite" → חייב currentText (ציטוט מהסרטון) + suggestedRewrite (שכתוב מוכן).',
+    '- fixType="visual" או "structural" → חייב action (מה לעשות) + evidence (ראיה מהסרטון, timestamp). אין currentText.',
+    '- אין להמציא currentText אם אין ציטוט ממשי מהסרטון.',
   ].join('\n');
 
   const schemaExample = JSON.stringify({
@@ -722,11 +917,36 @@ async function analyzeVideoFile({
     // timestamps MUST be anchored to real frame times or Whisper timestamps.
     // Format: "X:XX" where X:XX maps to actual seconds in the video.
     timestamps: [{ range: '0:00-0:05', observation: '', works: '', problem: '', suggestion: '', anchor: 'frame' }],
-    mosseri_scores: { C1: 0, C2: 0, C3: 0, C4: 0, C5: 0, C6: 0, C7: 0 },
+    // mosseri_scores: integers 0-5 per rubric. ANY value > 5 is a schema violation.
+    mosseri_scores: { C1: 3, C2: 2, C3: 3, C4: 3, C5: 2, C6: 4, C7: 4 },
     mosseri_flags: [],
-    mosseri_reasonings: { C1: '', C2: '', C3: '', C4: '', C5: '', C6: '', C7: '' },
+    mosseri_reasonings: { C1: 'משפט אחד עם ראיה מהסרטון', C2: '', C3: '', C4: '', C5: '', C6: '', C7: '' },
     mosseri_strengths: [],
-    mosseri_fixes: [],
+    // mosseri_fixes: up to 3, ordered by impact (highest weight × gap first).
+    // fixType determines required fields:
+    //   "rewrite"    → principleCode + currentText (verbatim quote) + suggestedRewrite (ready to use) + explanation
+    //   "visual"     → principleCode + action (what to do) + evidence (timestamp or frame description) + explanation
+    //   "structural" → principleCode + action + evidence + explanation
+    // Never fabricate currentText when there is no verbatim quote from the video.
+    mosseri_fixes: [
+      {
+        principleCode: 'HOOK-1',
+        fixType: 'rewrite',
+        name: 'שם התיקון',
+        currentText: 'המשפט הראשון שנאמר בסרטון (ציטוט מדויק מהתמלול)',
+        suggestedRewrite: 'השכתוב המוכן לשימוש ישיר, בקול של היוצר',
+        explanation: 'משפט הסבר אחד מדוע זה משנה',
+      },
+      {
+        principleCode: 'TEXT-1',
+        fixType: 'visual',
+        name: 'הוסיפי כתוביות לפריים הראשון',
+        currentText: null,
+        action: 'הוסיפי את הוק ההוק כתוב על המסך בפריים 0:00–0:03 בתוך אזור y=310–1240',
+        evidence: 'פריים 0.6s — ההוק נשמע בלבד, אין טקסט על המסך',
+        explanation: 'כחצי מהצופים בפיד עם שמע כבוי (TEXT-1)',
+      },
+    ],
     improvements_must: [],
     improvements_recommended: [],
     improvements_experiments: [],
@@ -774,9 +994,35 @@ async function analyzeVideoFile({
     throw new Error('ניתוח GPT-4o נכשל: ' + err.message);
   }
 
+  // ── Validate mosseri_scores scale (must be integers 0-5) ─────────────────
+  const scoreValidation = validateMosseriScores(gptData.mosseri_scores);
+  if (!scoreValidation.valid) {
+    logger.error('[dana] mosseri_scores scale violation', {
+      id,
+      errors:    scoreValidation.errors,
+      raw_scores: gptData.mosseri_scores,
+    });
+    throw new Error(
+      'ציוני מוסרי בסקאלה שגויה: ' + scoreValidation.errors.join('; ') +
+      '. המודל החזיר ערכים מחוץ לטווח 0-5. נסה שוב.'
+    );
+  }
+  // Use the validated (rounded) scores from here on
+  const validatedScores = scoreValidation.fixed;
+
+  // ── Validate principleCode in fixes against doctrine ─────────────────────
+  const citeMapForValidation = getCitations();
+  const rawFixes      = gptData.mosseri_fixes ?? [];
+  const validatedFixes = validateFixCodes(rawFixes, citeMapForValidation);
+  const invalidCodes  = validatedFixes.filter(f => !f.codeValid).map(f => f.principleCode ?? '(none)');
+  if (invalidCodes.length > 0) {
+    logger.warn('[dana] mosseri_fixes contain unknown principleCode(s)', { id, invalidCodes });
+    // Keep all fixes — but `codeValid: false` flags them. Citation stays null for invalid codes.
+  }
+
   // ── Mosseri scoring ───────────────────────────────────────────────────────
   progress('scoring', 'מחשב ציון מוסרי...');
-  const mosseriScores = gptData.mosseri_scores ?? {};
+  const mosseriScores = validatedScores;
   const mosseriFlags  = gptData.mosseri_flags  ?? [];
   const mosseriFormat = ['feed','trial'].includes(format) ? format : 'other';
   const estimation    = runEstimate(mosseriScores, mosseriFlags, mosseriFormat);
@@ -802,11 +1048,11 @@ async function analyzeVideoFile({
     };
   }).filter(t => !t.out_of_range); // remove hallucinated timestamps beyond video
 
-  // ── Mosseri fixes + citations ─────────────────────────────────────────────
+  // ── Mosseri fixes + citations (using already-validated fixes) ───────────
   const citeMap = getCitations();
-  const fixes = (gptData.mosseri_fixes ?? []).map(fix => ({
+  const fixes = validatedFixes.map(fix => ({
     ...fix,
-    citation: fix.principleCode ? (citeMap[fix.principleCode] ?? null) : null,
+    citation: (fix.codeValid && fix.principleCode) ? (citeMap[fix.principleCode] ?? null) : null,
   }));
 
   // ── Version comparison — computed in code, not by model (Fix 6) ──────────
@@ -859,6 +1105,8 @@ async function analyzeVideoFile({
     verdict:            estimation.verdict,
     share_direction:    estimation.share_direction ?? null,
     accuracy:           estimation.accuracy        ?? null,
+    baseline_missing:   estimation.baseline_missing ?? true,
+    scoreScaleValid:    true,     // set here because validation passed (throws otherwise)
     mosseri_scores:     mosseriScores,
     mosseri_flags:      mosseriFlags,
     flags:              mosseriFlags,
@@ -967,4 +1215,5 @@ module.exports = {
   updateJob,
   getJob,
   getSkillStatus,
+  markStaleReports,
 };
