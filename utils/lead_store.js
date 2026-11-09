@@ -105,9 +105,26 @@ class LeadStore {
 
   // ── Aggregate queries (used by manager_agent) ─────────────────────────────
 
-  /** All leads excluding reclassified members — use for sales/funnel operations. */
+  /**
+   * All leads in the sales/funnel view.
+   * Excludes confirmed members and opted-out contacts.
+   * human_owns / call_scheduled / escalated still appear in the funnel
+   * view (staff need to see them) but are skipped by getSendableLeads().
+   */
   getActiveLeads() {
-    return this.getAllLeads().filter(l => l.status !== 'converted_member');
+    return this.getAllLeads().filter(l =>
+      l.status !== 'converted_member' && l.status !== 'opted_out'
+    );
+  }
+
+  /**
+   * Leads eligible for automated outreach (Tomer worker, Barak follow-ups).
+   * Never touches human_owns, call_scheduled, opted_out, escalated, crisis.
+   * Use everywhere an automated message would fire without human review.
+   */
+  getSendableLeads() {
+    const SKIP = new Set(['converted_member', 'opted_out', 'human_owns', 'call_scheduled', 'escalated', 'crisis']);
+    return this.getAllLeads().filter(l => !SKIP.has(l.status));
   }
 
   getHotLeads()   { return this.getActiveLeads().filter(l => l.score >= 8); }
@@ -142,11 +159,14 @@ class LeadStore {
     };
   }
 
-  /** Leads with no activity for at least minDays, excluding crisis. */
+  /**
+   * Leads dormant for at least minDays that are eligible for automated re-engagement.
+   * Uses getSendableLeads() — never re-contacts human_owns, call_scheduled, opted_out.
+   */
   getDormantLeads(minDays = 3) {
     const cutoff = new Date(Date.now() - minDays * 86400000);
-    return this.getActiveLeads()
-      .filter(l => l.status !== 'crisis' && l.lastActivity && new Date(l.lastActivity) < cutoff)
+    return this.getSendableLeads()
+      .filter(l => l.lastActivity && new Date(l.lastActivity) < cutoff)
       .sort((a, b) => new Date(a.lastActivity) - new Date(b.lastActivity));
   }
 

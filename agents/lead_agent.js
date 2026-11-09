@@ -861,25 +861,62 @@ async function handleInbound({ from, name, text }) {
     return { reply: loopMsg, score: 1, status: 'escalated' };
   }
 
+  // ── Opt-out detector (checked BEFORE frustration) ───────────────────────────
+  // Explicit request to stop receiving messages. Different from frustration:
+  // frustration → human handoff (may resume); opt-out → permanent silence.
+  // We send ONE final confirmation, then mark opted_out in the persistent store.
+  // opted_out is preserved across restarts via persist.saveLeads.
+  const OPT_OUT_RE = /^\s*STOP\s*$|\bהסר\s+אות[יה]\b|\bאל\s+תשלח[יו]?\s+לי\b|\bלא\s+רוצה\s+הודעות\b|\bהסר\s+מרשימה\b|\bUnsubscribe\b|\bHDR\b/i;
+  if (OPT_OUT_RE.test(text)) {
+    const existing = store.getLead(from) ?? {};
+    if (existing.status !== 'opted_out') {
+      logger.info('[lead_agent] Opt-out request — marking opted_out', { from });
+      store.upsertLead(from, {
+        status: 'opted_out',
+        meta:   { ...(existing.meta ?? {}), optedOutAt: new Date().toISOString(), optedOutMsg: text.slice(0, 80) },
+      });
+      store.logEvent('opted_out', from, { preview: text.slice(0, 80) });
+      // Single silent acknowledgement; no further messages from any agent.
+      const optOutAck = `הסרנו אותך מרשימת ההתקשרויות שלנו. לא נשלח הודעות נוספות.`;
+      await sendText(from, optOutAck).catch(() => {});
+      return { reply: optOutAck, score: 0, status: 'opted_out' };
+    }
+    // Already opted_out — stay silent.
+    return { reply: null, score: 0, status: 'opted_out' };
+  }
+
   // ── Frustration detector ────────────────────────────────────────────────────
-  // Explicit signals that the person is upset with the automated flow.
+  // Signals frustration with the automated flow → human handoff (escalated).
+  // History is preserved via reclassifyEscalated; staff can release ownership later.
   const FRUSTRATION_RE = /תפסיק[יו]?|עצר[ו]?|מה זה בכלל|מה קורה פה|רובוט|בוט|מכונה|לא לאיים|מחריד|מה הבעיה|אל תשלח[יו]? יותר|לא רוצה לקבל הודעות|STOP\b|stop\b|אדם אמיתי|נציג אנושי|לא עונה לשאלה|לא מקשיב[ה]?|לא שומע[ת]?|שטויות|להציק|אל תציק/i;
   if (FRUSTRATION_RE.test(text)) {
     logger.warn('[lead_agent] Frustration detected', { from, preview: text.slice(0, 60) });
     const frustMsg = `מצטער/ת! מעביר אותך עכשיו לנציג מהצוות שייצור קשר ישירות 😊`;
     await sendText(from, frustMsg).catch(() => {});
-    store.upsertLead(from, { status: 'escalated' });
-    store.logEvent('frustration_escalated', from, { preview: text.slice(0, 80) });
-    // No alertOwner — event log is sufficient; staff monitors the dashboard
-    clearSession(from);
-    return { reply: frustMsg, score: 1, status: 'escalated' };
+    // Use human_owns instead of deleting — preserves history for staff and survives restart.
+    const existing2 = store.getLead(from) ?? {};
+    store.upsertLead(from, {
+      status: 'human_owns',
+      meta: { ...(existing2.meta ?? {}), humanOwnsReason: 'frustration', humanOwnsSince: new Date().toISOString() },
+    });
+    store.logEvent('human_takeover_frustration', from, { preview: text.slice(0, 80) });
+    alertOwner(
+      `🤝 Human takeover required — ${name ?? from}`,
+      `*Contact:* ${name ?? from} (${from})\n*Reason:* frustration\n*Message:* "${text.slice(0, 200)}"\n\nHistory preserved. Release via: POST /api/leads/${encodeURIComponent(from)}/release`
+    ).catch(() => {});
+    return { reply: frustMsg, score: 1, status: 'human_owns' };
   }
 
   // 3a. Detect callback time in this inbound message
   if (qualData.callProposed && !qualData.callTimeGiven && TIME_PATTERN.test(text)) {
     const callTime = text.trim().slice(0, 80);
     setQualData(from, { callTimeGiven: callTime });
+    // Mark call_scheduled immediately so:
+    //   • Tomer's re-engagement worker skips this lead (getSendableLeads excludes it)
+    //   • Next message triggers call_scheduled_ack, not a sales turn
+    //   • Status persists across restarts via persist.saveLeads
     store.upsertLead(from, {
+      status: 'call_scheduled',
       meta: {
         ...(store.getLead(from)?.meta ?? {}),
         callbackTime:         callTime,
@@ -888,7 +925,7 @@ async function handleInbound({ from, name, text }) {
       },
     });
     store.logEvent('call_time_captured', from, { callTime });
-    logger.info('[lead_agent] Call time captured', { from, callTime });
+    logger.info('[lead_agent] Call time captured — status → call_scheduled', { from, callTime });
   }
 
   // 3b. Location detection — runs on every message so early mentions are caught.

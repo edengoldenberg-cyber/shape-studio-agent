@@ -1389,6 +1389,76 @@ app.delete('/api/members/known/:phone', (req, res) => {
   }
 });
 
+// ── Lead ownership + stop-status management ───────────────────────────────────
+//
+// POST /api/leads/:phone/takeover  — staff takes ownership (stops all bot replies)
+// POST /api/leads/:phone/release   — return ownership to Barak
+// POST /api/leads/:phone/opt-out   — permanent opt-out (no outreach ever)
+
+app.post('/api/leads/:phone/takeover', jsonBody, (req, res) => {
+  const norm   = normalizeToE164(decodeURIComponent(req.params.phone));
+  const { reason = 'manual', staffName = null } = req.body ?? {};
+  if (!norm) return res.status(400).json({ error: 'invalid phone' });
+
+  const existing = store.getLead(norm) ?? {};
+  const prevStatus = existing.status ?? 'cold';
+  store.upsertLead(norm, {
+    status: 'human_owns',
+    meta: {
+      ...(existing.meta ?? {}),
+      humanOwnsReason:    reason,
+      humanOwnsSince:     new Date().toISOString(),
+      humanOwnsBy:        staffName,
+      previousStatus:     prevStatus,     // saved so release can restore it
+    },
+  });
+  store.logEvent('human_takeover_manual', norm, { reason, staffName, prevStatus });
+  persist.saveLeads(store);
+  logger.info('[lead-ownership] Takeover — bot suppressed', { phone: norm, reason, staffName });
+  res.json({ ok: true, phone: norm, status: 'human_owns', prevStatus });
+});
+
+app.post('/api/leads/:phone/release', jsonBody, (req, res) => {
+  const norm = normalizeToE164(decodeURIComponent(req.params.phone));
+  if (!norm) return res.status(400).json({ error: 'invalid phone' });
+
+  const existing = store.getLead(norm);
+  if (!existing) return res.status(404).json({ error: 'lead not found' });
+
+  const restoreStatus = existing.meta?.previousStatus ?? 'cold';
+  store.upsertLead(norm, {
+    status: restoreStatus,
+    meta: {
+      ...(existing.meta ?? {}),
+      humanOwnsReason:  null,
+      humanOwnsSince:   null,
+      humanOwnsBy:      null,
+      humanReleasedAt:  new Date().toISOString(),
+      previousStatus:   null,
+    },
+  });
+  store.logEvent('human_release', norm, { restoredTo: restoreStatus });
+  persist.saveLeads(store);
+  logger.info('[lead-ownership] Released — bot resumed', { phone: norm, restoredTo: restoreStatus });
+  res.json({ ok: true, phone: norm, status: restoreStatus });
+});
+
+app.post('/api/leads/:phone/opt-out', jsonBody, (req, res) => {
+  const norm = normalizeToE164(decodeURIComponent(req.params.phone));
+  if (!norm) return res.status(400).json({ error: 'invalid phone' });
+
+  const existing = store.getLead(norm) ?? {};
+  store.upsertLead(norm, {
+    status: 'opted_out',
+    score:  0,
+    meta: { ...(existing.meta ?? {}), optedOutAt: new Date().toISOString(), optedOutSource: 'manual_api' },
+  });
+  store.logEvent('opted_out_manual', norm, {});
+  persist.saveLeads(store);
+  logger.info('[lead-opt-out] Marked opted_out via API', { phone: norm });
+  res.json({ ok: true, phone: norm, status: 'opted_out' });
+});
+
 // GET /api/barak/arbox-dashboard — live Arbox sync + member + revenue metrics
 app.get('/api/barak/arbox-dashboard', (_req, res) => {
   const all      = store.getAllLeads();
@@ -2375,6 +2445,66 @@ async function processInboundWAMessage(msg) {
     });
 
     return { inboxEntry: holdEntry, clientMatch, intent, route: 'arbox_outage_hold', barakReply: holdMsg };
+  }
+
+  // 2c. Lead stop-status gate: suppress automated replies for leads in terminal states.
+  //
+  //   opted_out     → person asked to stop receiving messages; always silent.
+  //   human_owns    → staff took over; bot stays out until released via /api/leads/release.
+  //   call_scheduled → callback already confirmed; no sales push; ack only if they write again.
+  //
+  //   These checks run before routing so ALL send paths (Barak AI, Tomer,
+  //   scheduling, deterministic) are blocked when the status requires silence.
+  //   Only applies to the Barak branch (!isExistingClient) — Tomer handles members.
+  if (!isExistingClient) {
+    const leadRec    = store.getLead(fromNorm);
+    const leadStatus = leadRec?.status;
+
+    if (leadStatus === 'opted_out') {
+      // Opted-out: log, never reply. No confirmation (they want silence).
+      store.logEvent('reply_suppressed_opted_out', fromNorm, { preview: (msg.text ?? '').slice(0, 60) });
+      logger.info('[pipeline] Reply suppressed — opted_out', { from: fromNorm });
+      const optEntry = inbox.push({
+        from: fromNorm, fromIsraeli, name: msg.name ?? null,
+        text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
+        receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
+        clientMatch, intent, route: 'opted_out_silent', barakReply: null,
+      });
+      return { inboxEntry: optEntry, clientMatch, intent, route: 'opted_out_silent', barakReply: null };
+    }
+
+    if (leadStatus === 'human_owns') {
+      // Human owns: log, never send AI reply. Staff sees it in inbox.
+      store.logEvent('reply_suppressed_human_owns', fromNorm, { preview: (msg.text ?? '').slice(0, 60) });
+      logger.info('[pipeline] Reply suppressed — human_owns', { from: fromNorm });
+      const hoEntry = inbox.push({
+        from: fromNorm, fromIsraeli, name: msg.name ?? null,
+        text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
+        receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
+        clientMatch, intent, route: 'human_owns_hold', barakReply: null,
+      });
+      broadcastSse('message', { phone: hoEntry.from, name: hoEntry.name ?? null, route: 'human_owns' });
+      persist.saveInbox(inbox);
+      return { inboxEntry: hoEntry, clientMatch, intent, route: 'human_owns_hold', barakReply: null };
+    }
+
+    if (leadStatus === 'call_scheduled') {
+      // Call is confirmed — no new sales. Acknowledge only, do not reopen funnel.
+      const ackMsg = `קיבלנו! הצוות שלנו ייצור קשר כמוסכם. יש עוד שאלה? 😊`;
+      if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
+        await sendText(fromNorm, ackMsg).catch(() => {});
+        _markReplied(fromNorm);
+      }
+      store.logEvent('reply_call_scheduled_ack', fromNorm, { preview: (msg.text ?? '').slice(0, 60) });
+      logger.info('[pipeline] Call-scheduled ack — no sales reopen', { from: fromNorm });
+      const csEntry = inbox.push({
+        from: fromNorm, fromIsraeli, name: msg.name ?? null,
+        text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
+        receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
+        clientMatch, intent, route: 'call_scheduled_ack', barakReply: ackMsg,
+      });
+      return { inboxEntry: csEntry, clientMatch, intent, route: 'call_scheduled_ack', barakReply: ackMsg };
+    }
   }
 
   // 3. Routing decision — strict Barak / Tomer boundary
