@@ -611,9 +611,20 @@ async function submitVideoAnalysis() {
            </div>`
         : '';
 
+    // Review text from output-format.md (cite_check verified)
+    const reviewTextHtml = r.review_text
+      ? `<details class="vup-review-text panel" style="margin-bottom:16px">
+           <summary style="cursor:pointer;font-size:13px;font-weight:600;padding:8px 0;user-select:none">
+             📋 ביקורת לפי מוסרי — פורמט מלא${r.cite_check?.passed === false ? ' ⚠️ ציטוטים לא אומתו' : ''}
+           </summary>
+           <pre style="white-space:pre-wrap;font-size:12px;padding:12px;background:#f8fafc;border-radius:6px;direction:rtl">${esc(r.review_text)}</pre>
+         </details>`
+      : '';
+
     const sections = [
       staleNotice,
       renderDecisionBanner(r, readiness, verdictKey, verdictEmoji, scoreClass),
+      reviewTextHtml,
       renderVideoPlayer(r.id),          // ← video player, separate from report
       r.warnings?.length ? renderWarnings(r.warnings) : '',
       renderHighlights(r.report_strengths ?? r.strengths ?? [], r.report_problems ?? []),

@@ -724,64 +724,78 @@ app.post('/api/dana/analyze-video-upload',
 );
 
 // Reprocess a saved video — retries analysis on a previously uploaded file without re-uploading.
-// Use when the original analysis failed (e.g. ffprobe missing) but the video file was saved.
+// Re-analyse an existing video.
+// Always creates a NEW job ID → original report.json is never overwritten.
+// previousVersionId links the new report to the old one.
 app.post('/api/dana/analysis-job/:id/retry', jsonBody, async (req, res) => {
-  const id  = req.params.id;
-  const job = danaAgent.getJob(id);
-  if (!job) return res.status(404).json({ error: 'Job לא נמצא' });
-  // ?force=true allows re-analysis of completed jobs (e.g. after scoring-bug fix)
-  const force = req.query.force === 'true' || req.body?.force === true;
-  if (job.status === 'completed' && !force) return res.status(409).json({ error: 'Job הושלם בהצלחה — אין צורך בניסיון חוזר. שלח ?force=true לניתוח מחדש.' });
+  const originalId = req.params.id;
+  const originalJob = danaAgent.getJob(originalId);
+  if (!originalJob) return res.status(404).json({ error: 'Job לא נמצא' });
 
-  // Find the saved video file
+  // Find the saved video file from the original job
   const videoSvc  = require('./services/video.service');
   const dataDir   = videoSvc.DATA_DIR_FN();
-  const videoDir  = require('path').join(dataDir, 'videos', id);
+  const videoDir  = require('path').join(dataDir, 'videos', originalId);
   if (!require('fs').existsSync(videoDir)) {
     return res.status(404).json({ error: 'תיקיית הסרטון לא נמצאה — יש להעלות שוב' });
   }
 
-  // Find the video file (video.mp4, video.mov, etc.)
-  const files   = require('fs').readdirSync(videoDir).filter(f => f.startsWith('video.'));
+  const files = require('fs').readdirSync(videoDir).filter(f => f.startsWith('video.'));
   if (files.length === 0) {
     return res.status(404).json({ error: 'קובץ הסרטון לא נמצא — יש להעלות שוב' });
   }
 
-  const videoFile = files[0];
-  const videoPath = require('path').join(videoDir, videoFile);
-  const ext       = videoFile.split('.').pop() ?? 'mp4';
-  const prevMeta  = job.title ? { title: job.title } : {};
+  const videoFile   = files[0];
+  const srcPath     = require('path').join(videoDir, videoFile);
+  const ext         = videoFile.split('.').pop() ?? 'mp4';
 
-  logger.info('[dana] Retrying failed job', { id, videoPath, ext });
-  res.json({ jobId: id, status: 'retrying', videoFile, videoPath });
+  // Always use a new UUID — the original report.json is NEVER overwritten
+  const { v4: _uuid4reanalyze } = require('uuid');
+  const newId    = _uuid4reanalyze();
+  const newDir   = require('path').join(dataDir, 'videos', newId);
+  require('fs').mkdirSync(newDir, { recursive: true });
+  const destPath = require('path').join(newDir, videoFile);
+  require('fs').copyFileSync(srcPath, destPath);
 
-  // Reset job and re-run analysis
-  danaAgent.updateJob(id, { status: 'running', stage: 'meta', note: 'מנסה שוב...', error: null });
+  const { title, goal, format, audience, organic_or_paid, message, focus_notes } = req.body ?? {};
+  const prevMeta = originalJob.title ? { title: originalJob.title } : {};
+
+  logger.info('[dana] Re-analyse with new ID', { originalId, newId, ext });
+  const newJob = danaAgent.createAnalysisJob(newId, {
+    title:    title ?? prevMeta.title ?? 'ניתוח מחדש',
+    sizeKb:   Math.round(require('fs').statSync(destPath).size / 1024),
+    previousVersionId: originalId,
+  });
+
+  res.json({ jobId: newId, originalId, status: 'queued' });
 
   setImmediate(async () => {
+    let savedPath;
     try {
-      const { title, goal, format, audience, organic_or_paid, message, focus_notes } = req.body ?? {};
+      savedPath = destPath; // already copied
+      danaAgent.updateJob(newId, { status: 'running', stage: 'meta', note: 'מנסה שוב...' });
       const report = await danaAgent.analyzeVideoFile({
-        videoPath,
-        id,
+        videoPath:  savedPath,
+        id:         newId,
         ext,
-        title:            title            ?? prevMeta.title ?? 'סרטון ללא כותרת',
+        title:            title            ?? prevMeta.title ?? 'ניתוח מחדש',
         goal:             goal             ?? 'leads',
         format:           format           ?? 'feed',
         audience:         audience         ?? '',
         organic_or_paid:  organic_or_paid  ?? 'organic',
         message:          message          ?? '',
         focus_notes:      focus_notes      ?? '',
-        onProgress: (stage, note) => danaAgent.updateJob(id, { status: 'running', stage, note }),
+        previousVersionId: originalId,
+        onProgress: (stage, note) => danaAgent.updateJob(newId, { status: 'running', stage, note }),
       });
-      danaAgent.updateJob(id, {
+      danaAgent.updateJob(newId, {
         status: 'completed', stage: 'done',
         note:   `ניתוח הושלם — ציון ${report.readiness}/100`,
-        result: { id, readiness: report.readiness, verdict: report.verdict },
+        result: { id: newId, readiness: report.readiness, verdict: report.verdict },
       });
     } catch (err) {
-      logger.error('[dana] retry failed', { id, error: err.message });
-      danaAgent.updateJob(id, { status: 'failed', stage: 'error', error: err.message });
+      logger.error('[dana] re-analyse failed', { newId, originalId, error: err.message });
+      danaAgent.updateJob(newId, { status: 'failed', stage: 'error', error: err.message });
     }
   });
 });

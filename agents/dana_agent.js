@@ -19,12 +19,45 @@ const DANA_PROMPT = BUSINESS_CONTEXT + '\n\n---\n\n' + fs.readFileSync(
 );
 
 // ── Mosseri skill paths ────────────────────────────────────────────────────────
-const SKILL_DIR     = path.join(__dirname, '../mosseri-skill-main/mosseri');
-const RUBRIC_PATH   = path.join(SKILL_DIR, 'reference/rubric.md');
-const DOCTRINE_PATH = path.join(SKILL_DIR, 'reference/doctrine.md');
-const ESTIMATE_BIN  = path.join(SKILL_DIR, 'scripts/estimate.py');
-const PYTHON_BIN    = process.env.PYTHON_BIN
+const SKILL_DIR        = path.join(__dirname, '../mosseri-skill-main/mosseri');
+const RUBRIC_PATH      = path.join(SKILL_DIR, 'reference/rubric.md');
+const DOCTRINE_PATH    = path.join(SKILL_DIR, 'reference/doctrine.md');
+const OUTPUT_FORMAT_PATH = path.join(SKILL_DIR, 'reference/output-format.md');
+const ESTIMATE_BIN     = path.join(SKILL_DIR, 'scripts/estimate.py');
+const CITE_CHECK_BIN   = path.join(SKILL_DIR, 'scripts/cite_check.py');
+const PYTHON_BIN       = process.env.PYTHON_BIN
   ?? 'C:\\Users\\owner\\AppData\\Local\\Programs\\Python\\Python310\\python.exe';
+
+// ── JSON Schema for blind scoring phase (OpenAI structured outputs) ───────────
+// Guarantees integer types for C1-C7 at API level — no floats, no strings.
+// Range [0-5] enforced post-hoc by validateMosseriScores().
+const BLIND_SCORE_RESPONSE_FORMAT = {
+  type: 'json_schema',
+  json_schema: {
+    name: 'blind_mosseri_score',
+    strict: true,
+    schema: {
+      type: 'object',
+      properties: {
+        C1: { type: 'integer' }, C2: { type: 'integer' }, C3: { type: 'integer' },
+        C4: { type: 'integer' }, C5: { type: 'integer' }, C6: { type: 'integer' },
+        C7: { type: 'integer' },
+        flags:        { type: 'array', items: { type: 'string' } },
+        reasoning_C1: { type: 'string' }, reasoning_C2: { type: 'string' },
+        reasoning_C3: { type: 'string' }, reasoning_C4: { type: 'string' },
+        reasoning_C5: { type: 'string' }, reasoning_C6: { type: 'string' },
+        reasoning_C7: { type: 'string' },
+        what_works:   { type: 'array', items: { type: 'string' } },
+      },
+      required: [
+        'C1','C2','C3','C4','C5','C6','C7','flags',
+        'reasoning_C1','reasoning_C2','reasoning_C3','reasoning_C4',
+        'reasoning_C5','reasoning_C6','reasoning_C7','what_works',
+      ],
+      additionalProperties: false,
+    },
+  },
+};
 
 // Penalty weights mirrored from estimate.py (used in the JS fallback only)
 const WEIGHTS  = { C1: 25, C2: 20, C3: 20, C4: 15, C5: 10, C6: 5, C7: 5 };
@@ -262,6 +295,114 @@ function markStaleReports() {
 
   logger.info('[dana] Stale-report scan complete', { scanned, marked, alreadyMarked });
   return { scanned, marked, alreadyMarked };
+}
+
+// ── cite_check.py runner ──────────────────────────────────────────────────────
+
+/**
+ * Run cite_check.py against a review text to verify every attributed Mosseri
+ * quote exists in the doctrine on the stated date.
+ * Returns { passed, failures, output }.
+ * Never throws — failures are logged as warnings and stored in the report.
+ */
+function runCiteCheck(reviewText) {
+  const tmpReview = path.join(os.tmpdir(), `mosseri_review_${Date.now()}.txt`);
+  try {
+    fs.writeFileSync(tmpReview, reviewText, 'utf8');
+    const output = execFileSync(
+      PYTHON_BIN,
+      [CITE_CHECK_BIN, DOCTRINE_PATH, '--review', tmpReview],
+      { encoding: 'utf8', env: { ...process.env, PYTHONIOENCODING: 'utf-8' }, timeout: 15000 }
+    );
+    logger.info('[dana] cite_check passed', { summary: output.trim().slice(0, 120) });
+    return { passed: true, failures: [], output: output.trim() };
+  } catch (err) {
+    const stderr = err.stderr ?? err.message ?? '';
+    const failures = stderr.split('\n').filter(l => l.includes('FAIL'));
+    logger.warn('[dana] cite_check failed', { failures, error: err.message?.slice(0, 150) });
+    return { passed: false, failures, output: stderr.trim().slice(0, 300) };
+  } finally {
+    try { fs.unlinkSync(tmpReview); } catch {}
+  }
+}
+
+// ── Review text builder (output-format.md) ────────────────────────────────────
+
+/**
+ * Build the human-readable Hebrew review text that follows output-format.md exactly.
+ * This is separate from the JSON report structure and can be run through cite_check.py.
+ *
+ * Rules from output-format.md:
+ * - No tables. Bullets. One minute to read.
+ * - Fixes: "עכשיו: / במקום: / למה: (מוסרי, DD.MM.YYYY: "...")"
+ * - share_direction and accuracy lines come word-for-word from estimate.py
+ * - "מה מוסרי היה אומר" — either a dated doctrine quote or a marked paraphrase
+ * - Never "I am Mosseri" — always the lens of a reviewer who knows his public statements
+ */
+function buildReviewText({ title, estimation, fixes, flags, what_works, format, citeMap }) {
+  const lines = [];
+  lines.push(`🎬 ביקורת לפי מוסרי: ${title}`);
+  lines.push('');
+  lines.push(`פסק דין: ${estimation.verdict}`);
+  lines.push(`ציון מוכנות: ${estimation.readiness}/100`);
+
+  const isCalibrated = ['feed', 'trial'].includes(format);
+  if (isCalibrated) {
+    if (estimation.share_direction) lines.push(`שיתוף: ${estimation.share_direction}`);
+    lines.push(`חשיפה: ${estimation.reach_note ?? 'אי אפשר לנבא חשיפה מהציון.'}`);
+  } else {
+    lines.push('אין הערכת חשיפה או שיתוף לפורמט הזה, רק ציון ותיקונים.');
+  }
+  if (estimation.accuracy) lines.push(estimation.accuracy);
+  lines.push('');
+
+  const strengths = (what_works ?? []).slice(0, 3);
+  if (strengths.length > 0) {
+    lines.push('מה עובד');
+    strengths.forEach(s => lines.push(`• ${s}`));
+    lines.push('');
+  }
+
+  const topFixes = (fixes ?? []).filter(f => f.codeValid).slice(0, 3);
+  if (topFixes.length > 0) {
+    lines.push(`${topFixes.length} התיקונים הכי חשובים`);
+    topFixes.forEach((fix, i) => {
+      const cite    = fix.citation ?? (fix.principleCode ? citeMap[fix.principleCode] : null);
+      const citeStr = cite ? ` (מוסרי, ${cite.date}: "${cite.quote.slice(0, 80)}")` : '';
+      lines.push('');
+      lines.push(`${i + 1}. ${fix.name}`);
+      if (fix.fixType === 'rewrite' && fix.currentText) {
+        lines.push(`עכשיו: "${fix.currentText}"`);
+        lines.push(`במקום: "${fix.suggestedRewrite ?? '—'}"`);
+        lines.push(`למה: ${fix.explanation}${citeStr}`);
+      } else {
+        // visual / structural
+        if (fix.action)   lines.push(`מה לעשות: ${fix.action}`);
+        if (fix.evidence) lines.push(`ראיה: ${fix.evidence}`);
+        lines.push(`למה: ${fix.explanation}${citeStr}`);
+      }
+    });
+  }
+  lines.push('');
+
+  lines.push('דגלי סיכון');
+  if (!flags || flags.length === 0) {
+    lines.push('• אין דגלים');
+  } else {
+    flags.forEach(f => lines.push(`• ${translateFlag(f)}`));
+  }
+  lines.push('');
+
+  lines.push('מה מוסרי היה אומר');
+  const topFix  = topFixes[0];
+  const mCite   = topFix?.principleCode ? (citeMap[topFix.principleCode] ?? null) : null;
+  if (mCite) {
+    lines.push(`מוסרי, ${mCite.date}: "${mCite.quote}"${topFix.explanation ? '. ' + topFix.explanation : ''}`);
+  } else {
+    lines.push('לפי הדוקטרינה, הוא היה שואל: האם יש כאן סיבה קונקרטית שזר יעצור ב-3 השניות הראשונות?');
+  }
+
+  return lines.join('\n');
 }
 
 // ── Chat interface ─────────────────────────────────────────────────────────────
@@ -912,148 +1053,175 @@ async function analyzeVideoFile({
   - תנועה ואנימציות בין פריימים
   - סנכרון מדויק בין שמע לתמונה`;
 
-  const skillRules = [
-    '## חוקים קשיחים של מסגרת מוסרי',
-    '1. **שפה:** עברית כברירת מחדל.',
-    '2. **כל תיקון נשען על עיקרון מהדוקטרינה עם principleCode תקין** (כגון HOOK-1, RANK-3, TEXT-1, SEND-1). תיקון בלי עיגון לא נכנס.',
-    '3. **מספרים רק מ-estimate.py.** לא מעגלים, לא "מרגישים". (הציון מחושב אוטומטית — אל תכניסי readiness בעצמך.)',
-    '4. **סתירה בין הדוקטרינה לנתוני הסרטון נאמרת בקול** — "הדוקטרינה אומרת X; בסרטון רואים Y".',
-    '5. **לא דורסים החלטות של היוצר** — מעירים, לא כופים שכתוב.',
-    '6. **השכתוב בקול של היוצר**, לא בקול גנרי.',
-    '7. **ביקורת בלבד** — לא מפרסמות, לא מתזמנות.',
-    '8. **מנקדים כמו זר מוחלט** — לפי המחוון, לפני שקוראים ההקשר העסקי. ההקשר (Shape Studio) נכנס רק בתיקונים.',
-    '9. **אין הבטחת מספר צפיות.** הציון לא ניבא חשיפה בבדיקה עיוורת.',
-  ].join('\n');
-
-  const systemMsg = [
-    `אתה דנה, מנהלת התוכן הדיגיטלי של Shape Studio.`,
-    `אתה מנתחת סרטוני אינסטגרם לפני פרסום — ביקורת מקצועית, כנה, מנומקת.`,
-    '',
-    DANA_PROMPT,
-    '',
-    skillRules,
-    '',
-    audioLimitNote,
-    '',
-    rubricText ? `## מחוון ניקוד מוסרי C1–C7\n\n${rubricText}` : '',
-    '',
-    doctrineChapters ? `## דוקטרינת מוסרי — עקרונות רלוונטיים לפורמט זה\n\n${doctrineChapters}` : '',
-    '',
-    '## כללי חובה לפלט JSON',
-    '- אל תמציאי נתונים שאינם בסרטון (מחירים, עדויות, ציטוטים).',
-    '- unverified=true → score=null. אסור ציון אפס כסימן "לא עובד".',
-    '- חותמות זמן חייבות להסתמך על timestamp של פריים שנשלח או timestamp מ-Whisper בלבד.',
-    '- ציונים מבוססים רק על מה שנראה/נשמע — לא הנחות.',
-    '- אל תציגי את הסקיל ככלי "רשמי" של אינסטגרם — זה ניתוח לפי עקרונות ציבוריים של אדם מוסרי.',
-    '- **mosseri_scores: כל ערך חייב להיות מספר שלם 0–5 בלבד לפי המחוון.** ערך > 5 הוא שגיאת סכמה.',
-    '- **mosseri_fixes: principleCode חייב להיות מהדוקטרינה שקיבלת (HOOK-1, RANK-5, TEXT-1, SEND-3, ORIG-4, WATCH-1 וכד׳).**',
-    '- fixType="rewrite" → חייב currentText (ציטוט מהסרטון) + suggestedRewrite (שכתוב מוכן).',
-    '- fixType="visual" או "structural" → חייב action (מה לעשות) + evidence (ראיה מהסרטון, timestamp). אין currentText.',
-    '- אין להמציא currentText אם אין ציטוט ממשי מהסרטון.',
-  ].join('\n');
-
-  // Schema specification — field names and types ONLY, no example values.
-  // Using prose description instead of JSON.stringify avoids model anchoring on numeric examples.
-  const schemaSpec = [
-    '## סכמת פלט — שמות שדות וטיפוסים. אל תכניסי ערכים מקבילים לאלה שרשומים כאן.',
-    '',
-    'כל התוכן חייב להגיע מהסרטון הספציפי הזה — פריימים שנשלחו, Whisper, וראיה חזותית.',
-    '',
-    'שדות ראשיים:',
-    '  perceived_message: string(1-2 משפטים מה הסרטון אומר)',
-    '  message_lands: boolean',
-    '  recommendation: אחת מ: "מוכן לפרסום" | "דורש תיקונים קלים" | "דורש עריכה משמעותית"',
-    '  strengths: array of string (חוזקות מהסרטון עם ראיה)',
-    '  problems:  array of string (בעיות עם הסבר)',
-    '',
-    'sections — אובייקט עם המפתחות: hook, message, content, editing, captions, audio, visuals, cta, platform',
-    '  כל מפתח: { finding: string, score: integer 0-5 | null, unverified: boolean }',
-    '  editing:  score=null, unverified=true (פריימים לא מוכיחים קצב חיתוכים)',
-    '  audio:    score=null, unverified=true, speech_text: תמלול מ-Whisper',
-    '',
-    'timestamps: array of { range: "M:SS-M:SS", observation: string, works: string,',
-    '  problem: string, suggestion: string, anchor: "frame"|"whisper", approximate: boolean }',
-    '  — רק timestamps מפריים שנשלחו בפועל או מ-Whisper. אין להמציא זמנים.',
-    '',
-    'mosseri_scores: { C1: integer, C2: integer, C3: integer, C4: integer, C5: integer, C6: integer, C7: integer }',
-    '  — כל ערך: מספר שלם 0-5 בלבד, לפי המחוון שקיבלת לסרטון זה. לא ברירת מחדל.',
-    '  — ציון שונה לכל קריטריון לפי מה שנראה/נשמע בפועל.',
-    '',
-    'mosseri_flags: array (ריק אם אין) — ערכים אפשריים: "wordmark"|"aggregated"|"reupload"|"unpaid_promise"|"ai_slick"',
-    'mosseri_reasonings: { C1..C7: string — משפט אחד עם ראיה ספציפית מהסרטון הזה }',
-    'mosseri_strengths: array of string',
-    '',
-    'mosseri_fixes: array, עד 3 תיקונים, מסודרים לפי (משקל קריטריון × פער מ-5) בסרטון הזה:',
-    '  כל fix חייב:',
-    '    principleCode: string — קוד מהפרקים שקיבלת (לא קוד שלא הופיע בדוקטרינה שנשלחה)',
-    '    fixType: "rewrite" | "visual" | "structural"',
-    '    name: string',
-    '    explanation: string',
-    '  rewrite בלבד: currentText (ציטוט מילולי מדויק מהתמלול), suggestedRewrite (מוכן לשימוש)',
-    '  visual/structural בלבד: action (ספציפי לסרטון), evidence (timestamp מפריים שנשלחו)',
-    '  currentText=null עבור visual/structural. אין להמציא ציטוטים.',
-    '',
-    'improvements_must: array | improvements_recommended: array | improvements_experiments: array',
-    'hook_alternatives: array of 3 strings',
-    'cta_options: array of 2 strings',
-    'edit_plan: array of { order: integer, segment: string, duration: "M:SS-M:SS" }',
-    'analysis_limitations: array of string',
-  ].join('\n');
-
-  const userMsg = [
-    `נתחי את הסרטון הבא לפני פרסום.`,
-    `פריימים מחולקים לאורך ${meta.durationSec.toFixed(1)}s — כל פריים מסומן בזמן שחולץ בפועל.`,
-    '',
-    contextBlock,
-    prevBlock,
-    '',
-    schemaSpec,
-    '',
-    'החזירי JSON תקין בלבד (ללא טקסט מחוץ ל-JSON) עם כל השדות שמפורטים למעלה.',
-  ].join('\n');
-
-  // Build GPT-4o vision content: text + labeled frames
+  // ── Build frame messages (shared by both phases) ─────────────────────────
   const frameMessages = frames.map((f, i) => [
-    // Label each frame with its real timestamp before the image
-    { type: 'text', text: `[פריים ${i+1}: ${f.timestampSec.toFixed(1)}s]` },
+    { type: 'text', text: `[פריים ${i + 1}: ${f.timestampSec.toFixed(1)}s]` },
     { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${f.base64}`, detail: 'low' } },
   ]).flat();
 
-  const userContent = hasFrames
-    ? [{ type: 'text', text: userMsg }, ...frameMessages]
-    : userMsg;
+  // ── PHASE 1 — BLIND SCORING (rubric + doctrine, NO business context) ───────
+  // SKILL.md rule 8: "מנקדים כמו זר מוחלט, לפי המחוון, לפני שקוראים ההקשר העסקי".
+  // This call intentionally omits the studio name, goal, and audience.
+  progress('score', 'מנקד בעין עיוורת...');
+
+  const blindSystemMsg = [
+    'You are an anonymous Instagram content scorer applying the Mosseri readiness rubric.',
+    'You do not know who made this video, what studio it is for, or what the business goal is.',
+    'Score exactly as a complete stranger scrolling the Reels tab.',
+    'Apply the rubric criteria literally. Each criterion independently.',
+    '',
+    audioLimitNote,
+    '',
+    rubricText ? `## Mosseri Readiness Rubric C1–C7\n\n${rubricText}` : '',
+    '',
+    doctrineChapters ? `## Relevant Doctrine (chapters for this format)\n\n${doctrineChapters}` : '',
+    '',
+    '## Scoring rules',
+    '- Each C1–C7 score: exact integer 0 through 5 per rubric. No decimals.',
+    '- reasoning_Cx: one sentence with specific evidence from frames or transcript.',
+    '- flags: only if clear evidence exists in frames/transcript.',
+    '- what_works: up to 3 specific strengths with evidence.',
+    '- Do NOT infer business context from video content to give higher scores.',
+  ].join('\n');
+
+  const blindVideoContext = [
+    `Video: ${meta.durationSec.toFixed(1)}s, ${meta.width}×${meta.height}, format=${effectiveFormat}`,
+    hasTranscript
+      ? `Transcript (Whisper): ${audioResult.text.slice(0, 2000)}${audioResult.truncated ? ' [truncated]' : ''}`
+      : 'No transcript available.',
+    hasFrames
+      ? `${frames.length} frames from ${frames[0].timestampSec.toFixed(1)}s to ${frames[frames.length - 1].timestampSec.toFixed(1)}s.`
+      : 'No frames available.',
+  ].filter(Boolean).join('\n');
+
+  const blindUserContent = hasFrames
+    ? [{ type: 'text', text: blindVideoContext }, ...frameMessages]
+    : blindVideoContext;
+
+  let blindData;
+  try {
+    const blindCompletion = await openai.chat.completions.create({
+      model:           'gpt-4o',
+      messages:        [{ role: 'system', content: blindSystemMsg }, { role: 'user', content: blindUserContent }],
+      temperature:     0.2,
+      max_tokens:      1200,
+      response_format: BLIND_SCORE_RESPONSE_FORMAT,
+    });
+    blindData = JSON.parse(blindCompletion.choices[0].message.content);
+    logger.info('[dana] Phase 1 blind score complete', { id, scores: { C1: blindData.C1, C2: blindData.C2, C3: blindData.C3 } });
+  } catch (err) {
+    logger.error('[dana] Phase 1 blind scoring failed', { id, error: err.message });
+    throw new Error('ניקוד עיוור נכשל: ' + err.message);
+  }
+
+  // Validate Phase 1 scores (range check; type is guaranteed by json_schema)
+  const phase1Scores = { C1: blindData.C1, C2: blindData.C2, C3: blindData.C3, C4: blindData.C4, C5: blindData.C5, C6: blindData.C6, C7: blindData.C7 };
+  const scoreValidation = validateMosseriScores(phase1Scores);
+  if (!scoreValidation.valid) {
+    logger.error('[dana] Phase 1 scores out of range', { id, errors: scoreValidation.errors, raw: phase1Scores });
+    throw new Error('ציוני מוסרי מחוץ לטווח 0-5: ' + scoreValidation.errors.join('; '));
+  }
+  const validatedScores = scoreValidation.fixed;
+
+  // ── PHASE 1 → estimate.py ────────────────────────────────────────────────
+  const phase1Flags  = (blindData.flags ?? []).filter(f =>
+    ['wordmark','aggregated','reupload','unpaid_promise','ai_slick'].includes(f)
+  );
+
+  // ── PHASE 2 — FIXES + SECTIONS with business context ─────────────────────
+  // Now that scores are locked, inject Shape Studio context for actionable fixes.
+  progress('analyze', 'מייצרת המלצות ספציפיות...');
+
+  const phase2SystemMsg = [
+    `אתה דנה, מנהלת התוכן הדיגיטלי של Shape Studio.`,
+    `ניקוד C1–C7 כבר בוצע בעין עיוורת (ללא הקשר עסקי). הציונים נעולים.`,
+    `תפקידך עכשיו: תרגמי ציונים לתיקונים ספציפיים ו-Shape-Studio-aware.`,
+    '',
+    DANA_PROMPT,
+    '',
+    audioLimitNote,
+    '',
+    doctrineChapters ? `## דוקטרינת מוסרי — פרקים רלוונטיים\n\n${doctrineChapters}` : '',
+    '',
+    '## כללי תיקונים',
+    '- principleCode: חייב להיות מהפרקים שסופקו למעלה. לא להמציא קודים.',
+    '- fixType "rewrite": currentText = ציטוט מדויק מהתמלול, suggestedRewrite = מוכן לשימוש, בקול היוצר.',
+    '- fixType "visual"/"structural": action = פעולה ספציפית, evidence = timestamp מפריים שנשלחו.',
+    '- אל תמציאי currentText אם אין ציטוט ממשי בתמלול.',
+    '- הציונים C1–C7 לא משתנים בשלב הזה. ציין אם ההקשר העסקי סותר משהו שהסרטון מאותת.',
+    '- אל תבטיחי חשיפה, צפיות, לידים או מכירות.',
+  ].join('\n');
+
+  const fixSchemaSpec = [
+    'החזירי JSON עם השדות הבאים:',
+    'perceived_message: string(1-2 משפטים)',
+    'message_lands: boolean',
+    'recommendation: "מוכן לפרסום"|"דורש תיקונים קלים"|"דורש עריכה משמעותית"',
+    'report_strengths: string[]',
+    'report_problems:  string[]',
+    'sections: { hook, message, content, editing, captions, audio, visuals, cta, platform }',
+    '  כל מפתח: { finding: string, score: integer 0-5|null, unverified: boolean }',
+    '  editing: score=null, unverified=true',
+    '  audio:   score=null, unverified=true, speech_text: string',
+    'timestamps: [{ range: "M:SS-M:SS", observation: string, works: string, problem: string, suggestion: string, anchor: "frame"|"whisper" }]',
+    '  — timestamps אמיתיים בלבד, מפריימים שנשלחו או מ-Whisper.',
+    'mosseri_fixes: עד 3, מסודרים לפי (משקל × פער מ-5):',
+    '  rewrite: { principleCode, fixType:"rewrite", name, currentText(ציטוט), suggestedRewrite, explanation }',
+    '  visual:  { principleCode, fixType:"visual", name, action, evidence(timestamp), explanation, currentText:null }',
+    '  structural: { principleCode, fixType:"structural", name, action, evidence, explanation, currentText:null }',
+    'mosseri_strengths: string[]',
+    'improvements_must: string[] | improvements_recommended: string[] | improvements_experiments: string[]',
+    'hook_alternatives: 3 strings | cta_options: 2 strings',
+    'edit_plan: [{ order: integer, segment: string, duration: "M:SS-M:SS" }]',
+    'analysis_limitations: string[]',
+  ].join('\n');
+
+  const phase2VideoContext = [
+    `**כותרת:** ${title} | **מטרה:** ${goal} | **פורמט:** ${format} | **פרסום:** ${organic_or_paid}`,
+    `**קהל יעד:** ${effectiveAudience}`,
+    message     && `**מסר ו-CTA:** ${message}`,
+    focus_notes && `**דגשים:** ${focus_notes}`,
+    `**משך:** ${meta.durationSec.toFixed(1)}s | **פריימים:** ${frames.length} (${dataAvail.frame_first_sec?.toFixed(1) ?? '—'}s–${dataAvail.frame_last_sec?.toFixed(1) ?? '—'}s)`,
+    hasTranscript ? `**תמלול (Whisper):** ${audioResult.text.slice(0, 2000)}` : '**תמלול:** לא זמין',
+    '',
+    '**ציונים שנקבעו בשלב הניקוד העיוור (נעולים):**',
+    `C1=${validatedScores.C1} | C2=${validatedScores.C2} | C3=${validatedScores.C3} | C4=${validatedScores.C4} | C5=${validatedScores.C5} | C6=${validatedScores.C6} | C7=${validatedScores.C7}`,
+    phase1Flags.length > 0 ? `דגלים: ${phase1Flags.join(', ')}` : 'דגלים: אין',
+    '',
+    prevBlock,
+    '',
+    fixSchemaSpec,
+  ].filter(Boolean).join('\n');
+
+  const phase2UserContent = hasFrames
+    ? [{ type: 'text', text: phase2VideoContext }, ...frameMessages]
+    : phase2VideoContext;
 
   let gptData;
   try {
-    const completion = await openai.chat.completions.create({
+    const phase2Completion = await openai.chat.completions.create({
       model:           'gpt-4o',
-      messages:        [{ role: 'system', content: systemMsg }, { role: 'user', content: userContent }],
+      messages:        [{ role: 'system', content: phase2SystemMsg }, { role: 'user', content: phase2UserContent }],
       temperature:     0.2,
-      max_tokens:      4000,
+      max_tokens:      3000,
       response_format: { type: 'json_object' },
     });
-    gptData = JSON.parse(completion.choices[0].message.content);
-    logger.info('[dana] GPT-4o analysis complete', { id });
+    gptData = JSON.parse(phase2Completion.choices[0].message.content);
+    logger.info('[dana] Phase 2 fixes complete', { id });
   } catch (err) {
-    logger.error('[dana] GPT-4o analysis failed', { id, error: err.message });
-    throw new Error('ניתוח GPT-4o נכשל: ' + err.message);
+    logger.error('[dana] Phase 2 fixes failed', { id, error: err.message });
+    throw new Error('ייצור המלצות נכשל: ' + err.message);
   }
 
-  // ── Validate mosseri_scores scale (must be integers 0-5) ─────────────────
-  const scoreValidation = validateMosseriScores(gptData.mosseri_scores);
-  if (!scoreValidation.valid) {
-    logger.error('[dana] mosseri_scores scale violation', {
-      id,
-      errors:    scoreValidation.errors,
-      raw_scores: gptData.mosseri_scores,
-    });
-    throw new Error(
-      'ציוני מוסרי בסקאלה שגויה: ' + scoreValidation.errors.join('; ') +
-      '. המודל החזיר ערכים מחוץ לטווח 0-5. נסה שוב.'
-    );
-  }
-  // Use the validated (rounded) scores from here on
-  const validatedScores = scoreValidation.fixed;
+  // Merge Phase 1 scores into gptData for downstream compatibility
+  gptData.mosseri_scores    = validatedScores;
+  gptData.mosseri_flags     = phase1Flags;
+  gptData.mosseri_reasonings = {
+    C1: blindData.reasoning_C1, C2: blindData.reasoning_C2, C3: blindData.reasoning_C3,
+    C4: blindData.reasoning_C4, C5: blindData.reasoning_C5, C6: blindData.reasoning_C6,
+    C7: blindData.reasoning_C7,
+  };
+  gptData.mosseri_strengths = gptData.mosseri_strengths ?? blindData.what_works ?? [];
 
   // ── Validate principleCode in fixes — two independent checks ────────────
   // Check 1 (inGlobalMap):   code exists anywhere in the full doctrine.md (not hallucinated).
@@ -1102,11 +1270,15 @@ async function analyzeVideoFile({
   }).filter(t => !t.out_of_range); // remove hallucinated timestamps beyond video
 
   // ── Mosseri fixes + citations (using already-validated fixes) ───────────
-  const citeMap = getCitations();
-  const fixes = validatedFixes.map(fix => ({
-    ...fix,
-    citation: (fix.codeValid && fix.principleCode) ? (citeMap[fix.principleCode] ?? null) : null,
-  }));
+  // citeMap declared below (before buildReviewText call) — reuse it here
+  const fixesWithCitations = (validatedFixes) => {
+    const cm = getCitations();
+    return validatedFixes.map(fix => ({
+      ...fix,
+      citation: (fix.codeValid && fix.principleCode) ? (cm[fix.principleCode] ?? null) : null,
+    }));
+  };
+  const fixes = fixesWithCitations(validatedFixes);
 
   // ── Version comparison — computed in code, not by model (Fix 6) ──────────
   let comparison = null;
@@ -1125,6 +1297,27 @@ async function analyzeVideoFile({
     };
   }
 
+  // ── Build review_text following output-format.md ─────────────────────────
+  progress('scoring', 'מחשב ציון ומייצר ביקורת...');
+  const citeMap = getCitations();
+  const reviewText     = buildReviewText({
+    title,
+    estimation,
+    fixes,
+    flags:       mosseriFlags,
+    what_works:  blindData.what_works ?? [],
+    format:      effectiveFormat,
+    citeMap,
+  });
+
+  // ── cite_check.py — verify every attributed Mosseri quote in the review ──
+  const citeCheckResult = runCiteCheck(reviewText);
+  if (!citeCheckResult.passed) {
+    logger.warn('[dana] cite_check: quoted citations failed verification', {
+      id, failures: citeCheckResult.failures.slice(0, 5),
+    });
+  }
+
   // ── Warnings (data quality, not hidden) ────────────────────────────────────
   const warnings = [
     frameError   && `חילוץ פריימים נכשל: ${frameError}`,
@@ -1135,7 +1328,7 @@ async function analyzeVideoFile({
     ...(gptData.analysis_limitations ?? []),
   ].filter(Boolean);
 
-  // ── Skill status (Fix 5) ─────────────────────────────────────────────────
+  // ── Skill status ─────────────────────────────────────────────────────────
   const skillStatus = getSkillStatus();
 
   // ── Assemble report ────────────────────────────────────────────────────────
@@ -1153,14 +1346,15 @@ async function analyzeVideoFile({
     message,
     focus_notes,
 
-    // Mosseri framework output
+    // Mosseri framework output — scores from Phase 1 (blind), fixes from Phase 2
     readiness:          estimation.readiness,
     verdict:            estimation.verdict,
     share_direction:    estimation.share_direction ?? null,
     accuracy:           estimation.accuracy        ?? null,
     baseline_missing:   estimation.baseline_missing ?? true,
-    scoreScaleValid:    true,         // set here because validateMosseriScores passed (throws otherwise)
-    sentDoctrineChapters: sentChapterNums, // which doctrine chapters were in this analysis
+    scoreScaleValid:    true,
+    scoring_phase:      'blind',   // Phase 1 had no business context
+    sentDoctrineChapters: sentChapterNums,
     mosseri_scores:     mosseriScores,
     mosseri_flags:      mosseriFlags,
     flags:              mosseriFlags,
@@ -1168,12 +1362,16 @@ async function analyzeVideoFile({
     fixes,
     reasonings:         gptData.mosseri_reasonings ?? {},
 
-    // Detailed review
+    // Human-readable review text following output-format.md
+    review_text:        reviewText,
+    cite_check:         { passed: citeCheckResult.passed, failures: citeCheckResult.failures },
+
+    // Detailed review (from Phase 2)
     perceived_message:  gptData.perceived_message ?? '',
     message_lands:      gptData.message_lands     ?? null,
     recommendation:     gptData.recommendation    ?? '',
-    report_strengths:   gptData.strengths  ?? [],
-    report_problems:    gptData.problems   ?? [],
+    report_strengths:   gptData.report_strengths  ?? gptData.strengths ?? [],
+    report_problems:    gptData.report_problems   ?? gptData.problems  ?? [],
     sections,
     category_scores:    categoryScores,
     timestamps,
