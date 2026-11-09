@@ -25,10 +25,31 @@ const DOCTRINE_PATH    = path.join(SKILL_DIR, 'reference/doctrine.md');
 const OUTPUT_FORMAT_PATH = path.join(SKILL_DIR, 'reference/output-format.md');
 const ESTIMATE_BIN     = path.join(SKILL_DIR, 'scripts/estimate.py');
 const CITE_CHECK_BIN   = path.join(SKILL_DIR, 'scripts/cite_check.py');
-const PYTHON_BIN       = process.env.PYTHON_BIN
-  ?? (process.platform === 'win32'
-    ? 'C:\\Users\\owner\\AppData\\Local\\Programs\\Python\\Python310\\python.exe'
-    : 'python3');
+// Detect the Python executable at module load time.
+// On Linux/Nix (Railway), PATH seen by execFileSync may not include Nix profile bins
+// even when nixPkgs = ["python3"] is declared — test candidates directly.
+const PYTHON_BIN = (() => {
+  if (process.env.PYTHON_BIN) return process.env.PYTHON_BIN;
+  if (process.platform === 'win32') {
+    return 'C:\\Users\\owner\\AppData\\Local\\Programs\\Python\\Python310\\python.exe';
+  }
+  // Test candidates in priority order: system path, common Nix profile locations
+  const { execFileSync: _ef } = require('child_process');
+  for (const candidate of [
+    'python3',
+    'python',
+    '/usr/bin/python3',
+    '/usr/local/bin/python3',
+    '/root/.nix-profile/bin/python3',
+    '/nix/var/nix/profiles/default/bin/python3',
+  ]) {
+    try {
+      _ef(candidate, ['--version'], { stdio: 'pipe', timeout: 3000 });
+      return candidate;
+    } catch {}
+  }
+  return 'python3'; // give up — execFileSync will ENOENT and callers will log it
+})();
 
 // ── JSON Schema for blind scoring phase (OpenAI structured outputs) ───────────
 // Guarantees integer types for C1-C7 at API level — no floats, no strings.
@@ -516,6 +537,7 @@ function runCiteCheck(reviewText, fixes) {
       citations_in_review:         citationsInReview,
       cite_check_ran:              true,
       cite_check_applicable:       true,
+      status:                      'passed',
       passed:                      true,
       failures:                    [],
       output:                      output.trim(),
@@ -524,6 +546,8 @@ function runCiteCheck(reviewText, fixes) {
     const stderr   = err.stderr ?? err.message ?? '';
     const failures = stderr.split('\n').filter(l => l.includes('FAIL'));
     const pyMissing = err.code === 'ENOENT' || stderr.includes('No such file') || stderr.includes('not found');
+    const ranOk     = !pyMissing;
+    const passed    = ranOk && failures.length === 0;
     if (pyMissing) {
       logger.warn('[dana] cite_check: Python not available', { PYTHON_BIN });
     } else {
@@ -534,9 +558,10 @@ function runCiteCheck(reviewText, fixes) {
       recommendations_code_valid:  validFixCount,
       recommendations_excluded:    excludedFixes,
       citations_in_review:         citationsInReview,
-      cite_check_ran:              !pyMissing,
+      cite_check_ran:              ranOk,
       cite_check_applicable:       true,
-      passed:                      failures.length === 0 && !pyMissing,
+      status:                      pyMissing ? 'execution_error' : passed ? 'passed' : 'failed',
+      passed,
       failures,
       note:                        pyMissing ? 'Python not available on this platform — cite_check could not run' : undefined,
     };

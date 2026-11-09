@@ -349,4 +349,97 @@ describe('runCiteCheck — actual function', () => {
     expect(typeof result.passed).toBe('boolean');
     expect(result.failures).toBeDefined();
   });
+
+  test('cite_check status field: execution_error when Python missing, passed/failed when ran', () => {
+    // When Python is absent (ENOENT), status must be 'execution_error', not 'failed'
+    // We cannot synthetically cause ENOENT in a unit test, but we can verify that:
+    //   (a) the not_applicable path sets status='not_applicable' (already tested above)
+    //   (b) the execution-error path sets passed:false and cite_check_ran:false
+    // These are the same conditions — verify runCiteCheck does not say "passed" on error.
+    const result = runCiteCheck('מוסרי, 15.01.2026: "quote"', []);
+    // If Python ran: status is 'passed' or 'failed' — both are boolean passed.
+    // If Python missing: status is 'execution_error', passed=false, cite_check_ran=false.
+    if (result.cite_check_ran === false && result.cite_check_applicable) {
+      expect(result.status).toBe('execution_error');
+      expect(result.passed).toBe(false);
+    } else if (result.cite_check_ran === true) {
+      expect(['passed', 'failed']).toContain(result.status);
+      expect(typeof result.passed).toBe('boolean');
+    }
+  });
+});
+
+// ── 7. incomplete-review banner — controlled fixture ─────────────────────────
+// Exercises the rendering logic from public/app.js with controlled report fixtures.
+// This is a pure-logic test; browser rendering is not checked here (noted separately).
+
+describe('incomplete-review banner rendering logic', () => {
+  // Mirror the rendering logic from public/app.js so we can unit-test it.
+  // If this logic changes in app.js it must be kept in sync here.
+  const esc = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+  function renderIncompleteBanner(r) {
+    const incompleteRecs = Array.isArray(r.incomplete_recommendations)
+      ? r.incomplete_recommendations
+      : (r.review_incomplete && r.incomplete_recommendations
+          ? [{ originalCode: '?', excludeReason: String(r.incomplete_recommendations) }]
+          : []);
+    if (incompleteRecs.length === 0 && !r.review_incomplete) return '';
+    return [
+      '<div class="banner">',
+      `⚠️ ביקורת חלקית${incompleteRecs.length > 0 ? ` — ${incompleteRecs.length} המלצות לא הוצגו` : ''}`,
+      r.review_incomplete_note ? `<em>${esc(r.review_incomplete_note)}</em>` : '',
+      incompleteRecs.map(x => `• ${esc(x.originalCode ?? '?')}: ${esc(x.excludeReason ?? '')}`).join('\n'),
+      '</div>',
+    ].filter(Boolean).join('\n');
+  }
+
+  test('review_incomplete:false, empty array → no banner', () => {
+    const html = renderIncompleteBanner({ review_incomplete: false, incomplete_recommendations: [] });
+    expect(html).toBe('');
+  });
+
+  test('review_incomplete:true, empty array → banner shown without item list', () => {
+    const html = renderIncompleteBanner({
+      review_incomplete: true,
+      review_incomplete_note: 'ביקורת חלקית',
+      incomplete_recommendations: [],
+    });
+    expect(html).toContain('⚠️ ביקורת חלקית');
+    expect(html).not.toContain('המלצות לא הוצגו'); // no count line when array empty
+  });
+
+  test('review_incomplete:true with excluded fixes → banner lists them', () => {
+    const html = renderIncompleteBanner({
+      review_incomplete: true,
+      review_incomplete_note: 'קוד לא בפרקים שנשלחו',
+      incomplete_recommendations: [
+        { originalCode: 'HOOK', excludeReason: 'HOOK principles not in sent chapters' },
+      ],
+    });
+    expect(html).toContain('1 המלצות לא הוצגו');
+    expect(html).toContain('HOOK');
+    expect(html).toContain('not in sent chapters');
+  });
+
+  test('legacy string incomplete_recommendations + review_incomplete:true → banner shown', () => {
+    // Old reports stored a string; normalize to array for display
+    const html = renderIncompleteBanner({
+      review_incomplete: true,
+      incomplete_recommendations: 'Requires light corrections',
+    });
+    expect(html).toContain('⚠️ ביקורת חלקית');
+    expect(html).toContain('Requires light corrections');
+  });
+
+  test('review_incomplete:false even if incomplete_recommendations has items → no banner', () => {
+    // This should not happen in practice; test defensive behavior
+    const html = renderIncompleteBanner({
+      review_incomplete: false,
+      incomplete_recommendations: [{ originalCode: 'X', excludeReason: 'test' }],
+    });
+    // Array items present but review_incomplete=false → still renders because incompleteRecs.length>0
+    // This matches the production behavior: either flag triggers the banner.
+    expect(html).toContain('⚠️ ביקורת חלקית');
+  });
 });
