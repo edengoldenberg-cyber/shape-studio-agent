@@ -7,3 +7,4 @@ node_modules/
 *.pdf
 test_*.js
 meta_webhook_test.js
+data/
