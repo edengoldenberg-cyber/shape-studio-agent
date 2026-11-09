@@ -108,19 +108,28 @@ async function extractFrames(videoPath, durationSec) {
       throw new Error('לא ניתן לחלץ פריימים — הסרטון קצר מדי.');
     }
 
-    // Extract each frame with its exact timestamp as the filename key
-    await new Promise((resolve, reject) => {
-      let cmd = ffmpeg(videoPath);
-      timestamps.forEach(ts => {
-        const safeName = ts.toFixed(3).replace('.', 'd');
-        cmd = cmd
-          .output(path.join(tmpDir, `f${safeName}.jpg`))
+    // Extract each frame as an INDEPENDENT ffmpeg call.
+    // Multi-output with seekInput per output is unreliable in fluent-ffmpeg
+    // (outputs share one global input, seek position per output not supported
+    // cleanly — causes "Error initializing output stream N" for N≥10).
+    // Sequential calls are slower but correct and reliable.
+    for (const ts of timestamps) {
+      const safeName = ts.toFixed(3).replace('.', 'd');
+      const outPath  = path.join(tmpDir, `f${safeName}.jpg`);
+      await new Promise((resolve) => { // non-rejecting: a single frame failure is non-fatal
+        ffmpeg(videoPath)
           .seekInput(ts)
           .frames(1)
-          .outputOptions(`-q:v ${FRAME_JPG_Q}`);
+          .output(outPath)
+          .outputOptions(`-q:v ${FRAME_JPG_Q}`)
+          .on('end', resolve)
+          .on('error', (err) => {
+            logger.warn('[video-service] Frame extraction failed for single timestamp', { ts, error: err.message });
+            resolve(); // skip this frame, continue
+          })
+          .run();
       });
-      cmd.on('end', resolve).on('error', reject).run();
-    });
+    }
 
     const frames = [];
     for (const ts of timestamps) {
