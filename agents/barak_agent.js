@@ -171,10 +171,31 @@ async function lookupClient(phoneOrName) {
   const qCore     = phoneCore(normQuery);
   const isPhone   = /^[0-9]{7,}$/.test(normQuery);
 
-  const [members, leads] = await Promise.all([
-    arbox.getMembers({ limit: 500 }).catch(() => []),
-    arbox.getLeads({ limit: 500 }).catch(() => []),
+  // Run member and lead lookups separately so we can distinguish:
+  //   "member search succeeded, person not found" vs
+  //   "member search failed — cannot confirm cold-lead status"
+  // The caller uses memberLookupFailed to set arboxLookupFailed = true,
+  // ensuring the Tier-4 safety net fires instead of routing to Barak.
+  let membersFetchFailed = false;
+  let members = [];
+  let leads   = [];
+
+  const [membersResult, leadsResult] = await Promise.allSettled([
+    arbox.getMembers({ limit: 500 }),
+    arbox.getLeads({ limit: 500 }),
   ]);
+
+  if (membersResult.status === 'fulfilled') {
+    members = membersResult.value;
+  } else {
+    membersFetchFailed = true;
+    logger.warn('[lookupClient] getMembers failed', { error: membersResult.reason?.message });
+  }
+  if (leadsResult.status === 'fulfilled') {
+    leads = leadsResult.value;
+  } else {
+    logger.warn('[lookupClient] getLeads failed', { error: leadsResult.reason?.message });
+  }
 
   // EXACT core match — avoids the false-positive from substring matching.
   // Root-cause fix: `'anyPhone'.includes('')` is always true,
@@ -211,9 +232,11 @@ async function lookupClient(phoneOrName) {
   }));
 
   const results = [...foundMembers, ...foundLeads];
-  logger.info('Barak lookupClient', { query, found: results.length });
-  store.logEvent('barak_lookup', null, { agent: 'barak', query, found: results.length });
-  return { query, results, total: results.length };
+  logger.info('Barak lookupClient', { query, found: results.length, membersFetchFailed });
+  store.logEvent('barak_lookup', null, { agent: 'barak', query, found: results.length, membersFetchFailed });
+  // memberLookupFailed = true means: "we could not confirm whether this person is a member"
+  // The caller MUST NOT treat this as "confirmed cold lead" and route to Barak.
+  return { query, results, total: results.length, memberLookupFailed: membersFetchFailed && foundMembers.length === 0 };
 }
 
 // ── Hebrew day-of-week resolver ───────────────────────────────────────────────

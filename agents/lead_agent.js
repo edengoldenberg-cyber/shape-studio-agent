@@ -776,8 +776,11 @@ async function handleInbound({ from, name, text }) {
   // Checks memberCache (in-process, seeded every 15 min from Arbox) first,
   // then known_members.json. Both must miss before we continue.
   if (_isKnownMemberPhone(from)) {
-    logger.warn('[lead_agent] GATE 1 BLOCKED — known member reached lead flow; removing stale record', { from });
-    store.deleteLead(from);
+    logger.warn('[lead_agent] GATE 1 BLOCKED — known member reached lead flow; reclassifying stale record', { from });
+    const existing = store.getLead(from);
+    if (existing && existing.status !== 'converted_member') {
+      store.reclassifyAsConvertedMember(from, { name: existing.name ?? name ?? null, source: 'gate1_block' });
+    }
     return { reply: null, score: 0, status: 'member' };
   }
 
@@ -1280,5 +1283,26 @@ function clearSession(phone) {
   store.deleteLead(phone);
 }
 
-module.exports = { handleInbound, clearSession, generateLeadBrief, sendIntroOffer, getLastDebugContext };
+/**
+ * Record a scheduling exchange (timetable send, Waze reply, etc.) that was
+ * handled by the scheduling pipeline in server.js — NOT by the AI.
+ * Without this, follow-up messages like "שלח שוב" or "תמונה" arrive at the AI
+ * with no context that the previous turn was about the timetable.
+ *
+ * Keeps the history cap at 20 entries so memory stays bounded.
+ */
+function recordSchedulingExchange(phone, userText, agentReply) {
+  if (!phone || !userText || !agentReply) return;
+  try {
+    if (!store.getLead(phone)) store.upsertLead(phone, {});
+    const history = store.getLead(phone).history ?? [];
+    history.push({ role: 'user',      content: userText  });
+    history.push({ role: 'assistant', content: agentReply });
+    saveHistory(phone, history);
+  } catch (err) {
+    logger.warn('[lead_agent] recordSchedulingExchange failed', { phone, error: err.message });
+  }
+}
+
+module.exports = { handleInbound, clearSession, generateLeadBrief, sendIntroOffer, getLastDebugContext, recordSchedulingExchange };
 

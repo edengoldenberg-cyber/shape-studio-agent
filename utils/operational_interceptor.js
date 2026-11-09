@@ -41,6 +41,23 @@ const RULES = [
     ],
   },
 
+  // ── SELF-CLAIM: "I'm already a member" — explicit declaration ────────────────
+  // Requires exact phrases so a lead describing a competitor membership doesn't trigger.
+  // Note: \b doesn't work with Hebrew Unicode — using (?=\s|$|[?!.,]) or no-anchor.
+  // "מנוי" (m) / "מנויה" (f) / "מנויות" (fp) all need explicit suffix handling.
+  {
+    weight: 10,
+    intent: 'member_self_claim',
+    patterns: [
+      /אני\s+כבר\s+מנוי(?:ה|ות)?(?=\s|$|[?!.,])/,           // "אני כבר מנוי/מנויה"
+      /אני\s+מנוי(?:ה|ות)?\s+(?:אצלכם|שם|בסטודיו|בשייפ)/,  // "אני מנויה אצלכם"
+      /כבר\s+מנוי(?:ה|ות)?\s+(?:אצלכם|בסטודיו|בשייפ)/,
+      /מנוי(?:ה|ות)?\s+אצלכם/,                               // "מנויה אצלכם"
+      /אני\s+חבר[הת]?\s+(?:אצלכם|בסטודיו)/,                 // "אני חברה אצלכם"
+      /כבר\s+(?:רשומ[הת]?|חבר[הת]?)\s+(?:אצלכם|בסטודיו)/,
+    ],
+  },
+
   // ── POSSESSIVE: "my class", "my slot", "my membership" ──────────────────────
   // Signals an existing account at our studio.
   // Note: "המנוי שלי בחדר הכושר האחר" is explicitly excluded so a lead

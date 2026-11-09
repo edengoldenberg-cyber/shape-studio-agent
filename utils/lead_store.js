@@ -60,6 +60,34 @@ class LeadStore {
     this._leads.delete(phone);
   }
 
+  /**
+   * Reclassify a lead as a confirmed member WITHOUT deleting the record.
+   * Preserves all conversation history, meta, name, and engagement metrics.
+   * Sets status='converted_member' so all sales flows skip this record.
+   *
+   * Use this instead of deleteLead when the person has become (or was always)
+   * a studio member. This preserves the conversation for audit and prevents
+   * reappearance of the record on the next restart.
+   */
+  reclassifyAsConvertedMember(phone, { name = null, source = 'unknown' } = {}) {
+    const existing = this._leads.get(phone);
+    if (!existing) return null;
+    const updated = {
+      ...existing,
+      status: 'converted_member',
+      score:  0,          // zero out lead score so hot/warm queries never surface this
+      lastActivity: new Date(),
+      name: name ?? existing.name,
+      meta: {
+        ...existing.meta,
+        convertedAt:     new Date().toISOString(),
+        convertedSource: source,
+      },
+    };
+    this._leads.set(phone, updated);
+    return updated;
+  }
+
   // ── Event log ─────────────────────────────────────────────────────────────
 
   logEvent(type, phone, data = {}) {
@@ -77,10 +105,15 @@ class LeadStore {
 
   // ── Aggregate queries (used by manager_agent) ─────────────────────────────
 
-  getHotLeads()   { return this.getAllLeads().filter(l => l.score >= 8); }
-  getWarmLeads()  { return this.getAllLeads().filter(l => l.score >= 5 && l.score < 8); }
-  getColdLeads()  { return this.getAllLeads().filter(l => l.score < 5); }
-  getCrisisLeads(){ return this.getAllLeads().filter(l => l.status === 'crisis'); }
+  /** All leads excluding reclassified members — use for sales/funnel operations. */
+  getActiveLeads() {
+    return this.getAllLeads().filter(l => l.status !== 'converted_member');
+  }
+
+  getHotLeads()   { return this.getActiveLeads().filter(l => l.score >= 8); }
+  getWarmLeads()  { return this.getActiveLeads().filter(l => l.score >= 5 && l.score < 8); }
+  getColdLeads()  { return this.getActiveLeads().filter(l => l.score < 5); }
+  getCrisisLeads(){ return this.getActiveLeads().filter(l => l.status === 'crisis'); }
 
   getDailyStats() {
     const dayStart = new Date();
@@ -112,7 +145,7 @@ class LeadStore {
   /** Leads with no activity for at least minDays, excluding crisis. */
   getDormantLeads(minDays = 3) {
     const cutoff = new Date(Date.now() - minDays * 86400000);
-    return this.getAllLeads()
+    return this.getActiveLeads()
       .filter(l => l.status !== 'crisis' && l.lastActivity && new Date(l.lastActivity) < cutoff)
       .sort((a, b) => new Date(a.lastActivity) - new Date(b.lastActivity));
   }

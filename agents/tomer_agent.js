@@ -119,7 +119,9 @@ async function chat(userMessage) {
  * Returns a summary object.
  */
 async function runDailyChecks() {
-  const leads  = store.getAllLeads();
+  // getActiveLeads() excludes converted_member records — reclassified members
+  // must never receive Tomer's re-engagement messages.
+  const leads  = store.getActiveLeads();
   const result = { reEngaged: 0, introFollowUps: 0, skipped: 0, errors: 0 };
 
   // Load member identity guards (lazy requires to avoid circular deps at module load).
@@ -132,8 +134,9 @@ async function runDailyChecks() {
 
   for (const lead of leads) {
     try {
-      if (lead.status === 'crisis')             { result.skipped++; continue; }
-      if (!lead.phone)                          { result.skipped++; continue; }
+      if (lead.status === 'crisis')            { result.skipped++; continue; }
+      if (lead.status === 'converted_member')  { result.skipped++; continue; }
+      if (!lead.phone)                         { result.skipped++; continue; }
 
       // Guard: never re-engage a lead that has silently converted to an Arbox member.
       // Checks both the in-process cache (< 1ms) AND known_members.json (< 2ms).

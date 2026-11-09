@@ -49,12 +49,22 @@ async function _loadFromArbox() {
   _loading = true;
   try {
     const arboxSvc = require('../services/arbox.service');
-    const users = await arboxSvc.getAllUsers({ limit: 2000 });
+    // Arbox API rejects limit > ~999 with 400 "must be smaller than 500" on /v3/users.
+    // getAllUsers() is paginated and walks all pages, so limit=200 per page fetches
+    // all 1000+ users correctly without triggering the API error.
+    const users = await arboxSvc.getAllUsers({ limit: 200 });
 
     const next = new Set();
     for (const u of users) {
       if (!u.phone) continue;
-      const isMember = u.active === 1 || u.user_role === 'aggregatorMember';
+      // Only confirmed studio members belong in this registry.
+      // Leads with active=1 (Arbox trial/unqualified) are NOT members —
+      // they must still reach Barak's qualification funnel.
+      // Staff are handled by isStaffPhone() and must not block the member gate.
+      // aggregatorMember (ClassPass/Gympass) included regardless of active status
+      // because Arbox sometimes marks them active=0 between sessions.
+      const isMember = (u.user_role === 'client' && u.active === 1) ||
+                        u.user_role === 'aggregatorMember';
       if (!isMember) continue;
       const norm = normalize(u.phone);
       if (norm) next.add(norm);

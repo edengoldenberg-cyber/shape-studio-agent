@@ -134,7 +134,9 @@ async function runBarakIngestion(store) {
   automations.touchWorker('barak-ingestion');
   logger.info('Worker[Barak]: CRM ingestion check starting');
 
-  const all       = store.getAllLeads();
+  // getActiveLeads() excludes converted_member records so Barak's ingestion
+  // worker never flags a reclassified member as "invalid phone" or "pending sync".
+  const all       = store.getActiveLeads();
   const PHONE_RE  = /^972[0-9]{8,10}$/;
   const nameIndex = new Map(); // normalized name → first phone seen
 

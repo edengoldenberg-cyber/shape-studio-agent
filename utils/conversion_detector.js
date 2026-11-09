@@ -89,13 +89,14 @@ async function detectAndMarkConversions(store, memberCache, normalizeToE164, _au
     // 2. Stamp known_members.json as the durable file-backed override
     _autoAddKnownMember(norm, name);
 
-    // 3. Remove from lead_store so Tomer's cron never touches this person
-    store.deleteLead(lead.phone);
+    // 3. Reclassify in lead_store — preserves history, removes from sales flows
+    store.reclassifyAsConvertedMember(lead.phone, { name, source: 'conversion_detector' });
     store.logEvent('lead_converted_detected', norm, {
       name,
-      arboxId:   String(arboxUser.user_id),
-      arboxRole: arboxUser.user_role,
-      source:    'conversion_detector',
+      arboxId:          String(arboxUser.user_id),
+      arboxRole:        arboxUser.user_role,
+      source:           'conversion_detector',
+      historyPreserved: (lead.history ?? []).length,
     });
 
     converted++;

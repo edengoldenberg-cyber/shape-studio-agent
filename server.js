@@ -82,10 +82,18 @@ function getScheduleImageUrl() {
  */
 function getActiveTimetableUrl() {
   const base = getBackendBase();
-  if (!base) return null;
+  if (!base) {
+    logger.warn('[timetable] getActiveTimetableUrl: no base URL — BACKEND_URL and RAILWAY_PUBLIC_DOMAIN both unset');
+    return null;
+  }
   const imgPath = studioAssets.getTimetableImagePath();
   if (imgPath && fs.existsSync(imgPath)) return `${base}/api/admin/timetable-image`;
   if (fs.existsSync(SCHEDULE_PNG_PATH))  return `${base}/schedule.png`;
+  logger.warn('[timetable] getActiveTimetableUrl: no image file found', {
+    uploadedPath: imgPath ?? '(not uploaded)',
+    staticPath:   SCHEDULE_PNG_PATH,
+    hint:         'Upload timetable image via admin UI, or check DATA_DIR Volume is mounted on Railway',
+  });
   return null;
 }
 
@@ -157,8 +165,11 @@ function _autoAddKnownMember(phone, name) {
  *   • 15-min cron: catches conversions that occurred since the last daily
  *     09:15 detectAndMarkConversions run.
  *
- * Returns the count of deleted records so callers can decide whether to
- * persist and broadcast.
+ * Does NOT delete records — reclassifies to status='converted_member'.
+ * This preserves conversation history and meta for audit while removing the
+ * record from all sales flows, cron queues, and dashboard lead views.
+ *
+ * Returns count of reclassified records so callers can persist and broadcast.
  *
  * @param {'startup'|'cron_15min'|string} source - label for logs/events
  * @returns {number}
@@ -167,24 +178,27 @@ function _purgeKnownMembersFromLeadStore(source = 'unknown') {
   const leads = store.getAllLeads();
   if (!leads.length) return 0;
 
-  let purged = 0;
+  let reclassified = 0;
   for (const lead of leads) {
     if (!lead.phone) continue;
+    if (lead.status === 'converted_member') continue; // already done
     if (!phoneRegistry.isMember(lead.phone)) continue;
 
-    store.deleteLead(lead.phone);
-    store.logEvent('member_purged_from_leads', lead.phone, {
+    store.reclassifyAsConvertedMember(lead.phone, { name: lead.name ?? null, source });
+    store.logEvent('member_reclassified_from_leads', lead.phone, {
       name: lead.name ?? null,
       source,
+      historyPreserved: (lead.history ?? []).length,
     });
-    logger.info('[lead-purge] Confirmed member removed from lead store', {
-      phone: lead.phone,
-      name:  lead.name ?? '(unknown)',
+    logger.info('[lead-purge] Member reclassified (history preserved)', {
+      phone:        lead.phone,
+      name:         lead.name ?? '(unknown)',
+      historyTurns: (lead.history ?? []).length,
       source,
     });
-    purged++;
+    reclassified++;
   }
-  return purged;
+  return reclassified;
 }
 
 /**
@@ -256,6 +270,157 @@ app.use(express.static(path.join(__dirname, 'public')));
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ status: 'ok', ts: new Date().toISOString() }));
 
+// GET /api/health/registry — phone registry and timetable facts (no assumptions)
+app.get('/api/health/registry', (_req, res) => {
+  const ageMs  = phoneRegistry.age();
+  const size   = phoneRegistry.size();
+  const refreshIntervalMs = 60_000; // phone_registry background interval
+  // Stale = more than 3 missed refresh cycles (3 min) since last successful sync
+  const staleThresholdMs = refreshIntervalMs * 3;
+
+  const assets   = studioAssets.getAssets();
+  const imgPath  = studioAssets.getTimetableImagePath();
+  const imgPath2 = studioAssets.getTimetable2ImagePath();
+  const base     = getBackendBase();
+
+  // Fact: does the file actually exist on disk?
+  const img1Exists = !!(imgPath && fs.existsSync(imgPath));
+  const img2Exists = !!(imgPath2 && fs.existsSync(imgPath2));
+  const staticExists = fs.existsSync(SCHEDULE_PNG_PATH);
+
+  // Fact: when was the image file last written (mtime)? Independent of URL reachability.
+  let img1LastModifiedAt = null;
+  if (img1Exists && imgPath) {
+    try { img1LastModifiedAt = fs.statSync(imgPath).mtime.toISOString(); } catch {}
+  } else if (staticExists) {
+    try { img1LastModifiedAt = fs.statSync(SCHEDULE_PNG_PATH).mtime.toISOString(); } catch {}
+  }
+
+  // Fact: what URL would be constructed (requires base URL)?
+  // Presence of a URL does NOT imply the image is accessible from outside — it
+  // requires the base URL to be reachable and the DATA_DIR Volume to be mounted.
+  const img1Url = base && img1Exists
+    ? `${base}/api/admin/timetable-image`
+    : base && staticExists
+      ? `${base}/schedule.png`
+      : null;
+  const img2Url = base && img2Exists ? `${base}/api/admin/timetable2-image` : null;
+
+  res.json({
+    registry: {
+      size,
+      ageMs,
+      ageSec:             Math.round(ageMs / 1000),
+      refreshIntervalSec: refreshIntervalMs / 1000,   // actual Arbox poll cadence: 60s
+      staleBeyondSec:     staleThresholdMs / 1000,    // 3 missed cycles = 180s
+      isStale:            ageMs > staleThresholdMs,
+      isEmpty:            size === 0,
+      diagnosis:          size === 0            ? 'EMPTY — registry never loaded or last refresh failed'
+                        : ageMs > staleThresholdMs ? 'STALE — last sync was ' + Math.round(ageMs/1000) + 's ago'
+                        : 'OK',
+    },
+    timetable: {
+      // Three independent facts (each can be true/false independently):
+      uploadedFlag:       assets.timetableImageUploaded,  // set by admin upload endpoint
+      imageExt:           assets.timetableImageExt || null,
+      img1Path:           imgPath ?? null,
+      img1FileExists:     img1Exists,          // disk presence — does NOT prove HTTP accessibility
+      img1LastModifiedAt: img1LastModifiedAt,  // when the file was last written
+      img2FileExists:     img2Exists,
+      staticPngExists:    staticExists,
+      baseUrlSet:         !!base,
+      img1Url:            img1Url ?? null,     // null if base missing or no file on disk
+      img2Url:            img2Url ?? null,
+      // Diagnosis is factual — no "will be sent" claims
+      diagnosis:          !base            ? 'BASE_URL_MISSING — set BACKEND_URL or deploy to Railway'
+                        : img1Exists       ? 'img1 file found on disk; URL constructable — verify Railway Volume is mounted for external access'
+                        : staticExists     ? 'using static schedule.png fallback; img1LastModifiedAt shows when it was last updated'
+                        : 'NO_IMAGE_FILE — uploadedFlag=' + assets.timetableImageUploaded +
+                          '; if true, file may have been lost (check DATA_DIR Volume mount)',
+    },
+    checkedAt: new Date(),
+  });
+});
+
+// ── Admin: dry-run reclassification ──────────────────────────────────────────
+// GET  /api/admin/dry-run-members  — show what would be reclassified (no changes)
+// POST /api/admin/reclassify-members — apply reclassification with backup first
+//
+// Backup file: DATA_DIR/converted_members_backup_<timestamp>.json
+// Restore: copy backup phones back to known_members.json and invalidate memberCache.
+
+app.get('/api/admin/dry-run-members', (_req, res) => {
+  const allLeads = store.getAllLeads();
+  const candidates = allLeads.filter(l =>
+    l.phone && l.status !== 'converted_member' && phoneRegistry.isMember(l.phone)
+  );
+  res.json({
+    wouldReclassify: candidates.length,
+    records: candidates.map(l => ({
+      phone_masked:    l.phone.slice(0, 5) + '****' + l.phone.slice(-3),
+      name:            l.name ?? null,
+      status:          l.status,
+      score:           l.score,
+      messageCount:    l.messageCount,
+      firstSeen:       l.firstSeen,
+      lastActivity:    l.lastActivity,
+      historyTurns:    (l.history ?? []).length,
+      metaKeys:        Object.keys(l.meta ?? {}),
+      introOfferSent:  l.introOfferSent,
+    })),
+    note: 'No changes made. POST /api/admin/reclassify-members to apply with backup.',
+    checkedAt: new Date(),
+  });
+});
+
+app.post('/api/admin/reclassify-members', async (_req, res) => {
+  const allLeads = store.getAllLeads();
+  const candidates = allLeads.filter(l =>
+    l.phone && l.status !== 'converted_member' && phoneRegistry.isMember(l.phone)
+  );
+
+  if (!candidates.length) {
+    return res.json({ reclassified: 0, note: 'No member records found in lead store.' });
+  }
+
+  // Write backup BEFORE making any changes
+  const backupPath = path.join(
+    (process.env.DATA_DIR ?? path.join(__dirname, 'data')).replace(/\/$/, ''),
+    `converted_members_backup_${Date.now()}.json`
+  );
+  try {
+    fs.writeFileSync(backupPath, JSON.stringify({
+      createdAt: new Date().toISOString(),
+      count: candidates.length,
+      records: candidates.map(l => ({ ...l, phone_masked: l.phone.slice(0,5)+'****'+l.phone.slice(-3) })),
+    }, null, 2), 'utf8');
+    logger.info('[reclassify] Backup written', { path: backupPath, count: candidates.length });
+  } catch (backupErr) {
+    return res.status(500).json({ error: 'Backup failed — no changes made', detail: backupErr.message });
+  }
+
+  // Apply reclassification
+  let done = 0;
+  for (const l of candidates) {
+    store.reclassifyAsConvertedMember(l.phone, { name: l.name ?? null, source: 'admin_reclassify' });
+    store.logEvent('member_reclassified_admin', l.phone, {
+      name: l.name, historyPreserved: (l.history ?? []).length,
+    });
+    done++;
+  }
+
+  persist.saveLeads(store);
+  broadcastSse('leads_updated', { reclassified: done, source: 'admin_reclassify' });
+  logger.info('[reclassify] Admin reclassification complete', { reclassified: done, backupPath });
+
+  res.json({
+    reclassified: done,
+    backupPath,
+    note: 'All changes persisted. Backup available at backupPath for rollback.',
+    reclassifiedAt: new Date(),
+  });
+});
+
 // ── WhatsApp webhook — verification (GET) ────────────────────────────────────
 app.get('/webhook/whatsapp', verifyWebhook);
 
@@ -290,22 +455,25 @@ app.get('/api/leads', (_req, res) => {
 
   // Identify any leads that are now confirmed members in PhoneRegistry.
   // isMember() is synchronous O(1) — safe to call in a request handler.
-  const memberLeads = allLeads.filter(l => l.phone && phoneRegistry.isMember(l.phone));
+  const memberLeads = allLeads.filter(l =>
+    l.phone && l.status !== 'converted_member' && phoneRegistry.isMember(l.phone)
+  );
 
-  // Reactively purge and persist so the stale record never reappears.
+  // Reactively reclassify members found during dashboard load.
+  // Uses reclassifyAsConvertedMember so history is preserved.
   if (memberLeads.length > 0) {
     for (const l of memberLeads) {
-      store.deleteLead(l.phone);
-      store.logEvent('reactive_purge_on_api_read', l.phone, { name: l.name ?? null });
-      logger.info('[api/leads] Reactive purge — confirmed member removed from lead store', {
-        phone: l.phone, name: l.name,
+      store.reclassifyAsConvertedMember(l.phone, { name: l.name ?? null, source: 'reactive_api_read' });
+      store.logEvent('member_reclassified_on_api_read', l.phone, { name: l.name ?? null });
+      logger.info('[api/leads] Reactive reclassify — confirmed member removed from lead view', {
+        phone: l.phone, name: l.name, historyTurns: (l.history ?? []).length,
       });
     }
     persist.saveLeads(store);
   }
 
   const leads = allLeads
-    .filter(l => !l.phone || !phoneRegistry.isMember(l.phone))
+    .filter(l => l.status !== 'converted_member' && (!l.phone || !phoneRegistry.isMember(l.phone)))
     .map(({ history, ...l }) => ({ ...l, phone: maskPhone(l.phone) }));
 
   res.json(leads);
@@ -688,7 +856,19 @@ app.post('/api/leads/webhook', jsonBody, async (req, res) => {
       return;
     }
 
-    // ── Lead resolved — store and notify ─────────────────────────────────────
+    // ── Lead resolved — guard against re-opening the funnel for existing members ─
+    // phoneRegistry is a synchronous O(1) Set — safe to call without await.
+    // If the phone is a confirmed Arbox member, log and skip the upsert entirely.
+    // Without this guard, a Meta Lead Ad for an existing subscriber would override
+    // their converted_member status and restart Barak's qualification flow.
+    if (phoneRegistry.isMember(lead.phone)) {
+      logger.info('[meta-lead] Skipping upsert — phone is a confirmed Arbox member', {
+        phone: lead.phone, name: lead.name, leadgenId,
+      });
+      store.logEvent('meta_lead_member_skip', lead.phone, { name: lead.name, leadgenId, source: 'meta_ads' });
+      return;
+    }
+
     store.upsertLead(lead.phone, {
       name:   lead.name,
       status: 'new',
@@ -1409,7 +1589,7 @@ const INTENT_PATTERNS = {
   // Keep in sync with SCHEDULE_TIMETABLE_RE in deterministic_reply.js — any phrase
   // that matches that regex but not this one will route through lead_agent instead
   // of the scheduling pipeline's null-URL fallback.
-  schedule_query:   /מערכת שעות|לוח שיעורים|מה יש|מתי יש|יש שיעור|יש מקום|מה קורה|סדר יום|מה הלוח|הלוח שלכם|הלוח שלך|שעות.*הסטודיו|שעות.*שלכם|שעות פעילות|שעות פתיחה|מתי פתוח|מתי פתוחים|לראות.*שעות|רוצה.*לוח|איזה שיעורים|מה התוכנית|מה הוא שיעור|מי מדריך|מי המדריך|מי מלמד|מי מנהל|מי נותן|באיזה שעה|בכמה|מה השעה|שיעור.{0,15}ב(יום|ערב|בוקר|צהריים)|ב(יום\s)?(ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת)|יש לכם.*תמונה|שלח.*תמונה.*לוח|תמונה.*לוח|לוח.*תמונה|יש תמונה|שלח.*מערכת|רוצה.*מערכת|לראות.*מערכת|לוח.*שבוע|שבוע.*לוח|אפשר.*לראות.*לוח/,
+  schedule_query:   /מערכת שעות|לוח שיעורים|מה יש|מתי יש|יש שיעור|יש מקום|מה קורה|סדר יום|מה הלוח|הלוח שלכם|הלוח שלך|שעות.*הסטודיו|שעות.*שלכם|שעות פעילות|שעות פתיחה|מתי פתוח|מתי פתוחים|לראות.*שעות|רוצה.*לוח|איזה שיעורים|מה התוכנית|מה הוא שיעור|מי מדריך|מי המדריך|מי מלמד|מי מנהל|מי נותן|באיזה שעה|בכמה|מה השעה|שיעור.{0,15}ב(יום|ערב|בוקר|צהריים)|ב(יום\s)?(ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת)|יש לכם.*תמונה|שלח.*תמונה.*לוח|תמונה.*לוח|לוח.*תמונה|יש תמונה|שלח.*מערכת|רוצה.*מערכת|לראות.*מערכת|לוח.*שבוע|שבוע.*לוח|אפשר.*לראות.*לוח|שלח[יה]?\s+לי\s+תמונה|תשלח[יה]?\s+לי\s+תמונה|אפשר\s+תמונה|לשלוח\s+לי\s+תמונה|שלוח\s+לי\s+תמונה/,
 };
 
 function detectSchedulingIntent(text) {
@@ -1845,7 +2025,10 @@ async function processInboundWAMessage(msg) {
     try {
       const lookup = await barakAgent.lookupClient(fromIsraeli ?? fromNorm ?? '');
       if (lookup.total > 0) {
-        const best = lookup.results[0];
+        // Always prefer a member record over a lead record for the routing decision.
+        // If getMembers() partially failed and only the lead record was returned,
+        // results[0] would be type='lead' — routing the person to Barak despite being a member.
+        const best = lookup.results.find(r => r.type === 'member') ?? lookup.results[0];
         clientMatch = {
           found:     true,
           matchType: best.type,
@@ -1858,7 +2041,31 @@ async function processInboundWAMessage(msg) {
         if (best.type === 'member' || best.role === 'aggregatorMember') {
           memberCache.markConfirmed(fromNorm, { name: best.name, role: best.role ?? 'client', source: 'arbox_live' });
           _autoAddKnownMember(fromNorm, best.name ?? msg.name);
+        } else if (best.type === 'lead' && !lookup.memberLookupFailed) {
+          // Arbox confirmed this person as a cold lead — stamp the flag + a timestamp so
+          // Tier-4 can safely bypass during RECENT outages.
+          //
+          // Guard: !memberLookupFailed is REQUIRED before stamping.
+          // When getMembers() fails and only the lead record is returned, we have NOT
+          // confirmed there is no member record for this phone. Stamping here would let
+          // the next message bypass Tier-4 (via _tier4ActiveLead freshness window) even
+          // though member status is unknown — sending a potential subscriber to Barak.
+          const existing = store.getLead(fromNorm);
+          if (existing && existing.status !== 'converted_member') {
+            store.upsertLead(fromNorm, {
+              meta: { ...(existing.meta ?? {}), arboxConfirmedColdLead: true, arboxColdLeadConfirmedAt: Date.now() },
+            });
+          }
         }
+      }
+
+      // If getMembers() specifically failed and no member was found, we cannot confirm
+      // cold-lead status — treat this as an Arbox failure so Tier-4 fires correctly.
+      if (lookup.memberLookupFailed) {
+        arboxLookupFailed = true;
+        logger.warn('[pipeline] Member lookup failed in lookupClient — identity uncertain, triggering Tier-4', {
+          from: fromNorm,
+        });
       }
     } catch (lookupErr) {
       arboxLookupFailed = true;
@@ -2127,8 +2334,17 @@ async function processInboundWAMessage(msg) {
   const _tier4ActiveLead = (() => {
     const rec = store.getLead(fromNorm);
     if (!rec) return false;
-    const lastTs = rec.lastActivity ? new Date(rec.lastActivity).getTime() : 0;
-    return Date.now() - lastTs < 7 * 24 * 60 * 60 * 1000; // active in last 7 days
+    // Reclassified members must NEVER bypass Tier-4.
+    if (rec.status === 'converted_member') return false;
+    // Only bypass Tier-4 when Arbox RECENTLY confirmed this person is a cold lead.
+    // We require arboxColdLeadConfirmedAt (the timestamp set alongside the flag in Tier-3)
+    // to be < 2 hours old. An older flag is not proof of current cold-lead status:
+    // prior lead activity is not evidence the person has not since become a subscriber.
+    // Without the freshness window, a stale arboxConfirmedColdLead from a past session
+    // would route a misclassified member to Barak every time Arbox is unreachable.
+    const confirmedAt = rec.meta?.arboxColdLeadConfirmedAt;
+    if (!confirmedAt) return false;
+    return Date.now() - confirmedAt < 2 * 60 * 60 * 1000; // must be < 2 hours fresh
   })();
   if (arboxLookupFailed && !isExistingClient && !_tier4ActiveLead) {
     logger.warn('[pipeline] TIER-4 DEGRADED MODE — Arbox down, identity unverifiable', { from: fromNorm });
@@ -2351,20 +2567,24 @@ async function processInboundWAMessage(msg) {
       _autoAddKnownMember(fromNorm, clientMatch.arboxName ?? msg.name);
     }
 
-    // 5b. Remove any stale lead record for this confirmed member.
-    //     memberCache + known_members.json are now the durable protection layers
-    //     (populated in step 5a and in step 1 tier-3 seeding).
-    //     The old meta.isClient flag is no longer read by routing — deleted for clarity.
+    // 5b. Reclassify any stale lead record for this confirmed member.
+    //     Preserves conversation history and meta — only changes status to
+    //     'converted_member' so the record never surfaces in sales flows again.
+    //     memberCache + known_members.json are seeded above (5a) and in Tier-3.
     {
       const staleRecord = store.getLead(fromNorm);
-      if (staleRecord) {
-        _autoAddKnownMember(fromNorm, clientMatch.arboxName ?? msg.name ?? staleRecord.name);
-        store.deleteLead(fromNorm);
+      if (staleRecord && staleRecord.status !== 'converted_member') {
+        const memberName = clientMatch.arboxName ?? msg.name ?? staleRecord.name;
+        _autoAddKnownMember(fromNorm, memberName);
+        store.reclassifyAsConvertedMember(fromNorm, { name: memberName, source: 'pipeline_step5b' });
         store.logEvent('lead_converted_reactive', fromNorm, {
-          name: clientMatch.arboxName ?? msg.name ?? staleRecord.name,
+          name: memberName,
           source: 'pipeline_step5b',
+          historyPreserved: (staleRecord.history ?? []).length,
         });
-        logger.info('[pipeline] Stale lead converted to member and removed', { from: fromNorm });
+        logger.info('[pipeline] Stale lead reclassified as converted_member (history preserved)', {
+          from: fromNorm, historyTurns: (staleRecord.history ?? []).length,
+        });
       }
     }
 
@@ -2432,10 +2652,15 @@ async function processInboundWAMessage(msg) {
           await sendText(fromNorm, timetableFollowUp)
             .then(() => store.logEvent('timetable_followup_sent', fromNorm, { preview: timetableFollowUp.slice(0, 60) }))
             .catch(err => logger.warn('Timetable follow-up send failed', { from: fromNorm, error: err.message }));
+
+          // Record the scheduling exchange in the lead's AI history so follow-up requests
+          // ("שלח שוב", "תמונה") arrive at the AI with full context of the timetable exchange.
+          leadAgent.recordSchedulingExchange(fromNorm, msg.text ?? '', barakReply + '\n' + timetableFollowUp);
         })
         .catch(err => {
           logger.warn('Timetable image send failed — falling back to text reply', { from: fromNorm, error: err.message });
           sendText(fromNorm, barakReply).catch(() => {});
+          leadAgent.recordSchedulingExchange(fromNorm, msg.text ?? '', barakReply);
         });
     } else {
       try {
@@ -2446,6 +2671,8 @@ async function processInboundWAMessage(msg) {
           agent:   'barak',
           source:  'auto_reply',
         });
+        // Record fallback text exchange in AI history for follow-up context
+        leadAgent.recordSchedulingExchange(fromNorm, msg.text ?? '', barakReply);
       } catch (err) {
         logger.warn('WA auto-reply failed', { from: fromNorm, error: err.message });
       }
