@@ -299,20 +299,18 @@ function markStaleReports() {
   return { scanned, marked, alreadyMarked };
 }
 
-// ── principleCode repair ───────────────────────────────────────────────────────
+// ── principleCode flag + bounded model repair ─────────────────────────────────
 
 /**
- * For a fix whose principleCode failed validation (e.g. "HOOK" instead of "HOOK-1"),
- * attempt a bounded repair: match the prefix against sentChapterCodes.
- *
- * Rules:
- *   - Exact match already valid → return unchanged.
- *   - Prefix match in sentChapterCodes → take the lowest-numbered candidate.
- *     (Lowest = most foundational; caller can inspect originalCode.)
- *   - No prefix match → mark codeExcluded=true; fix is omitted from the review.
- *     (Never silently remove; always set excludeReason.)
+ * Phase 1 of the two-step repair: classify invalid fixes synchronously.
+ *   - Already valid → return unchanged.
+ *   - No principleCode / unparseable → exclude immediately.
+ *   - Prefix has NO matching codes in sentChapterCodes → exclude (chapter not sent).
+ *   - Prefix HAS candidates in sentChapterCodes → flag needsBoundedRepair=true.
+ *     The caller must then pass these to boundedRepairFixes() for model-based selection.
+ *     Never auto-select candidates[0] — that ignores the fix's actual recommendation.
  */
-function repairOrExcludeFix(fix, sentChapterCodes) {
+function flagForRepairOrExclude(fix, sentChapterCodes) {
   if (fix.codeValid) return fix;
 
   const code = fix.principleCode;
@@ -327,25 +325,143 @@ function repairOrExcludeFix(fix, sentChapterCodes) {
   if (candidates.length === 0) {
     return {
       ...fix,
-      codeExcluded:   true,
-      originalCode:   code,
-      excludeReason:  `"${prefix}" principles not in sent doctrine chapters — model referenced a chapter outside the sent set`,
+      codeExcluded:  true,
+      originalCode:  code,
+      excludeReason: `"${prefix}" principles not in sent doctrine chapters — model referenced a chapter outside the sent set`,
     };
   }
 
-  // Bounded repair: use the lowest-numbered principle with the matching prefix
-  const repairedCode = candidates[0];
-  return {
-    ...fix,
-    principleCode:  repairedCode,
-    originalCode:   code,
-    codeRepaired:   true,
-    codeExcluded:   false,
-    codeValid:      true,
-    inGlobalMap:    true,
-    inSentChapters: true,
-    codeError:      null,
+  // Has candidates — do NOT pick candidates[0]; flag for model-based selection
+  return { ...fix, needsBoundedRepair: true, originalCode: code, repairCandidates: candidates };
+}
+
+/**
+ * Phase 2 of the repair: call GPT to match each flagged fix to the best principle code.
+ * Revalidates the returned code against sentChapterCodes. If the model returns an
+ * invalid code or cannot match, the fix is excluded and review_incomplete is set.
+ *
+ * Uses json_schema to get a structured response; `principleCode` is validated post-call
+ * (not constrained by enum because null/excluded case is easier as a boolean field).
+ */
+async function boundedRepairFixes(flaggedFixes, sentChapterCodes, doctrineText, citeMap) {
+  if (!flaggedFixes.length) return [];
+
+  const codes = [...sentChapterCodes].sort();
+
+  // Extract one-line principle snippet for each candidate code
+  const principleSnippets = {};
+  for (const code of codes) {
+    const re = new RegExp(`- \\*\\*${code}\\.([^\n]+)`, 'i');
+    const m  = doctrineText.match(re);
+    principleSnippets[code] = m ? m[0].replace(/\*\*/g, '').trim() : code;
+  }
+
+  const fixSummaries = flaggedFixes.map((f, i) => ({
+    idx:          i,
+    originalCode: f.originalCode ?? f.principleCode,
+    name:         f.name,
+    explanation:  f.explanation,
+    currentText:  f.currentText  ?? null,
+    action:       f.action       ?? null,
+    evidence:     f.evidence     ?? null,
+    candidates:   f.repairCandidates,
+  }));
+
+  const repairPrompt = [
+    'Each fix below was returned with an invalid principleCode (bare prefix, no number).',
+    'Reclassify each fix to the most appropriate numbered code from the allowed list,',
+    'based on what the fix actually recommends — not just the prefix.',
+    '',
+    '## Allowed codes with their principle texts:',
+    codes.map(c => `${c}: ${principleSnippets[c]}`).join('\n'),
+    '',
+    '## Fixes to reclassify:',
+    JSON.stringify(fixSummaries, null, 2),
+    '',
+    'Return: for each fix, the idx, the best principleCode from the list, a one-sentence',
+    'justification, and excluded=true if no code clearly matches.',
+  ].join('\n');
+
+  const repairFormat = {
+    type: 'json_schema',
+    json_schema: {
+      name: 'repair_codes',
+      strict: true,
+      schema: {
+        type: 'object',
+        properties: {
+          repairs: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                idx:           { type: 'integer' },
+                principleCode: { type: 'string' },
+                justification: { type: 'string' },
+                excluded:      { type: 'boolean' },
+              },
+              required: ['idx', 'principleCode', 'justification', 'excluded'],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ['repairs'],
+        additionalProperties: false,
+      },
+    },
   };
+
+  try {
+    const repairCompletion = await openai.chat.completions.create({
+      model:           'gpt-4o',
+      messages:        [
+        { role: 'system', content: 'You match content recommendations to doctrine principle codes. Be precise; prefer null (excluded) over a wrong code.' },
+        { role: 'user',   content: repairPrompt },
+      ],
+      temperature:     0.1,
+      max_tokens:      400,
+      response_format: repairFormat,
+    });
+
+    const repairData = JSON.parse(repairCompletion.choices[0].message.content);
+
+    return flaggedFixes.map((fix, i) => {
+      const repair = (repairData.repairs ?? []).find(r => r.idx === i);
+      const base   = { ...fix, needsBoundedRepair: undefined, repairCandidates: undefined };
+
+      if (!repair || repair.excluded) {
+        return { ...base, codeExcluded: true, excludeReason: `Bounded repair: no matching principle found for "${fix.originalCode}"` };
+      }
+
+      // Revalidate: returned code MUST be in sentChapterCodes
+      if (!sentChapterCodes.has(repair.principleCode)) {
+        logger.warn('[dana] boundedRepair returned code not in sent chapters', { returned: repair.principleCode });
+        return { ...base, codeExcluded: true, excludeReason: `Bounded repair returned "${repair.principleCode}" which is not in sent chapters — revalidation failed` };
+      }
+
+      return {
+        ...base,
+        principleCode:      repair.principleCode,
+        codeRepaired:       true,
+        repairJustification: repair.justification,
+        codeValid:          true,
+        codeExcluded:       false,
+        inGlobalMap:        !!citeMap[repair.principleCode],
+        inSentChapters:     true,
+        codeError:          null,
+        citation:           citeMap[repair.principleCode] ?? null,
+      };
+    });
+  } catch (err) {
+    logger.warn('[dana] boundedRepairFixes failed', { error: err.message });
+    return flaggedFixes.map(fix => ({
+      ...fix,
+      needsBoundedRepair: undefined,
+      repairCandidates:   undefined,
+      codeExcluded:       true,
+      excludeReason:      `Bounded repair call failed: ${err.message}`,
+    }));
+  }
 }
 
 // ── cite_check.py runner ──────────────────────────────────────────────────────
@@ -1353,21 +1469,33 @@ async function analyzeVideoFile({
   gptData.mosseri_strengths = gptData.mosseri_strengths ?? blindData.what_works ?? [];
 
   // ── Validate + bounded-repair principleCode in fixes ────────────────────
-  // Step 1: validate (two checks: inGlobalMap, inSentChapters).
-  // Step 2: for invalid codes, attempt prefix repair from sentChapterCodes.
-  //         If repair is possible → mark codeRepaired=true.
-  //         If not → mark codeExcluded=true with excludeReason.
-  //         Never silently drop: excluded fixes are stored in report for transparency.
+  // Step 1: validate (inGlobalMap + inSentChapters).
+  // Step 2: flag invalid fixes — exclude those with no candidates immediately;
+  //         fixes with matching prefix candidates go to bounded model repair.
+  // Step 3: bounded repair calls GPT to pick the best matching numbered code
+  //         based on the fix's recommendation text, NOT auto-select candidates[0].
+  // Step 4: revalidate repaired codes — anything outside sentChapterCodes → excluded.
   const citeMapForValidation = getCitations();
-  const rawFixes         = gptData.mosseri_fixes ?? [];
-  const afterValidation  = validateFixCodes(rawFixes, citeMapForValidation, sentChapterCodes);
-  const validatedFixes   = afterValidation.map(f => repairOrExcludeFix(f, sentChapterCodes));
-  const invalidCodes     = validatedFixes.filter(f => !f.codeValid && !f.codeExcluded).map(f => ({
-    code: f.principleCode ?? '(none)', inGlobalMap: f.inGlobalMap, inSentChapters: f.inSentChapters,
-  }));
+  const rawFixes      = gptData.mosseri_fixes ?? [];
+  const afterValidate = validateFixCodes(rawFixes, citeMapForValidation, sentChapterCodes);
+  const afterFlag     = afterValidate.map(f => flagForRepairOrExclude(f, sentChapterCodes));
+
+  const toRepair  = afterFlag.filter(f => f.needsBoundedRepair);
+  const noRepair  = afterFlag.filter(f => !f.needsBoundedRepair);
+
+  let repairedFromModel = [];
+  if (toRepair.length > 0) {
+    progress('repair', 'מתקנת קודי עיקרון...');
+    repairedFromModel = await boundedRepairFixes(toRepair, sentChapterCodes, _loadDoctrineText(), citeMapForValidation);
+  }
+
+  const validatedFixes = [...noRepair, ...repairedFromModel];
   const repairedCodes  = validatedFixes.filter(f => f.codeRepaired);
   const excludedCodes  = validatedFixes.filter(f => f.codeExcluded);
-  if (repairedCodes.length > 0)  logger.info('[dana] fixes: codes repaired', { id, repaired: repairedCodes.map(f => `${f.originalCode}→${f.principleCode}`) });
+  const invalidCodes   = validatedFixes.filter(f => !f.codeValid && !f.codeExcluded).map(f => ({
+    code: f.principleCode ?? '(none)', inGlobalMap: f.inGlobalMap, inSentChapters: f.inSentChapters,
+  }));
+  if (repairedCodes.length > 0)  logger.info('[dana] fixes: codes repaired via bounded model', { id, repaired: repairedCodes.map(f => `${f.originalCode}→${f.principleCode}`) });
   if (excludedCodes.length > 0)  logger.warn('[dana] fixes: codes excluded', { id, excluded: excludedCodes.map(f => f.excludeReason) });
   if (invalidCodes.length > 0)   logger.warn('[dana] fixes: codes invalid after repair', { id, issues: invalidCodes });
 
@@ -1616,5 +1744,7 @@ module.exports = {
   buildPhase2SystemMsg,
   validateFixCodes,
   getChapterCodes,
-  repairOrExcludeFix,
+  flagForRepairOrExclude,
+  boundedRepairFixes,
+  runCiteCheck,
 };

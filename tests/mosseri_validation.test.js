@@ -25,7 +25,8 @@ const {
   validateMosseriScores,
   validateFixCodes,
   getChapterCodes,
-  repairOrExcludeFix,
+  flagForRepairOrExclude,
+  runCiteCheck,
   buildBlindSystemMsg,
   buildPhase2SystemMsg,
 } = require('../agents/dana_agent');
@@ -246,107 +247,106 @@ describe('two-phase analysis contract — real message builders', () => {
   });
 });
 
-// ── 5. principleCode repair pipeline ─────────────────────────────────────────
-// Tests validateFixCodes + repairOrExcludeFix against the story-format code set,
-// which is the case that exposed the HOOK/SEND bug.
+// ── 5. principleCode flag pipeline ───────────────────────────────────────────
+// Tests validateFixCodes + flagForRepairOrExclude against the story-format code set.
+// boundedRepairFixes (async, calls GPT) is tested in analyzeVideoFile_pipeline.test.js.
 
-describe('principleCode repair and exclusion — story format codes', () => {
+describe('principleCode flag and exclusion — story format codes', () => {
   const STORY_CODES = new Set([
     'SEND-1','SEND-2','SEND-3','SEND-4','SEND-5','SEND-6',
     'LONG-1','LONG-2','LONG-3','LONG-4','LONG-5',
   ]);
 
-  function runPipeline(principleCode) {
+  function flag(principleCode) {
     const fix = { principleCode, name: 'test', explanation: 'test' };
-    // citeMap={}: simulates "no doctrine citations loaded" — still exercises repair logic
     const after = validateFixCodes([fix], {}, STORY_CODES);
-    return after.map(f => repairOrExcludeFix(f, STORY_CODES))[0];
+    return after.map(f => flagForRepairOrExclude(f, STORY_CODES))[0];
   }
 
-  test('"SEND" (bare prefix, story format) → repaired to SEND-1', () => {
-    const result = runPipeline('SEND');
-    expect(result.codeRepaired).toBe(true);
-    expect(result.principleCode).toBe('SEND-1');
+  test('"SEND" (bare prefix, story) → flagged for bounded repair — NOT auto-repaired to SEND-1', () => {
+    const result = flag('SEND');
+    // Must NOT blindly pick SEND-1
+    expect(result.codeRepaired).toBeFalsy();
+    // Must NOT be excluded (candidates exist)
+    expect(result.codeExcluded).toBeFalsy();
+    // Must be flagged for model repair
+    expect(result.needsBoundedRepair).toBe(true);
+    expect(result.repairCandidates).toContain('SEND-1');
     expect(result.originalCode).toBe('SEND');
-    expect(result.codeExcluded).toBe(false);
-    expect(result.codeValid).toBe(true);
   });
 
-  test('"HOOK" (bare prefix, story format) → excluded: HOOK not in chapters [4,13,16]', () => {
-    const result = runPipeline('HOOK');
+  test('"HOOK" (bare prefix, story) → excluded immediately: HOOK not in chapters [4,13,16]', () => {
+    const result = flag('HOOK');
     expect(result.codeExcluded).toBe(true);
     expect(result.excludeReason).toMatch(/HOOK/);
-    expect(result.codeRepaired).toBeUndefined();
+    expect(result.needsBoundedRepair).toBeFalsy();
   });
 
-  test('"HOOK-1" valid code, story format → still excluded (chapter 2 not in story set)', () => {
-    const result = runPipeline('HOOK-1');
-    // HOOK-1 not in STORY_CODES set → inSentChapters=false → codeValid=false → excluded
+  test('"HOOK-1" (numbered, story) → excluded: chapter 2 not in story set', () => {
+    const result = flag('HOOK-1');
     expect(result.codeExcluded).toBe(true);
+    expect(result.needsBoundedRepair).toBeFalsy();
   });
 
-  test('"SEND-3" valid code, story format → valid (no repair needed)', () => {
+  test('"SEND-3" with citeMap entry → valid, no flag or exclusion needed', () => {
     const fix = { principleCode: 'SEND-3', name: 'test', explanation: 'test' };
-    // With a real citeMap entry the code passes inGlobalMap; here we test inSentChapters
-    const citeMapWithSend3 = { 'SEND-3': { date: '01.01.2026', quote: 'test quote' } };
-    const after = validateFixCodes([fix], citeMapWithSend3, STORY_CODES);
-    const repaired = after.map(f => repairOrExcludeFix(f, STORY_CODES))[0];
-    expect(repaired.codeValid).toBe(true);
-    expect(repaired.codeExcluded).toBeFalsy();
-    expect(repaired.codeRepaired).toBeFalsy();
+    const cm  = { 'SEND-3': { date: '01.01.2026', quote: 'test quote' } };
+    const after   = validateFixCodes([fix], cm, STORY_CODES);
+    const flagged = after.map(f => flagForRepairOrExclude(f, STORY_CODES))[0];
+    expect(flagged.codeValid).toBe(true);
+    expect(flagged.codeExcluded).toBeFalsy();
+    expect(flagged.needsBoundedRepair).toBeFalsy();
   });
 
-  test('review_incomplete must be true when any fix is excluded', () => {
-    const result = runPipeline('HOOK');
-    const excludedCodes = [result].filter(f => f.codeExcluded);
+  test('review_incomplete must be true when any fix is excluded after flagging', () => {
+    const excluded = [flag('HOOK')].filter(f => f.codeExcluded);
+    expect(excluded.length > 0).toBe(true);
     // analyzeVideoFile sets: review_incomplete = excludedCodes.length > 0
-    const review_incomplete = excludedCodes.length > 0;
+    const review_incomplete = excluded.length > 0;
     expect(review_incomplete).toBe(true);
   });
 });
 
-// ── 6. cite_check reporting contract ─────────────────────────────────────────
-// "No failures" with zero citations is not_applicable, not successful verification.
+// ── 6. runCiteCheck — actual function tests ───────────────────────────────────
+// Tests call the real runCiteCheck function (now exported).
+// "No failures" with zero citations must be not_applicable, not "passed".
 
-describe('cite_check reporting contract', () => {
-  // runCiteCheck is not exported; test via the report field populated by analyzeVideoFile.
-  // We document the contract here: when citations_in_review=0,
-  // passed must be null and status must be 'not_applicable'.
+describe('runCiteCheck — actual function', () => {
 
-  test('passed=null contract: null means not-checked, not "passed"', () => {
-    // This is the contract that runCiteCheck must satisfy when citationsInReview===0.
-    // A report with passed:null and cite_check_applicable:false must NOT be read as
-    // "citations verified successfully".
-    const citeCheck = {
-      recommendations_generated: 2,
-      recommendations_code_valid: 2,
-      recommendations_excluded: [],
-      citations_in_review: 0,
-      cite_check_ran: false,
-      cite_check_applicable: false,
-      status: 'not_applicable',
-      passed: null,
-      failures: [],
-      note: 'No attributed Mosseri citations in review text — cite_check not applicable. Zero citations found, zero verified.',
-    };
-    expect(citeCheck.passed).toBeNull();
-    expect(citeCheck.cite_check_applicable).toBe(false);
-    expect(citeCheck.status).toBe('not_applicable');
-    // Verify the note clearly states zero were verified
-    expect(citeCheck.note).toContain('Zero citations found');
+  test('zero citations → passed:null, status:not_applicable, cite_check_applicable:false', () => {
+    // Review text with no attributed Mosseri quotes
+    const result = runCiteCheck('ביקורת ללא ציטוטים מוסרי.', []);
+    expect(result.citations_in_review).toBe(0);
+    expect(result.cite_check_applicable).toBe(false);
+    expect(result.status).toBe('not_applicable');
+    expect(result.passed).toBeNull();      // null ≠ true: not "verified successfully"
+    expect(result.cite_check_ran).toBe(false);
+    expect(result.note).toContain('Zero citations found');
   });
 
-  test('cite_check_applicable=true only when citations are present in review text', () => {
-    // When citations ARE present, cite_check_applicable must be true
-    // and passed must be boolean (true or false), not null
-    const citeCheck = {
-      citations_in_review: 2,
-      cite_check_ran: true,
-      cite_check_applicable: true,
-      passed: true,
-      failures: [],
-    };
-    expect(citeCheck.cite_check_applicable).toBe(true);
-    expect(typeof citeCheck.passed).toBe('boolean'); // not null
+  test('zero citations — recommendations counters are still populated', () => {
+    const fixes = [
+      { codeValid: true, codeExcluded: false, principleCode: 'HOOK-1' },
+      { codeExcluded: true, originalCode: 'HOOK', excludeReason: 'not in sent chapters' },
+    ];
+    const result = runCiteCheck('ביקורת ללא ציטוטים.', fixes);
+    expect(result.recommendations_generated).toBe(2);
+    expect(result.recommendations_code_valid).toBe(1);
+    expect(result.recommendations_excluded).toHaveLength(1);
+    expect(result.recommendations_excluded[0]).toContain('HOOK');
+  });
+
+  test('review text with Mosseri citation → cite_check_applicable:true, passed is boolean', () => {
+    // This exercises the branch where citationsInReview > 0.
+    // On Railway, Python is unavailable → cite_check_ran:false, passed:false.
+    // Locally Python is available but cite_check.py may not find the quote → failures.
+    // Either way, passed must be boolean (true or false), never null.
+    const reviewWithCite = 'מוסרי, 15.01.2026: "צריך הוק"\nזהו סיכום הביקורת.';
+    const result = runCiteCheck(reviewWithCite, [{ codeValid: true, codeExcluded: false, principleCode: 'HOOK-1' }]);
+    expect(result.citations_in_review).toBeGreaterThan(0);
+    expect(result.cite_check_applicable).toBe(true);
+    // passed must be boolean — true (Python ran, no failures) or false (Python unavailable)
+    expect(typeof result.passed).toBe('boolean');
+    expect(result.failures).toBeDefined();
   });
 });

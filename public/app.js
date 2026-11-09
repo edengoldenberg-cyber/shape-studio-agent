@@ -612,12 +612,27 @@ async function submitVideoAnalysis() {
         : '';
 
     // Review text from output-format.md (cite_check verified)
+    const citeOk  = r.cite_check?.cite_check_applicable === false
+      ? '' // not applicable — no citations to check
+      : (r.cite_check?.passed === false ? ' ⚠️ ציטוטים לא אומתו' : '');
+
+    // Normalize incomplete_recommendations: may be array (new) or string (legacy reports)
+    const incompleteRecs = Array.isArray(r.incomplete_recommendations)
+      ? r.incomplete_recommendations
+      : (r.review_incomplete && r.incomplete_recommendations ? [{ originalCode: '?', excludeReason: String(r.incomplete_recommendations) }] : []);
+    const incompleteHtml = (incompleteRecs.length > 0 || r.review_incomplete)
+      ? `<div style="background:#fff3e0;border:1px solid #ff9800;border-radius:6px;padding:8px 12px;margin-top:8px;font-size:12px">
+           ⚠️ <strong>ביקורת חלקית</strong>${incompleteRecs.length > 0 ? ` — ${incompleteRecs.length} המלצות לא הוצגו` : ''}<br>
+           ${r.review_incomplete_note ? `<em>${esc(r.review_incomplete_note)}</em><br>` : ''}
+           ${incompleteRecs.map(x => `• ${esc(x.originalCode ?? '?')}: ${esc(x.excludeReason ?? '')}`).join('<br>')}
+         </div>` : '';
     const reviewTextHtml = r.review_text
       ? `<details class="vup-review-text panel" style="margin-bottom:16px">
            <summary style="cursor:pointer;font-size:13px;font-weight:600;padding:8px 0;user-select:none">
-             📋 ביקורת לפי מוסרי — פורמט מלא${r.cite_check?.passed === false ? ' ⚠️ ציטוטים לא אומתו' : ''}
+             📋 ביקורת לפי מוסרי — פורמט מלא${citeOk}
            </summary>
            <pre style="white-space:pre-wrap;font-size:12px;padding:12px;background:#f8fafc;border-radius:6px;direction:rtl">${esc(r.review_text)}</pre>
+           ${incompleteHtml}
          </details>`
       : '';
 
