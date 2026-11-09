@@ -217,62 +217,191 @@
 
         <!-- Right main: video analysis -->
         <div class="dana-main">
-          <div class="va-form-panel panel">
-            <div class="panel-header"><h2>🎬 ניתוח וידאו לפי מוסרי</h2></div>
-            <div class="va-form-body">
+
+          <!-- ── Video upload panel ── -->
+          <div class="vup-panel panel" id="vup-panel">
+            <div class="panel-header">
+              <h2>🎬 ניתוח סרטון לפני פרסום</h2>
+              <span class="vup-limit-note">עד 200 MB · mp4 / mov / webm · עד 15 דקות</span>
+            </div>
+
+            <!-- Upload zone -->
+            <div class="vup-drop-zone" id="vup-drop-zone" tabindex="0" role="button"
+                 aria-label="גרור קובץ או לחץ לבחירה">
+              <div class="vup-drop-icon">📁</div>
+              <div class="vup-drop-title">גרור קובץ לכאן</div>
+              <div class="vup-drop-or">או</div>
+              <label class="btn btn-secondary vup-pick-btn" for="vup-file-input">בחר קובץ</label>
+              <input type="file" id="vup-file-input" accept="video/mp4,video/quicktime,video/webm,video/x-msvideo,video/x-matroska,.mp4,.mov,.webm,.avi,.mkv" style="display:none"/>
+            </div>
+
+            <!-- Preview player (hidden until file selected) -->
+            <div class="vup-preview-wrap" id="vup-preview-wrap" style="display:none">
+              <video id="vup-preview" class="vup-player" controls playsinline preload="metadata"></video>
+              <div class="vup-file-info" id="vup-file-info"></div>
+              <button class="btn-link vup-clear-btn" id="vup-clear">✕ הסר קובץ</button>
+            </div>
+
+            <!-- Context fields -->
+            <div class="vup-context-grid" id="vup-context-grid" style="display:none">
               <div class="field-group">
-                <label class="field-label" for="va-title">כותרת הסרטון</label>
-                <input type="text" id="va-title" class="field-input" placeholder="ריל Reformer Pilates — Shape Studio"/>
+                <label class="field-label" for="vup-title">כותרת הסרטון</label>
+                <input type="text" id="vup-title" class="field-input" placeholder="ריל Reformer Pilates — Shape Studio"/>
               </div>
-              <div class="field-group">
-                <label class="field-label" for="va-desc">תיאור / תסריט / תמליל</label>
-                <textarea id="va-desc" class="field-textarea" rows="7"
-                  placeholder="הוק: &quot;90% מהנשים לא יודעות שזה קיים&quot;&#10;גוף: הסבר על Reformer — מה זה, למה זה עובד...&#10;CTA: &quot;בואי לשיעור ניסיון ב-60 ש״ח&quot;"></textarea>
-                <div class="field-hint">Ctrl+Enter לשליחה מהירה</div>
-              </div>
+
               <div class="field-row">
                 <div class="field-group field-half">
-                  <label class="field-label" for="va-format">פורמט</label>
-                  <select id="va-format" class="field-select">
+                  <label class="field-label" for="vup-format">פורמט</label>
+                  <select id="vup-format" class="field-select">
                     <option value="feed">Feed Reel (4:5)</option>
                     <option value="trial">Trial Reel</option>
-                    <option value="carousel">Carousel</option>
                     <option value="story">Story (9:16)</option>
-                    <option value="caption">Caption</option>
-                    <option value="cover">Cover</option>
+                    <option value="carousel">Carousel</option>
                   </select>
                 </div>
                 <div class="field-group field-half">
-                  <label class="field-label" for="va-goal">מטרה</label>
-                  <select id="va-goal" class="field-select">
-                    <option value="conversion">המרה — ניסיון</option>
-                    <option value="awareness">מודעות</option>
-                    <option value="retention">שימור</option>
+                  <label class="field-label" for="vup-goal">מטרה</label>
+                  <select id="vup-goal" class="field-select">
+                    <option value="leads">לידים</option>
+                    <option value="awareness">חשיפה</option>
+                    <option value="trust">אמון</option>
+                    <option value="community">קהילה</option>
+                    <option value="other">אחר</option>
                   </select>
                 </div>
               </div>
-              <button class="btn btn-primary va-btn-submit" id="va-submit">🔍 נתח לפי מוסרי</button>
-            </div>
-            <div class="va-framework-box">
-              <div class="va-fw-title">מסגרת מוסרי — 7 קריטריונים</div>
-              <div class="va-fw-chips">
-                <span class="va-chip">C1 הוק ×25%</span>
-                <span class="va-chip">C2 שליחות ×20%</span>
-                <span class="va-chip">C3 ערך לזר ×20%</span>
-                <span class="va-chip">C4 מבנה ×15%</span>
-                <span class="va-chip">C5 מקוריות ×10%</span>
-                <span class="va-chip">C6 קריאות ×5%</span>
-                <span class="va-chip">C7 נושא ×5%</span>
+
+              <div class="field-row">
+                <div class="field-group field-half">
+                  <label class="field-label" for="vup-paid">סוג פרסום</label>
+                  <select id="vup-paid" class="field-select">
+                    <option value="organic">אורגני</option>
+                    <option value="paid">ממומן</option>
+                  </select>
+                </div>
+                <div class="field-group field-half">
+                  <label class="field-label" for="vup-audience">קהל יעד</label>
+                  <input type="text" id="vup-audience" class="field-input" value="נשים 30-60, פרדס חנה-כרכור"/>
+                </div>
               </div>
-              <div class="va-fw-note">74 עקרונות של מוסרי, ראש אינסטגרם. הציון לא מנבא חשיפה.</div>
+
+              <div class="field-group">
+                <label class="field-label" for="vup-message">מסר והנעה לפעולה (אופציונלי)</label>
+                <input type="text" id="vup-message" class="field-input" placeholder="הוק + CTA המתוכנן"/>
+              </div>
+
+              <div class="field-group">
+                <label class="field-label" for="vup-focus">דגשים לבדיקה (אופציונלי)</label>
+                <input type="text" id="vup-focus" class="field-input" placeholder="לדוגמה: כתוביות, חיתוך בין שוטים, הוק"/>
+              </div>
+
+              <!-- Previous version comparison -->
+              <div class="field-group" id="vup-prev-wrap" style="display:none">
+                <label class="field-label" for="vup-prev">השוואה לגרסה קודמת</label>
+                <select id="vup-prev" class="field-select">
+                  <option value="">בלי השוואה</option>
+                </select>
+              </div>
+
+              <button class="btn btn-primary vup-submit-btn" id="vup-submit">🔍 שלח לניתוח של דנה</button>
+            </div>
+
+            <!-- Progress stages -->
+            <div class="vup-progress" id="vup-progress" style="display:none">
+              <div class="vup-stages">
+                <div class="vup-stage" id="vstage-upload">
+                  <span class="vup-stage-icon">⬆️</span>
+                  <span class="vup-stage-label">מעלה קובץ</span>
+                </div>
+                <div class="vup-stage-sep">›</div>
+                <div class="vup-stage" id="vstage-process">
+                  <span class="vup-stage-icon">⚙️</span>
+                  <span class="vup-stage-label">מחלץ פריימים ושמע</span>
+                </div>
+                <div class="vup-stage-sep">›</div>
+                <div class="vup-stage" id="vstage-analyze">
+                  <span class="vup-stage-icon">🧠</span>
+                  <span class="vup-stage-label">דנה מנתחת</span>
+                </div>
+                <div class="vup-stage-sep">›</div>
+                <div class="vup-stage" id="vstage-done">
+                  <span class="vup-stage-icon">✅</span>
+                  <span class="vup-stage-label">תוצאה מוכנה</span>
+                </div>
+              </div>
+              <div class="vup-progress-note" id="vup-progress-note">מכין...</div>
+            </div>
+
+            <!-- Error state -->
+            <div class="vup-error" id="vup-error" style="display:none">
+              <span class="vup-error-msg" id="vup-error-msg"></span>
+              <button class="btn btn-secondary" id="vup-retry">נסה שוב</button>
             </div>
           </div>
-          <div class="va-results-panel" id="va-results-panel">
-            <div id="va-empty-state" class="va-empty">
-              <div class="va-empty-icon">🎬</div>
-              <div class="va-empty-title">ממתין לניתוח</div>
-              <div class="va-empty-sub">הכניסי כותרת ותיאור, בחרי פורמט ומטרה, ולחצי <strong>נתח לפי מוסרי</strong></div>
+
+          <!-- ── Analysis result ── -->
+          <div class="vup-report-panel" id="vup-report-panel" style="display:none"></div>
+
+          <!-- ── Analysis history ── -->
+          <div class="vup-history-panel panel" id="vup-history-panel" style="display:none">
+            <div class="panel-header">
+              <h3>📂 היסטוריית ניתוחים</h3>
+              <button class="btn btn-secondary" style="font-size:12px;padding:4px 10px" id="vup-history-refresh">רענן</button>
             </div>
+            <div id="vup-history-list"></div>
+          </div>
+
+          <!-- ── Text-based Mosseri form (now secondary) ── -->
+          <details class="va-legacy-wrap">
+            <summary class="va-legacy-summary">📝 ניתוח מתיאור טקסט בלבד</summary>
+            <div class="va-form-panel panel" style="margin-top:0;border-top:none;border-radius:0 0 12px 12px">
+              <div class="va-form-body">
+                <div class="field-group">
+                  <label class="field-label" for="va-title">כותרת הסרטון</label>
+                  <input type="text" id="va-title" class="field-input" placeholder="ריל Reformer Pilates — Shape Studio"/>
+                </div>
+                <div class="field-group">
+                  <label class="field-label" for="va-desc">תיאור / תסריט / תמליל</label>
+                  <textarea id="va-desc" class="field-textarea" rows="5"
+                    placeholder="הוק: &quot;90% מהנשים לא יודעות שזה קיים&quot;&#10;גוף: הסבר על Reformer...&#10;CTA: &quot;בואי לשיעור ניסיון ב-60 ש״ח&quot;"></textarea>
+                </div>
+                <div class="field-row">
+                  <div class="field-group field-half">
+                    <label class="field-label" for="va-format">פורמט</label>
+                    <select id="va-format" class="field-select">
+                      <option value="feed">Feed Reel (4:5)</option>
+                      <option value="trial">Trial Reel</option>
+                      <option value="carousel">Carousel</option>
+                      <option value="story">Story (9:16)</option>
+                      <option value="caption">Caption</option>
+                      <option value="cover">Cover</option>
+                    </select>
+                  </div>
+                  <div class="field-group field-half">
+                    <label class="field-label" for="va-goal">מטרה</label>
+                    <select id="va-goal" class="field-select">
+                      <option value="conversion">המרה — ניסיון</option>
+                      <option value="awareness">מודעות</option>
+                      <option value="retention">שימור</option>
+                    </select>
+                  </div>
+                </div>
+                <button class="btn btn-primary va-btn-submit" id="va-submit">🔍 נתח לפי מוסרי (טקסט)</button>
+              </div>
+              <div class="va-framework-box">
+                <div class="va-fw-title">מסגרת מוסרי — 7 קריטריונים</div>
+                <div class="va-fw-chips">
+                  <span class="va-chip">C1 הוק ×25%</span><span class="va-chip">C2 שליחות ×20%</span>
+                  <span class="va-chip">C3 ערך לזר ×20%</span><span class="va-chip">C4 מבנה ×15%</span>
+                  <span class="va-chip">C5 מקוריות ×10%</span><span class="va-chip">C6 קריאות ×5%</span>
+                  <span class="va-chip">C7 נושא ×5%</span>
+                </div>
+                <div class="va-fw-note">74 עקרונות של מוסרי, ראש אינסטגרם. הציון לא מנבא חשיפה.</div>
+              </div>
+            </div>
+          </details>
+          <div class="va-results-panel" id="va-results-panel">
+            <div id="va-empty-state" class="va-empty" style="display:none"></div>
             <div id="va-result-content" class="va-result-content" style="display:none"></div>
           </div>
         </div>

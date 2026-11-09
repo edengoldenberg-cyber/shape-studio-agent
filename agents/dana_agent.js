@@ -3,9 +3,11 @@ const fs             = require('fs');
 const path           = require('path');
 const os             = require('os');
 const { execFileSync } = require('child_process');
+const { v4: uuidv4 } = require('uuid');
 const OpenAI         = require('openai');
 const logger         = require('../utils/logger');
 const store          = require('../utils/lead_store');
+const videoSvc       = require('../services/video.service');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -479,4 +481,326 @@ function timeSince(date) {
 
 function clearHistory() { danaHistory = []; }
 
-module.exports = { chat, generateContentPack, generateAdCopy, analyzeVideo, clearHistory };
+// ── Video-file analysis (actual video upload pipeline) ────────────────────────
+
+/**
+ * Analyse an actual video file using Dana's Mosseri framework.
+ *
+ * Pipeline:
+ *   1. Save video to DATA_DIR/videos/{id}/
+ *   2. Extract up to 20 evenly-spaced frames with ffmpeg
+ *   3. Transcribe audio with Whisper API (not local GPU)
+ *   4. Send frames + transcript to GPT-4o vision for structured analysis
+ *   5. Run Mosseri C1-C7 scoring via existing analyzeVideo()
+ *   6. Build comprehensive report (initial decision + 8 professional sections +
+ *      timestamped notes + scores + improvement suggestions)
+ *   7. Save report JSON to DATA_DIR and return
+ *
+ * @param {object} opts
+ * @param {Buffer} opts.videoBuffer
+ * @param {string} opts.ext          — file extension without dot
+ * @param {string} [opts.title]
+ * @param {string} [opts.goal]       — leads | awareness | trust | community | other
+ * @param {string} [opts.format]     — feed | trial | story | carousel
+ * @param {string} [opts.audience]
+ * @param {string} [opts.organic_or_paid]
+ * @param {string} [opts.message]    — intended message / CTA
+ * @param {string} [opts.focus_notes]
+ * @param {string} [opts.previousVersionId] — for comparison analysis
+ * @returns {Promise<object>} analysis report
+ */
+async function analyzeVideoFile({
+  videoBuffer,
+  ext           = 'mp4',
+  title         = 'סרטון ללא כותרת',
+  goal          = 'leads',
+  format        = 'feed',
+  audience      = 'נשים 30-60, אזור פרדס חנה-כרכור',
+  organic_or_paid = 'organic',
+  message       = '',
+  focus_notes   = '',
+  previousVersionId = null,
+} = {}) {
+  const id = uuidv4();
+  logger.info('[dana] analyzeVideoFile started', { id, title, format, goal });
+
+  // ── 1. Save video ─────────────────────────────────────────────────────────
+  const videoPath = videoSvc.saveVideoFile(id, videoBuffer, ext);
+  logger.info('[dana] Video saved', { id, path: videoPath, sizeKb: Math.round(videoBuffer.length / 1024) });
+
+  // ── 2. Get metadata ───────────────────────────────────────────────────────
+  let meta = { durationSec: 0, width: 0, height: 0, fps: 30, hasAudio: true };
+  try {
+    meta = await videoSvc.getVideoMeta(videoPath);
+    logger.info('[dana] Video meta', { id, ...meta });
+  } catch (err) {
+    logger.warn('[dana] ffprobe failed — continuing with defaults', { error: err.message });
+  }
+
+  // Reject video exceeding 15 minutes (UI limit is 200 MB / 15 min)
+  if (meta.durationSec > 900) {
+    throw new Error(`הסרטון ארוך מדי (${Math.round(meta.durationSec / 60)} דקות). הגבלה: 15 דקות.`);
+  }
+
+  // ── 3. Extract frames ─────────────────────────────────────────────────────
+  let frames = [];
+  const frameWarnings = [];
+  try {
+    frames = await videoSvc.extractFrames(videoPath, meta.durationSec || 30);
+  } catch (err) {
+    logger.warn('[dana] Frame extraction failed — will analyse without frames', { error: err.message });
+    frameWarnings.push('חילוץ פריימים נכשל — הניתוח מבוסס על שמע ותיאור בלבד.');
+  }
+
+  // ── 4. Transcribe audio ───────────────────────────────────────────────────
+  let transcript = '';
+  const audioWarnings = [];
+  try {
+    transcript = await videoSvc.transcribeAudio(videoPath, meta.hasAudio);
+  } catch (err) {
+    logger.warn('[dana] Transcription failed', { error: err.message });
+    audioWarnings.push('תמלול שמע נכשל — הניתוח מבוסס על תמונה בלבד.');
+  }
+
+  // ── 5. Load previous version for comparison ───────────────────────────────
+  let prevReport = null;
+  if (previousVersionId) {
+    prevReport = videoSvc.loadReport(previousVersionId);
+  }
+
+  // ── 6. GPT-4o full analysis ────────────────────────────────────────────────
+  const contextBlock = [
+    `**כותרת:** ${title}`,
+    `**מטרה:** ${goal}`,
+    `**פורמט:** ${format}`,
+    `**קהל יעד:** ${audience}`,
+    `**פרסום:** ${organic_or_paid}`,
+    message      && `**מסר ו-CTA:** ${message}`,
+    focus_notes  && `**דגשים לבדיקה:** ${focus_notes}`,
+    `**משך:** ${meta.durationSec ? Math.round(meta.durationSec) + ' שניות' : 'לא ידוע'}`,
+    `**רזולוציה:** ${meta.width && meta.height ? `${meta.width}×${meta.height}` : 'לא ידוע'}`,
+    transcript   && `\n**תמלול דיבור:**\n${transcript.slice(0, 4000)}`,
+  ].filter(Boolean).join('\n');
+
+  const prevBlock = prevReport ? `
+---
+## ביקורת גרסה קודמת (להשוואה)
+ציון קודם: ${prevReport.readiness}/100 | פסק דין: ${prevReport.verdict}
+חוזקות שזוהו: ${(prevReport.strengths ?? []).join('; ')}
+תיקונים שהוצעו: ${(prevReport.fixes ?? []).map(f => f.name).join('; ')}
+` : '';
+
+  // Build frame content for vision API
+  const frameContent = frames.map(f => ({
+    type:      'image_url',
+    image_url: { url: `data:image/jpeg;base64,${f.base64}`, detail: 'low' },
+  }));
+
+  const hasFrames   = frames.length > 0;
+  const hasTranscript = transcript.length > 0;
+  const dataNote = !hasFrames && !hasTranscript
+    ? '\n⚠️ לא עלה חומר ויזואלי ואודיו — ניתוח מוגבל.'
+    : !hasFrames ? '\n⚠️ ללא פריימים — ניתוח מבוסס שמע בלבד.'
+    : !hasTranscript ? '\n⚠️ ללא תמלול — ניתוח מבוסס ויזואלי בלבד.'
+    : '';
+
+  const systemMsg = `אתה דנה, מנהלת התוכן הדיגיטלי של Shape Studio.
+אתה מנתחת סרטוני אינסטגרם לפני פרסום ומייצרת ביקורת מקצועית ואמינה.
+
+${DANA_PROMPT}
+
+כלל עמוד עמוד:
+- אל תמציאי נתונים שאינם בסרטון (מחירים, עדויות, ציטוטים).
+- אל תציגי "לא נבדק" כציון אפס — סמני קטגוריה שלא ניתן לבדוק כ"לא נבדק".
+- ציונים מבוססים רק על חומר שנראה/נשמע — לא על הנחות.
+- הגבלות ניתוח: ${dataNote || 'ניתוח מלא (פריימים + שמע)'}`;
+
+  const userMsg = [
+    `נתחי את הסרטון הבא לפני פרסום. הפריימים מחולקים לאורך הסרטון.${dataNote}`,
+    '',
+    contextBlock,
+    prevBlock,
+    '',
+    'החזירי JSON תקין בלבד (ללא טקסט מחוץ ל-JSON) במבנה הבא:',
+    JSON.stringify({
+      perceived_message: 'מה דנה מבינה שהסרטון מנסה להעביר (1-2 משפטים)',
+      message_lands: true,
+      recommendation: 'מוכן לפרסום | דורש תיקונים קלים | דורש עריכה משמעותית',
+      strengths: ['חוזקה 1 עם ראיה', 'חוזקה 2', 'חוזקה 3'],
+      problems: ['בעיה 1 עם הסבר', 'בעיה 2', 'בעיה 3'],
+      sections: {
+        hook:     { finding: 'ממצא', score: 0, max: 10 },
+        message:  { finding: '', score: 0, max: 10 },
+        content:  { finding: '', score: 0, max: 10 },
+        editing:  { finding: '', score: 0, max: 10 },
+        captions: { finding: '', score: 0, max: 10 },
+        audio:    { finding: '', score: 0, max: 10, unverified: false },
+        visuals:  { finding: '', score: 0, max: 10 },
+        cta:      { finding: '', score: 0, max: 10 },
+        platform: { finding: '', score: 0, max: 10 },
+      },
+      timestamps: [
+        { range: '0:00-0:03', observation: '', works: '', problem: '', suggestion: '' },
+      ],
+      mosseri_scores: { C1: 0, C2: 0, C3: 0, C4: 0, C5: 0, C6: 0, C7: 0 },
+      mosseri_flags: [],
+      mosseri_reasonings: { C1: '', C2: '', C3: '', C4: '', C5: '', C6: '', C7: '' },
+      mosseri_strengths: [],
+      mosseri_fixes: [],
+      improvements_must: ['חובה לפני פרסום — מה ולמה'],
+      improvements_recommended: ['שיפור מומלץ'],
+      improvements_experiments: ['ניסוי לגרסה נוספת'],
+      hook_alternatives: ['הוק חלופי 1', 'הוק חלופי 2', 'הוק חלופי 3'],
+      cta_options: ['CTA אפשרות 1', 'CTA אפשרות 2'],
+      edit_plan: [{ order: 1, segment: 'תיאור קטע', duration: '0:00-0:00' }],
+      analysis_limitations: [],
+      comparison: prevReport ? {
+        improved: ['מה השתפר'],
+        still_needs_work: ['מה עדיין דורש עבודה'],
+        new_issues: ['בעיות שנוספו'],
+        score_change: 0,
+      } : null,
+    }, null, 2),
+  ].join('\n');
+
+  let gptData;
+  try {
+    const messages = [
+      { role: 'system', content: systemMsg },
+      {
+        role:    'user',
+        content: hasFrames
+          ? [{ type: 'text', text: userMsg }, ...frameContent]
+          : userMsg,
+      },
+    ];
+
+    const completion = await openai.chat.completions.create({
+      model:           'gpt-4o',
+      messages,
+      temperature:     0.2,
+      max_tokens:      4000,
+      response_format: { type: 'json_object' },
+    });
+    gptData = JSON.parse(completion.choices[0].message.content);
+    logger.info('[dana] GPT-4o analysis complete', { id });
+  } catch (err) {
+    logger.error('[dana] GPT-4o analysis failed', { id, error: err.message });
+    throw new Error('ניתוח GPT-4o נכשל: ' + err.message);
+  }
+
+  // ── 7. Mosseri scoring (runs estimate.py) ─────────────────────────────────
+  const mosseriScores = gptData.mosseri_scores ?? {};
+  const mosseriFlags  = gptData.mosseri_flags  ?? [];
+  const mosseriFormat = format === 'feed' ? 'feed' : format === 'trial' ? 'trial' : format;
+  const estimation    = runEstimate(mosseriScores, mosseriFlags, mosseriFormat);
+
+  // ── 8. Build category scores (1-100 scale) ────────────────────────────────
+  const sections = gptData.sections ?? {};
+  const categoryScores = {
+    hook:     sections.hook?.score     ?? null,
+    message:  sections.message?.score  ?? null,
+    content:  sections.content?.score  ?? null,
+    editing:  sections.editing?.score  ?? null,
+    captions: sections.captions?.score ?? null,
+    audio:    sections.audio?.unverified ? null : (sections.audio?.score ?? null),
+    visuals:  sections.visuals?.score  ?? null,
+    cta:      sections.cta?.score      ?? null,
+    platform: sections.platform?.score ?? null,
+  };
+
+  // ── 9. Enrich Mosseri fixes with doctrine citations ───────────────────────
+  const citeMap = getCitations();
+  const fixes = (gptData.mosseri_fixes ?? []).map(fix => ({
+    ...fix,
+    citation: fix.principleCode ? (citeMap[fix.principleCode] ?? null) : null,
+  }));
+
+  // ── 10. Build timestamps list (verify against duration) ──────────────────
+  const timestamps = (gptData.timestamps ?? []).map(t => ({
+    ...t,
+    approximate: !hasFrames,
+  }));
+
+  // ── 11. Assemble report ───────────────────────────────────────────────────
+  const warnings = [...frameWarnings, ...audioWarnings, ...(gptData.analysis_limitations ?? [])];
+
+  const report = {
+    id,
+    title,
+    createdAt:        new Date().toISOString(),
+    version:          previousVersionId ? ((videoSvc.loadReport(previousVersionId)?.version ?? 1) + 1) : 1,
+    previousVersionId: previousVersionId ?? null,
+    format,
+    goal,
+    audience,
+    organic_or_paid,
+    message,
+    focus_notes,
+
+    // Mosseri framework
+    readiness:        estimation.readiness,
+    verdict:          estimation.verdict,
+    share_direction:  estimation.share_direction ?? null,
+    accuracy:         estimation.accuracy ?? null,
+    mosseri_scores:   mosseriScores,
+    mosseri_flags:    mosseriFlags,
+    flags:            mosseriFlags,
+    strengths:        gptData.mosseri_strengths ?? gptData.strengths ?? [],
+    fixes,
+    reasonings:       gptData.mosseri_reasonings ?? {},
+
+    // Detailed review
+    perceived_message: gptData.perceived_message ?? '',
+    message_lands:     gptData.message_lands ?? null,
+    recommendation:    gptData.recommendation ?? '',
+    report_strengths:  gptData.strengths ?? [],
+    report_problems:   gptData.problems   ?? [],
+    sections,
+    category_scores:   categoryScores,
+    timestamps,
+    improvements_must:         gptData.improvements_must         ?? [],
+    improvements_recommended:  gptData.improvements_recommended  ?? [],
+    improvements_experiments:  gptData.improvements_experiments  ?? [],
+    hook_alternatives:         gptData.hook_alternatives         ?? [],
+    cta_options:               gptData.cta_options               ?? [],
+    edit_plan:                 gptData.edit_plan                 ?? [],
+
+    // Version comparison
+    comparison: gptData.comparison ?? null,
+
+    // Meta
+    videoMeta:  { durationSec: meta.durationSec, width: meta.width, height: meta.height },
+    frameCount: frames.length,
+    hasTranscript: transcript.length > 0,
+    transcript: transcript.slice(0, 2000),
+    warnings,
+  };
+
+  // ── 12. Persist ───────────────────────────────────────────────────────────
+  videoSvc.saveReport(id, report);
+
+  store.logEvent('video_analysis', null, {
+    id,
+    title,
+    format,
+    goal,
+    readiness: estimation.readiness,
+    verdict:   estimation.verdict,
+    version:   report.version,
+  });
+
+  logger.info('[dana] analyzeVideoFile complete', {
+    id,
+    readiness: estimation.readiness,
+    verdict:   estimation.verdict,
+    warnings:  warnings.length,
+  });
+
+  return report;
+}
+
+module.exports = { chat, generateContentPack, generateAdCopy, analyzeVideo, analyzeVideoFile, clearHistory,
+  getVideoHistory: () => videoSvc.listReports(),
+  getVideoReport:  (id) => videoSvc.loadReport(id),
+};

@@ -252,9 +252,465 @@ async function submitVideoAnalysis() {
     toast(`❌ ${err.message}`);
   } finally {
     vaSubmit.disabled = false;
-    vaSubmit.innerHTML = '🔍 נתח לפי מוסרי';
+    vaSubmit.innerHTML = '🔍 נתח לפי מוסרי (טקסט)';
   }
 }
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   VIDEO UPLOAD & FULL ANALYSIS — Dana
+   ══════════════════════════════════════════════════════════════════════════════ */
+
+(function initVideoUpload() {
+  const dropZone      = document.getElementById('vup-drop-zone');
+  const fileInput     = document.getElementById('vup-file-input');
+  const previewWrap   = document.getElementById('vup-preview-wrap');
+  const previewEl     = document.getElementById('vup-preview');
+  const fileInfoEl    = document.getElementById('vup-file-info');
+  const clearBtn      = document.getElementById('vup-clear');
+  const contextGrid   = document.getElementById('vup-context-grid');
+  const submitBtn     = document.getElementById('vup-submit');
+  const progressEl    = document.getElementById('vup-progress');
+  const progressNote  = document.getElementById('vup-progress-note');
+  const errorEl       = document.getElementById('vup-error');
+  const errorMsgEl    = document.getElementById('vup-error-msg');
+  const retryBtn      = document.getElementById('vup-retry');
+  const reportPanel   = document.getElementById('vup-report-panel');
+  const historyPanel  = document.getElementById('vup-history-panel');
+  const historyList   = document.getElementById('vup-history-list');
+  const histRefresh   = document.getElementById('vup-history-refresh');
+  const prevWrap      = document.getElementById('vup-prev-wrap');
+  const prevSel       = document.getElementById('vup-prev');
+
+  let currentFile     = null;
+  let currentAnalysisId = null;
+
+  // ── Allowed formats ─────────────────────────────────────────────────────────
+  const ALLOWED_TYPES  = new Set(['video/mp4','video/quicktime','video/webm','video/x-msvideo','video/x-matroska']);
+  const MAX_SIZE_BYTES = 200 * 1024 * 1024;
+  const MAX_SIZE_LABEL = '200 MB';
+
+  // ── Drop-zone events ─────────────────────────────────────────────────────────
+  dropZone.addEventListener('dragover',  e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+  dropZone.addEventListener('dragleave', ()=> dropZone.classList.remove('drag-over'));
+  dropZone.addEventListener('drop', e => {
+    e.preventDefault();
+    dropZone.classList.remove('drag-over');
+    const f = e.dataTransfer?.files?.[0];
+    if (f) handleFileSelected(f);
+  });
+  dropZone.addEventListener('click',    () => fileInput.click());
+  dropZone.addEventListener('keydown',  e => { if (e.key === 'Enter' || e.key === ' ') fileInput.click(); });
+  fileInput.addEventListener('change',  () => { if (fileInput.files[0]) handleFileSelected(fileInput.files[0]); });
+
+  // ── Clear ────────────────────────────────────────────────────────────────────
+  clearBtn.addEventListener('click', () => {
+    currentFile = null;
+    fileInput.value = '';
+    URL.revokeObjectURL(previewEl.src);
+    previewEl.src = '';
+    previewWrap.style.display  = 'none';
+    contextGrid.style.display  = 'none';
+    dropZone.style.display     = '';
+    hideError();
+  });
+
+  retryBtn.addEventListener('click', () => {
+    hideError();
+    if (currentFile) showContextGrid();
+  });
+
+  // ── File selected ────────────────────────────────────────────────────────────
+  function handleFileSelected(file) {
+    if (!ALLOWED_TYPES.has(file.type) && !file.name.match(/\.(mp4|mov|webm|avi|mkv)$/i)) {
+      showError(`פורמט לא נתמך: ${file.type || file.name}. נתמכים: mp4, mov, webm, avi, mkv`);
+      return;
+    }
+    if (file.size > MAX_SIZE_BYTES) {
+      showError(`הקובץ גדול מדי (${(file.size / 1024 / 1024).toFixed(0)} MB). מגבלה: ${MAX_SIZE_LABEL}`);
+      return;
+    }
+    currentFile = file;
+    hideError();
+
+    // Video preview
+    const url = URL.createObjectURL(file);
+    previewEl.src = url;
+    fileInfoEl.textContent = `${file.name} · ${(file.size / 1024 / 1024).toFixed(1)} MB`;
+    previewWrap.style.display = '';
+    dropZone.style.display    = 'none';
+    showContextGrid();
+  }
+
+  function showContextGrid() {
+    contextGrid.style.display = '';
+    // Auto-fill title from filename
+    const titleEl = document.getElementById('vup-title');
+    if (currentFile && !titleEl.value) {
+      titleEl.value = currentFile.name.replace(/\.[^.]+$/, '').replace(/[_-]/g, ' ');
+    }
+    // Load history for version comparison selector
+    loadHistoryForSelector();
+  }
+
+  // ── Load history into selector ───────────────────────────────────────────────
+  async function loadHistoryForSelector() {
+    try {
+      const { analyses = [] } = await fetch('/api/dana/video-history').then(r => r.json());
+      if (analyses.length === 0) { prevWrap.style.display = 'none'; return; }
+      prevSel.innerHTML = '<option value="">בלי השוואה</option>' +
+        analyses.slice(0, 10).map(a =>
+          `<option value="${esc(a.id)}">${esc(a.title)} — ${a.readiness ?? '?'}/100 (${new Date(a.createdAt).toLocaleDateString('he-IL')})</option>`
+        ).join('');
+      prevWrap.style.display = '';
+    } catch {}
+  }
+
+  // ── Submit ────────────────────────────────────────────────────────────────────
+  submitBtn.addEventListener('click', startAnalysis);
+
+  async function startAnalysis() {
+    if (!currentFile) return;
+    hideError();
+    submitBtn.disabled = true;
+
+    // Show progress
+    contextGrid.style.display  = 'none';
+    previewWrap.style.display  = 'none';
+    progressEl.style.display   = '';
+    reportPanel.style.display  = 'none';
+    setStage('upload');
+
+    try {
+      // 1. Read file as base64 data URI
+      progressNote.textContent = 'קורא קובץ...';
+      const dataUri = await readFileAsDataURI(currentFile);
+
+      setStage('process');
+      progressNote.textContent = 'שולח לשרת לעיבוד פריימים ושמע...';
+
+      // 2. POST to backend
+      const body = {
+        videoData:       dataUri,
+        title:           document.getElementById('vup-title').value.trim()   || currentFile.name,
+        goal:            document.getElementById('vup-goal').value,
+        format:          document.getElementById('vup-format').value,
+        audience:        document.getElementById('vup-audience').value.trim(),
+        organic_or_paid: document.getElementById('vup-paid').value,
+        message:         document.getElementById('vup-message').value.trim(),
+        focus_notes:     document.getElementById('vup-focus').value.trim(),
+        previousVersionId: prevSel.value || null,
+      };
+
+      setStage('analyze');
+      progressNote.textContent = 'דנה מנתחת את הפריימים והשמע...';
+
+      const res = await fetch('/api/dana/analyze-video-upload', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || `שגיאת שרת ${res.status}`);
+      }
+
+      const report = await res.json();
+      currentAnalysisId = report.id;
+
+      setStage('done');
+      progressNote.textContent = 'ניתוח הושלם!';
+
+      await new Promise(r => setTimeout(r, 600));
+
+      // 3. Show report
+      progressEl.style.display = 'none';
+      reportPanel.innerHTML    = renderFullReport(report);
+      reportPanel.style.display = '';
+      reportPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+      // 4. Reload history
+      loadHistory();
+
+    } catch (err) {
+      progressEl.style.display = 'none';
+      showError(err.message || 'שגיאה לא ידועה');
+      previewWrap.style.display = '';
+      contextGrid.style.display = '';
+      submitBtn.disabled = false;
+    }
+  }
+
+  // ── Stages ───────────────────────────────────────────────────────────────────
+  const STAGES = ['upload', 'process', 'analyze', 'done'];
+  function setStage(active) {
+    STAGES.forEach(s => {
+      const el = document.getElementById('vstage-' + s);
+      if (!el) return;
+      el.classList.remove('active', 'done');
+      const idx = STAGES.indexOf(s);
+      const actIdx = STAGES.indexOf(active);
+      if (idx < actIdx) el.classList.add('done');
+      else if (idx === actIdx) el.classList.add('active');
+    });
+  }
+
+  // ── Error helpers ─────────────────────────────────────────────────────────────
+  function showError(msg) {
+    errorMsgEl.textContent = '❌ ' + msg;
+    errorEl.style.display  = '';
+  }
+  function hideError() { errorEl.style.display = 'none'; }
+
+  // ── File reader utility ───────────────────────────────────────────────────────
+  function readFileAsDataURI(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload  = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error('קריאת הקובץ נכשלה'));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  // ── History ───────────────────────────────────────────────────────────────────
+  if (histRefresh) histRefresh.addEventListener('click', loadHistory);
+
+  async function loadHistory() {
+    try {
+      const { analyses = [] } = await fetch('/api/dana/video-history').then(r => r.json());
+      if (analyses.length === 0) {
+        historyPanel.style.display = 'none';
+        return;
+      }
+      historyPanel.style.display = '';
+      historyList.innerHTML = analyses.map(a => {
+        const score = a.readiness ?? 0;
+        const cls   = score >= 75 ? 'high' : score >= 50 ? 'mid' : 'low';
+        const emo   = a.verdict?.includes('לפרסם') ? '✅' : a.verdict?.includes('לגנוז') ? '🚫' : '⚠️';
+        const ver   = a.version > 1 ? ` v${a.version}` : '';
+        return `<div class="vup-history-item" data-id="${esc(a.id)}">
+          <div class="vup-history-verdict">${emo}</div>
+          <div class="vup-history-info">
+            <div class="vup-history-title">${esc(a.title)}${ver}</div>
+            <div class="vup-history-meta">${new Date(a.createdAt).toLocaleString('he-IL')} · ${esc(a.format ?? '')} · ${esc(a.goal ?? '')}</div>
+          </div>
+          <div class="vup-history-score ${cls}">${score}</div>
+        </div>`;
+      }).join('');
+
+      historyList.querySelectorAll('.vup-history-item').forEach(item => {
+        item.addEventListener('click', async () => {
+          try {
+            const id  = item.dataset.id;
+            const rpt = await fetch(`/api/dana/video-history/${id}`).then(r => r.json());
+            reportPanel.innerHTML   = renderFullReport(rpt);
+            reportPanel.style.display = '';
+            reportPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          } catch (e) { toast('❌ לא ניתן לטעון ניתוח: ' + e.message); }
+        });
+      });
+    } catch {}
+  }
+
+  // Load history when Dana tab is opened
+  const danaTabBtn = document.querySelector('[data-tab="dana"]');
+  if (danaTabBtn) {
+    danaTabBtn.addEventListener('click', () => {
+      loadHistory();
+      loadHistoryForSelector();
+    });
+  }
+
+  // ── Report renderer ───────────────────────────────────────────────────────────
+  function renderFullReport(r) {
+    const readiness  = r.readiness ?? 0;
+    const verdictKey = r.verdict?.includes('לפרסם') ? 'publish' : r.verdict?.includes('לגנוז') ? 'shelve' : 'fix';
+    const verdictEmoji = verdictKey === 'publish' ? '✅' : verdictKey === 'shelve' ? '🚫' : '⚠️';
+    const scoreClass = readiness >= 75 ? 'high' : readiness >= 50 ? 'mid' : 'low';
+
+    const sections = [
+      renderDecisionBanner(r, readiness, verdictKey, verdictEmoji, scoreClass),
+      r.warnings?.length ? renderWarnings(r.warnings) : '',
+      renderHighlights(r.report_strengths ?? r.strengths ?? [], r.report_problems ?? []),
+      r.sections         ? renderSections(r.sections)        : '',
+      r.timestamps?.length ? renderTimestamps(r.timestamps)  : '',
+      r.mosseri_scores   ? renderMosseriScores(r.mosseri_scores, r.reasonings ?? {}) : '',
+      renderImprovements(r),
+      renderCreative(r),
+      r.edit_plan?.length ? renderEditPlan(r.edit_plan)      : '',
+      r.comparison        ? renderComparison(r.comparison)   : '',
+    ].filter(Boolean).join('');
+
+    return `<div class="vup-report-wrap panel">${sections}</div>`;
+  }
+
+  function renderDecisionBanner(r, readiness, verdictKey, verdictEmoji, scoreClass) {
+    const metaStr = [
+      r.format && `פורמט: ${r.format}`,
+      r.goal   && `מטרה: ${r.goal}`,
+      r.organic_or_paid,
+      r.version > 1 ? `גרסה ${r.version}` : '',
+    ].filter(Boolean).join(' · ');
+
+    return `<div class="vup-decision">
+      <div class="vup-decision-row">
+        <div class="vup-verdict-badge ${verdictKey}">${verdictEmoji} ${esc(r.verdict ?? '')}</div>
+        <div class="vup-score-ring ${scoreClass}">${readiness}</div>
+        <div class="vup-decision-text">
+          <div style="font-weight:600;font-size:15px">${esc(r.title ?? '')}</div>
+          <div class="vup-perceived-msg">מה דנה מבינה: ${esc(r.perceived_message ?? '')}</div>
+          ${metaStr ? `<div style="font-size:11px;color:var(--muted);margin-top:4px">${esc(metaStr)}</div>` : ''}
+        </div>
+      </div>
+      ${r.recommendation ? `<div style="margin-top:12px;font-size:13px;padding:8px 12px;background:#f8fafc;border-radius:8px;">💡 ${esc(r.recommendation)}</div>` : ''}
+      ${r.share_direction ? `<div style="margin-top:8px;font-size:12px;color:var(--muted)">${esc(r.share_direction)}</div>` : ''}
+      ${r.accuracy ? `<div style="margin-top:4px;font-size:11px;color:var(--muted)">${esc(r.accuracy)}</div>` : ''}
+    </div>`;
+  }
+
+  function renderWarnings(warnings) {
+    return `<div class="vup-warnings">${warnings.map(w => `⚠️ ${esc(w)}`).join('<br>')}</div>`;
+  }
+
+  function renderHighlights(strengths, problems) {
+    if (!strengths.length && !problems.length) return '';
+    const strHtml = strengths.length
+      ? `<ul class="vup-hl-list strengths">${strengths.slice(0,3).map(s=>`<li>✅ ${esc(s)}</li>`).join('')}</ul>` : '';
+    const probHtml = problems.length
+      ? `<ul class="vup-hl-list problems">${problems.slice(0,3).map(p=>`<li>⚠️ ${esc(p)}</li>`).join('')}</ul>` : '';
+    return `<div class="vup-highlights">
+      <div class="vup-hl-block"><h4>חוזקות</h4>${strHtml}</div>
+      <div class="vup-hl-block"><h4>בעיות עיקריות</h4>${probHtml}</div>
+    </div>`;
+  }
+
+  const SECTION_LABELS = {
+    hook: '🎣 פתיחה והוק', message: '💬 מסר ותסריט', content: '🎬 תוכן מצולם',
+    editing: '✂️ עריכה', captions: '📝 כתוביות', audio: '🔊 שמע',
+    visuals: '📸 צילום ונראות', cta: '🚀 סיום והנעה', platform: '📱 התאמה לאינסטגרם',
+  };
+
+  function renderSections(sections) {
+    const cards = Object.entries(sections).map(([key, sec]) => {
+      if (!sec) return '';
+      const label = SECTION_LABELS[key] ?? key;
+      const score = sec.score;
+      const isUnverified = sec.unverified;
+      const badgeCls = isUnverified ? '' : score >= 7 ? 'good' : score >= 5 ? 'ok' : 'bad';
+      const badgeTxt = isUnverified ? 'לא נבדק' : score != null ? `${score}/10` : '—';
+      return `<div class="vup-section-card">
+        <div class="vup-section-card-header">
+          <span class="vup-section-name">${label}</span>
+          <span class="vup-section-score-badge ${badgeCls}">${badgeTxt}</span>
+        </div>
+        <div class="vup-section-finding">${esc(sec.finding ?? '')}</div>
+      </div>`;
+    }).filter(Boolean).join('');
+    return `<div class="vup-sections">${cards}</div>`;
+  }
+
+  function renderTimestamps(timestamps) {
+    if (!timestamps.length) return '';
+    const rows = timestamps.map(t => `<tr>
+      <td>${esc(t.range ?? '')}${t.approximate ? '<span class="vup-ts-approx">(משוער)</span>' : ''}</td>
+      <td>${esc(t.observation ?? '')}</td>
+      <td>${esc(t.works ?? '')}</td>
+      <td>${esc(t.problem ?? '')}</td>
+      <td>${esc(t.suggestion ?? '')}</td>
+    </tr>`).join('');
+    return `<div class="vup-timestamps">
+      <h4>⏱️ הערות לפי זמן</h4>
+      <table class="vup-ts-table">
+        <thead><tr><th>זמן</th><th>מה קורה</th><th>עובד</th><th>בעיה</th><th>הצעה</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+  }
+
+  const MOSSERI_LABELS = { C1: 'הוק ×25%', C2: 'שליחות ×20%', C3: 'ערך לזר ×20%',
+                           C4: 'מבנה ×15%',  C5: 'מקוריות ×10%', C6: 'קריאות ×5%', C7: 'נושא ×5%' };
+
+  function renderMosseriScores(scores, reasonings) {
+    const cards = Object.entries(scores).map(([k, v]) => {
+      const pct = Math.round((v / 5) * 100);
+      const reason = reasonings[k] ?? '';
+      return `<div class="vup-m-score" title="${esc(reason)}">
+        <span class="vup-m-code">${k}</span>
+        <span style="font-size:11px;color:var(--muted);flex:1">${MOSSERI_LABELS[k] ?? k}</span>
+        <div class="vup-m-bar"><div class="vup-m-fill" style="width:${pct}%"></div></div>
+        <span class="vup-m-val">${v}/5</span>
+      </div>`;
+    }).join('');
+    return `<div class="vup-mosseri"><h4>📊 ציוני מוסרי C1-C7</h4><div class="vup-mosseri-grid">${cards}</div></div>`;
+  }
+
+  function renderImprovements(r) {
+    const must = r.improvements_must ?? [];
+    const rec  = r.improvements_recommended ?? [];
+    const exp  = r.improvements_experiments ?? [];
+    if (!must.length && !rec.length && !exp.length) return '';
+    return `<div class="vup-improvements">
+      <h4>🔧 שיפורים מומלצים</h4>
+      ${must.length ? `<div class="vup-imp-group">
+        <div class="vup-imp-group-label">🔴 חובה לפני פרסום</div>
+        <ul class="vup-imp-list must">${must.map(i=>`<li>${esc(i)}</li>`).join('')}</ul>
+      </div>` : ''}
+      ${rec.length ? `<div class="vup-imp-group">
+        <div class="vup-imp-group-label">🟡 שיפורים מומלצים</div>
+        <ul class="vup-imp-list recommended">${rec.map(i=>`<li>${esc(i)}</li>`).join('')}</ul>
+      </div>` : ''}
+      ${exp.length ? `<div class="vup-imp-group">
+        <div class="vup-imp-group-label">🔵 ניסויים לגרסה נוספת</div>
+        <ul class="vup-imp-list experiments">${exp.map(i=>`<li>${esc(i)}</li>`).join('')}</ul>
+      </div>` : ''}
+    </div>`;
+  }
+
+  function renderCreative(r) {
+    const hooks = r.hook_alternatives ?? [];
+    const ctas  = r.cta_options       ?? [];
+    if (!hooks.length && !ctas.length) return '';
+    return `<div class="vup-creative">
+      <div>
+        <h4>🎣 אפשרויות הוק חלופיות</h4>
+        <ul class="vup-alt-list">${hooks.map((h,i)=>`<li><strong>${i+1}.</strong> ${esc(h)}</li>`).join('')}</ul>
+      </div>
+      <div>
+        <h4>🚀 אפשרויות CTA</h4>
+        <ul class="vup-alt-list">${ctas.map((c,i)=>`<li><strong>${i+1}.</strong> ${esc(c)}</li>`).join('')}</ul>
+      </div>
+    </div>`;
+  }
+
+  function renderEditPlan(plan) {
+    if (!plan.length) return '';
+    const items = plan.map((step, i) => `<li>
+      <div class="vup-ep-num">${i+1}</div>
+      <div>
+        <span>${esc(step.segment ?? '')}</span>
+        ${step.duration ? `<span class="vup-ep-dur">${esc(step.duration)}</span>` : ''}
+      </div>
+    </li>`).join('');
+    return `<div class="vup-edit-plan"><h4>🗂️ מתווה עריכה מוצע</h4><ul class="vup-ep-list">${items}</ul></div>`;
+  }
+
+  function renderComparison(c) {
+    if (!c) return '';
+    const delta = c.score_change ?? 0;
+    const cls   = delta > 0 ? 'better' : delta < 0 ? 'worse' : 'same';
+    const sign  = delta > 0 ? '+' : '';
+    return `<div class="vup-comparison">
+      <h4>📈 השוואה לגרסה קודמת</h4>
+      <div class="vup-comp-score-change ${cls}">${sign}${delta} נקודות</div>
+      <div class="vup-comp-lists">
+        <div class="vup-comp-list"><h5>✅ מה השתפר</h5><ul>${(c.improved??[]).map(x=>`<li>${esc(x)}</li>`).join('')}</ul></div>
+        <div class="vup-comp-list"><h5>🔧 עדיין דורש עבודה</h5><ul>${(c.still_needs_work??[]).map(x=>`<li>${esc(x)}</li>`).join('')}</ul></div>
+        <div class="vup-comp-list"><h5>⚠️ בעיות חדשות</h5><ul>${(c.new_issues??[]).map(x=>`<li>${esc(x)}</li>`).join('')}</ul></div>
+      </div>
+    </div>`;
+  }
+
+})(); // end initVideoUpload
 
 /* Video result rendering ──────────────────────────────────────────────────────*/
 function renderResultHTML(data) {

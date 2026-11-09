@@ -603,9 +603,7 @@ app.post('/api/dana/ad-copy', jsonBody, async (req, res) => {
   catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// POST /api/dana/analyze-video — Mosseri-framework content review
-// Body: { description, transcript, format, goal, title }
-// Returns: { review, readiness, verdict, scores, flags, strengths, reasonings }
+// POST /api/dana/analyze-video — Mosseri-framework content review (text-based)
 app.post('/api/dana/analyze-video', jsonBody, async (req, res) => {
   const { description, transcript, format, goal, title } = req.body ?? {};
   if (!description && !transcript) {
@@ -617,6 +615,77 @@ app.post('/api/dana/analyze-video', jsonBody, async (req, res) => {
     logger.error('Dana analyze-video error', { error: err.message });
     res.status(500).json({ error: err.message });
   }
+});
+
+// ── Dana video file upload + analysis ─────────────────────────────────────────
+//
+// POST /api/dana/analyze-video-upload
+//   Body (JSON, up to 200 MB): {
+//     videoData: "data:video/mp4;base64,...",
+//     title, goal, format, audience, organic_or_paid, message, focus_notes,
+//     previousVersionId (optional — for version comparison)
+//   }
+//
+// GET  /api/dana/video-history       — list all saved analyses
+// GET  /api/dana/video-history/:id   — load one analysis report
+
+const videoJsonBody = express.json({ limit: '200mb' });
+
+app.post('/api/dana/analyze-video-upload', videoJsonBody, async (req, res) => {
+  const {
+    videoData, title, goal, format, audience,
+    organic_or_paid, message, focus_notes, previousVersionId,
+  } = req.body ?? {};
+
+  if (!videoData) return res.status(400).json({ error: 'videoData (base64) חסר' });
+
+  // Parse data URI: data:video/mp4;base64,XXXX
+  const match = videoData.match(/^data:(video\/[a-zA-Z0-9]+);base64,(.+)$/);
+  if (!match) return res.status(400).json({ error: 'פורמט videoData לא תקין — נדרש data URI' });
+
+  const [, mimeType, b64] = match;
+  const extMap = { 'video/mp4': 'mp4', 'video/quicktime': 'mov', 'video/webm': 'webm',
+                   'video/x-msvideo': 'avi', 'video/avi': 'avi', 'video/x-matroska': 'mkv' };
+  const ext    = extMap[mimeType] ?? 'mp4';
+  const buffer = Buffer.from(b64, 'base64');
+
+  // 200 MB hard cap (larger files risk Railway memory / timeout)
+  if (buffer.length > 200 * 1024 * 1024) {
+    return res.status(413).json({ error: `הקובץ גדול מדי (${Math.round(buffer.length / 1024 / 1024)} MB). מגבלה: 200 MB.` });
+  }
+
+  logger.info('[dana] Video upload received', {
+    sizeKb: Math.round(buffer.length / 1024), ext, title: title?.slice(0, 40),
+  });
+
+  try {
+    const report = await danaAgent.analyzeVideoFile({
+      videoBuffer: buffer, ext,
+      title:            title        ?? 'סרטון ללא כותרת',
+      goal:             goal         ?? 'leads',
+      format:           format       ?? 'feed',
+      audience:         audience     ?? 'נשים 30-60, אזור פרדס חנה-כרכור',
+      organic_or_paid:  organic_or_paid ?? 'organic',
+      message:          message      ?? '',
+      focus_notes:      focus_notes  ?? '',
+      previousVersionId: previousVersionId ?? null,
+    });
+    res.json(report);
+  } catch (err) {
+    logger.error('[dana] analyze-video-upload error', { error: err.message });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/dana/video-history', (_req, res) => {
+  try { res.json({ analyses: danaAgent.getVideoHistory() }); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/dana/video-history/:id', (req, res) => {
+  const report = danaAgent.getVideoReport(req.params.id);
+  if (!report) return res.status(404).json({ error: 'ניתוח לא נמצא' });
+  res.json(report);
 });
 
 // ── Barak routes ──────────────────────────────────────────────────────────────
