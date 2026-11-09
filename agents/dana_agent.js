@@ -235,14 +235,23 @@ function markStaleReports() {
     scanned++;
     try {
       const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
-      if (report.scoreScaleInvalid === true) { alreadyMarked++; continue; }
+      if (report.scoreScaleInvalid === true || report.staleSchemaAnchored === true) { alreadyMarked++; continue; }
 
       const scores = report.mosseri_scores ?? {};
-      const hasInvalidScale = Object.values(scores).some(v => typeof v === 'number' && v > 5);
-      if (!hasInvalidScale) continue;
+      const ANCHOR = { C1: 3, C2: 2, C3: 3, C4: 3, C5: 2, C6: 4, C7: 4 };
+      const hasInvalidScale   = Object.values(scores).some(v => typeof v === 'number' && v > 5);
+      const hasSchemaAnchor   = Object.entries(ANCHOR).every(([k, v]) => scores[k] === v);
 
-      report.scoreScaleInvalid = true;
-      report.scoreScaleNote    = 'ציונים C1-C7 בדוח זה הוחזרו בסקאלה 0-100 במקום 0-5. הציון לא תקף. ניתן לנתח מחדש.';
+      if (!hasInvalidScale && !hasSchemaAnchor) continue;
+
+      if (hasInvalidScale) {
+        report.scoreScaleInvalid = true;
+        report.scoreScaleNote    = 'ציונים C1-C7 בדוח זה הוחזרו בסקאלה 0-100 במקום 0-5. הציון לא תקף. ניתן לנתח מחדש.';
+      }
+      if (hasSchemaAnchor && !hasInvalidScale) {
+        report.staleSchemaAnchored = true;
+        report.staleSchemaNote     = 'ציוני C1-C7 זהים לדוגמת ה-schema (schema-anchoring שתוקן ב-commit 354b17a). הדוח לא תקף.';
+      }
       fs.writeFileSync(reportPath, JSON.stringify(report, null, 2), 'utf8');
       marked++;
       logger.warn('[dana] Stale report marked', { id, scores });
@@ -943,68 +952,53 @@ async function analyzeVideoFile({
     '- אין להמציא currentText אם אין ציטוט ממשי מהסרטון.',
   ].join('\n');
 
-  const schemaExample = JSON.stringify({
-    perceived_message: '1-2 משפטים',
-    message_lands: true,
-    recommendation: 'מוכן לפרסום | דורש תיקונים קלים | דורש עריכה משמעותית',
-    strengths: ['חוזקה עם ראיה'],
-    problems:  ['בעיה עם הסבר'],
-    sections: {
-      hook:     { finding: '', score: 0, unverified: false },
-      message:  { finding: '', score: 0, unverified: false },
-      content:  { finding: '', score: 0, unverified: false },
-      editing:  { finding: '', score: null, unverified: true,
-                  note: 'לא נבדק — פריימים מדגמיים אינם מוכיחים קצב חיתוכים' },
-      captions: { finding: '', score: 0, unverified: false },
-      audio:    { finding: '', score: null, unverified: true,
-                  note: 'שמע: תמלול בלבד. איזון מוזיקה, ניקיון ורעשים — לא נבדקו.',
-                  speech_text: 'הטקסט הנאמר (מתמלול)' },
-      visuals:  { finding: '', score: 0, unverified: false },
-      cta:      { finding: '', score: 0, unverified: false },
-      platform: { finding: '', score: 0, unverified: false },
-    },
-    // timestamps MUST be anchored to real frame times or Whisper timestamps.
-    // Format: "X:XX" where X:XX maps to actual seconds in the video.
-    timestamps: [{ range: '0:00-0:05', observation: '', works: '', problem: '', suggestion: '', anchor: 'frame' }],
-    // !! PLACEHOLDER ZEROS — replace every 0 with your actual integer 0-5 per rubric.
-    // !! Do NOT copy these zeros or any other score from this template.
-    mosseri_scores: { C1: 0, C2: 0, C3: 0, C4: 0, C5: 0, C6: 0, C7: 0 },
-    mosseri_flags: [],
-    mosseri_reasonings: { C1: 'משפט אחד עם ראיה מהסרטון', C2: 'ראיה', C3: 'ראיה', C4: 'ראיה', C5: 'ראיה', C6: 'ראיה', C7: 'ראיה' },
-    mosseri_strengths: [],
-    // mosseri_fixes: up to 3, ordered by impact (highest weight × gap first).
-    // principleCode: use a code from the doctrine chapters you received (e.g. RANK-5, HOOK-2, SEND-3).
-    // fixType:  "rewrite"    → principleCode + currentText (verbatim quote) + suggestedRewrite + explanation
-    //           "visual"     → principleCode + action (specific to THIS video) + evidence (timestamp from frames) + explanation
-    //           "structural" → principleCode + action + evidence + explanation
-    // Never copy action/evidence/currentText from these placeholders. All text must come from the actual video.
-    mosseri_fixes: [
-      {
-        principleCode: 'RANK-N',
-        fixType: 'rewrite',
-        name: 'שם התיקון הספציפי לסרטון',
-        currentText: 'ציטוט מילולי מהתמלול של הסרטון הזה',
-        suggestedRewrite: 'השכתוב בקול של היוצר של הסרטון הזה',
-        explanation: 'הסבר אחד מה הבעיה',
-      },
-      {
-        principleCode: 'RANK-M',
-        fixType: 'visual',
-        name: 'שם התיקון הספציפי לסרטון',
-        currentText: null,
-        action: 'פעולה ספציפית לסרטון הזה (לא עותק מתבנית)',
-        evidence: 'timestamp או תיאור פריים ספציפי מהסרטון הזה',
-        explanation: 'הסבר אחד',
-      },
-    ],
-    improvements_must: [],
-    improvements_recommended: [],
-    improvements_experiments: [],
-    hook_alternatives: ['הוק 1', 'הוק 2', 'הוק 3'],
-    cta_options: ['CTA 1', 'CTA 2'],
-    edit_plan: [{ order: 1, segment: '', duration: '0:00-0:00' }],
-    analysis_limitations: [],
-  }, null, 2);
+  // Schema specification — field names and types ONLY, no example values.
+  // Using prose description instead of JSON.stringify avoids model anchoring on numeric examples.
+  const schemaSpec = [
+    '## סכמת פלט — שמות שדות וטיפוסים. אל תכניסי ערכים מקבילים לאלה שרשומים כאן.',
+    '',
+    'כל התוכן חייב להגיע מהסרטון הספציפי הזה — פריימים שנשלחו, Whisper, וראיה חזותית.',
+    '',
+    'שדות ראשיים:',
+    '  perceived_message: string(1-2 משפטים מה הסרטון אומר)',
+    '  message_lands: boolean',
+    '  recommendation: אחת מ: "מוכן לפרסום" | "דורש תיקונים קלים" | "דורש עריכה משמעותית"',
+    '  strengths: array of string (חוזקות מהסרטון עם ראיה)',
+    '  problems:  array of string (בעיות עם הסבר)',
+    '',
+    'sections — אובייקט עם המפתחות: hook, message, content, editing, captions, audio, visuals, cta, platform',
+    '  כל מפתח: { finding: string, score: integer 0-5 | null, unverified: boolean }',
+    '  editing:  score=null, unverified=true (פריימים לא מוכיחים קצב חיתוכים)',
+    '  audio:    score=null, unverified=true, speech_text: תמלול מ-Whisper',
+    '',
+    'timestamps: array of { range: "M:SS-M:SS", observation: string, works: string,',
+    '  problem: string, suggestion: string, anchor: "frame"|"whisper", approximate: boolean }',
+    '  — רק timestamps מפריים שנשלחו בפועל או מ-Whisper. אין להמציא זמנים.',
+    '',
+    'mosseri_scores: { C1: integer, C2: integer, C3: integer, C4: integer, C5: integer, C6: integer, C7: integer }',
+    '  — כל ערך: מספר שלם 0-5 בלבד, לפי המחוון שקיבלת לסרטון זה. לא ברירת מחדל.',
+    '  — ציון שונה לכל קריטריון לפי מה שנראה/נשמע בפועל.',
+    '',
+    'mosseri_flags: array (ריק אם אין) — ערכים אפשריים: "wordmark"|"aggregated"|"reupload"|"unpaid_promise"|"ai_slick"',
+    'mosseri_reasonings: { C1..C7: string — משפט אחד עם ראיה ספציפית מהסרטון הזה }',
+    'mosseri_strengths: array of string',
+    '',
+    'mosseri_fixes: array, עד 3 תיקונים, מסודרים לפי (משקל קריטריון × פער מ-5) בסרטון הזה:',
+    '  כל fix חייב:',
+    '    principleCode: string — קוד מהפרקים שקיבלת (לא קוד שלא הופיע בדוקטרינה שנשלחה)',
+    '    fixType: "rewrite" | "visual" | "structural"',
+    '    name: string',
+    '    explanation: string',
+    '  rewrite בלבד: currentText (ציטוט מילולי מדויק מהתמלול), suggestedRewrite (מוכן לשימוש)',
+    '  visual/structural בלבד: action (ספציפי לסרטון), evidence (timestamp מפריים שנשלחו)',
+    '  currentText=null עבור visual/structural. אין להמציא ציטוטים.',
+    '',
+    'improvements_must: array | improvements_recommended: array | improvements_experiments: array',
+    'hook_alternatives: array of 3 strings',
+    'cta_options: array of 2 strings',
+    'edit_plan: array of { order: integer, segment: string, duration: "M:SS-M:SS" }',
+    'analysis_limitations: array of string',
+  ].join('\n');
 
   const userMsg = [
     `נתחי את הסרטון הבא לפני פרסום.`,
@@ -1013,9 +1007,9 @@ async function analyzeVideoFile({
     contextBlock,
     prevBlock,
     '',
-    '⚠️ פורמט תשובה — JSON תקין בלבד (ללא טקסט מחוץ ל-JSON):',
-    '⚠️ חשוב: הדוגמה הבאה מכילה PLACEHOLDER בלבד. mosseri_scores: כל ה-0 הם placeholders — החלפי כל אחד בציון 0-5 האמיתי שלך לפי המחוון. RANK-N ו-RANK-M הם placeholders — החלפי בקוד עיקרון אמיתי מהדוקטרינה שקיבלת. כל הטקסטים בשדות action/evidence/currentText הם placeholders — החלפי בתוכן מהסרטון הזה בלבד.',
-    schemaExample,
+    schemaSpec,
+    '',
+    'החזירי JSON תקין בלבד (ללא טקסט מחוץ ל-JSON) עם כל השדות שמפורטים למעלה.',
   ].join('\n');
 
   // Build GPT-4o vision content: text + labeled frames

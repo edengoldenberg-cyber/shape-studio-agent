@@ -553,6 +553,16 @@ async function submitVideoAnalysis() {
     });
   }
 
+  // Load and display a report by ID (used by stale-report "פתח דוח חדש" links)
+  window.loadReportById = async function(id) {
+    try {
+      const rpt = await fetch(`/api/dana/video-history/${id}`).then(r => r.json());
+      reportPanel.innerHTML   = renderFullReport(rpt);
+      reportPanel.style.display = '';
+      reportPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (e) { alert('שגיאה בטעינת הדוח: ' + e.message); }
+  };
+
   // ── Report renderer ───────────────────────────────────────────────────────────
   function renderVideoPlayer(id) {
     if (!id) return '';
@@ -584,12 +594,22 @@ async function submitVideoAnalysis() {
     const verdictEmoji = verdictKey === 'publish' ? '✅' : verdictKey === 'shelve' ? '🚫' : '⚠️';
     const scoreClass = readiness >= 75 ? 'high' : readiness >= 50 ? 'mid' : 'low';
 
-    // Stale-score notice (before the main report)
+    // Stale-score notice — covers two distinct bug types, shown before the report
+    function staleLink(newId) {
+      if (!newId) return '';
+      return ` <a href="#" onclick="event.preventDefault();loadReportById('${esc(newId)}')" style="font-weight:600">פתח דוח חדש ›</a>`;
+    }
     const staleNotice = r.scoreScaleInvalid
       ? `<div style="background:#fff3cd;border:1px solid #ffc107;border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:13px">
-          ⚠️ <strong>ציוני C1–C7 בדוח זה אינם תקפים</strong> — הוחזרו בסקאלה 0-100 במקום 0-5 (באג שתוקן). ציון המוכנות שגוי. <em>מומלץ לנתח מחדש.</em>
+           ⚠️ <strong>ציוני C1–C7 בדוח זה אינם תקפים</strong> — הוחזרו בסקאלה 0-100 במקום 0-5 (באג שתוקן). ציון המוכנות שגוי.
+           ${staleLink(r.replacedByJobId)} <em>מומלץ לנתח מחדש.</em>
          </div>`
-      : '';
+      : r.staleSchemaAnchored
+        ? `<div style="background:#fff3cd;border:1px solid #ffc107;border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:13px">
+             ⚠️ <strong>ציוני C1–C7 בדוח זה הושפעו מהטיית-דוגמה</strong> — המודל העתיק ערכי placeholder מהתבנית (באג שתוקן ב-commit 354b17a). הציון לא משקף את הסרטון.
+             ${staleLink(r.replacedByJobId)} <em>מומלץ לנתח מחדש.</em>
+           </div>`
+        : '';
 
     const sections = [
       staleNotice,

@@ -894,21 +894,21 @@ app.get('/api/dana/video/:id', (req, res) => {
   }
 });
 
-// Stale-report audit: mark old reports that used wrong 0-100 score scale.
-// GET returns current status; POST triggers a rescan.
+// Stale-report audit: mark old reports that used wrong score scale or schema anchoring.
+// GET returns current status (both bug types). POST triggers a rescan.
 app.get('/api/dana/reports/audit', (_req, res) => {
   try {
     const history = danaAgent.getVideoHistory();
     const stale   = history.filter(r => {
       const full = danaAgent.getVideoReport(r.id);
-      return full?.scoreScaleInvalid === true;
+      return full?.scoreScaleInvalid === true || full?.staleSchemaAnchored === true;
     });
     res.json({
       total:        history.length,
       staleCount:   stale.length,
       staleIds:     stale.map(r => r.id),
       note:         stale.length > 0
-        ? `${stale.length} דוח/ות עם ציוני C1-C7 בסקאלה 0-100 שגויה. ציוניהם לא תקפים. הצע ניתוח מחדש.`
+        ? `${stale.length} דוח/ות עם ציונים לא תקפים (סקאלה שגויה או schema-anchoring). הצע ניתוח מחדש.`
         : 'כל הדוחות תקינים.',
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -917,7 +917,26 @@ app.get('/api/dana/reports/audit', (_req, res) => {
 app.post('/api/dana/reports/audit', jsonBody, (_req, res) => {
   try {
     const result = danaAgent.markStaleReports();
-    res.json({ ...result, note: 'סריקה הושלמה. דוחות פגומים סומנו ב-scoreScaleInvalid: true.' });
+    res.json({ ...result, note: 'סריקה הושלמה. דוחות פגומים סומנו.' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Mark a specific report as stale (schema-anchored) with optional replacedByJobId.
+// PATCH /api/dana/reports/:id/mark-stale { staleSchemaAnchored: true, replacedByJobId?: string }
+app.patch('/api/dana/reports/:id/mark-stale', jsonBody, (req, res) => {
+  const id = req.params.id;
+  const videoSvc = require('./services/video.service');
+  const dataDir  = videoSvc.DATA_DIR_FN();
+  const rptPath  = require('path').join(dataDir, 'videos', id, 'report.json');
+  if (!require('fs').existsSync(rptPath)) return res.status(404).json({ error: 'Report not found' });
+  try {
+    const r = JSON.parse(require('fs').readFileSync(rptPath, 'utf8'));
+    if (req.body?.staleSchemaAnchored) r.staleSchemaAnchored = true;
+    if (req.body?.scoreScaleInvalid)   r.scoreScaleInvalid   = true;
+    if (req.body?.replacedByJobId)     r.replacedByJobId     = req.body.replacedByJobId;
+    if (req.body?.staleSchemaNote)     r.staleSchemaNote     = req.body.staleSchemaNote;
+    require('fs').writeFileSync(rptPath, JSON.stringify(r, null, 2), 'utf8');
+    res.json({ id, marked: true, replacedByJobId: r.replacedByJobId ?? null });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
