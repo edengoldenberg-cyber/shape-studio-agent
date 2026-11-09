@@ -496,8 +496,96 @@ async function boundedRepairFixes(flaggedFixes, sentChapterCodes, doctrineText, 
  *   - note: explains "not applicable" vs "passed"
  *
  * "passed:true with citations_in_review=0" is reported honestly as "not applicable".
+ * Falls back to runCiteCheckJS when Python is unavailable (ENOENT).
  * Never throws.
  */
+
+/**
+ * JavaScript port of cite_check.py --review mode.
+ * Checks that every attributed Mosseri quote in the review exists verbatim
+ * (normalized) in doctrine.md on the stated date.
+ * Used as primary validator when Python is unavailable on the runtime platform.
+ */
+function runCiteCheckJS(reviewText, fixes) {
+  const validFixCount = (fixes ?? []).filter(f => f.codeValid && !f.codeExcluded).length;
+  const excludedFixes = (fixes ?? []).filter(f => f.codeExcluded).map(f =>
+    `${f.originalCode ?? f.principleCode ?? '?'}: ${f.excludeReason}`
+  );
+
+  // Quote pattern in review text: מוסרי|Mosseri, DD.MM.YYYY: "..."
+  const REVIEW_QUOTE_RE = /(?:מוסרי|Mosseri)[,،]?\s*(\d{2}\.\d{2}\.\d{4})\s*:\s*[“”"]([^“”"]+)[“”"]/g;
+  const reviewQuotes    = [...(reviewText ?? '').matchAll(REVIEW_QUOTE_RE)];
+  const citationsInReview = reviewQuotes.length;
+
+  if (citationsInReview === 0) {
+    return {
+      recommendations_generated:  (fixes ?? []).length,
+      recommendations_code_valid:  validFixCount,
+      recommendations_excluded:    excludedFixes,
+      citations_in_review:         0,
+      cite_check_ran:              false,
+      cite_check_applicable:       false,
+      status:                      'not_applicable',
+      passed:                      null,
+      failures:                    [],
+      note: 'No attributed Mosseri citations in review text — cite_check not applicable. Zero citations found, zero verified.',
+    };
+  }
+
+  // Normalize: lowercase, strip non-word (quotes disappear, punctuation gone)
+  function norm(s) {
+    return s.toLowerCase()
+      .replace(/[‘’‚‛]/g, "'")
+      .replace(/[^a-z0-9' ]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  // Parse doctrine citations: [DD.MM.YYYY · SHORTCODE · location] "verbatim quote"
+  const DOCTRINE_CITE_RE = /\[(\d{2})\.(\d{2})\.(\d{4}) · [A-Za-z0-9_-]{9,14} · [^\]]+\] "([^"]+)"/g;
+  const doctrineText = _loadDoctrineText();
+  const corpus  = [];
+  const byDate  = {};
+  for (const m of doctrineText.matchAll(DOCTRINE_CITE_RE)) {
+    const [, dd, mo, yy, quote] = m;
+    const date = `${dd}.${mo}.${yy}`;
+    const nq   = norm(quote);
+    corpus.push(nq);
+    (byDate[date] ??= []).push(nq);
+  }
+  const corpusStr = corpus.join(' | ');
+
+  const failures = [];
+  let checked = 0;
+  for (const m of reviewQuotes) {
+    const [, date, quote] = m;
+    const nq = norm(quote);
+    checked++;
+    if (!corpusStr.includes(nq)) {
+      failures.push(`review quote not in doctrine: "${quote.slice(0, 70)}"`);
+    } else if (!(byDate[date] ?? []).some(dq => dq.includes(nq))) {
+      failures.push(`review quote exists but not on ${date}: "${quote.slice(0, 70)}"`);
+    }
+  }
+
+  const passed = failures.length === 0;
+  logger.info('[dana] cite_check (JS): done', { checked, failures: failures.length });
+  return {
+    recommendations_generated:  (fixes ?? []).length,
+    recommendations_code_valid:  validFixCount,
+    recommendations_excluded:    excludedFixes,
+    citations_in_review:         citationsInReview,
+    cite_check_ran:              true,
+    cite_check_applicable:       true,
+    status:                      passed ? 'passed' : 'failed',
+    passed,
+    failures,
+    checked,
+    implementation:              'js',
+    note: `Verified ${checked} attributed Mosseri quote${checked !== 1 ? 's' : ''} against doctrine.md (JavaScript — Python unavailable on this platform)`,
+  };
+}
+
 function runCiteCheck(reviewText, fixes) {
   // Count attributed Mosseri quotes in the review text
   const citationsInReview = (reviewText?.match(/(?:מוסרי|Mosseri)[,،]?\s*\d{2}\.\d{2}\.\d{4}\s*:/g) ?? []).length;
@@ -546,21 +634,20 @@ function runCiteCheck(reviewText, fixes) {
     const stderr   = err.stderr ?? err.message ?? '';
     const failures = stderr.split('\n').filter(l => l.includes('FAIL'));
     const pyMissing = err.code === 'ENOENT' || stderr.includes('No such file') || stderr.includes('not found');
-    const ranOk     = !pyMissing;
-    const passed    = ranOk && failures.length === 0;
     if (pyMissing) {
-      logger.warn('[dana] cite_check: Python not available', { PYTHON_BIN });
-    } else {
-      logger.warn('[dana] cite_check: verification failed', { failures: failures.slice(0, 3) });
+      logger.info('[dana] cite_check: Python unavailable, falling back to JS implementation', { PYTHON_BIN });
+      return runCiteCheckJS(reviewText, fixes);
     }
+    const passed    = failures.length === 0;
+    logger.warn('[dana] cite_check: verification failed', { failures: failures.slice(0, 3) });
     return {
       recommendations_generated:  (fixes ?? []).length,
       recommendations_code_valid:  validFixCount,
       recommendations_excluded:    excludedFixes,
       citations_in_review:         citationsInReview,
-      cite_check_ran:              ranOk,
+      cite_check_ran:              true,
       cite_check_applicable:       true,
-      status:                      pyMissing ? 'execution_error' : passed ? 'passed' : 'failed',
+      status:                      passed ? 'passed' : 'failed',
       passed,
       failures,
       note:                        pyMissing ? 'Python not available on this platform — cite_check could not run' : undefined,
@@ -1772,4 +1859,5 @@ module.exports = {
   flagForRepairOrExclude,
   boundedRepairFixes,
   runCiteCheck,
+  runCiteCheckJS,
 };

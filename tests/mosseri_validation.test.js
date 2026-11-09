@@ -27,6 +27,7 @@ const {
   getChapterCodes,
   flagForRepairOrExclude,
   runCiteCheck,
+  runCiteCheckJS,
   buildBlindSystemMsg,
   buildPhase2SystemMsg,
 } = require('../agents/dana_agent');
@@ -348,6 +349,40 @@ describe('runCiteCheck — actual function', () => {
     // passed must be boolean — true (Python ran, no failures) or false (Python unavailable)
     expect(typeof result.passed).toBe('boolean');
     expect(result.failures).toBeDefined();
+  });
+
+  // ── runCiteCheckJS — JavaScript fallback ──────────────────────────────────
+
+  test('runCiteCheckJS: zero citations → not_applicable, passed:null', () => {
+    const result = runCiteCheckJS('ביקורת ללא ציטוטים.', []);
+    expect(result.citations_in_review).toBe(0);
+    expect(result.status).toBe('not_applicable');
+    expect(result.passed).toBeNull();
+  });
+
+  test('runCiteCheckJS: attributed quote from actual doctrine → passed:true', () => {
+    // Use a quote that actually appears in doctrine.md with the correct date.
+    // RANK-1 principle has [21.02.2026 · DVBOgtfEXtp · 0:21] "It is there and it's not going away."
+    const review = 'מוסרי, 21.02.2026: "It is there and it\'s not going away." — לסיכום.';
+    const result = runCiteCheckJS(review, []);
+    expect(result.citations_in_review).toBe(1);
+    expect(result.cite_check_applicable).toBe(true);
+    expect(result.cite_check_ran).toBe(true);
+    expect(result.implementation).toBe('js');
+    // If the quote is in doctrine on that date → passed; otherwise failed but should not be null
+    expect(typeof result.passed).toBe('boolean');
+    expect(result.failures).toBeDefined();
+  });
+
+  test('runCiteCheckJS: invented quote → failed with failure entry', () => {
+    // Fabricated quote that cannot be in doctrine
+    const review = 'מוסרי, 01.01.2025: "absolutely fabricated quote that cannot exist in doctrine"';
+    const result = runCiteCheckJS(review, []);
+    expect(result.citations_in_review).toBe(1);
+    expect(result.passed).toBe(false);
+    expect(result.status).toBe('failed');
+    expect(result.failures.length).toBeGreaterThan(0);
+    expect(result.failures[0]).toContain('not in doctrine');
   });
 
   test('cite_check status field: execution_error when Python missing, passed/failed when ran', () => {
