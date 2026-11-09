@@ -16,15 +16,25 @@
  *   - If ffprobe fails, durationSec is null — no fake default is used.
  */
 
-const path         = require('path');
-const fs           = require('fs');
-const os           = require('os');
-const ffmpegPath   = require('@ffmpeg-installer/ffmpeg').path;
-const ffmpeg       = require('fluent-ffmpeg');
-const OpenAI       = require('openai');
-const logger       = require('../utils/logger');
+const path           = require('path');
+const fs             = require('fs');
+const os             = require('os');
+const ffmpegPath     = require('@ffmpeg-installer/ffmpeg').path;
+const ffprobePath    = require('@ffprobe-installer/ffprobe').path;
+const ffmpeg         = require('fluent-ffmpeg');
+const OpenAI         = require('openai');
+const logger         = require('../utils/logger');
 
+// Set both binaries explicitly — @ffmpeg-installer only bundles ffmpeg, not ffprobe.
+// Without setFfprobePath, fluent-ffmpeg falls back to PATH which may not have ffprobe
+// on Railway's container image.
 ffmpeg.setFfmpegPath(ffmpegPath);
+ffmpeg.setFfprobePath(ffprobePath);
+
+logger.info('[video-service] ffmpeg + ffprobe paths set', {
+  ffmpeg:  ffmpegPath,
+  ffprobe: ffprobePath,
+});
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
