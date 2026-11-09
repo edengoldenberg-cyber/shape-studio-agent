@@ -723,6 +723,67 @@ app.post('/api/dana/analyze-video-upload',
   }
 );
 
+// Reprocess a saved video — retries analysis on a previously uploaded file without re-uploading.
+// Use when the original analysis failed (e.g. ffprobe missing) but the video file was saved.
+app.post('/api/dana/analysis-job/:id/retry', jsonBody, async (req, res) => {
+  const id  = req.params.id;
+  const job = danaAgent.getJob(id);
+  if (!job) return res.status(404).json({ error: 'Job לא נמצא' });
+  if (job.status === 'completed') return res.status(409).json({ error: 'Job הושלם בהצלחה — אין צורך בניסיון חוזר' });
+
+  // Find the saved video file
+  const videoSvc  = require('./services/video.service');
+  const dataDir   = videoSvc.DATA_DIR_FN();
+  const videoDir  = require('path').join(dataDir, 'videos', id);
+  if (!require('fs').existsSync(videoDir)) {
+    return res.status(404).json({ error: 'תיקיית הסרטון לא נמצאה — יש להעלות שוב' });
+  }
+
+  // Find the video file (video.mp4, video.mov, etc.)
+  const files   = require('fs').readdirSync(videoDir).filter(f => f.startsWith('video.'));
+  if (files.length === 0) {
+    return res.status(404).json({ error: 'קובץ הסרטון לא נמצא — יש להעלות שוב' });
+  }
+
+  const videoFile = files[0];
+  const videoPath = require('path').join(videoDir, videoFile);
+  const ext       = videoFile.split('.').pop() ?? 'mp4';
+  const prevMeta  = job.title ? { title: job.title } : {};
+
+  logger.info('[dana] Retrying failed job', { id, videoPath, ext });
+  res.json({ jobId: id, status: 'retrying', videoFile, videoPath });
+
+  // Reset job and re-run analysis
+  danaAgent.updateJob(id, { status: 'running', stage: 'meta', note: 'מנסה שוב...', error: null });
+
+  setImmediate(async () => {
+    try {
+      const { title, goal, format, audience, organic_or_paid, message, focus_notes } = req.body ?? {};
+      const report = await danaAgent.analyzeVideoFile({
+        videoPath,
+        id,
+        ext,
+        title:            title            ?? prevMeta.title ?? 'סרטון ללא כותרת',
+        goal:             goal             ?? 'leads',
+        format:           format           ?? 'feed',
+        audience:         audience         ?? '',
+        organic_or_paid:  organic_or_paid  ?? 'organic',
+        message:          message          ?? '',
+        focus_notes:      focus_notes      ?? '',
+        onProgress: (stage, note) => danaAgent.updateJob(id, { status: 'running', stage, note }),
+      });
+      danaAgent.updateJob(id, {
+        status: 'completed', stage: 'done',
+        note:   `ניתוח הושלם — ציון ${report.readiness}/100`,
+        result: { id, readiness: report.readiness, verdict: report.verdict },
+      });
+    } catch (err) {
+      logger.error('[dana] retry failed', { id, error: err.message });
+      danaAgent.updateJob(id, { status: 'failed', stage: 'error', error: err.message });
+    }
+  });
+});
+
 // Poll job status
 app.get('/api/dana/analysis-job/:id', (req, res) => {
   const job = danaAgent.getJob(req.params.id);
