@@ -966,34 +966,35 @@ async function analyzeVideoFile({
     // timestamps MUST be anchored to real frame times or Whisper timestamps.
     // Format: "X:XX" where X:XX maps to actual seconds in the video.
     timestamps: [{ range: '0:00-0:05', observation: '', works: '', problem: '', suggestion: '', anchor: 'frame' }],
-    // mosseri_scores: integers 0-5 per rubric. ANY value > 5 is a schema violation.
-    mosseri_scores: { C1: 3, C2: 2, C3: 3, C4: 3, C5: 2, C6: 4, C7: 4 },
+    // !! PLACEHOLDER ZEROS — replace every 0 with your actual integer 0-5 per rubric.
+    // !! Do NOT copy these zeros or any other score from this template.
+    mosseri_scores: { C1: 0, C2: 0, C3: 0, C4: 0, C5: 0, C6: 0, C7: 0 },
     mosseri_flags: [],
-    mosseri_reasonings: { C1: 'משפט אחד עם ראיה מהסרטון', C2: '', C3: '', C4: '', C5: '', C6: '', C7: '' },
+    mosseri_reasonings: { C1: 'משפט אחד עם ראיה מהסרטון', C2: 'ראיה', C3: 'ראיה', C4: 'ראיה', C5: 'ראיה', C6: 'ראיה', C7: 'ראיה' },
     mosseri_strengths: [],
     // mosseri_fixes: up to 3, ordered by impact (highest weight × gap first).
-    // fixType determines required fields:
-    //   "rewrite"    → principleCode + currentText (verbatim quote) + suggestedRewrite (ready to use) + explanation
-    //   "visual"     → principleCode + action (what to do) + evidence (timestamp or frame description) + explanation
-    //   "structural" → principleCode + action + evidence + explanation
-    // Never fabricate currentText when there is no verbatim quote from the video.
+    // principleCode: use a code from the doctrine chapters you received (e.g. RANK-5, HOOK-2, SEND-3).
+    // fixType:  "rewrite"    → principleCode + currentText (verbatim quote) + suggestedRewrite + explanation
+    //           "visual"     → principleCode + action (specific to THIS video) + evidence (timestamp from frames) + explanation
+    //           "structural" → principleCode + action + evidence + explanation
+    // Never copy action/evidence/currentText from these placeholders. All text must come from the actual video.
     mosseri_fixes: [
       {
-        principleCode: 'HOOK-1',
+        principleCode: 'RANK-N',
         fixType: 'rewrite',
-        name: 'שם התיקון',
-        currentText: 'המשפט הראשון שנאמר בסרטון (ציטוט מדויק מהתמלול)',
-        suggestedRewrite: 'השכתוב המוכן לשימוש ישיר, בקול של היוצר',
-        explanation: 'משפט הסבר אחד מדוע זה משנה',
+        name: 'שם התיקון הספציפי לסרטון',
+        currentText: 'ציטוט מילולי מהתמלול של הסרטון הזה',
+        suggestedRewrite: 'השכתוב בקול של היוצר של הסרטון הזה',
+        explanation: 'הסבר אחד מה הבעיה',
       },
       {
-        principleCode: 'TEXT-1',
+        principleCode: 'RANK-M',
         fixType: 'visual',
-        name: 'הוסיפי כתוביות לפריים הראשון',
+        name: 'שם התיקון הספציפי לסרטון',
         currentText: null,
-        action: 'הוסיפי את הוק ההוק כתוב על המסך בפריים 0:00–0:03 בתוך אזור y=310–1240',
-        evidence: 'פריים 0.6s — ההוק נשמע בלבד, אין טקסט על המסך',
-        explanation: 'כחצי מהצופים בפיד עם שמע כבוי (TEXT-1)',
+        action: 'פעולה ספציפית לסרטון הזה (לא עותק מתבנית)',
+        evidence: 'timestamp או תיאור פריים ספציפי מהסרטון הזה',
+        explanation: 'הסבר אחד',
       },
     ],
     improvements_must: [],
@@ -1012,7 +1013,8 @@ async function analyzeVideoFile({
     contextBlock,
     prevBlock,
     '',
-    'החזירי JSON תקין בלבד (ללא טקסט מחוץ ל-JSON):',
+    '⚠️ פורמט תשובה — JSON תקין בלבד (ללא טקסט מחוץ ל-JSON):',
+    '⚠️ חשוב: הדוגמה הבאה מכילה PLACEHOLDER בלבד. mosseri_scores: כל ה-0 הם placeholders — החלפי כל אחד בציון 0-5 האמיתי שלך לפי המחוון. RANK-N ו-RANK-M הם placeholders — החלפי בקוד עיקרון אמיתי מהדוקטרינה שקיבלת. כל הטקסטים בשדות action/evidence/currentText הם placeholders — החלפי בתוכן מהסרטון הזה בלבד.',
     schemaExample,
   ].join('\n');
 
