@@ -820,6 +820,30 @@ app.get('/api/dana/video-history/:id', (req, res) => {
   res.json(report);
 });
 
+// List backup reports for a job (created by saveReport before overwrite)
+app.get('/api/dana/video-history/:id/backups', (req, res) => {
+  const videoSvc = require('./services/video.service');
+  const videoDir = require('path').join(videoSvc.DATA_DIR_FN(), 'videos', req.params.id);
+  if (!require('fs').existsSync(videoDir)) return res.status(404).json({ backups: [] });
+  const baks = require('fs').readdirSync(videoDir)
+    .filter(f => f.endsWith('.bak.json'))
+    .sort().reverse()
+    .map(f => ({ file: f, url: `/api/dana/video-history/${req.params.id}/backup/${f}` }));
+  res.json({ id: req.params.id, backups: baks });
+});
+
+// Retrieve a specific backup
+app.get('/api/dana/video-history/:id/backup/:file', (req, res) => {
+  const f = req.params.file;
+  if (!/^report\.\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.bak\.json$/.test(f))
+    return res.status(400).json({ error: 'Invalid backup filename' });
+  const videoSvc = require('./services/video.service');
+  const p = require('path').join(videoSvc.DATA_DIR_FN(), 'videos', req.params.id, f);
+  if (!require('fs').existsSync(p)) return res.status(404).json({ error: 'Backup not found' });
+  try { res.json(JSON.parse(require('fs').readFileSync(p, 'utf8'))); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Skill status
 app.get('/api/dana/skill-status', (_req, res) => {
   try { res.json(danaAgent.getSkillStatus()); }

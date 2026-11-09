@@ -284,11 +284,29 @@ function loadJob(id) {
   try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; }
 }
 
-/** Save full analysis report JSON. */
+/** Save full analysis report JSON.
+ *  Before overwriting an existing report.json, moves it to report.<timestamp>.bak.json
+ *  so force-retry and re-analysis do not permanently destroy previous results.
+ */
 function saveReport(id, report) {
   const videoDir = path.join(DATA_DIR_FN(), 'videos', id);
   if (!fs.existsSync(videoDir)) fs.mkdirSync(videoDir, { recursive: true });
-  fs.writeFileSync(path.join(videoDir, 'report.json'), JSON.stringify(report, null, 2), 'utf8');
+  const rptPath = path.join(videoDir, 'report.json');
+  if (fs.existsSync(rptPath)) {
+    // Rotate: keep up to 5 backups named report.<iso-timestamp>.bak.json
+    const ts  = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const bak = path.join(videoDir, `report.${ts}.bak.json`);
+    try { fs.copyFileSync(rptPath, bak); } catch {}
+    // Prune: keep only the 5 newest .bak.json files to avoid unbounded growth
+    try {
+      const baks = fs.readdirSync(videoDir)
+        .filter(f => f.endsWith('.bak.json'))
+        .map(f => ({ f, mt: fs.statSync(path.join(videoDir, f)).mtimeMs }))
+        .sort((a, b) => b.mt - a.mt);
+      baks.slice(5).forEach(({ f }) => { try { fs.unlinkSync(path.join(videoDir, f)); } catch {} });
+    } catch {}
+  }
+  fs.writeFileSync(rptPath, JSON.stringify(report, null, 2), 'utf8');
 }
 
 /** Load a saved analysis report. Returns null if not found. */
