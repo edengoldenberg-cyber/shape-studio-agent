@@ -119,52 +119,98 @@ function extractDoctrineChapters(format) {
 const SCORE_KEYS = ['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7'];
 
 /**
- * Validate that mosseri_scores are all integers 0-5.
- * Returns { valid: bool, errors: string[], fixed: object|null }.
- * Does NOT silently clamp — if any value is out of range, valid=false.
+ * Strict validator: mosseri_scores must be JavaScript integers (typeof 'number',
+ * Number.isInteger) in [0, 5]. No Math.round, no string parsing, no boolean coercion.
+ *
+ * Rejects: 4.7 (float), true (boolean), "3" (string), "3abc" (string),
+ *          null (null), undefined (missing), 85 (out of range), -1 (out of range).
+ * Accepts: 0, 1, 2, 3, 4, 5 (exact integer values).
+ *
+ * Returns { valid: bool, errors: string[], fixed: object }.
+ * fixed[k] is the validated integer or null if validation failed for that key.
+ * scoreScaleValid=true should only be set when valid===true.
  */
 function validateMosseriScores(scores) {
-  if (!scores || typeof scores !== 'object') {
-    return { valid: false, errors: ['mosseri_scores is missing or not an object'], fixed: null };
+  if (!scores || typeof scores !== 'object' || Array.isArray(scores)) {
+    return { valid: false, errors: ['mosseri_scores is missing or not a plain object'], fixed: {} };
   }
   const errors = [];
   const fixed  = {};
 
   for (const k of SCORE_KEYS) {
     const raw = scores[k];
-    if (raw === null || raw === undefined) {
-      errors.push(`${k}: missing`);
+    // 1. Must be a JavaScript number (not string, boolean, null, undefined)
+    if (typeof raw !== 'number') {
+      errors.push(`${k}: expected integer 0-5, got ${raw === null ? 'null' : raw === undefined ? 'missing' : typeof raw + '(' + JSON.stringify(raw) + ')'}`);
       fixed[k] = null;
       continue;
     }
-    const n = typeof raw === 'string' ? parseFloat(raw) : Number(raw);
-    if (!Number.isFinite(n)) {
-      errors.push(`${k}: not a number (got ${JSON.stringify(raw)})`);
+    // 2. Must be an exact integer — rejects 4.7, NaN, Infinity
+    if (!Number.isInteger(raw)) {
+      errors.push(`${k}: expected integer, got float ${raw} — no rounding permitted`);
       fixed[k] = null;
       continue;
     }
-    if (n < 0 || n > 5) {
-      errors.push(`${k}: out of range 0-5 (got ${n}) — model used wrong scale`);
-      fixed[k] = null; // mark as unusable, not silently clamped
+    // 3. Must be in rubric range [0, 5]
+    if (raw < 0 || raw > 5) {
+      errors.push(`${k}: out of range [0,5] (got ${raw}) — model used wrong scale`);
+      fixed[k] = null;
       continue;
     }
-    fixed[k] = Math.round(n); // accept 4.0 → 4, reject 85 → error above
+    fixed[k] = raw;
   }
 
   return { valid: errors.length === 0, errors, fixed };
 }
 
+// ── Chapter-code extractor ─────────────────────────────────────────────────────
+
 /**
- * Validate principleCode values in a fixes array against the known citation map.
- * Returns the array with an added `codeValid` field on each fix.
+ * Extract the Set of principleCode values (e.g. 'HOOK-1', 'RANK-3') that appear
+ * in the specified chapter numbers of doctrine.md.
+ * Used to verify that a fix's principleCode comes from a chapter the model received.
  */
-function validateFixCodes(fixes, citeMap) {
+function getChapterCodes(doctrineText, chapterNums) {
+  if (!doctrineText) return new Set();
+  const wanted  = new Set(chapterNums);
+  const sections = doctrineText.split(/(?=^## \d+\.)/m);
+  const codes    = new Set();
+  for (const sec of sections) {
+    const m = sec.match(/^## (\d+)\./m);
+    if (!m || !wanted.has(Number(m[1]))) continue;
+    for (const match of sec.matchAll(/\*\*([A-Z]+-\d+)\./g)) {
+      codes.add(match[1]);
+    }
+  }
+  return codes;
+}
+
+/**
+ * Validate principleCode values in a fixes array.
+ * Two independent checks:
+ *   inGlobalMap   — code exists anywhere in doctrine (proves it's real, not hallucinated)
+ *   inSentChapters — code is in the chapters that were actually sent to the model
+ *
+ * codeValid = inGlobalMap && inSentChapters (both must pass for a fully valid fix).
+ * These are stored separately so callers can distinguish the two failure modes.
+ */
+function validateFixCodes(fixes, citeMap, sentChapterCodes) {
   if (!Array.isArray(fixes)) return [];
   return fixes.map(fix => {
     const code = fix.principleCode;
-    if (!code) return { ...fix, codeValid: false, codeError: 'principleCode missing' };
-    if (!citeMap[code]) return { ...fix, codeValid: false, codeError: `"${code}" not found in doctrine` };
-    return { ...fix, codeValid: true };
+    if (!code) {
+      return { ...fix, codeValid: false, inGlobalMap: false, inSentChapters: false,
+               codeError: 'principleCode missing' };
+    }
+    const inGlobalMap    = !!citeMap[code];
+    const inSentChapters = sentChapterCodes ? sentChapterCodes.has(code) : null; // null = not checked
+    const codeValid      = inGlobalMap && (inSentChapters !== false);
+    const codeError      = !inGlobalMap
+      ? `"${code}" not found in doctrine (hallucinated code)`
+      : inSentChapters === false
+        ? `"${code}" exists in doctrine but was NOT in the chapters sent to the model`
+        : null;
+    return { ...fix, codeValid, inGlobalMap, inSentChapters, codeError };
   });
 }
 
@@ -715,9 +761,12 @@ async function analyzeVideoFile({
 
   // Extract the doctrine chapters relevant to this format.
   // For a reel in feed: chapters 1 (RANK), 2 (HOOK), 3 (WATCH), 4 (SEND), 5 (TEXT), 6 (ORIG), 16 (myths).
-  const doctrineChapters = extractDoctrineChapters(
-    organic_or_paid === 'paid' ? 'feed' : (format || 'feed')
-  );
+  const effectiveFormat  = organic_or_paid === 'paid' ? 'feed' : (format || 'feed');
+  const sentChapterNums  = DOCTRINE_CHAPTERS_BY_FORMAT[effectiveFormat] ?? DOCTRINE_CHAPTERS_BY_FORMAT.feed;
+  const doctrineChapters = extractDoctrineChapters(effectiveFormat);
+  // Build the set of principle codes that are in the chapters sent to this model call.
+  // Used in validateFixCodes to separate "code exists globally" from "code was sent".
+  const sentChapterCodes = getChapterCodes(_loadDoctrineText(), sentChapterNums);
 
   const progress = (stage, note) => {
     logger.info('[dana] Analysis progress', { id, stage, note });
@@ -1010,14 +1059,22 @@ async function analyzeVideoFile({
   // Use the validated (rounded) scores from here on
   const validatedScores = scoreValidation.fixed;
 
-  // ── Validate principleCode in fixes against doctrine ─────────────────────
+  // ── Validate principleCode in fixes — two independent checks ────────────
+  // Check 1 (inGlobalMap):   code exists anywhere in the full doctrine.md (not hallucinated).
+  // Check 2 (inSentChapters): code is from the chapters that were sent to the model in this call.
+  // codeValid = both pass. These are stored separately in the fix for transparency.
   const citeMapForValidation = getCitations();
-  const rawFixes      = gptData.mosseri_fixes ?? [];
-  const validatedFixes = validateFixCodes(rawFixes, citeMapForValidation);
-  const invalidCodes  = validatedFixes.filter(f => !f.codeValid).map(f => f.principleCode ?? '(none)');
+  const rawFixes       = gptData.mosseri_fixes ?? [];
+  const validatedFixes = validateFixCodes(rawFixes, citeMapForValidation, sentChapterCodes);
+  const invalidCodes   = validatedFixes.filter(f => !f.codeValid).map(f => ({
+    code:            f.principleCode ?? '(none)',
+    inGlobalMap:     f.inGlobalMap,
+    inSentChapters:  f.inSentChapters,
+    error:           f.codeError,
+  }));
   if (invalidCodes.length > 0) {
-    logger.warn('[dana] mosseri_fixes contain unknown principleCode(s)', { id, invalidCodes });
-    // Keep all fixes — but `codeValid: false` flags them. Citation stays null for invalid codes.
+    logger.warn('[dana] mosseri_fixes principleCode issues', { id, issues: invalidCodes });
+    // Keep all fixes — codeValid:false and separate flags make each failure visible.
   }
 
   // ── Mosseri scoring ───────────────────────────────────────────────────────
@@ -1106,7 +1163,8 @@ async function analyzeVideoFile({
     share_direction:    estimation.share_direction ?? null,
     accuracy:           estimation.accuracy        ?? null,
     baseline_missing:   estimation.baseline_missing ?? true,
-    scoreScaleValid:    true,     // set here because validation passed (throws otherwise)
+    scoreScaleValid:    true,         // set here because validateMosseriScores passed (throws otherwise)
+    sentDoctrineChapters: sentChapterNums, // which doctrine chapters were in this analysis
     mosseri_scores:     mosseriScores,
     mosseri_flags:      mosseriFlags,
     flags:              mosseriFlags,
@@ -1216,4 +1274,6 @@ module.exports = {
   getJob,
   getSkillStatus,
   markStaleReports,
+  // Exported for testing
+  validateMosseriScores,
 };
