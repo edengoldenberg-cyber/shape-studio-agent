@@ -729,7 +729,9 @@ app.post('/api/dana/analysis-job/:id/retry', jsonBody, async (req, res) => {
   const id  = req.params.id;
   const job = danaAgent.getJob(id);
   if (!job) return res.status(404).json({ error: 'Job לא נמצא' });
-  if (job.status === 'completed') return res.status(409).json({ error: 'Job הושלם בהצלחה — אין צורך בניסיון חוזר' });
+  // ?force=true allows re-analysis of completed jobs (e.g. after scoring-bug fix)
+  const force = req.query.force === 'true' || req.body?.force === true;
+  if (job.status === 'completed' && !force) return res.status(409).json({ error: 'Job הושלם בהצלחה — אין צורך בניסיון חוזר. שלח ?force=true לניתוח מחדש.' });
 
   // Find the saved video file
   const videoSvc  = require('./services/video.service');
