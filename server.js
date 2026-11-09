@@ -617,64 +617,133 @@ app.post('/api/dana/analyze-video', jsonBody, async (req, res) => {
   }
 });
 
-// ── Dana video file upload + analysis ─────────────────────────────────────────
+// ── Dana video upload + async analysis job system (Fix 4) ─────────────────────
 //
-// POST /api/dana/analyze-video-upload
-//   Body (JSON, up to 200 MB): {
-//     videoData: "data:video/mp4;base64,...",
-//     title, goal, format, audience, organic_or_paid, message, focus_notes,
-//     previousVersionId (optional — for version comparison)
-//   }
+// Upload via multipart/form-data (not base64 JSON) to avoid 33% base64 overhead.
+// Max file size: 150 MB on disk (declared up-front in UI; multer enforces on server).
 //
-// GET  /api/dana/video-history       — list all saved analyses
-// GET  /api/dana/video-history/:id   — load one analysis report
+// Flow:
+//   POST /api/dana/analyze-video-upload   — save file, create job, return {jobId} immediately
+//   GET  /api/dana/analysis-job/:id       — poll: returns {status, stage, note, error, result}
+//   GET  /api/dana/video-history          — list saved analyses (from report.json files)
+//   GET  /api/dana/video-history/:id      — load one full report
+//   GET  /api/dana/skill-status           — which Mosseri skill files are loaded
 
-const videoJsonBody = express.json({ limit: '200mb' });
+const multer      = require('multer');
+const { v4: _uuid4 } = require('uuid');
 
-app.post('/api/dana/analyze-video-upload', videoJsonBody, async (req, res) => {
-  const {
-    videoData, title, goal, format, audience,
-    organic_or_paid, message, focus_notes, previousVersionId,
-  } = req.body ?? {};
+// Store uploads in DATA_DIR/uploads/ so Railway Volume keeps them
+const _uploadDir = () => {
+  const d = path.join((process.env.DATA_DIR ?? path.join(__dirname, 'data')).replace(/\/$/, ''), 'uploads');
+  if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+  return d;
+};
 
-  if (!videoData) return res.status(400).json({ error: 'videoData (base64) חסר' });
+const videoUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, _uploadDir()),
+    filename:    (_req, _file, cb) => cb(null, _uuid4() + '_' + Date.now()),
+  }),
+  limits: { fileSize: 150 * 1024 * 1024 },  // 150 MB — consistent with UI
+  fileFilter: (_req, file, cb) => {
+    const ALLOWED = new Set(['video/mp4','video/quicktime','video/webm','video/x-msvideo','video/x-matroska']);
+    const ext     = file.originalname.match(/\.([a-z0-9]+)$/i)?.[1]?.toLowerCase();
+    const ALLOWED_EXT = new Set(['mp4','mov','webm','avi','mkv']);
+    if (ALLOWED.has(file.mimetype) || ALLOWED_EXT.has(ext)) return cb(null, true);
+    cb(new Error(`פורמט לא נתמך: ${file.mimetype || ext}. נתמכים: mp4, mov, webm, avi, mkv`));
+  },
+});
 
-  // Parse data URI: data:video/mp4;base64,XXXX
-  const match = videoData.match(/^data:(video\/[a-zA-Z0-9]+);base64,(.+)$/);
-  if (!match) return res.status(400).json({ error: 'פורמט videoData לא תקין — נדרש data URI' });
+// MIME → extension mapping
+const MIME_TO_EXT = {
+  'video/mp4': 'mp4', 'video/quicktime': 'mov', 'video/webm': 'webm',
+  'video/x-msvideo': 'avi', 'video/x-matroska': 'mkv',
+};
 
-  const [, mimeType, b64] = match;
-  const extMap = { 'video/mp4': 'mp4', 'video/quicktime': 'mov', 'video/webm': 'webm',
-                   'video/x-msvideo': 'avi', 'video/avi': 'avi', 'video/x-matroska': 'mkv' };
-  const ext    = extMap[mimeType] ?? 'mp4';
-  const buffer = Buffer.from(b64, 'base64');
+app.post('/api/dana/analyze-video-upload',
+  videoUpload.single('video'),
+  async (req, res) => {
+    if (!req.file) return res.status(400).json({ error: 'קובץ וידאו חסר (שדה: video)' });
 
-  // 200 MB hard cap (larger files risk Railway memory / timeout)
-  if (buffer.length > 200 * 1024 * 1024) {
-    return res.status(413).json({ error: `הקובץ גדול מדי (${Math.round(buffer.length / 1024 / 1024)} MB). מגבלה: 200 MB.` });
-  }
+    const { title, goal, format, audience, organic_or_paid, message, focus_notes, previousVersionId } = req.body ?? {};
 
-  logger.info('[dana] Video upload received', {
-    sizeKb: Math.round(buffer.length / 1024), ext, title: title?.slice(0, 40),
-  });
+    const ext = MIME_TO_EXT[req.file.mimetype] ??
+                (req.file.originalname.match(/\.([a-z0-9]+)$/i)?.[1]?.toLowerCase() ?? 'mp4');
 
-  try {
-    const report = await danaAgent.analyzeVideoFile({
-      videoBuffer: buffer, ext,
-      title:            title        ?? 'סרטון ללא כותרת',
-      goal:             goal         ?? 'leads',
-      format:           format       ?? 'feed',
-      audience:         audience     ?? 'נשים 30-60, אזור פרדס חנה-כרכור',
-      organic_or_paid:  organic_or_paid ?? 'organic',
-      message:          message      ?? '',
-      focus_notes:      focus_notes  ?? '',
-      previousVersionId: previousVersionId ?? null,
+    // Create job immediately and return jobId — client will poll
+    const id  = _uuid4();
+    const job = danaAgent.createAnalysisJob(id, {
+      title: title ?? 'סרטון ללא כותרת',
+      sizeKb: Math.round(req.file.size / 1024),
     });
-    res.json(report);
-  } catch (err) {
-    logger.error('[dana] analyze-video-upload error', { error: err.message });
-    res.status(500).json({ error: err.message });
+
+    logger.info('[dana] Video upload received — job created', { id, sizeKb: job.sizeKb, ext });
+    res.json({ jobId: id, status: 'queued' });
+
+    // Run analysis asynchronously — does NOT block the HTTP response
+    setImmediate(async () => {
+      let savedVideoPath;
+      try {
+        // Move multer temp file to DATA_DIR/videos/{id}/video.{ext}
+        const videoSvc = require('./services/video.service');
+        savedVideoPath = videoSvc.saveVideoFromPath(id, req.file.path, ext);
+
+        danaAgent.updateJob(id, { status: 'running', stage: 'meta', note: 'קורא מטא-דאטה...' });
+
+        const report = await danaAgent.analyzeVideoFile({
+          videoPath:  savedVideoPath,
+          id,
+          ext,
+          title:            title            ?? 'סרטון ללא כותרת',
+          goal:             goal             ?? 'leads',
+          format:           format           ?? 'feed',
+          audience:         audience         ?? '',
+          organic_or_paid:  organic_or_paid  ?? 'organic',
+          message:          message          ?? '',
+          focus_notes:      focus_notes      ?? '',
+          previousVersionId: previousVersionId ?? null,
+          onProgress: (stage, note) => danaAgent.updateJob(id, { status: 'running', stage, note }),
+        });
+
+        danaAgent.updateJob(id, {
+          status: 'completed',
+          stage:  'done',
+          note:   `ניתוח הושלם — ציון ${report.readiness}/100`,
+          result: { id, readiness: report.readiness, verdict: report.verdict },
+        });
+      } catch (err) {
+        logger.error('[dana] async analysis failed', { id, error: err.message });
+        danaAgent.updateJob(id, { status: 'failed', stage: 'error', error: err.message });
+        // Clean up tmp file if save didn't happen
+        if (req.file?.path && !savedVideoPath) {
+          try { fs.unlinkSync(req.file.path); } catch {}
+        }
+      }
+    });
   }
+);
+
+// Poll job status
+app.get('/api/dana/analysis-job/:id', (req, res) => {
+  const job = danaAgent.getJob(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job לא נמצא' });
+
+  const payload = {
+    id:        job.id,
+    status:    job.status,
+    stage:     job.stage,
+    note:      job.note,
+    error:     job.error    ?? null,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+  };
+
+  // If completed, include the full report
+  if (job.status === 'completed') {
+    payload.report = danaAgent.getVideoReport(job.id) ?? null;
+  }
+
+  res.json(payload);
 });
 
 app.get('/api/dana/video-history', (_req, res) => {
@@ -686,6 +755,12 @@ app.get('/api/dana/video-history/:id', (req, res) => {
   const report = danaAgent.getVideoReport(req.params.id);
   if (!report) return res.status(404).json({ error: 'ניתוח לא נמצא' });
   res.json(report);
+});
+
+// Skill status (Fix 5)
+app.get('/api/dana/skill-status', (_req, res) => {
+  try { res.json(danaAgent.getSkillStatus()); }
+  catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ── Barak routes ──────────────────────────────────────────────────────────────

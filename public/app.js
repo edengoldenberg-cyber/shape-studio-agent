@@ -286,8 +286,8 @@ async function submitVideoAnalysis() {
 
   // ── Allowed formats ─────────────────────────────────────────────────────────
   const ALLOWED_TYPES  = new Set(['video/mp4','video/quicktime','video/webm','video/x-msvideo','video/x-matroska']);
-  const MAX_SIZE_BYTES = 200 * 1024 * 1024;
-  const MAX_SIZE_LABEL = '200 MB';
+  const MAX_SIZE_BYTES = 150 * 1024 * 1024;  // must match multer server limit
+  const MAX_SIZE_LABEL = '150 MB';
 
   // ── Drop-zone events ─────────────────────────────────────────────────────────
   dropZone.addEventListener('dragover',  e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
@@ -326,6 +326,7 @@ async function submitVideoAnalysis() {
       return;
     }
     if (file.size > MAX_SIZE_BYTES) {
+      // 150 MB client cap — same as multer server limit (no base64 overhead)
       showError(`הקובץ גדול מדי (${(file.size / 1024 / 1024).toFixed(0)} MB). מגבלה: ${MAX_SIZE_LABEL}`);
       return;
     }
@@ -368,77 +369,118 @@ async function submitVideoAnalysis() {
   // ── Submit ────────────────────────────────────────────────────────────────────
   submitBtn.addEventListener('click', startAnalysis);
 
+  // Current active job ID — survives page actions (not full reload)
+  let activeJobId = null;
+  let pollTimer   = null;
+
   async function startAnalysis() {
     if (!currentFile) return;
     hideError();
     submitBtn.disabled = true;
+    stopPolling();
 
-    // Show progress
     contextGrid.style.display  = 'none';
     previewWrap.style.display  = 'none';
     progressEl.style.display   = '';
     reportPanel.style.display  = 'none';
     setStage('upload');
+    progressNote.textContent   = 'שולח קובץ...';
 
     try {
-      // 1. Read file as base64 data URI
-      progressNote.textContent = 'קורא קובץ...';
-      const dataUri = await readFileAsDataURI(currentFile);
-
-      setStage('process');
-      progressNote.textContent = 'שולח לשרת לעיבוד פריימים ושמע...';
-
-      // 2. POST to backend
-      const body = {
-        videoData:       dataUri,
-        title:           document.getElementById('vup-title').value.trim()   || currentFile.name,
-        goal:            document.getElementById('vup-goal').value,
-        format:          document.getElementById('vup-format').value,
-        audience:        document.getElementById('vup-audience').value.trim(),
-        organic_or_paid: document.getElementById('vup-paid').value,
-        message:         document.getElementById('vup-message').value.trim(),
-        focus_notes:     document.getElementById('vup-focus').value.trim(),
-        previousVersionId: prevSel.value || null,
-      };
-
-      setStage('analyze');
-      progressNote.textContent = 'דנה מנתחת את הפריימים והשמע...';
-
-      const res = await fetch('/api/dana/analyze-video-upload', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.error || `שגיאת שרת ${res.status}`);
+      // ── Upload via multipart/form-data (no base64 overhead) ───────────────
+      // Client-side cap: 150 MB (server enforces the same, multer rejects larger)
+      const MAX_MB = 150;
+      if (currentFile.size > MAX_MB * 1024 * 1024) {
+        throw new Error(`הקובץ גדול מדי (${(currentFile.size/1024/1024).toFixed(0)} MB). מגבלה: ${MAX_MB} MB.`);
       }
 
-      const report = await res.json();
-      currentAnalysisId = report.id;
+      const formData = new FormData();
+      formData.append('video',           currentFile);
+      formData.append('title',           document.getElementById('vup-title').value.trim()   || currentFile.name);
+      formData.append('goal',            document.getElementById('vup-goal').value);
+      formData.append('format',          document.getElementById('vup-format').value);
+      formData.append('audience',        document.getElementById('vup-audience').value.trim());
+      formData.append('organic_or_paid', document.getElementById('vup-paid').value);
+      formData.append('message',         document.getElementById('vup-message').value.trim());
+      formData.append('focus_notes',     document.getElementById('vup-focus').value.trim());
+      if (prevSel.value) formData.append('previousVersionId', prevSel.value);
 
-      setStage('done');
-      progressNote.textContent = 'ניתוח הושלם!';
+      const uploadRes = await fetch('/api/dana/analyze-video-upload', {
+        method: 'POST',
+        body:   formData,   // Content-Type set automatically by browser
+      });
 
-      await new Promise(r => setTimeout(r, 600));
+      if (!uploadRes.ok) {
+        const err = await uploadRes.json().catch(() => ({}));
+        throw new Error(err.error || `שגיאת העלאה ${uploadRes.status}`);
+      }
 
-      // 3. Show report
-      progressEl.style.display = 'none';
-      reportPanel.innerHTML    = renderFullReport(report);
-      reportPanel.style.display = '';
-      reportPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      const { jobId } = await uploadRes.json();
+      activeJobId = jobId;
+      setStage('process');
+      progressNote.textContent = 'הקובץ הועלה — מחלץ פריימים ושמע...';
 
-      // 4. Reload history
-      loadHistory();
+      // ── Poll job status every 3 s ─────────────────────────────────────────
+      await pollJobUntilDone(jobId);
 
     } catch (err) {
+      stopPolling();
       progressEl.style.display = 'none';
       showError(err.message || 'שגיאה לא ידועה');
       previewWrap.style.display = '';
       contextGrid.style.display = '';
       submitBtn.disabled = false;
     }
+  }
+
+  async function pollJobUntilDone(jobId) {
+    return new Promise((resolve, reject) => {
+      pollTimer = setInterval(async () => {
+        try {
+          const res = await fetch(`/api/dana/analysis-job/${jobId}`);
+          if (!res.ok) {
+            clearInterval(pollTimer);
+            return reject(new Error(`Poll שגיאה: ${res.status}`));
+          }
+          const job = await res.json();
+
+          // Update progress UI from live job status
+          const stageMap = {
+            queued:   'upload',  meta:     'process', frames: 'process',
+            audio:    'process', analyze:  'analyze', scoring: 'analyze',
+            done:     'done',    error:    'analyze',
+          };
+          setStage(stageMap[job.stage] ?? 'analyze');
+          progressNote.textContent = job.note || 'מעבד...';
+
+          if (job.status === 'completed') {
+            clearInterval(pollTimer);
+            setStage('done');
+            progressNote.textContent = `ניתוח הושלם — ציון ${job.report?.readiness ?? '—'}/100`;
+            await new Promise(r => setTimeout(r, 600));
+
+            progressEl.style.display = 'none';
+            reportPanel.innerHTML    = renderFullReport(job.report);
+            reportPanel.style.display = '';
+            reportPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            loadHistory();
+            resolve();
+
+          } else if (job.status === 'failed') {
+            clearInterval(pollTimer);
+            reject(new Error(job.error || 'הניתוח נכשל'));
+          }
+          // else: still running — keep polling
+        } catch (err) {
+          clearInterval(pollTimer);
+          reject(err);
+        }
+      }, 3000);
+    });
+  }
+
+  function stopPolling() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   }
 
   // ── Stages ───────────────────────────────────────────────────────────────────
@@ -461,16 +503,6 @@ async function submitVideoAnalysis() {
     errorEl.style.display  = '';
   }
   function hideError() { errorEl.style.display = 'none'; }
-
-  // ── File reader utility ───────────────────────────────────────────────────────
-  function readFileAsDataURI(file) {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload  = () => resolve(reader.result);
-      reader.onerror = () => reject(new Error('קריאת הקובץ נכשלה'));
-      reader.readAsDataURL(file);
-    });
-  }
 
   // ── History ───────────────────────────────────────────────────────────────────
   if (histRefresh) histRefresh.addEventListener('click', loadHistory);

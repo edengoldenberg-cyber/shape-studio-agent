@@ -3,16 +3,17 @@
 /**
  * video.service.js — FFmpeg + Whisper pipeline for Dana video analysis.
  *
- * Frame extraction: fluent-ffmpeg with @ffmpeg-installer/ffmpeg (bundled binary,
- * no system-level ffmpeg required, works on Railway).
+ * Frame extraction: fluent-ffmpeg with @ffmpeg-installer/ffmpeg (bundled binary).
+ * Audio transcription: OpenAI Whisper API, verbose_json for word-level timestamps.
  *
- * Audio transcription: OpenAI Whisper API (not local GPU Whisper — works on Railway).
- *
- * Limitations:
- *   - Frame analysis relies on sampled stills; motion, transitions, and sync
- *     between audio and visuals are inferred, not directly measured.
- *   - Timestamps in the report are approximate (derived from frame spacing).
- *   - On-screen text is read from frames by GPT-4o vision; small text may be missed.
+ * ANALYSIS LIMITATIONS (reported to callers, never hidden):
+ *   - Frame analysis = sampled stills. Motion, transitions, and audio-visual sync
+ *     are inferred from still images + transcript, not directly measured.
+ *   - Whisper transcript ≠ audio quality: balance, noise, and clarity are unverified
+ *     unless explicit audio analysis tools are used.
+ *   - Timestamps from Whisper are real (word-level). Frame timestamps are real (from ffmpeg
+ *     seekInput). Neither implies frame-perfect accuracy in the report.
+ *   - If ffprobe fails, durationSec is null — no fake default is used.
  */
 
 const path         = require('path');
@@ -27,64 +28,83 @@ ffmpeg.setFfmpegPath(ffmpegPath);
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Max frames sent to GPT-4o vision. More = better coverage, higher token cost.
-const MAX_FRAMES     = 20;
-const FRAME_JPG_Q    = 2;    // 1=best, 31=worst. 2 gives good quality at reasonable size.
+const MAX_FRAMES      = 20;
+const FRAME_JPG_Q     = 2;        // 1=best, 31=worst
 const AUDIO_SAMPLE_HZ = 16000;
+const MAX_TRANSCRIPT_CHARS = 8000; // approx 15-min of dense Hebrew speech
+
+// ── Video metadata ─────────────────────────────────────────────────────────────
 
 /**
- * Get video metadata (duration, width, height) without extracting any files.
- * @param {string} videoPath
- * @returns {Promise<{ durationSec: number, width: number, height: number, fps: number }>}
+ * @returns {{ durationSec: number|null, width, height, fps, hasAudio, probeOk }}
+ *   durationSec is null if ffprobe fails — callers MUST handle null, not substitute a default.
  */
 function getVideoMeta(videoPath) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     ffmpeg.ffprobe(videoPath, (err, meta) => {
-      if (err) return reject(new Error('ffprobe failed: ' + err.message));
-      const vs = meta.streams?.find(s => s.codec_type === 'video') ?? {};
-      const as = meta.streams?.find(s => s.codec_type === 'audio');
-      const fps = vs.avg_frame_rate
-        ? eval(vs.avg_frame_rate.replace('/', '/')) // "30/1" → 30
-        : 30;
+      if (err) {
+        logger.warn('[video-service] ffprobe failed', { error: err.message, videoPath });
+        resolve({ durationSec: null, width: 0, height: 0, fps: null, hasAudio: null, probeOk: false });
+        return;
+      }
+      const vs  = meta.streams?.find(s => s.codec_type === 'video') ?? {};
+      const as  = meta.streams?.find(s => s.codec_type === 'audio');
+      const fpsRaw = vs.avg_frame_rate ?? '';
+      let fps = null;
+      if (fpsRaw && fpsRaw.includes('/')) {
+        const [n, d] = fpsRaw.split('/').map(Number);
+        fps = d > 0 ? n / d : null;
+      }
+      const dur = parseFloat(meta.format?.duration);
       resolve({
-        durationSec: parseFloat(meta.format?.duration ?? '0'),
-        width:        vs.width  ?? 0,
-        height:       vs.height ?? 0,
-        fps:          isFinite(fps) ? fps : 30,
-        hasAudio:     !!as,
+        durationSec: isFinite(dur) && dur > 0 ? dur : null,
+        width:       vs.width   ?? 0,
+        height:      vs.height  ?? 0,
+        fps:         fps && isFinite(fps) ? fps : null,
+        hasAudio:    !!as,
+        probeOk:     true,
       });
     });
   });
 }
 
+// ── Frame extraction ───────────────────────────────────────────────────────────
+
 /**
- * Extract up to MAX_FRAMES evenly-spaced JPEG frames from a video.
- * Returns array of { timestampSec, base64 } objects.
+ * Extract up to MAX_FRAMES evenly-spaced JPEG frames.
+ * Returns array of { timestampSec: number, base64: string }.
+ * timestampSec is the ACTUAL ffmpeg seekInput value — real, not calculated from order.
  *
  * @param {string} videoPath
- * @param {number} durationSec
- * @returns {Promise<Array<{ timestampSec: number, base64: string }>>}
+ * @param {number} durationSec  — must be a known positive number; throws if 0 or null
  */
 async function extractFrames(videoPath, durationSec) {
+  if (!durationSec || durationSec <= 0) {
+    throw new Error('חילוץ פריימים נכשל: משך הסרטון אינו ידוע (ffprobe נכשל).');
+  }
+
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dana-frames-'));
-
   try {
-    // Choose interval so we get at most MAX_FRAMES frames
     const rawInterval = durationSec / MAX_FRAMES;
-    const interval    = Math.max(rawInterval, 0.5); // never more than 2 fps for cost
-    const frameCount  = Math.min(MAX_FRAMES, Math.floor(durationSec / interval));
+    const interval    = Math.max(rawInterval, 1.0); // ≥1 s to keep token count sane
+    const count       = Math.min(MAX_FRAMES, Math.max(1, Math.floor(durationSec / interval)));
 
-    // Build a comma-separated list of exact timestamps
-    const timestamps = Array.from({ length: frameCount }, (_, i) =>
-      +(interval * i + interval * 0.5).toFixed(2)   // centre of each interval
-    );
+    // Timestamps are the exact seekInput values used — real, not approximated
+    const timestamps = Array.from({ length: count }, (_, i) =>
+      +(interval * i + interval * 0.5).toFixed(2)
+    ).filter(ts => ts < durationSec);
 
-    // extract each frame individually for timestamp accuracy
+    if (timestamps.length === 0) {
+      throw new Error('לא ניתן לחלץ פריימים — הסרטון קצר מדי.');
+    }
+
+    // Extract each frame with its exact timestamp as the filename key
     await new Promise((resolve, reject) => {
       let cmd = ffmpeg(videoPath);
       timestamps.forEach(ts => {
+        const safeName = ts.toFixed(3).replace('.', 'd');
         cmd = cmd
-          .output(path.join(tmpDir, `frame_${String(ts).replace('.', '_')}.jpg`))
+          .output(path.join(tmpDir, `f${safeName}.jpg`))
           .seekInput(ts)
           .frames(1)
           .outputOptions(`-q:v ${FRAME_JPG_Q}`);
@@ -94,39 +114,54 @@ async function extractFrames(videoPath, durationSec) {
 
     const frames = [];
     for (const ts of timestamps) {
-      const fp = path.join(tmpDir, `frame_${String(ts).replace('.', '_')}.jpg`);
-      if (!fs.existsSync(fp)) continue;
-      const buf    = fs.readFileSync(fp);
-      const base64 = buf.toString('base64');
-      frames.push({ timestampSec: ts, base64 });
+      const safeName = ts.toFixed(3).replace('.', 'd');
+      const fp = path.join(tmpDir, `f${safeName}.jpg`);
+      if (!fs.existsSync(fp)) {
+        logger.warn('[video-service] Frame file missing', { ts, fp });
+        continue;
+      }
+      const buf = fs.readFileSync(fp);
+      if (buf.length < 500) continue; // empty/corrupt JPEG
+      frames.push({ timestampSec: ts, base64: buf.toString('base64') });
     }
 
-    logger.info('[video-service] Frames extracted', { count: frames.length, durationSec });
+    if (frames.length === 0) throw new Error('כל הפריימים שנחלצו ריקים או חסרים.');
+
+    logger.info('[video-service] Frames extracted', {
+      count: frames.length, durationSec,
+      coverage: `${frames[0].timestampSec.toFixed(1)}s–${frames[frames.length-1].timestampSec.toFixed(1)}s`,
+    });
     return frames;
   } finally {
-    // Clean up temp files
     try {
-      const files = fs.readdirSync(tmpDir);
-      files.forEach(f => fs.unlinkSync(path.join(tmpDir, f)));
+      fs.readdirSync(tmpDir).forEach(f => fs.unlinkSync(path.join(tmpDir, f)));
       fs.rmdirSync(tmpDir);
     } catch {}
   }
 }
 
+// ── Audio transcription ────────────────────────────────────────────────────────
+
 /**
- * Extract audio from video as a mono WAV, then transcribe with OpenAI Whisper API.
- * Returns the transcript string, or empty string if no audio track.
+ * Transcribe audio using Whisper API with verbose_json for word-level timestamps.
+ *
+ * Returns:
+ *   { text, wordTimestamps: [{word, start, end}], coverage, truncated }
+ *
+ * What Whisper CAN tell us:  spoken words, timing, language.
+ * What Whisper CANNOT tell us: audio quality, music balance, background noise,
+ *   recording clarity, volume levels. Those require signal analysis tools.
  *
  * @param {string} videoPath
- * @param {boolean} hasAudio
- * @returns {Promise<string>}
+ * @param {boolean|null} hasAudio
  */
 async function transcribeAudio(videoPath, hasAudio) {
-  if (!hasAudio) return '';
+  if (hasAudio === false) {
+    return { text: '', wordTimestamps: [], coverage: 'no_audio_track', truncated: false };
+  }
 
   const tmpAudio = path.join(os.tmpdir(), `dana-audio-${Date.now()}.mp3`);
   try {
-    // Extract audio as mp3 (smaller than wav, Whisper API accepts it)
     await new Promise((resolve, reject) => {
       ffmpeg(videoPath)
         .noVideo()
@@ -139,37 +174,64 @@ async function transcribeAudio(videoPath, hasAudio) {
         .run();
     });
 
-    const fileSize = fs.statSync(tmpAudio).size;
-    if (fileSize < 1000) return ''; // effectively silent
+    const fileSize = fs.existsSync(tmpAudio) ? fs.statSync(tmpAudio).size : 0;
+    if (fileSize < 1000) {
+      return { text: '', wordTimestamps: [], coverage: 'silent_or_extraction_failed', truncated: false };
+    }
 
-    const transcript = await openai.audio.transcriptions.create({
-      file:     fs.createReadStream(tmpAudio),
-      model:    'whisper-1',
-      language: 'he',
-      response_format: 'text',
+    // verbose_json returns segments+words with timestamps
+    const result = await openai.audio.transcriptions.create({
+      file:            fs.createReadStream(tmpAudio),
+      model:           'whisper-1',
+      language:        'he',
+      response_format: 'verbose_json',
+      timestamp_granularities: ['word'],
     });
 
-    logger.info('[video-service] Audio transcribed', { chars: transcript?.length ?? 0 });
-    return typeof transcript === 'string' ? transcript.trim() : '';
+    const text  = result.text ?? '';
+    const words = (result.words ?? []).map(w => ({
+      word:  w.word,
+      start: w.start,
+      end:   w.end,
+    }));
+
+    const truncated = text.length > MAX_TRANSCRIPT_CHARS;
+    const finalText = truncated ? text.slice(0, MAX_TRANSCRIPT_CHARS) : text;
+
+    const duration = result.duration ?? null;
+    const lastWordEnd = words.length > 0 ? words[words.length - 1].end : null;
+
+    logger.info('[video-service] Audio transcribed', {
+      chars: finalText.length, words: words.length, truncated,
+      whisper_duration: duration, last_word_end: lastWordEnd,
+    });
+
+    return {
+      text:           finalText,
+      wordTimestamps: words,
+      coverage:       duration ? `0s–${duration.toFixed(1)}s (Whisper)` : 'coverage_unknown',
+      truncated,
+      whisperDuration: duration,
+    };
   } catch (err) {
     logger.warn('[video-service] Audio transcription failed', { error: err.message });
-    return '';
+    return { text: '', wordTimestamps: [], coverage: 'transcription_failed', truncated: false };
   } finally {
-    try { fs.unlinkSync(tmpAudio); } catch {}
+    try { if (fs.existsSync(tmpAudio)) fs.unlinkSync(tmpAudio); } catch {}
   }
 }
 
+// ── Job store ──────────────────────────────────────────────────────────────────
+
+const DATA_DIR_FN = () =>
+  (process.env.DATA_DIR ?? require('path').join(__dirname, '../data')).replace(/\/$/, '');
+
 /**
- * Save a video buffer to DATA_DIR/videos/{id}/video.{ext}
- * Returns the saved path.
- *
- * @param {string} id  — unique analysis id
- * @param {Buffer} buffer
- * @param {string} ext — without dot
+ * Save a video buffer to DATA_DIR/videos/{id}/video.{ext}.
+ * Returns the absolute path.
  */
 function saveVideoFile(id, buffer, ext) {
-  const dataDir  = (process.env.DATA_DIR ?? path.join(__dirname, '../data')).replace(/\/$/, '');
-  const videoDir = path.join(dataDir, 'videos', id);
+  const videoDir = path.join(DATA_DIR_FN(), 'videos', id);
   if (!fs.existsSync(videoDir)) fs.mkdirSync(videoDir, { recursive: true });
   const videoPath = path.join(videoDir, `video.${ext}`);
   fs.writeFileSync(videoPath, buffer);
@@ -177,33 +239,49 @@ function saveVideoFile(id, buffer, ext) {
 }
 
 /**
- * Save a JSON analysis report to DATA_DIR/videos/{id}/report.json
+ * Save a video from a file path (multer disk upload) to DATA_DIR.
+ * Moves (or copies) the file so multer tmp is cleaned up.
  */
-function saveReport(id, report) {
-  const dataDir  = (process.env.DATA_DIR ?? path.join(__dirname, '../data')).replace(/\/$/, '');
-  const videoDir = path.join(dataDir, 'videos', id);
+function saveVideoFromPath(id, srcPath, ext) {
+  const videoDir = path.join(DATA_DIR_FN(), 'videos', id);
   if (!fs.existsSync(videoDir)) fs.mkdirSync(videoDir, { recursive: true });
-  const reportPath = path.join(videoDir, 'report.json');
-  fs.writeFileSync(reportPath, JSON.stringify(report, null, 2), 'utf8');
-  return reportPath;
+  const destPath = path.join(videoDir, `video.${ext}`);
+  fs.copyFileSync(srcPath, destPath);
+  try { fs.unlinkSync(srcPath); } catch {}
+  return destPath;
 }
 
-/**
- * Load a saved analysis report.
- */
+/** Persist a job status record to DATA_DIR/videos/{id}/job.json */
+function saveJob(id, job) {
+  const videoDir = path.join(DATA_DIR_FN(), 'videos', id);
+  if (!fs.existsSync(videoDir)) fs.mkdirSync(videoDir, { recursive: true });
+  fs.writeFileSync(path.join(videoDir, 'job.json'), JSON.stringify(job, null, 2), 'utf8');
+}
+
+/** Load a job status record. Returns null if not found. */
+function loadJob(id) {
+  const p = path.join(DATA_DIR_FN(), 'videos', id, 'job.json');
+  if (!fs.existsSync(p)) return null;
+  try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; }
+}
+
+/** Save full analysis report JSON. */
+function saveReport(id, report) {
+  const videoDir = path.join(DATA_DIR_FN(), 'videos', id);
+  if (!fs.existsSync(videoDir)) fs.mkdirSync(videoDir, { recursive: true });
+  fs.writeFileSync(path.join(videoDir, 'report.json'), JSON.stringify(report, null, 2), 'utf8');
+}
+
+/** Load a saved analysis report. Returns null if not found. */
 function loadReport(id) {
-  const dataDir    = (process.env.DATA_DIR ?? path.join(__dirname, '../data')).replace(/\/$/, '');
-  const reportPath = path.join(dataDir, 'videos', id, 'report.json');
-  if (!fs.existsSync(reportPath)) return null;
-  try { return JSON.parse(fs.readFileSync(reportPath, 'utf8')); } catch { return null; }
+  const p = path.join(DATA_DIR_FN(), 'videos', id, 'report.json');
+  if (!fs.existsSync(p)) return null;
+  try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; }
 }
 
-/**
- * List all saved analyses (most recent first).
- */
+/** List all saved analyses (most recent first, up to 50). */
 function listReports() {
-  const dataDir   = (process.env.DATA_DIR ?? path.join(__dirname, '../data')).replace(/\/$/, '');
-  const videosDir = path.join(dataDir, 'videos');
+  const videosDir = path.join(DATA_DIR_FN(), 'videos');
   if (!fs.existsSync(videosDir)) return [];
   const ids = fs.readdirSync(videosDir).filter(d =>
     fs.existsSync(path.join(videosDir, d, 'report.json'))
@@ -218,7 +296,8 @@ function listReports() {
       } catch { return null; }
     })
     .filter(Boolean)
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+    .slice(0, 50);
 }
 
 module.exports = {
@@ -226,7 +305,11 @@ module.exports = {
   extractFrames,
   transcribeAudio,
   saveVideoFile,
+  saveVideoFromPath,
+  saveJob,
+  loadJob,
   saveReport,
   loadReport,
   listReports,
+  DATA_DIR_FN,
 };

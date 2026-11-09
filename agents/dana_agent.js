@@ -481,203 +481,288 @@ function timeSince(date) {
 
 function clearHistory() { danaHistory = []; }
 
+// ── Default audience from business context (Fix 7) ───────────────────────────
+// Loaded once from business_context.md so it stays current with studio settings.
+// Can be overridden per-request; never hardcoded in code.
+function getDefaultAudience() {
+  try {
+    const ctx = fs.readFileSync(path.join(__dirname, '../prompts/business_context.md'), 'utf8');
+    const m   = ctx.match(/## Target Audience\n([\s\S]*?)(?:\n## |\n---)/);
+    if (m) return m[1].replace(/\*\*/g, '').replace(/^-\s*/gm, '').trim().split('\n')[0].trim();
+  } catch {}
+  return 'לקוחות Shape Studio, שרון'; // minimal fallback, no hardcoded demographics
+}
+
+// ── Skill connection status (Fix 5) ──────────────────────────────────────────
+function getSkillStatus() {
+  const rubricOk   = fs.existsSync(RUBRIC_PATH);
+  const doctrineOk = fs.existsSync(DOCTRINE_PATH);
+  const estimateOk = fs.existsSync(ESTIMATE_BIN);
+  const citations  = doctrineOk ? Object.keys(getCitations()).length : 0;
+  return {
+    rubric_path:    RUBRIC_PATH,
+    rubric_loaded:  rubricOk,
+    doctrine_path:  DOCTRINE_PATH,
+    doctrine_loaded: doctrineOk,
+    doctrine_citations: citations,
+    estimate_path:  ESTIMATE_BIN,
+    estimate_exists: estimateOk,
+    python_bin:     PYTHON_BIN,
+    scoring_note:   'ציון C1-C7 מחושב על-ידי estimate.py (או fallback JS). ' +
+                    'אין קשר לאלגוריתם ה-ranking של אינסטגרם; הציון מייצג את מחוון מוסרי הציבורי בלבד.',
+  };
+}
+
 // ── Video-file analysis (actual video upload pipeline) ────────────────────────
 
 /**
- * Analyse an actual video file using Dana's Mosseri framework.
- *
- * Pipeline:
- *   1. Save video to DATA_DIR/videos/{id}/
- *   2. Extract up to 20 evenly-spaced frames with ffmpeg
- *   3. Transcribe audio with Whisper API (not local GPU)
- *   4. Send frames + transcript to GPT-4o vision for structured analysis
- *   5. Run Mosseri C1-C7 scoring via existing analyzeVideo()
- *   6. Build comprehensive report (initial decision + 8 professional sections +
- *      timestamped notes + scores + improvement suggestions)
- *   7. Save report JSON to DATA_DIR and return
+ * Analyse a video file saved to DATA_DIR (after multer upload).
  *
  * @param {object} opts
- * @param {Buffer} opts.videoBuffer
- * @param {string} opts.ext          — file extension without dot
+ * @param {string} opts.videoPath    — absolute path to saved video file
+ * @param {string} opts.id           — pre-assigned analysis ID (created by createAnalysisJob)
+ * @param {string} [opts.ext]
  * @param {string} [opts.title]
- * @param {string} [opts.goal]       — leads | awareness | trust | community | other
- * @param {string} [opts.format]     — feed | trial | story | carousel
- * @param {string} [opts.audience]
+ * @param {string} [opts.goal]
+ * @param {string} [opts.format]
+ * @param {string} [opts.audience]   — defaults to getDefaultAudience()
  * @param {string} [opts.organic_or_paid]
- * @param {string} [opts.message]    — intended message / CTA
+ * @param {string} [opts.message]
  * @param {string} [opts.focus_notes]
- * @param {string} [opts.previousVersionId] — for comparison analysis
- * @returns {Promise<object>} analysis report
+ * @param {string} [opts.previousVersionId]
+ * @param {function} [opts.onProgress]  — (stage, note) callback for job status updates
  */
 async function analyzeVideoFile({
-  videoBuffer,
-  ext           = 'mp4',
-  title         = 'סרטון ללא כותרת',
-  goal          = 'leads',
-  format        = 'feed',
-  audience      = 'נשים 30-60, אזור פרדס חנה-כרכור',
+  videoPath,
+  id,
+  ext             = 'mp4',
+  title           = 'סרטון ללא כותרת',
+  goal            = 'leads',
+  format          = 'feed',
+  audience        = '',       // empty = load from business context
   organic_or_paid = 'organic',
-  message       = '',
-  focus_notes   = '',
+  message         = '',
+  focus_notes     = '',
   previousVersionId = null,
+  onProgress      = null,
 } = {}) {
-  const id = uuidv4();
+  const effectiveAudience = audience?.trim() || getDefaultAudience();
+
+  const progress = (stage, note) => {
+    logger.info('[dana] Analysis progress', { id, stage, note });
+    if (onProgress) onProgress(stage, note);
+  };
+
+  progress('meta', 'קורא מטא-דאטה...');
   logger.info('[dana] analyzeVideoFile started', { id, title, format, goal });
 
-  // ── 1. Save video ─────────────────────────────────────────────────────────
-  const videoPath = videoSvc.saveVideoFile(id, videoBuffer, ext);
-  logger.info('[dana] Video saved', { id, path: videoPath, sizeKb: Math.round(videoBuffer.length / 1024) });
+  // ── 1. Get metadata — required; fail if ffprobe broken ───────────────────
+  const meta = await videoSvc.getVideoMeta(videoPath);
+  logger.info('[dana] Video meta', { id, ...meta });
 
-  // ── 2. Get metadata ───────────────────────────────────────────────────────
-  let meta = { durationSec: 0, width: 0, height: 0, fps: 30, hasAudio: true };
-  try {
-    meta = await videoSvc.getVideoMeta(videoPath);
-    logger.info('[dana] Video meta', { id, ...meta });
-  } catch (err) {
-    logger.warn('[dana] ffprobe failed — continuing with defaults', { error: err.message });
+  if (!meta.probeOk) {
+    throw new Error(
+      'לא ניתן לקרוא את פרטי הסרטון (ffprobe נכשל). ' +
+      'ודא שהקובץ תקין ופורמטו נתמך (mp4/mov/webm).'
+    );
   }
-
-  // Reject video exceeding 15 minutes (UI limit is 200 MB / 15 min)
+  if (!meta.durationSec) {
+    throw new Error('משך הסרטון לא זוהה — לא ניתן לחלץ פריימים ולקבוע כיסוי.');
+  }
   if (meta.durationSec > 900) {
     throw new Error(`הסרטון ארוך מדי (${Math.round(meta.durationSec / 60)} דקות). הגבלה: 15 דקות.`);
   }
 
-  // ── 3. Extract frames ─────────────────────────────────────────────────────
+  // ── 2. Extract frames with real timestamps ───────────────────────────────
+  progress('frames', 'מחלץ פריימים...');
   let frames = [];
-  const frameWarnings = [];
+  let frameError = null;
   try {
-    frames = await videoSvc.extractFrames(videoPath, meta.durationSec || 30);
+    frames = await videoSvc.extractFrames(videoPath, meta.durationSec);
   } catch (err) {
-    logger.warn('[dana] Frame extraction failed — will analyse without frames', { error: err.message });
-    frameWarnings.push('חילוץ פריימים נכשל — הניתוח מבוסס על שמע ותיאור בלבד.');
+    frameError = err.message;
+    logger.warn('[dana] Frame extraction failed', { id, error: err.message });
   }
 
-  // ── 4. Transcribe audio ───────────────────────────────────────────────────
-  let transcript = '';
-  const audioWarnings = [];
+  // ── 3. Transcribe audio (Whisper verbose_json for real word timestamps) ──
+  progress('audio', 'מתמלל שמע...');
+  let audioResult = { text: '', wordTimestamps: [], coverage: 'not_attempted', truncated: false };
+  let audioError  = null;
   try {
-    transcript = await videoSvc.transcribeAudio(videoPath, meta.hasAudio);
+    audioResult = await videoSvc.transcribeAudio(videoPath, meta.hasAudio);
   } catch (err) {
-    logger.warn('[dana] Transcription failed', { error: err.message });
-    audioWarnings.push('תמלול שמע נכשל — הניתוח מבוסס על תמונה בלבד.');
+    audioError = err.message;
+    logger.warn('[dana] Transcription failed', { id, error: err.message });
   }
 
-  // ── 5. Load previous version for comparison ───────────────────────────────
-  let prevReport = null;
-  if (previousVersionId) {
-    prevReport = videoSvc.loadReport(previousVersionId);
+  const hasFrames     = frames.length > 0;
+  const hasTranscript = audioResult.text.length > 0;
+
+  // ── 3a. Gate: refuse to generate a report with no data ───────────────────
+  if (!hasFrames && !hasTranscript) {
+    throw new Error(
+      'הניתוח נעצר: לא הצלחנו לחלץ פריימים ולא להפיק תמלול מהסרטון. ' +
+      (frameError ? `שגיאת פריימים: ${frameError}. ` : '') +
+      (audioError ? `שגיאת שמע: ${audioError}.` : '')
+    );
   }
 
-  // ── 6. GPT-4o full analysis ────────────────────────────────────────────────
+  // ── 4. Load previous version for comparison ───────────────────────────────
+  const prevReport = previousVersionId ? videoSvc.loadReport(previousVersionId) : null;
+
+  // ── 5. Build analysis input ───────────────────────────────────────────────
+  progress('analyze', 'דנה מנתחת...');
+
+  // Data availability summary — explicit, used in prompt and stored in report
+  const dataAvail = {
+    frames_extracted:     frames.length,
+    frames_total_planned: Math.min(20, Math.floor(meta.durationSec)),
+    frame_first_sec:      hasFrames ? frames[0].timestampSec      : null,
+    frame_last_sec:       hasFrames ? frames[frames.length-1].timestampSec : null,
+    has_transcript:       hasTranscript,
+    transcript_chars:     audioResult.text.length,
+    transcript_truncated: audioResult.truncated,
+    transcript_coverage:  audioResult.coverage,
+    whisper_duration:     audioResult.whisperDuration ?? null,
+    audio_quality_verified: false, // Whisper cannot verify audio quality/balance/noise
+    motion_verified:        false, // sampled frames cannot verify continuous motion
+    sync_verified:          false, // audio-visual sync not directly measurable
+    video_duration_sec:   meta.durationSec,
+    ffprobe_ok:           meta.probeOk,
+  };
+
+  // Build Whisper word-timestamp context for the prompt (real timestamps, labeled)
+  let whisperContext = '';
+  if (audioResult.wordTimestamps?.length > 0) {
+    const lines = audioResult.wordTimestamps
+      .slice(0, 150) // cap at 150 words to fit token budget
+      .map(w => `[${w.start.toFixed(1)}s] ${w.word}`)
+      .join(' ');
+    whisperContext = `\n\n**תמלול מתוזמן (Whisper):**\n${lines}`;
+    if (audioResult.truncated) {
+      whisperContext += `\n_(תמלול קוצר ב-${audioResult.text.length} תווים מתוך ${meta.durationSec.toFixed(0)}s)_`;
+    }
+  } else if (hasTranscript) {
+    whisperContext = `\n\n**תמלול דיבור (ללא חותמות זמן):**\n${audioResult.text}`;
+  }
+
   const contextBlock = [
     `**כותרת:** ${title}`,
     `**מטרה:** ${goal}`,
     `**פורמט:** ${format}`,
-    `**קהל יעד:** ${audience}`,
+    `**קהל יעד:** ${effectiveAudience}`,
     `**פרסום:** ${organic_or_paid}`,
     message      && `**מסר ו-CTA:** ${message}`,
     focus_notes  && `**דגשים לבדיקה:** ${focus_notes}`,
-    `**משך:** ${meta.durationSec ? Math.round(meta.durationSec) + ' שניות' : 'לא ידוע'}`,
-    `**רזולוציה:** ${meta.width && meta.height ? `${meta.width}×${meta.height}` : 'לא ידוע'}`,
-    transcript   && `\n**תמלול דיבור:**\n${transcript.slice(0, 4000)}`,
+    `**משך:** ${meta.durationSec.toFixed(1)} שניות`,
+    meta.width && meta.height ? `**רזולוציה:** ${meta.width}×${meta.height}` : '',
+    `**פריימים שנחלצו:** ${frames.length} (טווח: ${dataAvail.frame_first_sec?.toFixed(1) ?? '—'}s–${dataAvail.frame_last_sec?.toFixed(1) ?? '—'}s)`,
+    whisperContext,
   ].filter(Boolean).join('\n');
 
-  const prevBlock = prevReport ? `
----
-## ביקורת גרסה קודמת (להשוואה)
-ציון קודם: ${prevReport.readiness}/100 | פסק דין: ${prevReport.verdict}
-חוזקות שזוהו: ${(prevReport.strengths ?? []).join('; ')}
-תיקונים שהוצעו: ${(prevReport.fixes ?? []).map(f => f.name).join('; ')}
-` : '';
+  const prevBlock = prevReport ? [
+    '---',
+    '## ביקורת גרסה קודמת (הקשר בלבד)',
+    `ציון קודם: ${prevReport.readiness}/100 | פסק דין: ${prevReport.verdict}`,
+    `מטרה קודמת: ${prevReport.goal} | בסיס ההשוואה מוגבל אם המטרה השתנתה.`,
+    `חוזקות שזוהו: ${(prevReport.report_strengths ?? prevReport.strengths ?? []).slice(0,2).join('; ')}`,
+    `בעיות שזוהו: ${(prevReport.report_problems ?? []).slice(0,2).join('; ')}`,
+    '---',
+  ].join('\n') : '';
 
-  // Build frame content for vision API
-  const frameContent = frames.map(f => ({
-    type:      'image_url',
-    image_url: { url: `data:image/jpeg;base64,${f.base64}`, detail: 'low' },
-  }));
+  // Audio quality note — explicit in prompt
+  const audioLimitNote = `
+⚠️ מה CANNOT להעריך מתמלול בלבד (יסומן unverified=true):
+  - איזון מוזיקה מול קריינות
+  - רעשי רקע וניקיון ההקלטה
+  - סנכרון אודיו-ויזואל
+  - עוצמת קול ודינמיקה
 
-  const hasFrames   = frames.length > 0;
-  const hasTranscript = transcript.length > 0;
-  const dataNote = !hasFrames && !hasTranscript
-    ? '\n⚠️ לא עלה חומר ויזואלי ואודיו — ניתוח מוגבל.'
-    : !hasFrames ? '\n⚠️ ללא פריימים — ניתוח מבוסס שמע בלבד.'
-    : !hasTranscript ? '\n⚠️ ללא תמלול — ניתוח מבוסס ויזואלי בלבד.'
-    : '';
+⚠️ מה CANNOT להעריך מפריימים מדגמיים:
+  - קצב חיתוכים רציף
+  - תנועה ואנימציות בין פריימים
+  - סנכרון מדויק בין שמע לתמונה`;
 
-  const systemMsg = `אתה דנה, מנהלת התוכן הדיגיטלי של Shape Studio.
-אתה מנתחת סרטוני אינסטגרם לפני פרסום ומייצרת ביקורת מקצועית ואמינה.
+  const systemMsg = [
+    `אתה דנה, מנהלת התוכן הדיגיטלי של Shape Studio.`,
+    `אתה מנתחת סרטוני אינסטגרם לפני פרסום — ביקורת מקצועית, כנה, מנומקת.`,
+    '',
+    DANA_PROMPT,
+    '',
+    audioLimitNote,
+    '',
+    'כללי חובה:',
+    '- אל תמציאי נתונים שאינם בסרטון (מחירים, עדויות, ציטוטים).',
+    '- unverified=true → אל תיתני ציון (score=null). אל תיתני ציון אפס כסימן "לא עובד".',
+    '- חותמות זמן בדוח חייבות להסתמך על: (א) timestamp של פריים שנשלח, (ב) timestamp מ-Whisper. אל תמציאי זמנים.',
+    '- ציונים מבוססים רק על מה שנראה/נשמע — לא על הנחות כלליות.',
+    '- אל תציגי את ציון מוסרי ככלי "רשמי" של אינסטגרם — זהו ניתוח לפי עקרונות שפירסם אדם מוסרי בפומבי.',
+  ].join('\n');
 
-${DANA_PROMPT}
-
-כלל עמוד עמוד:
-- אל תמציאי נתונים שאינם בסרטון (מחירים, עדויות, ציטוטים).
-- אל תציגי "לא נבדק" כציון אפס — סמני קטגוריה שלא ניתן לבדוק כ"לא נבדק".
-- ציונים מבוססים רק על חומר שנראה/נשמע — לא על הנחות.
-- הגבלות ניתוח: ${dataNote || 'ניתוח מלא (פריימים + שמע)'}`;
+  const schemaExample = JSON.stringify({
+    perceived_message: '1-2 משפטים',
+    message_lands: true,
+    recommendation: 'מוכן לפרסום | דורש תיקונים קלים | דורש עריכה משמעותית',
+    strengths: ['חוזקה עם ראיה'],
+    problems:  ['בעיה עם הסבר'],
+    sections: {
+      hook:     { finding: '', score: 0, unverified: false },
+      message:  { finding: '', score: 0, unverified: false },
+      content:  { finding: '', score: 0, unverified: false },
+      editing:  { finding: '', score: null, unverified: true,
+                  note: 'לא נבדק — פריימים מדגמיים אינם מוכיחים קצב חיתוכים' },
+      captions: { finding: '', score: 0, unverified: false },
+      audio:    { finding: '', score: null, unverified: true,
+                  note: 'שמע: תמלול בלבד. איזון מוזיקה, ניקיון ורעשים — לא נבדקו.',
+                  speech_text: 'הטקסט הנאמר (מתמלול)' },
+      visuals:  { finding: '', score: 0, unverified: false },
+      cta:      { finding: '', score: 0, unverified: false },
+      platform: { finding: '', score: 0, unverified: false },
+    },
+    // timestamps MUST be anchored to real frame times or Whisper timestamps.
+    // Format: "X:XX" where X:XX maps to actual seconds in the video.
+    timestamps: [{ range: '0:00-0:05', observation: '', works: '', problem: '', suggestion: '', anchor: 'frame' }],
+    mosseri_scores: { C1: 0, C2: 0, C3: 0, C4: 0, C5: 0, C6: 0, C7: 0 },
+    mosseri_flags: [],
+    mosseri_reasonings: { C1: '', C2: '', C3: '', C4: '', C5: '', C6: '', C7: '' },
+    mosseri_strengths: [],
+    mosseri_fixes: [],
+    improvements_must: [],
+    improvements_recommended: [],
+    improvements_experiments: [],
+    hook_alternatives: ['הוק 1', 'הוק 2', 'הוק 3'],
+    cta_options: ['CTA 1', 'CTA 2'],
+    edit_plan: [{ order: 1, segment: '', duration: '0:00-0:00' }],
+    analysis_limitations: [],
+  }, null, 2);
 
   const userMsg = [
-    `נתחי את הסרטון הבא לפני פרסום. הפריימים מחולקים לאורך הסרטון.${dataNote}`,
+    `נתחי את הסרטון הבא לפני פרסום.`,
+    `פריימים מחולקים לאורך ${meta.durationSec.toFixed(1)}s — כל פריים מסומן בזמן שחולץ בפועל.`,
     '',
     contextBlock,
     prevBlock,
     '',
-    'החזירי JSON תקין בלבד (ללא טקסט מחוץ ל-JSON) במבנה הבא:',
-    JSON.stringify({
-      perceived_message: 'מה דנה מבינה שהסרטון מנסה להעביר (1-2 משפטים)',
-      message_lands: true,
-      recommendation: 'מוכן לפרסום | דורש תיקונים קלים | דורש עריכה משמעותית',
-      strengths: ['חוזקה 1 עם ראיה', 'חוזקה 2', 'חוזקה 3'],
-      problems: ['בעיה 1 עם הסבר', 'בעיה 2', 'בעיה 3'],
-      sections: {
-        hook:     { finding: 'ממצא', score: 0, max: 10 },
-        message:  { finding: '', score: 0, max: 10 },
-        content:  { finding: '', score: 0, max: 10 },
-        editing:  { finding: '', score: 0, max: 10 },
-        captions: { finding: '', score: 0, max: 10 },
-        audio:    { finding: '', score: 0, max: 10, unverified: false },
-        visuals:  { finding: '', score: 0, max: 10 },
-        cta:      { finding: '', score: 0, max: 10 },
-        platform: { finding: '', score: 0, max: 10 },
-      },
-      timestamps: [
-        { range: '0:00-0:03', observation: '', works: '', problem: '', suggestion: '' },
-      ],
-      mosseri_scores: { C1: 0, C2: 0, C3: 0, C4: 0, C5: 0, C6: 0, C7: 0 },
-      mosseri_flags: [],
-      mosseri_reasonings: { C1: '', C2: '', C3: '', C4: '', C5: '', C6: '', C7: '' },
-      mosseri_strengths: [],
-      mosseri_fixes: [],
-      improvements_must: ['חובה לפני פרסום — מה ולמה'],
-      improvements_recommended: ['שיפור מומלץ'],
-      improvements_experiments: ['ניסוי לגרסה נוספת'],
-      hook_alternatives: ['הוק חלופי 1', 'הוק חלופי 2', 'הוק חלופי 3'],
-      cta_options: ['CTA אפשרות 1', 'CTA אפשרות 2'],
-      edit_plan: [{ order: 1, segment: 'תיאור קטע', duration: '0:00-0:00' }],
-      analysis_limitations: [],
-      comparison: prevReport ? {
-        improved: ['מה השתפר'],
-        still_needs_work: ['מה עדיין דורש עבודה'],
-        new_issues: ['בעיות שנוספו'],
-        score_change: 0,
-      } : null,
-    }, null, 2),
+    'החזירי JSON תקין בלבד (ללא טקסט מחוץ ל-JSON):',
+    schemaExample,
   ].join('\n');
+
+  // Build GPT-4o vision content: text + labeled frames
+  const frameMessages = frames.map((f, i) => [
+    // Label each frame with its real timestamp before the image
+    { type: 'text', text: `[פריים ${i+1}: ${f.timestampSec.toFixed(1)}s]` },
+    { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${f.base64}`, detail: 'low' } },
+  ]).flat();
+
+  const userContent = hasFrames
+    ? [{ type: 'text', text: userMsg }, ...frameMessages]
+    : userMsg;
 
   let gptData;
   try {
-    const messages = [
-      { role: 'system', content: systemMsg },
-      {
-        role:    'user',
-        content: hasFrames
-          ? [{ type: 'text', text: userMsg }, ...frameContent]
-          : userMsg,
-      },
-    ];
-
     const completion = await openai.chat.completions.create({
       model:           'gpt-4o',
-      messages,
+      messages:        [{ role: 'system', content: systemMsg }, { role: 'user', content: userContent }],
       temperature:     0.2,
       max_tokens:      4000,
       response_format: { type: 'json_object' },
@@ -689,118 +774,197 @@ ${DANA_PROMPT}
     throw new Error('ניתוח GPT-4o נכשל: ' + err.message);
   }
 
-  // ── 7. Mosseri scoring (runs estimate.py) ─────────────────────────────────
+  // ── Mosseri scoring ───────────────────────────────────────────────────────
+  progress('scoring', 'מחשב ציון מוסרי...');
   const mosseriScores = gptData.mosseri_scores ?? {};
   const mosseriFlags  = gptData.mosseri_flags  ?? [];
-  const mosseriFormat = format === 'feed' ? 'feed' : format === 'trial' ? 'trial' : format;
+  const mosseriFormat = ['feed','trial'].includes(format) ? format : 'other';
   const estimation    = runEstimate(mosseriScores, mosseriFlags, mosseriFormat);
 
-  // ── 8. Build category scores (1-100 scale) ────────────────────────────────
+  // ── Category scores — exclude unverified (Fix 2 + Fix 6) ─────────────────
   const sections = gptData.sections ?? {};
-  const categoryScores = {
-    hook:     sections.hook?.score     ?? null,
-    message:  sections.message?.score  ?? null,
-    content:  sections.content?.score  ?? null,
-    editing:  sections.editing?.score  ?? null,
-    captions: sections.captions?.score ?? null,
-    audio:    sections.audio?.unverified ? null : (sections.audio?.score ?? null),
-    visuals:  sections.visuals?.score  ?? null,
-    cta:      sections.cta?.score      ?? null,
-    platform: sections.platform?.score ?? null,
-  };
+  const categoryScores = {};
+  for (const [k, sec] of Object.entries(sections)) {
+    categoryScores[k] = sec?.unverified ? null : (sec?.score ?? null);
+  }
 
-  // ── 9. Enrich Mosseri fixes with doctrine citations ───────────────────────
+  // ── Timestamps: validate against known video duration (Fix 1) ────────────
+  const rawTimestamps = gptData.timestamps ?? [];
+  const durationSec   = meta.durationSec;
+  const timestamps = rawTimestamps.map(t => {
+    // Check if range start is within actual video duration
+    const startSec = parseTimestampRange(t.range);
+    const inRange  = startSec !== null ? startSec <= durationSec : null;
+    return {
+      ...t,
+      approximate: t.anchor === 'frame' ? false : !hasFrames,
+      out_of_range: inRange === false,
+    };
+  }).filter(t => !t.out_of_range); // remove hallucinated timestamps beyond video
+
+  // ── Mosseri fixes + citations ─────────────────────────────────────────────
   const citeMap = getCitations();
   const fixes = (gptData.mosseri_fixes ?? []).map(fix => ({
     ...fix,
     citation: fix.principleCode ? (citeMap[fix.principleCode] ?? null) : null,
   }));
 
-  // ── 10. Build timestamps list (verify against duration) ──────────────────
-  const timestamps = (gptData.timestamps ?? []).map(t => ({
-    ...t,
-    approximate: !hasFrames,
-  }));
+  // ── Version comparison — computed in code, not by model (Fix 6) ──────────
+  let comparison = null;
+  if (prevReport && gptData.comparison) {
+    const scoreDelta = estimation.readiness - (prevReport.readiness ?? 0);
+    const goalChanged = prevReport.goal && prevReport.goal !== goal;
+    comparison = {
+      ...gptData.comparison,
+      score_change:         scoreDelta,         // always from stored data
+      goal_changed:         goalChanged,
+      comparison_note:      goalChanged
+        ? `⚠️ מטרת הסרטון השתנתה (${prevReport.goal} → ${goal}). ההשוואה מוגבלת.`
+        : null,
+      prev_readiness:       prevReport.readiness ?? null,
+      current_readiness:    estimation.readiness,
+    };
+  }
 
-  // ── 11. Assemble report ───────────────────────────────────────────────────
-  const warnings = [...frameWarnings, ...audioWarnings, ...(gptData.analysis_limitations ?? [])];
+  // ── Warnings (data quality, not hidden) ────────────────────────────────────
+  const warnings = [
+    frameError   && `חילוץ פריימים נכשל: ${frameError}`,
+    audioError   && `תמלול שמע נכשל: ${audioError}`,
+    audioResult.truncated && `תמלול קוצר — ${audioResult.text.length} תווים מכסים חלק מהסרטון.`,
+    !hasTranscript && hasFrames && 'ניתוח מבוסס ויזואל בלבד — שמע לא זמין.',
+    !hasFrames && hasTranscript && 'ניתוח מבוסס שמע בלבד — פריימים לא זמינים.',
+    ...(gptData.analysis_limitations ?? []),
+  ].filter(Boolean);
 
+  // ── Skill status (Fix 5) ─────────────────────────────────────────────────
+  const skillStatus = getSkillStatus();
+
+  // ── Assemble report ────────────────────────────────────────────────────────
+  const prevVersion = prevReport?.version ?? 0;
   const report = {
     id,
     title,
-    createdAt:        new Date().toISOString(),
-    version:          previousVersionId ? ((videoSvc.loadReport(previousVersionId)?.version ?? 1) + 1) : 1,
-    previousVersionId: previousVersionId ?? null,
+    createdAt:          new Date().toISOString(),
+    version:            previousVersionId ? prevVersion + 1 : 1,
+    previousVersionId:  previousVersionId ?? null,
     format,
     goal,
-    audience,
+    audience:           effectiveAudience,
     organic_or_paid,
     message,
     focus_notes,
 
-    // Mosseri framework
-    readiness:        estimation.readiness,
-    verdict:          estimation.verdict,
-    share_direction:  estimation.share_direction ?? null,
-    accuracy:         estimation.accuracy ?? null,
-    mosseri_scores:   mosseriScores,
-    mosseri_flags:    mosseriFlags,
-    flags:            mosseriFlags,
-    strengths:        gptData.mosseri_strengths ?? gptData.strengths ?? [],
+    // Mosseri framework output
+    readiness:          estimation.readiness,
+    verdict:            estimation.verdict,
+    share_direction:    estimation.share_direction ?? null,
+    accuracy:           estimation.accuracy        ?? null,
+    mosseri_scores:     mosseriScores,
+    mosseri_flags:      mosseriFlags,
+    flags:              mosseriFlags,
+    strengths:          gptData.mosseri_strengths ?? [],
     fixes,
-    reasonings:       gptData.mosseri_reasonings ?? {},
+    reasonings:         gptData.mosseri_reasonings ?? {},
 
     // Detailed review
-    perceived_message: gptData.perceived_message ?? '',
-    message_lands:     gptData.message_lands ?? null,
-    recommendation:    gptData.recommendation ?? '',
-    report_strengths:  gptData.strengths ?? [],
-    report_problems:   gptData.problems   ?? [],
+    perceived_message:  gptData.perceived_message ?? '',
+    message_lands:      gptData.message_lands     ?? null,
+    recommendation:     gptData.recommendation    ?? '',
+    report_strengths:   gptData.strengths  ?? [],
+    report_problems:    gptData.problems   ?? [],
     sections,
-    category_scores:   categoryScores,
+    category_scores:    categoryScores,
     timestamps,
-    improvements_must:         gptData.improvements_must         ?? [],
-    improvements_recommended:  gptData.improvements_recommended  ?? [],
-    improvements_experiments:  gptData.improvements_experiments  ?? [],
-    hook_alternatives:         gptData.hook_alternatives         ?? [],
-    cta_options:               gptData.cta_options               ?? [],
-    edit_plan:                 gptData.edit_plan                 ?? [],
+    improvements_must:        gptData.improvements_must        ?? [],
+    improvements_recommended: gptData.improvements_recommended ?? [],
+    improvements_experiments: gptData.improvements_experiments ?? [],
+    hook_alternatives:        gptData.hook_alternatives        ?? [],
+    cta_options:              gptData.cta_options              ?? [],
+    edit_plan:                gptData.edit_plan                ?? [],
+    comparison,
 
-    // Version comparison
-    comparison: gptData.comparison ?? null,
-
-    // Meta
-    videoMeta:  { durationSec: meta.durationSec, width: meta.width, height: meta.height },
-    frameCount: frames.length,
-    hasTranscript: transcript.length > 0,
-    transcript: transcript.slice(0, 2000),
+    // Analysis metadata
+    videoMeta:        { durationSec: meta.durationSec, width: meta.width, height: meta.height, fps: meta.fps },
+    dataAvailability: dataAvail,
+    skillStatus,
+    frameCount:       frames.length,
+    transcript:       audioResult.text.slice(0, 2000),
     warnings,
   };
 
-  // ── 12. Persist ───────────────────────────────────────────────────────────
   videoSvc.saveReport(id, report);
-
-  store.logEvent('video_analysis', null, {
-    id,
-    title,
-    format,
-    goal,
-    readiness: estimation.readiness,
-    verdict:   estimation.verdict,
-    version:   report.version,
-  });
-
-  logger.info('[dana] analyzeVideoFile complete', {
-    id,
-    readiness: estimation.readiness,
-    verdict:   estimation.verdict,
-    warnings:  warnings.length,
-  });
+  store.logEvent('video_analysis', null, { id, title, format, goal, readiness: estimation.readiness, verdict: estimation.verdict, version: report.version });
+  logger.info('[dana] analyzeVideoFile complete', { id, readiness: estimation.readiness, verdict: estimation.verdict, warnings: warnings.length });
 
   return report;
 }
 
-module.exports = { chat, generateContentPack, generateAdCopy, analyzeVideo, analyzeVideoFile, clearHistory,
-  getVideoHistory: () => videoSvc.listReports(),
-  getVideoReport:  (id) => videoSvc.loadReport(id),
+// ── Timestamp parser helper ────────────────────────────────────────────────────
+// Parses "1:23" or "0:03-0:08" → first time in seconds. Returns null if unparseable.
+function parseTimestampRange(range) {
+  if (!range) return null;
+  const first = range.split('-')[0].trim();
+  const parts = first.split(':').map(Number);
+  if (parts.some(isNaN)) return null;
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  if (parts.length === 1) return parts[0];
+  return null;
+}
+
+// ── Async job management (Fix 4) ──────────────────────────────────────────────
+
+const _activeJobs = new Map(); // in-process job registry (augments DATA_DIR persistence)
+
+function createAnalysisJob(id, metadata = {}) {
+  const job = {
+    id,
+    status: 'queued',
+    stage:  'queued',
+    note:   'ממתין להתחלה...',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    error: null,
+    result: null,
+    ...metadata,
+  };
+  _activeJobs.set(id, job);
+  videoSvc.saveJob(id, { ...job, result: null }); // don't persist large result in job.json
+  return job;
+}
+
+function updateJob(id, patch) {
+  const existing = _activeJobs.get(id) ?? videoSvc.loadJob(id) ?? { id };
+  const updated  = { ...existing, ...patch, updatedAt: new Date().toISOString() };
+  _activeJobs.set(id, updated);
+  // Persist without full result (result is in report.json)
+  const { result: _r, ...slim } = updated;
+  videoSvc.saveJob(id, slim);
+  return updated;
+}
+
+function getJob(id) {
+  // In-process first (fastest); fall back to disk for jobs that survived restart
+  const mem = _activeJobs.get(id);
+  if (mem && mem.status !== 'queued') return mem;
+  const disk = videoSvc.loadJob(id);
+  if (disk) {
+    // If completed on disk, load report
+    if (disk.status === 'completed') {
+      const result = videoSvc.loadReport(id);
+      return { ...disk, result };
+    }
+    return disk;
+  }
+  return null;
+}
+
+module.exports = {
+  chat, generateContentPack, generateAdCopy, analyzeVideo, analyzeVideoFile,
+  clearHistory,
+  getVideoHistory:  () => videoSvc.listReports(),
+  getVideoReport:   (id) => videoSvc.loadReport(id),
+  createAnalysisJob,
+  updateJob,
+  getJob,
+  getSkillStatus,
 };
