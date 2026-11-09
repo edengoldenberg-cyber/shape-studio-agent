@@ -554,14 +554,47 @@ async function submitVideoAnalysis() {
   }
 
   // ── Report renderer ───────────────────────────────────────────────────────────
+  function renderVideoPlayer(id) {
+    if (!id) return '';
+    const src = `/api/dana/video/${encodeURIComponent(id)}`;
+    return `
+      <details class="vup-video-section" style="margin-bottom:16px">
+        <summary style="cursor:pointer;font-size:13px;font-weight:600;color:var(--muted);padding:8px 0;user-select:none">
+          🎬 צפייה בסרטון המקורי
+        </summary>
+        <div style="margin-top:8px">
+          <video
+            controls playsinline preload="metadata"
+            style="width:100%;max-height:480px;border-radius:8px;background:#000"
+            onerror="this.parentElement.innerHTML='<p style=&quot;font-size:12px;color:var(--muted);padding:8px&quot;>הסרטון אינו זמין בנפח הקבוע (נמחק או לא נשמר).</p>'"
+          >
+            <source src="${src}" type="video/mp4">
+            <source src="${src}" type="video/quicktime">
+          </video>
+          <p style="font-size:11px;color:var(--muted);margin-top:4px">
+            צפייה בסרטון המקורי שנשמר בשרת — נפרד מהדוח ואינו תנאי להצגתו.
+          </p>
+        </div>
+      </details>`;
+  }
+
   function renderFullReport(r) {
     const readiness  = r.readiness ?? 0;
     const verdictKey = r.verdict?.includes('לפרסם') ? 'publish' : r.verdict?.includes('לגנוז') ? 'shelve' : 'fix';
     const verdictEmoji = verdictKey === 'publish' ? '✅' : verdictKey === 'shelve' ? '🚫' : '⚠️';
     const scoreClass = readiness >= 75 ? 'high' : readiness >= 50 ? 'mid' : 'low';
 
+    // Stale-score notice (before the main report)
+    const staleNotice = r.scoreScaleInvalid
+      ? `<div style="background:#fff3cd;border:1px solid #ffc107;border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:13px">
+          ⚠️ <strong>ציוני C1–C7 בדוח זה אינם תקפים</strong> — הוחזרו בסקאלה 0-100 במקום 0-5 (באג שתוקן). ציון המוכנות שגוי. <em>מומלץ לנתח מחדש.</em>
+         </div>`
+      : '';
+
     const sections = [
+      staleNotice,
       renderDecisionBanner(r, readiness, verdictKey, verdictEmoji, scoreClass),
+      renderVideoPlayer(r.id),          // ← video player, separate from report
       r.warnings?.length ? renderWarnings(r.warnings) : '',
       renderHighlights(r.report_strengths ?? r.strengths ?? [], r.report_problems ?? []),
       r.sections         ? renderSections(r.sections)        : '',

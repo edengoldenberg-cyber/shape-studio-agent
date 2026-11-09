@@ -824,6 +824,74 @@ app.get('/api/dana/skill-status', (_req, res) => {
   catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── Video file serving (for panel playback) ───────────────────────────────────
+// GET /api/dana/video/:id  — stream the original uploaded video.
+//   • id  must match a saved report (guards against path traversal).
+//   • Supports HTTP Range requests so the browser <video> element can seek.
+//   • Report and video are independent: 404 on the video does NOT break the report.
+
+const MIME_BY_EXT = {
+  mp4: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm',
+  avi: 'video/x-msvideo', mkv: 'video/x-matroska',
+};
+
+app.get('/api/dana/video/:id', (req, res) => {
+  const id = req.params.id;
+  // Reject IDs that look like path traversal attempts
+  if (!/^[a-f0-9-]{30,40}$/.test(id)) {
+    return res.status(400).json({ error: 'Invalid analysis ID format' });
+  }
+
+  // Report must exist — proves the video was produced by this server
+  const report = danaAgent.getVideoReport(id);
+  if (!report) return res.status(404).json({ error: 'ניתוח לא נמצא' });
+
+  const videoSvc  = require('./services/video.service');
+  const videoDir  = require('path').join(videoSvc.DATA_DIR_FN(), 'videos', id);
+  const files     = require('fs').existsSync(videoDir)
+    ? require('fs').readdirSync(videoDir).filter(f => f.startsWith('video.'))
+    : [];
+
+  if (files.length === 0) {
+    return res.status(404).json({ error: 'קובץ הסרטון לא זמין (נמחק או לא נשמר בנפח הקבוע)' });
+  }
+
+  const videoFile = files[0];
+  const ext       = videoFile.split('.').pop()?.toLowerCase() ?? 'mp4';
+  const videoPath = require('path').join(videoDir, videoFile);
+  const stat      = require('fs').statSync(videoPath);
+  const fileSize  = stat.size;
+  const mimeType  = MIME_BY_EXT[ext] ?? 'video/mp4';
+
+  const rangeHeader = req.headers.range;
+  if (rangeHeader) {
+    // Partial content (Range request) — required for browser seeking
+    const [startStr, endStr] = rangeHeader.replace('bytes=', '').split('-');
+    const start = parseInt(startStr, 10);
+    const end   = endStr ? parseInt(endStr, 10) : Math.min(start + 1024 * 1024 - 1, fileSize - 1);
+    if (start >= fileSize || start > end) {
+      res.status(416).set('Content-Range', `bytes */${fileSize}`).end();
+      return;
+    }
+    const chunkSize = end - start + 1;
+    res.writeHead(206, {
+      'Content-Range':  `bytes ${start}-${end}/${fileSize}`,
+      'Accept-Ranges':  'bytes',
+      'Content-Length': chunkSize,
+      'Content-Type':   mimeType,
+    });
+    require('fs').createReadStream(videoPath, { start, end }).pipe(res);
+  } else {
+    // Full file response
+    res.writeHead(200, {
+      'Content-Length': fileSize,
+      'Content-Type':   mimeType,
+      'Accept-Ranges':  'bytes',
+    });
+    require('fs').createReadStream(videoPath).pipe(res);
+  }
+});
+
 // Stale-report audit: mark old reports that used wrong 0-100 score scale.
 // GET returns current status; POST triggers a rescan.
 app.get('/api/dana/reports/audit', (_req, res) => {
