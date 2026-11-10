@@ -7,7 +7,11 @@ const OpenAI = require('openai');
 const logger = require('../utils/logger');
 
 const openai        = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const PROFILES_PATH = path.join(__dirname, '../data/lead_profiles.json');
+// Use DATA_DIR env var (Railway Volume at /data) to match all other persist files.
+// Previously hardcoded to __dirname/../data which resolves to /app/data on Railway
+// (not the Volume), causing ENOENT on every write and silently dropping barakReply.
+const _DATA_DIR     = (process.env.DATA_DIR ?? path.join(__dirname, '../data')).replace(/\/$/, '');
+const PROFILES_PATH = path.join(_DATA_DIR, 'lead_profiles.json');
 
 // ─── Persistence helpers ───────────────────────────────────────────────────────
 
