@@ -219,10 +219,26 @@ function isDemoPhone(phone) {
   return DEMO_PHONE_RE.test(String(phone).replace(/[^\d]/g, ''));
 }
 
+// ── Test send log ─────────────────────────────────────────────────────────────
+// Always-on ring buffer that records every outbound send attempt.
+// Queryable via GET /api/test/sends (see server.js).
+// Never calls real Green API for demo phones — only logs the attempt.
+// Not gated by demoCapture.isActive() so integration tests can inspect counts
+// without putting the system into demo mode.
+const _testSendLog = [];
+function _recordTestSend(to, text, type = 'sendText') {
+  _testSendLog.push({ to, preview: text.slice(0, 200), type, ts: new Date().toISOString() });
+  if (_testSendLog.length > 500) _testSendLog.shift(); // keep bounded
+}
+function getTestSendLog() { return [..._testSendLog]; }
+function clearTestSendLog() { _testSendLog.length = 0; }
+
 async function _dispatch(to, text) {
   const chatId = toChatId(to);
 
   if (isDemoPhone(to) || demoCapture.isActive()) {
+    // Record to both the test log (always-on) and demoCapture (session-based)
+    _recordTestSend(to, text, isDemoPhone(to) ? 'demo_send' : 'demo_capture_send');
     demoCapture.record('whatsapp_send', {
       to:          isDemoPhone(to) ? to : '[owner/staff]',
       preview:     text.slice(0, 400),
@@ -231,6 +247,8 @@ async function _dispatch(to, text) {
     logger.info('[Green API] DEMO — message intercepted (not sent)', { to: isDemoPhone(to) ? to : '***', preview: text.slice(0, 60) });
     return { idMessage: `demo-${Date.now()}`, demo: true };
   }
+
+  _recordTestSend(to, text, 'real_send');
 
   let url;
   try {
@@ -650,4 +668,4 @@ function parseGreenApiWebhook(body) {
   }
 }
 
-module.exports = { sendText, sendFileByUrl, alertOwner, notifyLeadTeam, releaseQueuedMessages, verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, probeGreenApiConnection, getGreenCreds, _tokenSourceVar };
+module.exports = { sendText, sendFileByUrl, alertOwner, notifyLeadTeam, releaseQueuedMessages, verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, probeGreenApiConnection, getGreenCreds, _tokenSourceVar, getTestSendLog, clearTestSendLog };

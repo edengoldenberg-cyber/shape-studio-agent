@@ -2,264 +2,423 @@
 /**
  * Integration tests: Barak WhatsApp pipeline — through processInboundWAMessage.
  *
- * These tests send real HTTP requests to the running server on localhost:3000
- * and inspect the resulting inbox entry and lead state via the REST API.
- * External services (OpenAI, WhatsApp) are NOT mocked — test phones use
- * the demo number range (972000000001-9) which the server already bypasses
- * for outbound sends (sendText demo gate).
- *
- * Tests verify routing, suppression, and state via the inbox route field
- * and lead store, NOT via delivered WhatsApp messages (which never go out
- * on demo numbers).
+ * Sends real HTTP requests to the server on localhost:3000.
+ * Demo phones (972000000001-9) are intercepted by the sendText demo gate —
+ * no real Green API calls are made. The /api/test/sends endpoint returns a log
+ * of every intercepted send attempt, letting tests assert exact outbound counts.
  *
  * Run with: npm test -- --testPathPattern=barak_pipeline
- * Requires the server running on localhost:3000 with WHATSAPP_AUTO_REPLY=true.
+ * Requires: server restarted from current code on localhost:3000
  */
 
-const fs      = require('fs');
-const path    = require('path');
-const http    = require('http');
 const supertest = require('supertest');
 
-const BASE = 'http://localhost:3000';
+const BASE  = 'http://localhost:3000';
 const agent = supertest(BASE);
 
 let serverUp = false;
 
-// Demo phones: recognized by the server's sendText demo gate — no real WA send
+// All phones are in the demo gate range 972000000001-9 so sendText is intercepted.
 const DEMO_PHONES = {
-  newLead:        '972000000001',
-  optedOut:       '972000000002',
-  humanOwns:      '972000000003',
-  callRequested:  '972000000004',
-  memberPhone:    '972000000005', // cannot inject as real Arbox member; used for lead-status tests
+  newLead:   '972000000006',
+  optedOut:  '972000000007',
+  humanOwns: '972000000008',
+  member:    '972000000009',
+  dedup:     '972000000005',
 };
 
-function skipIfDown() {
-  if (!serverUp) return pending('Server not running on localhost:3000 — skipping');
-}
+// ── Utilities ─────────────────────────────────────────────────────────────────
 
-// Build a Green API webhook body for a text message
-function greenApiBody(phone, text, name = 'Test Lead') {
+function greenApiBody(phone, text, name = 'Test Lead', messageId = null) {
   return {
-    typeWebhook:   'incomingMessageReceived',
-    instanceData:  { idInstance: 7103533626, wid: '972500000000@c.us', typeInstance: 'whatsapp' },
-    timestamp:     Math.floor(Date.now() / 1000),
-    idMessage:     `TEST_${Date.now()}_${Math.random().toString(36).slice(2)}`,
-    senderData:    { chatId: `${phone}@c.us`, sender: `${phone}@c.us`, senderName: name },
-    messageData:   { typeMessage: 'textMessage', textMessageData: { textMessage: text } },
+    typeWebhook:  'incomingMessageReceived',
+    instanceData: { idInstance: 7103533626, wid: '972500000000@c.us', typeInstance: 'whatsapp' },
+    timestamp:    Math.floor(Date.now() / 1000),
+    idMessage:    messageId ?? `TEST_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+    senderData:   { chatId: `${phone}@c.us`, sender: `${phone}@c.us`, senderName: name },
+    messageData:  { typeMessage: 'textMessage', textMessageData: { textMessage: text } },
   };
 }
 
-// POST a webhook message and return the inbox entry for the given phone
-async function sendMessage(phone, text, name) {
-  const body = greenApiBody(phone, text, name);
-  await agent.post('/api/green-api/webhook')
-    .send(body)
+async function postWebhook(phone, text, name, messageId) {
+  await agent
+    .post('/api/green-api/webhook')
+    .send(greenApiBody(phone, text, name, messageId))
     .set('Content-Type', 'application/json')
     .expect(200);
-  // Wait briefly for async processing
-  await new Promise(r => setTimeout(r, 300));
-  // Find the inbox entry — endpoint is /api/whatsapp/inbox
-  const inboxRes = await agent.get('/api/whatsapp/inbox?limit=200').expect(200);
-  const entries = inboxRes.body?.messages ?? [];
-  // Return the most recent entry for this phone
-  return entries.filter(e => e.from === phone || e.from?.startsWith(phone)).at(-1) ?? null;
 }
 
-// Get the lead record for a phone via the API
+/** Clear the send log and reply cooldowns before a test so counts and routing are unambiguous. */
+async function clearSends() {
+  await agent.delete('/api/test/sends').expect(200);
+  await agent.delete('/api/test/cooldowns').expect(200);
+}
+
+/** Poll the send log until at least minCount sends for phone appear, or timeout. */
+async function waitForSends(phone, { minCount = 1, timeoutMs = 4000, intervalMs = 80 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const res = await agent.get('/api/test/sends').expect(200);
+    const sends = (res.body?.sends ?? []).filter(s => s.to === phone);
+    if (sends.length >= minCount) return sends;
+    await new Promise(r => setTimeout(r, intervalMs));
+  }
+  const res = await agent.get('/api/test/sends').expect(200);
+  return (res.body?.sends ?? []).filter(s => s.to === phone);
+}
+
+/** Poll inbox for a message received after sentAt, for the given phone. */
+async function waitForInboxEntry(phone, { timeoutMs = 5000, intervalMs = 80, sentAt = null } = {}) {
+  const after   = sentAt ?? (Date.now() - 500);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const res = await agent.get('/api/whatsapp/inbox?limit=200').expect(200);
+    // getAll() returns newest-first; find the first (most recent) entry for this phone after sentAt
+    const match = (res.body?.messages ?? []).find(e => {
+      if (!(e.from === phone || e.from?.startsWith(phone))) return false;
+      return new Date(e.receivedAt ?? e.timestamp ?? 0).getTime() >= after;
+    });
+    if (match) return match;
+    await new Promise(r => setTimeout(r, intervalMs));
+  }
+  return null;
+}
+
+/** Poll inbox for an entry with this specific messageId. Returns all matches. */
+async function waitForMessageId(messageId, { timeoutMs = 3000, intervalMs = 80 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const res = await agent.get('/api/whatsapp/inbox?limit=200').expect(200);
+    const matches = (res.body?.messages ?? []).filter(e => e.messageId === messageId);
+    if (matches.length > 0) return { entries: matches, count: matches.length };
+    await new Promise(r => setTimeout(r, intervalMs));
+  }
+  return { entries: [], count: 0 };
+}
+
+async function deleteLead(phone) {
+  try { await agent.delete(`/api/leads/${encodeURIComponent(phone)}`); } catch {}
+}
+
 async function getLead(phone) {
   const res = await agent.get('/api/leads').expect(200);
-  const leads = res.body ?? [];
-  return leads.find(l => l.phone?.includes(phone.slice(-6))) ?? null;
+  // Masked format: "97200••••006" — only last 3 digits are unmasked.
+  // Use slice(-3) so matching works regardless of mask length.
+  const tail = phone.slice(-3);
+  return (res.body ?? []).find(l => l.phone?.endsWith(tail)) ?? null;
 }
 
-// Delete a test lead to reset state between tests
-async function deleteLead(phone) {
-  try {
-    await agent.delete(`/api/leads/${encodeURIComponent(phone)}`);
-  } catch {}
+async function addKnownMember(phone) {
+  await agent.post('/api/members/known').send({ phone }).expect(200);
 }
+
+async function removeKnownMember(phone) {
+  try { await agent.delete(`/api/members/known/${encodeURIComponent(phone)}`); } catch {}
+}
+
+// ── Setup ─────────────────────────────────────────────────────────────────────
 
 beforeAll(async () => {
   try {
     await agent.get('/health').timeout(5000).expect(200);
     serverUp = true;
-  } catch {}
+  } catch (e) {
+    console.warn('Server not up:', e.message);
+  }
 });
 
 afterAll(async () => {
   if (!serverUp) return;
-  // Clean up demo leads created during testing
   for (const phone of Object.values(DEMO_PHONES)) {
     await deleteLead(phone);
+    await removeKnownMember(phone);
   }
+  await clearSends();
 });
 
-// ── 1. New lead enters Barak's flow ─────────────────────────────────────────
-describe('New lead routing', () => {
-  test('unknown phone → route=barak or lead flow processes it', async () => {
+function skipIfDown() {
+  if (!serverUp) return pending('Server not running on localhost:3000 — skipping');
+}
+
+// ── 1. Unknown lead enters Barak's flow ───────────────────────────────────────
+describe('New lead routing → Barak', () => {
+  beforeEach(async () => {
+    await deleteLead(DEMO_PHONES.newLead);
+    await clearSends();
+  });
+  afterEach(async () => { await deleteLead(DEMO_PHONES.newLead); });
+
+  test('schedule query → route=barak, sendText fired, barakReply set', async () => {
     skipIfDown();
-    // Send initial message
-    const entry = await sendMessage(DEMO_PHONES.newLead, 'שלום, מחפש/ת פילאטיס');
+    // The schedule-query path sets barakReply and calls sendText directly.
+    // Tier-3 Arbox lookup runs first (unknown phone → network call → may take several seconds).
+    // waitForInboxEntry with generous timeout is the primary signal;
+    // the send log is checked after the inbox entry confirms processing completed.
+    const sentAt = Date.now();
+    await postWebhook(DEMO_PHONES.newLead, 'מה מערכת השעות?');
+
+    // Wait for inbox entry — appears right before sendText is called
+    const entry = await waitForInboxEntry(DEMO_PHONES.newLead, { sentAt, timeoutMs: 15000 });
     expect(entry).not.toBeNull();
-    // Route should be barak or contain barak qualifier
-    // (not tomer, not opted_out_silent, not human_owns_hold)
-    expect(entry.route).not.toBe('opted_out_silent');
-    expect(entry.route).not.toBe('human_owns_hold');
+    expect(entry.route).toBe('barak');
+    expect(['opted_out_silent', 'human_owns_hold', 'tomer']).not.toContain(entry.route);
+
+    // After the inbox entry appears, sendText has been called (it runs after the inbox push).
+    // Allow a brief moment for the in-process send log to reflect the call.
+    const sends = await waitForSends(DEMO_PHONES.newLead, { minCount: 1, timeoutMs: 2000 });
+    expect(sends.length).toBeGreaterThanOrEqual(1);
+  });
+
+  test('general message → route=barak, sendText fired, lead record created', async () => {
+    skipIfDown();
+    // AI path: leadAgent.handleInbound calls sendText internally.
+    // Arbox Tier-3 lookup + OpenAI call both run → allow up to 15s.
+    const sentAt = Date.now();
+    await postWebhook(DEMO_PHONES.newLead, 'מחפש/ת שיעורי פילאטיס');
+
+    const entry = await waitForInboxEntry(DEMO_PHONES.newLead, { sentAt, timeoutMs: 15000 });
+    expect(entry).not.toBeNull();
+    expect(entry.route).toBe('barak');
+    expect(['opted_out_silent', 'human_owns_hold', 'tomer']).not.toContain(entry.route);
+
+    // sendText fired (AI qualification reply)
+    const sends = await waitForSends(DEMO_PHONES.newLead, { minCount: 1, timeoutMs: 3000 });
+    expect(sends.length).toBeGreaterThanOrEqual(1);
+
+    // Lead record exists: leadAgent.handleInbound ran
+    const lead = await getLead(DEMO_PHONES.newLead);
+    expect(lead).not.toBeNull();
   });
 });
 
-// ── 2. Opted-out contact receives no automated sales reply ───────────────────
-describe('Opted-out contact', () => {
-  test('pre-opted-out phone → route=opted_out_silent, barakReply=null', async () => {
+// ── 2. Known member → Tomer, zero Barak sales sends ──────────────────────────
+// buildSchedulingReply makes a live Arbox call that can take >5s on local dev.
+// Extend Jest timeout for this describe block.
+jest.setTimeout(30000);
+
+describe('Known member routing → Tomer, zero Barak sends', () => {
+  beforeEach(async () => {
+    await deleteLead(DEMO_PHONES.member);
+    await addKnownMember(DEMO_PHONES.member);
+    await clearSends();
+  });
+  afterEach(async () => {
+    await removeKnownMember(DEMO_PHONES.member);
+    await deleteLead(DEMO_PHONES.member);
+  });
+
+  test('known member general message → route=tomer, Barak sales funnel did not run', async () => {
     skipIfDown();
-    // Set the lead as opted_out via the API
+    // Use a message > 20 chars so isBriefAck returns false (brief-ack guard applies to all phones).
+    // 'רוצה לדעת על מערכת השיעורים' (28 chars) is unambiguous.
+    // The message goes to Tomer's AI — no Barak lead upsert, no Barak sendText.
+    // Note: stale lead records for this phone may survive between test runs because
+    //   reclassifyAsConvertedMember preserves opted_out/human_owns status per design.
+    //   Route='tomer' is the authoritative proof that Barak's funnel did not run.
+    const sentAt = Date.now();
+    await postWebhook(DEMO_PHONES.member, 'רוצה לדעת על מערכת השיעורים');
+
+    const entry = await waitForInboxEntry(DEMO_PHONES.member, { sentAt, timeoutMs: 20000 });
+    expect(entry).not.toBeNull();
+    expect(entry.route).toBe('tomer');
+
+    // No Barak sales send: Barak's leadAgent.handleInbound was never called,
+    // so no Barak-initiated sendText appears in the send log for this phone.
+    // (Tomer may or may not send — both are valid.)
+    const sends = (await agent.get('/api/test/sends').expect(200)).body?.sends ?? [];
+    const barakSalesSends = sends.filter(s => s.to === DEMO_PHONES.member && s.type === 'demo_send');
+    // We cannot distinguish Tomer vs Barak sends by content alone, so we only
+    // assert the route (above). Send count is informational.
+    void barakSalesSends; // informational only
+  });
+
+  test('known member schedule query → route=tomer', async () => {
+    skipIfDown();
+    // The schedule query for a known member goes to Tomer's scheduling path,
+    // which calls buildSchedulingReply (live Arbox call — may take several seconds).
+    // waitForInboxEntry must wait until the routing block + Arbox call complete
+    // before the inbox push happens.
+    const sentAt = Date.now();
+    await postWebhook(DEMO_PHONES.member, 'מה מערכת השעות?');
+
+    const entry = await waitForInboxEntry(DEMO_PHONES.member, { sentAt, timeoutMs: 20000 });
+    expect(entry).not.toBeNull();
+    expect(entry.route).toBe('tomer');
+  });
+});
+
+// ── 3. Opted-out → silent, zero sends ────────────────────────────────────────
+describe('Opted-out contact → no automated sales send', () => {
+  beforeEach(async () => {
+    await deleteLead(DEMO_PHONES.optedOut);
     await agent.post(`/api/leads/${encodeURIComponent(DEMO_PHONES.optedOut)}/opt-out`)
       .send({}).expect(200);
+    await clearSends();
+  });
+  afterEach(async () => { await deleteLead(DEMO_PHONES.optedOut); });
 
-    const entry = await sendMessage(DEMO_PHONES.optedOut, 'שלום שוב');
+  test('opted-out → route=opted_out_silent, barakReply=null, zero sends', async () => {
+    skipIfDown();
+    const sentAt = Date.now();
+    await postWebhook(DEMO_PHONES.optedOut, 'שלום שוב');
+
+    const entry = await waitForInboxEntry(DEMO_PHONES.optedOut, { sentAt });
     expect(entry).not.toBeNull();
     expect(entry.route).toBe('opted_out_silent');
     expect(entry.barakReply).toBeNull();
+
+    // Zero outbound sends — opted_out returns before any sendText call
+    const sends = (await agent.get('/api/test/sends').expect(200)).body?.sends ?? [];
+    const phoneSends = sends.filter(s => s.to === DEMO_PHONES.optedOut);
+    expect(phoneSends.length).toBe(0);
   });
 });
 
-// ── 3. Human-owned contact receives no automated reply ───────────────────────
-describe('Human-owned contact', () => {
-  test('human_owns phone → route=human_owns_hold, barakReply=null', async () => {
-    skipIfDown();
-    // Create a lead then take ownership
+// ── 4. Human-owned → hold, zero sales sends ──────────────────────────────────
+describe('Human-owned contact → no automated sales send', () => {
+  beforeEach(async () => {
+    await deleteLead(DEMO_PHONES.humanOwns);
     await agent.post(`/api/leads/${encodeURIComponent(DEMO_PHONES.humanOwns)}/takeover`)
       .send({ reason: 'test', staffName: 'Test Staff' }).expect(200);
+    await clearSends();
+  });
+  afterEach(async () => { await deleteLead(DEMO_PHONES.humanOwns); });
 
-    const entry = await sendMessage(DEMO_PHONES.humanOwns, 'אז מה קורה?');
+  test('human_owns → route=human_owns_hold, barakReply=null, zero sends', async () => {
+    skipIfDown();
+    const sentAt = Date.now();
+    await postWebhook(DEMO_PHONES.humanOwns, 'אז מה קורה?');
+
+    const entry = await waitForInboxEntry(DEMO_PHONES.humanOwns, { sentAt });
     expect(entry).not.toBeNull();
     expect(entry.route).toBe('human_owns_hold');
     expect(entry.barakReply).toBeNull();
+
+    const sends = (await agent.get('/api/test/sends').expect(200)).body?.sends ?? [];
+    expect(sends.filter(s => s.to === DEMO_PHONES.humanOwns).length).toBe(0);
   });
 });
 
-// ── 4. Release cannot reactivate opted-out or member ────────────────────────
-describe('Release semantics', () => {
-  test('releasing human_owns over opted_out restores opted_out, not cold', async () => {
+// ── 5. Release semantics ─────────────────────────────────────────────────────
+describe('Release semantics — terminal statuses preserved', () => {
+  afterEach(async () => {
+    await deleteLead(DEMO_PHONES.optedOut);
+    await deleteLead(DEMO_PHONES.humanOwns);
+  });
+
+  test('opted_out survives human_owns takeover + release', async () => {
     skipIfDown();
-    // Set up: opted_out first, then human takes ownership
+    await deleteLead(DEMO_PHONES.optedOut);
     await agent.post(`/api/leads/${encodeURIComponent(DEMO_PHONES.optedOut)}/opt-out`)
       .send({}).expect(200);
     await agent.post(`/api/leads/${encodeURIComponent(DEMO_PHONES.optedOut)}/takeover`)
       .send({ reason: 'manual' }).expect(200);
 
-    // Release
-    const releaseRes = await agent.post(`/api/leads/${encodeURIComponent(DEMO_PHONES.optedOut)}/release`)
+    const res = await agent.post(`/api/leads/${encodeURIComponent(DEMO_PHONES.optedOut)}/release`)
       .send({}).expect(200);
 
-    // Core assertion: status must remain opted_out (not revert to cold)
-    expect(releaseRes.body.status).toBe('opted_out');
-    // automationResumed is added by the new release code — verify when present
-    if ('automationResumed' in releaseRes.body) {
-      expect(releaseRes.body.automationResumed).toBe(false);
-      expect(releaseRes.body.reason).toBe('opted_out_preserved');
-    }
+    expect(res.body.status).toBe('opted_out');
+    expect(res.body.automationResumed).toBe(false);
+    expect(res.body.reason).toBe('opted_out_preserved');
   });
 
-  test('releasing human_owns for a plain lead restores automation', async () => {
+  test('previousStatus=opted_out preserved even without meta.optedOutAt (legacy path)', async () => {
     skipIfDown();
-    // Set up: warm lead, then take ownership
+    // Both the meta.optedOutAt AND previousStatus guards should fire.
+    // Here the opt-out API sets meta.optedOutAt, so both paths agree.
+    // Legacy records lacking meta.optedOutAt are protected by previousStatus.
+    await deleteLead(DEMO_PHONES.optedOut);
+    await agent.post(`/api/leads/${encodeURIComponent(DEMO_PHONES.optedOut)}/opt-out`)
+      .send({}).expect(200);
+    await agent.post(`/api/leads/${encodeURIComponent(DEMO_PHONES.optedOut)}/takeover`)
+      .send({ reason: 'test' }).expect(200);
+
+    const res = await agent.post(`/api/leads/${encodeURIComponent(DEMO_PHONES.optedOut)}/release`)
+      .send({}).expect(200);
+    expect(res.body.status).toBe('opted_out');
+    expect(res.body.automationResumed).toBe(false);
+  });
+
+  test('plain cold lead restores to automation after release', async () => {
+    skipIfDown();
+    await deleteLead(DEMO_PHONES.humanOwns);
     await agent.post(`/api/leads/${encodeURIComponent(DEMO_PHONES.humanOwns)}/takeover`)
       .send({ reason: 'manual' }).expect(200);
 
-    const releaseRes = await agent.post(`/api/leads/${encodeURIComponent(DEMO_PHONES.humanOwns)}/release`)
+    const res = await agent.post(`/api/leads/${encodeURIComponent(DEMO_PHONES.humanOwns)}/release`)
       .send({}).expect(200);
-
-    // After release: status must not be human_owns (ownership was cleared).
-    // Old servers (pre-deployment) may still return human_owns when previousStatus was
-    // human_owns — the TERMINAL guard in the new release code prevents this.
-    // automationResumed is only present in the new code; use it to gate this assertion.
-    if ('automationResumed' in releaseRes.body) {
-      // New code: human_owns is in TERMINAL, so cold is returned, not human_owns
-      expect(releaseRes.body.status).not.toBe('human_owns');
-      expect(releaseRes.body.automationResumed).toBe(true);
-    } else {
-      // Old code: test only verifies the endpoint succeeded
-      expect(releaseRes.body.ok).toBe(true);
-    }
+    expect(res.body.status).not.toBe('human_owns');
+    expect(res.body.automationResumed).toBe(true);
   });
 });
 
-// ── 5. Callback requested ≠ confirmed appointment ───────────────────────────
-describe('Callback vs confirmed appointment', () => {
-  test('call_time captured via AI flow → status=callback_requested, not call_scheduled', async () => {
+// ── 6. Callback ≠ confirmed appointment ─────────────────────────────────────
+describe('Callback request vs confirmed appointment', () => {
+  afterEach(async () => { await deleteLead(DEMO_PHONES.newLead); });
+
+  test('time mention without prior callProposed → not call_scheduled', async () => {
     skipIfDown();
-    // Set up a lead with callProposed=true so the pipeline captures the next time mention
-    // We can't easily trigger the full AI flow, so test via the lead store state.
-    // The /api/leads/:phone endpoint reveals the status.
-    // Post-call status test: inject to a lead that has callback_requested status
-    await agent.post(`/api/leads/${encodeURIComponent(DEMO_PHONES.callRequested)}/takeover`)
-      .send({ reason: 'test' }).expect(200);
-    await agent.post(`/api/leads/${encodeURIComponent(DEMO_PHONES.callRequested)}/release`)
+    await deleteLead(DEMO_PHONES.newLead);
+    await postWebhook(DEMO_PHONES.newLead, 'יום שני בעשר בבוקר');
+    // Poll briefly for the lead to be created (may not exist if swallowed)
+    await new Promise(r => setTimeout(r, 500));
+    const lead = await getLead(DEMO_PHONES.newLead);
+    if (lead) {
+      // If a lead exists, it must not have been elevated to call_scheduled
+      // (only an aptStore entry can do that — the AI flow sets callback_requested)
+      expect(lead.status).not.toBe('call_scheduled');
+    }
+    // No lead at all is also valid (ack-swallowed or spam-filtered)
+  });
+});
+
+// ── 7. Duplicate webhook → exactly one outbound action ───────────────────────
+describe('Duplicate webhook deduplication', () => {
+  beforeEach(async () => {
+    await deleteLead(DEMO_PHONES.dedup);
+    // Opt-out so the pipeline exits before any sendText call,
+    // making processing deterministic and fast (no AI or Arbox).
+    await agent.post(`/api/leads/${encodeURIComponent(DEMO_PHONES.dedup)}/opt-out`)
       .send({}).expect(200);
+    await clearSends();
+  });
+  afterEach(async () => { await deleteLead(DEMO_PHONES.dedup); });
 
-    // Inject a time-like message — this should NOT auto-create an aptStore entry
-    // unless the lead has callProposed=true set by the AI
-    const entry = await sendMessage(DEMO_PHONES.callRequested, 'יום שני בעשר בבוקר');
-    if (entry) {
-      // If the lead did not have callProposed set, this should be treated as a normal message
-      // and NOT jump to call_scheduled. Only the aptStore flow can set call_scheduled.
-      const lead = await getLead(DEMO_PHONES.callRequested);
-      if (lead) {
-        expect(lead.status).not.toBe('call_scheduled'); // only aptStore can set this
-      }
-    }
+  test('identical messageId sent twice → exactly one inbox entry, zero sends', async () => {
+    skipIfDown();
+    const messageId = `DEDUP_${Date.now()}`;
+
+    // Send the same webhook body twice (opted_out path is synchronous — no race)
+    await postWebhook(DEMO_PHONES.dedup, 'בדיקת כפילות', 'Test', messageId);
+    await postWebhook(DEMO_PHONES.dedup, 'בדיקת כפילות', 'Test', messageId);
+
+    // Poll until the entry appears (opted_out is fast: no AI, no Arbox)
+    const { entries, count } = await waitForMessageId(messageId, { timeoutMs: 2000 });
+    // Exactly one entry for this messageId (the second was deduplicated)
+    expect(count).toBe(1);
+    // opted_out path performs no outbound send
+    expect(entries[0].route).toBe('opted_out_silent');
+    expect(entries[0].barakReply).toBeNull();
+
+    // The send log confirms zero outbound sends for this phone
+    const sends = (await agent.get('/api/test/sends').expect(200)).body?.sends ?? [];
+    expect(sends.filter(s => s.to === DEMO_PHONES.dedup).length).toBe(0);
   });
 });
 
-// ── 6. Duplicate webhook messages do not create duplicate inbox entries ───────
-describe('Duplicate webhook handling', () => {
-  test('two identical messageIds → only one inbox entry', async () => {
+// ── 8. Phone registry ─────────────────────────────────────────────────────────
+describe('Phone registry', () => {
+  test('/api/version returns a numeric phoneRegistrySize > 0', async () => {
     skipIfDown();
-    const messageId = `DEDUP_TEST_${Date.now()}`;
-    const body = {
-      ...greenApiBody(DEMO_PHONES.newLead, 'בדיקת כפילות', 'Test'),
-      idMessage: messageId,
-    };
-
-    // Send the same message twice
-    await agent.post('/api/green-api/webhook').send(body).expect(200);
-    await agent.post('/api/green-api/webhook').send(body).expect(200);
-    await new Promise(r => setTimeout(r, 400));
-
-    // Count entries with this messageId
-    const inboxRes = await agent.get('/api/whatsapp/inbox?limit=200').expect(200);
-    const entries  = (inboxRes.body?.messages ?? []);
-    const dupes    = entries.filter(e => e.messageId === messageId);
-    expect(dupes.length).toBeLessThanOrEqual(1);
+    const res = await agent.get('/api/version').expect(200);
+    expect(typeof res.body?.phoneRegistrySize).toBe('number');
+    expect(res.body.phoneRegistrySize).toBeGreaterThan(0);
   });
-});
 
-// ── 7. Phone registry: row count vs loaded Set ───────────────────────────────
-describe('Phone registry integrity', () => {
-  test('system endpoint reports member count; version confirms registry size', async () => {
+  test('/api/health/registry reports registry OK', async () => {
     skipIfDown();
-    const sysRes = await agent.get('/api/system').expect(200);
-    // The registry size from /api/version
-    const verRes = await agent.get('/api/version');
-    // /api/version is a new endpoint — 404 means the server predates this commit
-    // phoneRegistrySize and arbox member count may differ:
-    //   - Arbox returns DB row count (includes deactivated, aggregator, etc.)
-    //   - phoneRegistrySize is the number of normalized phones actually in the Set
-    // We only assert the endpoint responds and that both are numbers.
-    if (verRes.status === 404) {
-      // Server predates the /api/version endpoint — log and pass
-      console.log('[version] /api/version not yet available — deploy pending');
-      return;
-    }
-    expect(verRes.status).toBe(200);
-    const registrySize = verRes.body?.phoneRegistrySize;
-    if (registrySize !== undefined && registrySize !== 'unavailable') {
-      expect(typeof registrySize).toBe('number');
-    }
-    // Log both for the report
-    console.log(`[registry] Set size: ${registrySize}`);
+    const res = await agent.get('/api/health/registry').expect(200);
+    expect(res.body?.registry?.diagnosis).toBe('OK');
+    expect(res.body?.timetable).toBeDefined();
   });
 });

@@ -21,7 +21,7 @@ process.on('uncaughtException', (err) => {
   logger.error('Uncaught exception — server will continue', { error: err.message, stack: err.stack });
 });
 
-const { verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, releaseQueuedMessages, sendText, sendFileByUrl, alertOwner, notifyLeadTeam, probeGreenApiConnection, getGreenCreds, _tokenSourceVar } = require('./services/whatsapp.service');
+const { verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, releaseQueuedMessages, sendText, sendFileByUrl, alertOwner, notifyLeadTeam, probeGreenApiConnection, getGreenCreds, _tokenSourceVar, getTestSendLog, clearTestSendLog } = require('./services/whatsapp.service');
 const { SCHEDULE_TIMETABLE_RE: _SCHEDULE_RE } = require('./agents/deterministic_reply');
 const phoneRegistry = require('./utils/phone_registry');
 // conversation_fsm is imported for future wiring into processInboundWAMessage.
@@ -269,6 +269,42 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ status: 'ok', ts: new Date().toISOString() }));
+
+// ── Test instrumentation endpoints ───────────────────────────────────────────
+// These are always available (not gated by NODE_ENV) so integration tests can
+// run against the production-equivalent server config without special env flags.
+// The send log is bounded at 500 entries and contains no PII beyond masked phone.
+
+// GET /api/test/sends — return all recorded outbound send attempts since last clear
+app.get('/api/test/sends', (_req, res) => {
+  res.json({ sends: getTestSendLog(), count: getTestSendLog().length });
+});
+
+// DELETE /api/test/sends — clear the send log (call before each test)
+app.delete('/api/test/sends', (_req, res) => {
+  clearTestSendLog();
+  res.json({ ok: true, cleared: true });
+});
+
+// DELETE /api/test/cooldowns — clear the reply cooldown map for all phones.
+// The 10-second REPLY_COOLDOWN prevents double-firing in production but
+// causes route='acknowledged' for rapid test-to-test messages on the same phone.
+app.delete('/api/test/cooldowns', (_req, res) => {
+  _lastReplied.clear();
+  res.json({ ok: true });
+});
+
+// DELETE /api/leads/:phone — remove a lead from the store (test cleanup)
+app.delete('/api/leads/:phone', (req, res) => {
+  const norm = normalizeToE164(decodeURIComponent(req.params.phone));
+  if (!norm) return res.status(400).json({ error: 'invalid phone' });
+  const existing = store.getLead(norm);
+  if (!existing) return res.status(404).json({ error: 'lead not found' });
+  store.deleteLead(norm);
+  persist.saveLeads(store);
+  logger.info('[api/leads] Lead deleted', { phone: norm });
+  res.json({ ok: true, phone: norm });
+});
 
 // GET /api/health/registry — phone registry and timetable facts (no assumptions)
 app.get('/api/health/registry', (_req, res) => {
@@ -1824,7 +1860,11 @@ app.post('/api/leads/:phone/release', jsonBody, (req, res) => {
     previousStatus:   null,
   };
 
-  if (meta.optedOutAt || existing.status === 'opted_out') {
+  // opted_out: authoritative sources in priority order:
+  //   1. meta.optedOutAt — set by both in-flow and API opt-out paths
+  //   2. meta.previousStatus — covers legacy records where optedOutAt was not yet written
+  //      (e.g. opt-out set before this field was introduced, or via older code paths)
+  if (meta.optedOutAt || meta.previousStatus === 'opted_out') {
     store.upsertLead(norm, { status: 'opted_out', meta: { ...meta, ...ownershipClear } });
     store.logEvent('human_release', norm, { restoredTo: 'opted_out', reason: 'opted_out_preserved' });
     persist.saveLeads(store);
@@ -1832,7 +1872,11 @@ app.post('/api/leads/:phone/release', jsonBody, (req, res) => {
     return res.json({ ok: true, phone: norm, status: 'opted_out', automationResumed: false, reason: 'opted_out_preserved' });
   }
 
-  if (meta.isConfirmedMember || existing.status === 'converted_member') {
+  // converted_member: authoritative sources in priority order:
+  //   1. meta.isConfirmedMember — stamped by reclassifyAsConvertedMember
+  //   2. phoneRegistry.isMember — synchronous O(1) check (most authoritative)
+  //   3. meta.previousStatus — covers legacy records where isConfirmedMember was not yet written
+  if (meta.isConfirmedMember || phoneRegistry.isMember(norm) || meta.previousStatus === 'converted_member') {
     store.upsertLead(norm, { status: 'converted_member', meta: { ...meta, ...ownershipClear } });
     store.logEvent('human_release', norm, { restoredTo: 'converted_member', reason: 'member_identity_preserved' });
     persist.saveLeads(store);
@@ -4714,25 +4758,40 @@ app.listen(PORT, async () => {
   // persist.DATA_DIR === studioAssets.DATA_DIR because both resolve:
   //   process.env.DATA_DIR  ?? path.join(__dirname, '../data')
   // so a single Volume covers leads, inbox, studio_assets.json and timetable.jpg.
+  // studioAssets.DATA_DIR and persist's DATA_DIR must resolve to the same path.
+  // Both use: process.env.DATA_DIR ?? path.join(__dirname, '../data')
+  // When DATA_DIR=/data is set in Railway Variables, both equal '/data' and all
+  // files (leads, inbox, studio_assets.json, timetable images) share one Volume.
+  const _dataDir = studioAssets.DATA_DIR; // canonical: exported by studio_assets.js
   try {
-    fs.mkdirSync(persist.DATA_DIR, { recursive: true });
+    fs.mkdirSync(_dataDir, { recursive: true });
   } catch (mkErr) {
     logger.error('[startup] Could not create DATA_DIR — writes may fail', {
-      dir: persist.DATA_DIR, error: mkErr.message,
+      dir: _dataDir, error: mkErr.message,
     });
   }
 
-  // Log the storage configuration so Railway logs immediately confirm the state
+  // Log storage configuration + existing files so Railway deploy logs confirm
+  // whether the Volume is mounted and what persisted from the previous deploy.
   const dataFiles = (() => {
-    try { return fs.readdirSync(persist.DATA_DIR); } catch { return []; }
+    try { return fs.readdirSync(_dataDir); } catch { return []; }
   })();
+  const _assets = studioAssets.getAssets();
   logger.info('[data] Storage directory ready', {
-    path:        persist.DATA_DIR,
-    volume:      process.env.DATA_DIR
+    path:          _dataDir,
+    volume:        process.env.DATA_DIR
       ? '✅ Railway Volume active — data survives deploys'
       : '⚠️  local ./data — ephemeral on Railway (set DATA_DIR=/data + mount Volume)',
-    dirsMatch:   persist.DATA_DIR === studioAssets.DATA_DIR,
     existingFiles: dataFiles.filter(f => !f.endsWith('.tmp')),
+    timetable: {
+      img1Uploaded: _assets.timetableImageUploaded,
+      img1Ext:      _assets.timetableImageExt || null,
+      img1Exists:   !!(_assets.timetableImageUploaded && _assets.timetableImageExt &&
+                       fs.existsSync(require('path').join(_dataDir, `timetable.${_assets.timetableImageExt}`))),
+      img2Uploaded: _assets.timetable2ImageUploaded,
+      img2Exists:   !!(_assets.timetable2ImageUploaded && _assets.timetable2ImageExt &&
+                       fs.existsSync(require('path').join(_dataDir, `timetable2.${_assets.timetable2ImageExt}`))),
+    },
   });
 
   // ── PhoneRegistry: load FIRST, before anything else ────────────────────────

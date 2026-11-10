@@ -163,14 +163,11 @@ async function generateHandoffBrief(phone, name, history, qualData = {}) {
     `\n━━━━━━━━━━━━━━━━━━━━━`,
   ].filter(l => l !== null).join('\n');
 
-  try {
-    await alertOwner(`📋 ליד מוכן לשיחה — ${displayName}`, briefLines);
-    logger.info('[handoff] Brief sent', { phone, readiness: readiness.level });
-  } catch (err) {
-    logger.warn('[handoff] Brief alert failed', { phone, error: err.message });
-  }
+  // The caller (reliableHandoffAlert) owns all notification sending through its
+  // deduplicated gate. This function only generates content — no alertOwner call.
+  logger.info('[handoff] Brief generated', { phone, readiness: readiness.level });
 
-  return { briefData, readiness };
+  return { briefData, readiness, briefLines };
 }
 
 module.exports = { scoreReadiness, generateHandoffBrief };

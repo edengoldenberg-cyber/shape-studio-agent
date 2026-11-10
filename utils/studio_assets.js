@@ -95,13 +95,29 @@ function saveTimetableImage(buffer, ext) {
   const imgPath  = path.join(DATA_DIR, filename);
 
   fs.writeFileSync(imgPath, buffer);
-  logger.info('[studio-assets] Timetable image saved', { path: imgPath, sizeKb: Math.round(buffer.length / 1024) });
+
+  // Verify the image was actually written to disk before updating the metadata flag.
+  // On some Railway Volume configurations renameSync can silently fail;
+  // this guard prevents the metadata from claiming the image exists when it doesn't.
+  const writtenStat = fs.statSync(imgPath);
+  if (writtenStat.size !== buffer.length) {
+    throw new Error(`Timetable image write mismatch: expected ${buffer.length}B, got ${writtenStat.size}B at ${imgPath}`);
+  }
+  logger.info('[studio-assets] Timetable image saved and verified', {
+    path: imgPath, sizeKb: Math.round(buffer.length / 1024), dataDir: DATA_DIR,
+  });
 
   const current = getAssets();
   const toSave  = { ...current, timetableImageUploaded: true, timetableImageExt: safeExt };
   atomicWrite(FILE, toSave);
 
-  return { timetableImageUploaded: true, timetableImageExt: safeExt };
+  // Verify the metadata was written
+  const readBack = getAssets();
+  if (!readBack.timetableImageUploaded || readBack.timetableImageExt !== safeExt) {
+    throw new Error(`studio_assets.json metadata write failed — readBack: ${JSON.stringify(readBack)}`);
+  }
+
+  return { timetableImageUploaded: true, timetableImageExt: safeExt, sizeKb: Math.round(buffer.length / 1024), path: imgPath };
 }
 
 /**
@@ -125,13 +141,25 @@ function saveTimetable2Image(buffer, ext) {
   const imgPath  = path.join(DATA_DIR, filename);
 
   fs.writeFileSync(imgPath, buffer);
-  logger.info('[studio-assets] Timetable2 image saved', { path: imgPath, sizeKb: Math.round(buffer.length / 1024) });
+
+  const writtenStat = fs.statSync(imgPath);
+  if (writtenStat.size !== buffer.length) {
+    throw new Error(`Timetable2 image write mismatch: expected ${buffer.length}B, got ${writtenStat.size}B at ${imgPath}`);
+  }
+  logger.info('[studio-assets] Timetable2 image saved and verified', {
+    path: imgPath, sizeKb: Math.round(buffer.length / 1024), dataDir: DATA_DIR,
+  });
 
   const current = getAssets();
   const toSave  = { ...current, timetable2ImageUploaded: true, timetable2ImageExt: safeExt };
   atomicWrite(FILE, toSave);
 
-  return { timetable2ImageUploaded: true, timetable2ImageExt: safeExt };
+  const readBack = getAssets();
+  if (!readBack.timetable2ImageUploaded || readBack.timetable2ImageExt !== safeExt) {
+    throw new Error(`studio_assets.json metadata write failed — readBack: ${JSON.stringify(readBack)}`);
+  }
+
+  return { timetable2ImageUploaded: true, timetable2ImageExt: safeExt, sizeKb: Math.round(buffer.length / 1024), path: imgPath };
 }
 
 /**
@@ -144,6 +172,7 @@ function getTimetable2ImagePath() {
 }
 
 module.exports = {
+  DATA_DIR,  // exported so server.js startup log can verify it matches persist.DATA_DIR
   getAssets, saveAssets,
   saveTimetableImage,  getTimetableImagePath,
   saveTimetable2Image, getTimetable2ImagePath,
