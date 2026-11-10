@@ -1385,7 +1385,10 @@ async function handleInbound({ from, name, text }) {
       '⚠️ WhatsApp send failure — lead got no reply',
       `Phone: ${from}\nMessage: "${text.slice(0, 100)}"\nDraft reply: "${reply.slice(0, 200)}"\nError: ${sendErr.message}\n\nCheck Green API instance state.`
     ).catch(() => {});
-    return { reply: null, score, status };
+    // Return the generated reply even though it could not be sent.
+    // The outer pipeline sets _replyAlreadySent=true, preventing a double-send attempt.
+    // The reply text is preserved in barakReply for inbox visibility and diagnostics.
+    return { reply, score, status };
   }
 
   // 9. Fire-and-forget brief + memory pipeline when entering Stage 3 or when a

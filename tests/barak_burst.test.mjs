@@ -14,7 +14,8 @@
  */
 
 const BASE  = process.env.TEST_BASE_URL ?? 'http://localhost:3000';
-const PHONE_PREFIX = '9720001';
+// Synthetic phones: valid 12-digit Israeli format so Green API accepts the format.
+const PHONE_PREFIX = '97250991';
 let counter = 1;
 function phone() { return `${PHONE_PREFIX}${String(counter++).padStart(4, '0')}`; }
 

@@ -22,7 +22,10 @@ import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 
 const BASE = process.env.TEST_BASE_URL ?? 'http://localhost:3000';
-const PHONE_PREFIX = '9720000'; // synthetic, never real
+// Synthetic phones: valid 12-digit Israeli format (97250990XXXX) so Green API
+// accepts the format without a 400 validation error. These numbers don't correspond
+// to real subscribers — WhatsApp delivery fails silently at the network level.
+const PHONE_PREFIX = '97250990';
 let phoneCounter = 1;
 
 function syntheticPhone() {
