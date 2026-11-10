@@ -1874,7 +1874,7 @@ function renderBarakTable(leads) {
   const rows  = activeFilter === 'all' ? leads : leads.filter(l => l.status === activeFilter);
   const tbody = document.getElementById('barak-leads-tbody');
   if (!rows.length) {
-    tbody.innerHTML = `<tr><td colspan="8" class="empty-state">אין לידים להצגה</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9" class="empty-state">אין לידים להצגה</td></tr>`;
     return;
   }
   tbody.innerHTML = rows.map(l => {
@@ -1882,15 +1882,23 @@ function renderBarakTable(leads) {
     const arbox = l.arboxSynced
       ? `<span style="color:var(--green);font-size:12px">✅ ${l.arboxId ?? ''}</span>`
       : `<span style="color:var(--muted);font-size:12px">—</span>`;
+    // qualProfile — computed on every AI turn, stored in meta.qualProfile
+    const qp = l.meta?.qualProfile;
+    const nextAction = qp?.nextBestAction ?? '—';
+    const qualReason = qp?.qualificationReason ?? '';
+    const readyEmoji = qp?.readiness === 'HIGH' ? '🔥' : qp?.readiness === 'MEDIUM' ? '🌡️' : qp?.readiness === 'LOW' ? '❄️' : '';
+    // Status badge: show qualification reason as tooltip
+    const statusTitle = qualReason ? ` title="${esc(qualReason)}"` : '';
     return `<tr>
       <td><span class="lead-name">${esc(l.name ?? '—')}</span></td>
       <td style="direction:ltr;text-align:right;font-variant-numeric:tabular-nums">${esc(l.phone)}</td>
       <td><div class="score-cell"><span class="score-num">${l.score}</span><div class="score-track"><div class="score-fill ${tier}" style="width:${l.score*10}%"></div></div></div></td>
-      <td><span class="badge ${l.status||'new'}">${statusLabel(l.status)}</span></td>
+      <td><span class="badge ${l.status||'new'}"${statusTitle}>${statusLabel(l.status)}</span></td>
       <td>${l.messageCount}</td>
       <td style="text-align:center">${l.introOfferSent ? '✅' : '—'}</td>
       <td>${arbox}</td>
       <td style="color:var(--muted)">${timeSince(l.lastActivity)}</td>
+      <td style="font-size:12px;max-width:180px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(nextAction)}">${readyEmoji} ${esc(nextAction)}</td>
     </tr>`;
   }).join('');
 }

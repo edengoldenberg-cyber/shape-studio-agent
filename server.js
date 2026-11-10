@@ -432,15 +432,20 @@ app.post('/webhook/whatsapp', captureRawBody, verifyMetaSignature, async (req, r
   let body = {};
   try { body = JSON.parse(req.rawBody || '{}'); } catch { return; }
 
-  const message = parseInbound(body);
+  // Previously called leadAgent.handleInbound directly, bypassing:
+  //   - 4-tier member identity resolution (members reached the sales funnel)
+  //   - message deduplication (duplicate webhooks caused duplicate replies)
+  //   - ownership / opt-out gates
+  //   - inbox logging and SSE broadcasting
+  // Now routes through processInboundWAMessage (the same full pipeline used by
+  // /api/whatsapp/webhook and /api/green-api/webhook).
+  const message = parseInboundRich(body);
   if (!message) return;
 
-  logger.info('Inbound WhatsApp message', { from: message.from, preview: message.text.slice(0, 60) });
-  try {
-    await leadAgent.handleInbound(message);
-  } catch (err) {
-    logger.error('Lead agent error', { error: err.message, from: message.from });
-  }
+  logger.info('Inbound WhatsApp message (Meta webhook)', { from: message.from, preview: (message.text ?? '').slice(0, 60) });
+  processInboundWAMessage(message).catch(err => {
+    logger.error('processInboundWAMessage error (Meta webhook)', { error: err.message, from: message.from });
+  });
 });
 
 // ── REST API — shared express.json() parser for all /api POST routes ──────────
@@ -1784,7 +1789,12 @@ app.post('/api/leads/:phone/release', jsonBody, (req, res) => {
   const existing = store.getLead(norm);
   if (!existing) return res.status(404).json({ error: 'lead not found' });
 
-  const restoreStatus = existing.meta?.previousStatus ?? 'cold';
+  // Restore to previousStatus only when it represents an active automation state.
+  // Terminal states (opted_out, converted_member) and human_owns (which got here by
+  // the same path) are never valid restore targets — fall back to 'cold' instead.
+  const prev = existing.meta?.previousStatus ?? 'cold';
+  const TERMINAL = new Set(['opted_out', 'converted_member', 'human_owns', 'escalated']);
+  const restoreStatus = TERMINAL.has(prev) ? 'cold' : prev;
   store.upsertLead(norm, {
     status: restoreStatus,
     meta: {
@@ -1796,10 +1806,10 @@ app.post('/api/leads/:phone/release', jsonBody, (req, res) => {
       previousStatus:   null,
     },
   });
-  store.logEvent('human_release', norm, { restoredTo: restoreStatus });
+  store.logEvent('human_release', norm, { restoredTo: restoreStatus, wasStatus: prev });
   persist.saveLeads(store);
   logger.info('[lead-ownership] Released — bot resumed', { phone: norm, restoredTo: restoreStatus });
-  res.json({ ok: true, phone: norm, status: restoreStatus });
+  res.json({ ok: true, phone: norm, status: restoreStatus, automationResumed: !TERMINAL.has(prev) });
 });
 
 app.post('/api/leads/:phone/opt-out', jsonBody, (req, res) => {

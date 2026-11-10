@@ -630,6 +630,98 @@ function setQualData(phone, updates) {
   demoCapture.record('qual_flag_changed', { updates, before: current });
 }
 
+// ── Lead profile: qualification reason + next best action ────────────────────
+//
+// Computed after every scored turn and stored in meta.qualProfile.
+// Gives the team panel a one-glance summary without reading the conversation.
+
+function computeLeadProfile(lead, qualData, history) {
+  const { scoreReadiness } = handoffService;
+  const readiness = scoreReadiness(history ?? [], qualData);
+
+  // Human-readable explanation of why the lead is at this level
+  const reasonParts = [];
+  if (qualData.fitnessInterest)        reasonParts.push(`ענין: ${qualData.fitnessInterest}`);
+  if (qualData.goal && !qualData.fitnessInterest) reasonParts.push(`מטרה: ${qualData.goal}`);
+  if (qualData.location) {
+    const travelNote =
+      qualData.locationViable === true  ? ' (מרחק בסדר)' :
+      qualData.locationViable === false ? ' (מרחק בעיה)'  : '';
+    reasonParts.push(`אזור: ${qualData.location}${travelNote}`);
+  }
+  if (qualData.pricingObjection)       reasonParts.push('התנגדות מחיר');
+  if (qualData.callTimeGiven)          reasonParts.push(`זמן שיחה: ${qualData.callTimeGiven}`);
+  else if (qualData.callProposed)      reasonParts.push('הוצעה שיחה, ממתין לאישור');
+  const qualificationReason = reasonParts.length > 0 ? reasonParts.join(' · ') : 'אין עדיין מידע';
+
+  // What the team should do next
+  const st = lead?.status ?? 'cold';
+  let nextBestAction;
+  if      (st === 'opted_out')           nextBestAction = 'אין פעולה — ביקש/ה הסרה';
+  else if (st === 'human_owns')          nextBestAction = `המשך ידני${lead?.meta?.humanOwnsBy ? ' — ' + lead.meta.humanOwnsBy : ''}`;
+  else if (st === 'call_scheduled')      nextBestAction = `שיחה מתוזמנת${qualData.callTimeGiven ? ': ' + qualData.callTimeGiven : ''} — לא נדרשת פעולה נוספת`;
+  else if (st === 'callback_requested')  nextBestAction = `חזור${qualData.callbackTime ? ': ' + qualData.callbackTime : ''} — ממתין לשיחה`;
+  else if (qualData.locationViable === false) nextBestAction = 'סגור — מרחק לא ריאלי';
+  else if (readiness.level === 'HIGH')   nextBestAction = 'התקשר כמה שיותר מהר — מוכנות גבוהה';
+  else if (readiness.level === 'MEDIUM') nextBestAction = 'המשך את הבוט — בירור נוסף נדרש';
+  else                                   nextBestAction = 'המתן — מעורבות נמוכה';
+
+  const appointmentState =
+    qualData.callTimeGiven ? (st === 'call_scheduled' ? 'confirmed' : 'requested') :
+    qualData.callProposed  ? 'proposed' : 'none';
+
+  return {
+    readiness:          readiness.level,
+    readinessEvidence:  readiness.evidence,
+    qualificationReason,
+    nextBestAction,
+    appointmentState,
+    preferredCallTime:  qualData.callTimeGiven ?? qualData.callbackTime ?? null,
+    interests:          qualData.fitnessInterest ?? qualData.goal ?? null,
+    location:           qualData.location ?? null,
+    updatedAt:          new Date().toISOString(),
+  };
+}
+
+// ── Reliable handoff alert ────────────────────────────────────────────────────
+//
+// Wraps handoffService.generateHandoffBrief with a 12-second timeout and a
+// direct alertOwner fallback, so the team is ALWAYS notified when a call time
+// is captured, even if the LLM brief fails.
+//
+// Call with await; never fire-and-forget for the call-time-captured path.
+
+async function reliableHandoffAlert(phone, name, history, latestQualData) {
+  let timer;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error('handoff brief timed out after 12s')), 12000);
+  });
+
+  try {
+    await Promise.race([
+      handoffService.generateHandoffBrief(phone, name, history, latestQualData),
+      timeoutPromise,
+    ]);
+    clearTimeout(timer);
+    logger.info('[lead_agent] Handoff brief sent to team', { phone });
+  } catch (err) {
+    clearTimeout(timer);
+    logger.warn('[lead_agent] Handoff brief failed — sending direct fallback alert', { phone, error: err.message });
+    const qd = latestQualData;
+    const fallback = [
+      `📋 ליד חדש — ${name ?? phone}`,
+      `📱 ${phone}`,
+      qd.callTimeGiven     ? `📞 זמן שיחה: ${qd.callTimeGiven}` : '📞 זמן שיחה: לא נקבע',
+      qd.location          ? `📍 ${qd.location}` : '',
+      qd.fitnessInterest   ? `💪 ענין: ${qd.fitnessInterest}` : '',
+      qd.goal              ? `🎯 מטרה: ${qd.goal}` : '',
+      `\n⚠️ Brief מפורט לא הצליח — בדוק/י ב-dashboard.\nסיבה: ${err.message}`,
+    ].filter(Boolean).join('\n');
+    alertOwner(`📋 ליד (fallback) — ${name ?? phone}`, fallback)
+      .catch(e => logger.error('[lead_agent] Even fallback handoff alert failed', { phone, error: e.message }));
+  }
+}
+
 // ── Lead brief generation ─────────────────────────────────────────────────────
 
 /**
@@ -1180,6 +1272,19 @@ async function handleInbound({ from, name, text }) {
   logger.info('[lead_agent] Score', { from, score, status });
   if (score !== prevScore) demoCapture.record('score_changed', { previous: prevScore, current: score, status });
 
+  // 7a. Update qualProfile — computed after every turn for panel display.
+  //     Gives the team a one-glance summary (reason + next action) without
+  //     reading the full conversation.  Stored in meta so it survives restarts.
+  try {
+    const currentLead  = store.getLead(from);
+    const currentMeta  = currentLead?.meta ?? {};
+    const currentQD    = currentMeta.qualData ?? {};
+    const qualProfile  = computeLeadProfile({ ...currentLead, status }, currentQD, history);
+    store.upsertLead(from, { meta: { ...currentMeta, qualProfile } });
+  } catch (profileErr) {
+    logger.warn('[lead_agent] qualProfile update failed', { from, error: profileErr.message });
+  }
+
   // 8. Send reply
   //    sendText is outside the OpenAI try/catch because a WhatsApp API failure
   //    is a different class of error from an OpenAI failure.  Wrapping it here
@@ -1219,12 +1324,14 @@ async function handleInbound({ from, name, text }) {
   }
 
   if (callTimeCapturedNow) {
-    // Send the rich hand-off brief to the owner only when a call time is confirmed
-    const lead = store.getLead(from);
-    handoffService.generateHandoffBrief(from, lead?.name ?? from, history, latestQualData)
-      .catch(err => logger.warn('[lead_agent] Handoff brief error', { from, error: err.message }));
+    // Reliable handoff: awaited with timeout + direct fallback.
+    // The team MUST be notified when a call time is confirmed — this is not fire-and-forget.
+    const handoffLead = store.getLead(from);
+    reliableHandoffAlert(from, handoffLead?.name ?? from, history, latestQualData)
+      .catch(err => logger.error('[lead_agent] reliableHandoffAlert threw unexpectedly', { from, error: err.message }));
 
-    // Save a persistent session summary to the memory store
+    // Save a persistent session summary to the memory store (fire-and-forget is acceptable
+    // here — it enriches future conversations but is not required for the team handoff)
     memoryService.generateAndSaveSessionSummary(from, history, latestQualData)
       .catch(err => logger.warn('[lead_agent] Session summary error', { from, error: err.message }));
   }
@@ -1358,5 +1465,5 @@ function recordSchedulingExchange(phone, userText, agentReply) {
   }
 }
 
-module.exports = { handleInbound, clearSession, generateLeadBrief, sendIntroOffer, getLastDebugContext, recordSchedulingExchange };
+module.exports = { handleInbound, clearSession, generateLeadBrief, sendIntroOffer, getLastDebugContext, recordSchedulingExchange, computeLeadProfile };
 
