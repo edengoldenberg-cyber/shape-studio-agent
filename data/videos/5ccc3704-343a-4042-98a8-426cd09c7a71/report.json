@@ -1,0 +1,192 @@
+{
+  "id": "5ccc3704-343a-4042-98a8-426cd09c7a71",
+  "title": "0604(1) — בדיקת ffprobe pipeline",
+  "createdAt": "2026-11-09T13:04:37.260Z",
+  "version": 1,
+  "previousVersionId": null,
+  "format": "feed",
+  "goal": "leads",
+  "audience": "Women aged 30–60, Sharon region. Core profile:",
+  "organic_or_paid": "organic",
+  "message": "",
+  "focus_notes": "",
+  "readiness": 100,
+  "verdict": "לפרסם",
+  "share_direction": "הציון מצביע על שיתוף מעל הרגיל שלך",
+  "accuracy": "דיוק: בבדיקה עיוורת על 16 רילס של יוצר אחד, הציון לא ניבא חשיפה (מתאם 0.00), אבל היה קשור לשיעור השיתוף (מתאם ספירמן בערך 0.5). מדגם קטן של חשבון אחד, ולכן כיוון השיתוף הוא רמז ולא תחזית, וחשיפה לא מנובאת בכלל.",
+  "mosseri_scores": {
+    "C1": 85,
+    "C2": 80,
+    "C3": 85,
+    "C4": 80,
+    "C5": 75,
+    "C6": 90,
+    "C7": 85
+  },
+  "mosseri_flags": [],
+  "flags": [],
+  "strengths": [
+    "הוק ברור ומזמין",
+    "כתוביות ברורות ומסונכרנות"
+  ],
+  "fixes": [
+    {
+      "suggestion": "לשפר את הקריאה לפעולה בסוף הסרטון",
+      "reason": "כדי להגדיל את הסיכוי לפעולה מצד הצופה",
+      "quote": "הקריאה לפעולה היא חלק קריטי בהנעת הצופה לפעולה — מוסרי, נובמבר 2025",
+      "citation": null
+    }
+  ],
+  "reasonings": {
+    "C1": "הוק ברור ומזמין",
+    "C2": "המסר מזמין לשיתוף עם חברות",
+    "C3": "הצגת יתרונות ברורים למי שלא מכיר",
+    "C4": "מבנה ברור ומזמין",
+    "C5": "מקוריות בתוכן ובמסר",
+    "C6": "כתוביות ברורות ומסונכרנות",
+    "C7": "נושא ברור של הצטרפות לאימונים"
+  },
+  "perceived_message": "הזמנה להצטרף לאימוני פילאטיס מכשירים בפרדס חנה עם מנוי חופשי",
+  "message_lands": true,
+  "recommendation": "דורש תיקונים קלים",
+  "report_strengths": [
+    "המסר ברור ומזמין להצטרף לאימונים",
+    "הצגת המחיר בצורה ברורה ומושכת"
+  ],
+  "report_problems": [
+    "הקריאה לפעולה בסוף הסרטון יכולה להיות יותר ברורה ומזמינה"
+  ],
+  "sections": {
+    "hook": {
+      "finding": "הוק ברור ומזמין בתחילת הסרטון",
+      "score": 85,
+      "unverified": false
+    },
+    "message": {
+      "finding": "המסר מועבר בצורה ברורה ומזמינה",
+      "score": 90,
+      "unverified": false
+    },
+    "content": {
+      "finding": "התוכן מתאים לקהל היעד ומציג את היתרונות של האימונים",
+      "score": 85,
+      "unverified": false
+    },
+    "editing": {
+      "finding": "עריכה לא נבדקה — פריימים מדגמיים אינם מוכיחים קצב חיתוכים",
+      "score": null,
+      "unverified": true,
+      "note": "לא נבדק — פריימים מדגמיים אינם מוכיחים קצב חיתוכים"
+    },
+    "captions": {
+      "finding": "כתוביות ברורות ומסונכרנות עם התמלול",
+      "score": 90,
+      "unverified": false
+    },
+    "audio": {
+      "finding": "שמע: תמלול בלבד. איזון מוזיקה, ניקיון ורעשים — לא נבדקו.",
+      "score": null,
+      "unverified": true,
+      "note": "שמע: תמלול בלבד. איזון מוזיקה, ניקיון ורעשים — לא נבדקו.",
+      "speech_text": "מחפשת אימון שגם יעשה לך טוב לגוף וגם יגרום לך להתמיד בשייפ סטודיו תמצאי פילאטיס מכשירים שמותם בדיוק בשבילך אימונים שמחזקים את הגוף משפרים יציבה וגמישות עוזרים בשיקום ונותנים לך שעה שהיא רק שלך כל זה במנוי חופשי לכל האימונים ב-399 שקלים בלבד לחודש רוצה לבדוק אם זה מתאים לך קחי שני אימוני ניסיון ב-60 שקלים בלבד יאללה מחכים לך בסטודיו"
+    },
+    "visuals": {
+      "finding": "ויזואליה מתאימה ומושכת",
+      "score": 85,
+      "unverified": false
+    },
+    "cta": {
+      "finding": "הקריאה לפעולה בסוף הסרטון יכולה להיות יותר ברורה ומזמינה",
+      "score": 70,
+      "unverified": false
+    },
+    "platform": {
+      "finding": "מתאים לפורמט feed באינסטגרם",
+      "score": 85,
+      "unverified": false
+    }
+  },
+  "category_scores": {
+    "hook": 85,
+    "message": 90,
+    "content": 85,
+    "editing": null,
+    "captions": 90,
+    "audio": null,
+    "visuals": 85,
+    "cta": 70,
+    "platform": 85
+  },
+  "timestamps": [
+    {
+      "range": "0:00-0:05",
+      "observation": "הוק ברור ומזמין",
+      "works": "מושך את הצופה להמשיך לצפות",
+      "problem": "",
+      "suggestion": "",
+      "anchor": "frame",
+      "approximate": false,
+      "out_of_range": false
+    }
+  ],
+  "improvements_must": [],
+  "improvements_recommended": [
+    "לשפר את הקריאה לפעולה בסוף הסרטון"
+  ],
+  "improvements_experiments": [],
+  "hook_alternatives": [
+    "מחפשת אימון שיגרום לך להרגיש טוב?",
+    "רוצה להתחיל להתאמן ולהתמיד?",
+    "בואי לגלות את האימון שיתאים לך בדיוק!"
+  ],
+  "cta_options": [
+    "לחצי כאן להצטרפות",
+    "בדקי את האימונים שלנו עכשיו"
+  ],
+  "edit_plan": [
+    {
+      "order": 1,
+      "segment": "סוף הסרטון",
+      "duration": "17.4s-21.8s"
+    }
+  ],
+  "comparison": null,
+  "videoMeta": {
+    "durationSec": 22.383991,
+    "width": 2160,
+    "height": 3840,
+    "fps": 30
+  },
+  "dataAvailability": {
+    "frames_extracted": 20,
+    "frames_total_planned": 20,
+    "frame_first_sec": 0.56,
+    "frame_last_sec": 21.82,
+    "has_transcript": true,
+    "transcript_chars": 343,
+    "transcript_truncated": false,
+    "transcript_coverage": "0s–22.4s (Whisper)",
+    "whisper_duration": 22.3799991607666,
+    "audio_quality_verified": false,
+    "motion_verified": false,
+    "sync_verified": false,
+    "video_duration_sec": 22.383991,
+    "ffprobe_ok": true
+  },
+  "skillStatus": {
+    "rubric_path": "C:\\Users\\owner\\Desktop\\shape-studio-agent\\mosseri-skill-main\\mosseri\\reference\\rubric.md",
+    "rubric_loaded": true,
+    "doctrine_path": "C:\\Users\\owner\\Desktop\\shape-studio-agent\\mosseri-skill-main\\mosseri\\reference\\doctrine.md",
+    "doctrine_loaded": true,
+    "doctrine_citations": 74,
+    "estimate_path": "C:\\Users\\owner\\Desktop\\shape-studio-agent\\mosseri-skill-main\\mosseri\\scripts\\estimate.py",
+    "estimate_exists": true,
+    "python_bin": "C:\\Users\\owner\\AppData\\Local\\Programs\\Python\\Python310\\python.exe",
+    "scoring_note": "ציון C1-C7 מחושב על-ידי estimate.py (או fallback JS). אין קשר לאלגוריתם ה-ranking של אינסטגרם; הציון מייצג את מחוון מוסרי הציבורי בלבד."
+  },
+  "frameCount": 20,
+  "transcript": "מחפשת אימון שגם יעשה לך טוב לגוף וגם יגרום לך להתמיד? בשייפ סטודיו תמצאי פילאטיס מכשירים שמותם בדיוק בשבילך. אימונים שמחזקים את הגוף, משפרים יציבה וגמישות, עוזרים בשיקום ונותנים לך שעה שהיא רק שלך. כל זה במנוי חופשי לכל האימונים ב-399 שקלים בלבד לחולש. רוצה לבדוק אם זה מתאים לך? קחי שני אימוני ניסיון ב-60 שקלים בלבד. יאללה, מחכים לך בסטודיו!",
+  "warnings": [],
+  "scoreScaleInvalid": true,
+  "scoreScaleNote": "ציונים C1-C7 בדוח זה הוחזרו בסקאלה 0-100 במקום 0-5. הציון לא תקף. ניתן לנתח מחדש."
+}

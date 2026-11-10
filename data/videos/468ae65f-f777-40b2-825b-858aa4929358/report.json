@@ -1,0 +1,259 @@
+{
+  "id": "468ae65f-f777-40b2-825b-858aa4929358",
+  "title": "variance-test",
+  "createdAt": "2026-11-09T20:08:05.149Z",
+  "version": 1,
+  "previousVersionId": null,
+  "format": "feed",
+  "goal": "leads",
+  "audience": "Women aged 30–60, Sharon region. Core profile:",
+  "organic_or_paid": "organic",
+  "message": "",
+  "focus_notes": "",
+  "readiness": 63,
+  "verdict": "לתקן קודם",
+  "share_direction": "הציון מצביע על שיתוף בינוני לפי המחוון",
+  "accuracy": "דיוק: בבדיקה עיוורת על 16 רילס של יוצר אחד, הציון לא ניבא חשיפה (מתאם 0.00), אבל היה קשור לשיעור השיתוף (מתאם ספירמן בערך 0.5). מדגם קטן של חשבון אחד, ולכן כיוון השיתוף הוא רמז ולא תחזית, וחשיפה לא מנובאת בכלל.",
+  "baseline_missing": true,
+  "scoreScaleValid": true,
+  "sentDoctrineChapters": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    16
+  ],
+  "mosseri_scores": {
+    "C1": 2,
+    "C2": 3,
+    "C3": 4,
+    "C4": 4,
+    "C5": 3,
+    "C6": 2,
+    "C7": 5
+  },
+  "mosseri_flags": [],
+  "flags": [],
+  "strengths": [
+    "המסר ברור וממוקד על היתרונות של פילאטיס מכשירים.",
+    "הצעה למנוי חופשי במחיר אטרקטיבי."
+  ],
+  "fixes": [
+    {
+      "principleCode": "HOOK-1",
+      "fixType": "rewrite",
+      "name": "חיזוק ההוק",
+      "explanation": "ההוק בתחילת הסרטון לא מספיק חזק כדי למשוך את הצופה מיד.",
+      "currentText": "מחפשת אימון שגם יעשה לך טוב לגוף וגם יגרום לך להתמיד",
+      "suggestedRewrite": "רוצה למצוא את האימון שיגרום לך להרגיש טוב ולהתמיד?",
+      "codeValid": true,
+      "inGlobalMap": true,
+      "inSentChapters": true,
+      "codeError": null,
+      "citation": {
+        "date": "05.11.2025",
+        "quote": "One, you need a hook. Give me a reason to keep watching those first three seconds so I don't keep scrolling on."
+      }
+    },
+    {
+      "principleCode": "TEXT-1",
+      "fixType": "visual",
+      "name": "שיפור מיקום הכיתוב",
+      "explanation": "הכיתוב לא תמיד נמצא באזור הבטוח ויכול להיחתך.",
+      "action": "למקם את הכיתוב באזור בטוח יותר על המסך.",
+      "evidence": "0:06-0:09",
+      "codeValid": true,
+      "inGlobalMap": true,
+      "inSentChapters": true,
+      "codeError": null,
+      "citation": {
+        "date": "05.11.2025",
+        "quote": "Two, turn on captions. About half the time that people are in feed, their audio is off."
+      }
+    }
+  ],
+  "reasonings": {
+    "C1": "ההוק לא מספיק חזק כדי למשוך את הצופה מיד.",
+    "C2": "המסר יכול להיות משותף עם חברות שמתעניינות באימונים.",
+    "C3": "הצופה מקבל מידע על יתרונות האימון והצעה למנוי.",
+    "C4": "התוכן בנוי בצורה ברורה ומובנה.",
+    "C5": "הסרטון מציג תוכן ייחודי לסטודיו שייפ.",
+    "C6": "הכיתוב לא תמיד נמצא באזור הבטוח ויכול להיחתך.",
+    "C7": "הנושא ברור וממוקד על פילאטיס מכשירים."
+  },
+  "perceived_message": "הסרטון מציג את היתרונות של אימוני פילאטיס מכשירים בסטודיו שייפ ומציע מנוי חופשי לכל האימונים במחיר מיוחד.",
+  "message_lands": true,
+  "recommendation": "דורש תיקונים קלים",
+  "report_strengths": [
+    "המסר ברור וממוקד על היתרונות של פילאטיס מכשירים.",
+    "הצעה למנוי חופשי במחיר אטרקטיבי."
+  ],
+  "report_problems": [
+    "ההוק בתחילת הסרטון לא מספיק חזק כדי למשוך את הצופה.",
+    "הכיתוב לא תמיד נמצא באזור הבטוח ויכול להיחתך."
+  ],
+  "sections": {
+    "hook": {
+      "finding": "ההוק לא מספיק חזק כדי למשוך את הצופה מיד.",
+      "score": 2,
+      "unverified": false
+    },
+    "message": {
+      "finding": "המסר ברור וממוקד על היתרונות של פילאטיס מכשירים.",
+      "score": 4,
+      "unverified": false
+    },
+    "content": {
+      "finding": "התוכן מציג את היתרונות וההצעות בצורה ברורה.",
+      "score": 4,
+      "unverified": false
+    },
+    "editing": {
+      "finding": "לא ניתן להעריך את קצב החיתוכים מהפריימים שנשלחו.",
+      "score": null,
+      "unverified": true
+    },
+    "captions": {
+      "finding": "הכיתוב לא תמיד נמצא באזור הבטוח ויכול להיחתך.",
+      "score": 2,
+      "unverified": false
+    },
+    "audio": {
+      "finding": "הדיבור ברור ומובן לאורך כל הסרטון.",
+      "score": null,
+      "unverified": true,
+      "speech_text": "מחפשת אימון שגם יעשה לך טוב לגוף וגם יגרום לך להתמיד בשייפ סטודיו תמצאי פילאטיס מכשירים שמותם בדיוק בשבילך אימונים שמחזקים את הגוף משפרים יציבה וגמישות עוזרים בשיקום ונותנים לך שעה שהיא רק שלך כל זה במנוי חופשי לכל האימונים ב 399 שקלים בלבד לחולש רוצה לבדוק אם זה מתאים לך קחי שני אימוני ניסיון ב 60 שקלים בלבד יאללה מחכים לך בסטודיו"
+    },
+    "visuals": {
+      "finding": "הוויזואליות תומכת במסר ומציגה את האימונים בצורה מושכת.",
+      "score": 4,
+      "unverified": false
+    },
+    "cta": {
+      "finding": "הקריאה לפעולה ברורה אך יכולה להיות חזקה יותר.",
+      "score": 3,
+      "unverified": false
+    },
+    "platform": {
+      "finding": "הפורמט מתאים לפרסום בפיד.",
+      "score": 4,
+      "unverified": false
+    }
+  },
+  "category_scores": {
+    "hook": 2,
+    "message": 4,
+    "content": 4,
+    "editing": null,
+    "captions": 2,
+    "audio": null,
+    "visuals": 4,
+    "cta": 3,
+    "platform": 4
+  },
+  "timestamps": [
+    {
+      "range": "0:00-0:03",
+      "observation": "ההוק לא מספיק חזק כדי למשוך את הצופה מיד.",
+      "works": "התחלת הסרטון עם שאלה יכולה למשוך את הצופה.",
+      "problem": "ההוק לא מספיק חזק כדי למשוך את הצופה מיד.",
+      "suggestion": "להתחיל בשאלה שמדברת על הצורך של הצופה באימון אפקטיבי.",
+      "anchor": "whisper",
+      "approximate": false,
+      "out_of_range": false
+    },
+    {
+      "range": "0:06-0:09",
+      "observation": "הכיתוב לא תמיד נמצא באזור הבטוח ויכול להיחתך.",
+      "works": "הכיתוב ברור ומסביר את היתרונות של האימון.",
+      "problem": "הכיתוב לא תמיד נמצא באזור הבטוח ויכול להיחתך.",
+      "suggestion": "למקם את הכיתוב באזור בטוח יותר על המסך.",
+      "anchor": "frame",
+      "approximate": false,
+      "out_of_range": false
+    }
+  ],
+  "improvements_must": [
+    "לחזק את ההוק בתחילת הסרטון.",
+    "למקם את הכיתוב באזור בטוח יותר על המסך."
+  ],
+  "improvements_recommended": [
+    "להוסיף כתוביות לכל הסרטון."
+  ],
+  "improvements_experiments": [
+    "לנסות להתחיל את הסרטון עם שאלה שתמשוך את הצופה."
+  ],
+  "hook_alternatives": [
+    "רוצה למצוא את האימון שיגרום לך להרגיש טוב ולהתמיד?",
+    "מחפשת דרך לשפר את הכושר והבריאות שלך?",
+    "רוצה להתחיל את היום עם אנרגיה חדשה?"
+  ],
+  "cta_options": [
+    "לחצי כאן לפרטים נוספים!",
+    "בואי לנסות אימון ניסיון ב-60 שקלים בלבד!"
+  ],
+  "edit_plan": [
+    {
+      "order": 1,
+      "segment": "התחלת הסרטון",
+      "duration": "0:00-0:03"
+    },
+    {
+      "order": 2,
+      "segment": "הצגת היתרונות",
+      "duration": "0:03-0:12"
+    },
+    {
+      "order": 3,
+      "segment": "הצעת המנוי",
+      "duration": "0:12-0:18"
+    },
+    {
+      "order": 4,
+      "segment": "קריאה לפעולה",
+      "duration": "0:18-0:22"
+    }
+  ],
+  "comparison": null,
+  "videoMeta": {
+    "durationSec": 22.383991,
+    "width": 2160,
+    "height": 3840,
+    "fps": 30
+  },
+  "dataAvailability": {
+    "frames_extracted": 20,
+    "frames_total_planned": 20,
+    "frame_first_sec": 0.56,
+    "frame_last_sec": 21.82,
+    "has_transcript": true,
+    "transcript_chars": 343,
+    "transcript_truncated": false,
+    "transcript_coverage": "0s–22.4s (Whisper)",
+    "whisper_duration": 22.3799991607666,
+    "audio_quality_verified": false,
+    "motion_verified": false,
+    "sync_verified": false,
+    "video_duration_sec": 22.383991,
+    "ffprobe_ok": true
+  },
+  "skillStatus": {
+    "rubric_path": "C:\\Users\\owner\\Desktop\\shape-studio-agent\\mosseri-skill-main\\mosseri\\reference\\rubric.md",
+    "rubric_loaded": true,
+    "doctrine_path": "C:\\Users\\owner\\Desktop\\shape-studio-agent\\mosseri-skill-main\\mosseri\\reference\\doctrine.md",
+    "doctrine_loaded": true,
+    "doctrine_citations": 74,
+    "estimate_path": "C:\\Users\\owner\\Desktop\\shape-studio-agent\\mosseri-skill-main\\mosseri\\scripts\\estimate.py",
+    "estimate_exists": true,
+    "python_bin": "C:\\Users\\owner\\AppData\\Local\\Programs\\Python\\Python310\\python.exe",
+    "scoring_note": "ציון C1-C7 מחושב על-ידי estimate.py (או fallback JS). אין קשר לאלגוריתם ה-ranking של אינסטגרם; הציון מייצג את מחוון מוסרי הציבורי בלבד."
+  },
+  "frameCount": 20,
+  "transcript": "מחפשת אימון שגם יעשה לך טוב לגוף וגם יגרום לך להתמיד? בשייפ סטודיו תמצאי פילאטיס מכשירים שמותם בדיוק בשבילך. אימונים שמחזקים את הגוף, משפרים יציבה וגמישות, עוזרים בשיקום ונותנים לך שעה שהיא רק שלך. כל זה במנוי חופשי לכל האימונים ב-399 שקלים בלבד לחולש. רוצה לבדוק אם זה מתאים לך? קחי שני אימוני ניסיון ב-60 שקלים בלבד. יאללה, מחכים לך בסטודיו!",
+  "warnings": [
+    "לא ניתן להעריך את קצב החיתוכים מהפריימים שנשלחו.",
+    "לא ניתן להעריך את איכות הסאונד מהפריימים שנשלחו."
+  ]
+}

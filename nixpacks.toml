@@ -8,7 +8,7 @@
 # Node 20 LTS satisfies the >=18.0.0 engines constraint.
 
 [phases.setup]
-nixPkgs = ["nodejs_20"]
+nixPkgs = ["nodejs_20", "python3"]
 
 [phases.install]
 cmds = ["npm ci --omit=dev"]

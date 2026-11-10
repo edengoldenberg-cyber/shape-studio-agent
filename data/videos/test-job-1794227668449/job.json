@@ -1,0 +1,10 @@
+{
+  "id": "test-job-1794227668449",
+  "status": "failed",
+  "stage": "frames",
+  "note": "מחלץ...",
+  "createdAt": "2026-11-09T12:34:28.449Z",
+  "updatedAt": "2026-11-09T12:34:28.450Z",
+  "error": "test error",
+  "title": "test video"
+}
