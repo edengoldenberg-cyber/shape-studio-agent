@@ -2447,80 +2447,137 @@ function _markReplied(phone) {
   _lastReplied.set(phone, Date.now());
 }
 
-// ── Burst accumulator — collect rapid successive messages from one sender ────────
+// ── Burst accumulator — collect rapid successive messages, serialize processing ──
 //
-// When a person sends 3 short messages in quick succession ("שלום" / "אני מחפשת
-// פילאטיס" / "מחדרה") Barak would previously reply after the first message alone,
-// missing the context in messages 2 and 3 and triggering the 10-second cooldown
-// that discards them entirely.
+// Four behaviors:
+//   1. Burst accumulation: messages within BURST_WINDOW_MS of each other are
+//      combined into one context before processing.
+//   2. Per-phone serialization: _processingLock prevents concurrent calls for
+//      the same phone. Messages arriving while locked queue in _pendingMessages.
+//   3. Max wait cap: BURST_MAX_WAIT_MS prevents indefinitely delaying processing
+//      when someone keeps typing. After 5s, flush regardless.
+//   4. Full message-ID deduplication: each msgId in a burst is tracked; if Green
+//      API retries any individual message it is discarded, not re-processed.
 //
-// This collects all messages that arrive within BURST_WINDOW_MS of each other
-// and processes them as a single combined message.
+// Stale reply suppression: processInboundWAMessage checks _pendingMessages before
+// sending the outer-pipeline reply. If a newer message arrived during AI generation,
+// the outer reply is suppressed so only the more-informed follow-up reply is sent.
+// (AI-internal sends via leadAgent cannot be suppressed without a larger refactor.)
 //
-// Tradeoff: introduces a 1500ms delay before ANY reply, even single messages.
-// This is acceptable for a business chat — it is imperceptible to users and
-// prevents far worse outcomes (generic reply + silenced follow-up messages).
-//
-// Simulate endpoint calls processInboundWAMessage directly (no debounce needed).
-const _inboundBurst   = new Map(); // phone → { texts, latestMsg, firstMsg, timer }
-const BURST_WINDOW_MS = 1500;
+// Simulate endpoint calls processInboundWAMessage directly — no debounce.
+
+const _inboundBurst   = new Map(); // phone → { texts, msgIds, firstMsg, latestMsg, startedAt, timer }
+const _processingLock = new Set(); // phones currently being processed by processInboundWAMessage
+const _pendingMessages = new Map(); // phone → { texts, msgIds, firstMsg, latestMsg } — arrived while locked
+const BURST_WINDOW_MS  = 1500;     // collect messages within this window
+const BURST_MAX_WAIT_MS = 5000;    // hard cap: flush after this even during a continuous burst
 
 function scheduleInboundProcessing(msg) {
   const fromNorm = normalizeToE164(msg.from);
   if (!fromNorm) {
-    // No normalizable phone — process immediately, cannot deduplicate anyway
     processInboundWAMessage(msg).catch(err =>
       logger.error('processInboundWAMessage error (immediate)', { error: err.message })
     );
     return;
   }
 
+  const msgId = msg.messageId;
+
+  // If phone is locked (currently being processed): queue as pending override.
+  // These messages will be processed immediately after the in-flight call completes.
+  if (_processingLock.has(fromNorm)) {
+    const pending = _pendingMessages.get(fromNorm) ?? {
+      texts: [], msgIds: new Set(), firstMsg: msg, latestMsg: msg,
+    };
+    if (msgId && pending.msgIds.has(msgId)) {
+      logger.info('[burst] Duplicate msgId during processing — skipped', { from: fromNorm, msgId });
+      return;
+    }
+    if (msg.text) pending.texts.push(msg.text);
+    if (msgId)   pending.msgIds.add(msgId);
+    pending.latestMsg = msg;
+    _pendingMessages.set(fromNorm, pending);
+    logger.info('[burst] Queued during processing', { from: fromNorm, pendingCount: pending.texts.length });
+    return;
+  }
+
+  // Not locked — add to burst window.
   const existing = _inboundBurst.get(fromNorm);
   if (existing) {
+    if (msgId && existing.msgIds.has(msgId)) {
+      logger.info('[burst] Duplicate msgId in burst — skipped', { from: fromNorm, msgId });
+      return;
+    }
     clearTimeout(existing.timer);
     if (msg.text) existing.texts.push(msg.text);
+    if (msgId)    existing.msgIds.add(msgId);
     existing.latestMsg = msg;
-    logger.info('[burst] Extended burst window', { from: fromNorm, pendingCount: existing.texts.length });
   } else {
     _inboundBurst.set(fromNorm, {
-      texts:    msg.text ? [msg.text] : [],
-      firstMsg: msg,
+      texts:     msg.text ? [msg.text] : [],
+      msgIds:    new Set(msgId ? [msgId] : []),
+      firstMsg:  msg,
       latestMsg: msg,
-      timer:    null,
+      startedAt: Date.now(),
+      timer:     null,
     });
   }
 
-  const entry = _inboundBurst.get(fromNorm);
+  const entry   = _inboundBurst.get(fromNorm);
+  const elapsed = Date.now() - entry.startedAt;
+  const waitMs  = elapsed >= BURST_MAX_WAIT_MS ? 0 : BURST_WINDOW_MS;
+
   entry.timer = setTimeout(() => {
     _inboundBurst.delete(fromNorm);
+    _flushBurst(fromNorm, entry);
+  }, waitMs);
+}
 
-    // Build combined message: metadata from latest message, text from all.
-    // Keep the FIRST messageId so deduplication stays correct across retries.
-    const combined = {
-      ...entry.latestMsg,
-      messageId: entry.firstMsg.messageId,
-      text: entry.texts.length > 1 ? entry.texts.join('\n') : (entry.latestMsg.text ?? ''),
-    };
+/**
+ * Process a burst entry: acquire lock, run pipeline, flush any pending messages
+ * that arrived during the in-flight call.
+ */
+function _flushBurst(fromNorm, entry) {
+  const combined = {
+    ...entry.latestMsg,
+    messageId: entry.firstMsg.messageId,  // first ID for pipeline dedup
+    text: entry.texts.length > 1 ? entry.texts.join('\n') : (entry.latestMsg.text ?? ''),
+  };
 
-    if (entry.texts.length > 1) {
-      logger.info('[burst] Processing combined messages', {
-        from:     fromNorm,
-        count:    entry.texts.length,
-        combined: combined.text.slice(0, 120),
-      });
-    }
+  if (entry.texts.length > 1) {
+    logger.info('[burst] Processing combined messages', {
+      from: fromNorm, count: entry.texts.length, combined: combined.text.slice(0, 120),
+    });
+  }
 
-    processInboundWAMessage(combined)
-      .then(r => {
-        if (!r) return;
+  _processingLock.add(fromNorm);
+
+  processInboundWAMessage(combined)
+    .then(r => {
+      _processingLock.delete(fromNorm);
+      if (r) {
         broadcastSse('message', { phone: r.inboxEntry.from, name: r.inboxEntry.name ?? null });
         persist.saveInbox(inbox);
         persist.saveLeads(store);
-      })
-      .catch(err =>
-        logger.error('processInboundWAMessage error (burst)', { error: err.message, from: fromNorm })
-      );
-  }, BURST_WINDOW_MS);
+      }
+      _flushPending(fromNorm);
+    })
+    .catch(err => {
+      _processingLock.delete(fromNorm);
+      logger.error('processInboundWAMessage error (burst)', { error: err.message, from: fromNorm });
+      _flushPending(fromNorm);
+    });
+}
+
+/** If messages arrived while the phone was locked, process them now. */
+function _flushPending(fromNorm) {
+  const pending = _pendingMessages.get(fromNorm);
+  if (!pending) return;
+  _pendingMessages.delete(fromNorm);
+  logger.info('[burst] Flushing pending messages that arrived during processing', {
+    from: fromNorm, count: pending.texts.length,
+  });
+  _flushBurst(fromNorm, pending);
 }
 
 // ── Internal processor (shared by webhook + simulate) ─────────────────────────
@@ -3138,10 +3195,10 @@ async function processInboundWAMessage(msg) {
     return qd.locationCheckAsked === true && qd.locationViable == null;
   })();
 
-  // Explicit timetable/image requests bypass the reply cooldown: the person asked
-  // for something specific and must receive it, even if Barak just replied.
-  const isExplicitMediaRequest = isSchedulingMsg;
-  const skipAiReply  = (ackDetected && !awaitingLocation) || (inCooldown && !isExplicitMediaRequest);
+  // Brief acks are suppressed. Genuine follow-up questions and requests are NOT
+  // blocked by cooldown — deduplication by messageId prevents true duplicates,
+  // and the burst accumulator prevents concurrent replies to the same burst.
+  const skipAiReply  = (ackDetected && !awaitingLocation);
 
   if (ackDetected && !awaitingLocation) logger.info('Brief ack — skipping AI reply', { from: fromNorm, text: msg.text?.slice(0, 20) });
   if (awaitingLocation && ackDetected)  logger.info('Brief ack allowed — awaiting location confirmation', { from: fromNorm });
@@ -3382,12 +3439,23 @@ async function processInboundWAMessage(msg) {
       store.logEvent('reply_suppressed_late', fromNorm, { status: _lateStatus });
       barakReply = null;
     }
+    // Stale reply suppression: a newer message arrived during AI generation.
+    // Suppress the outer-pipeline reply so only the more-informed follow-up reply
+    // is sent when the pending message is processed after the lock is released.
+    // Note: AI-internal sends (via leadAgent.handleInbound) cannot be suppressed here.
+    if (barakReply && _pendingMessages.has(fromNorm)) {
+      logger.info('[pipeline] Outer reply suppressed — newer message pending', { from: fromNorm });
+      store.logEvent('reply_suppressed_stale', fromNorm, { pendingCount: _pendingMessages.get(fromNorm).texts.length });
+      barakReply     = null;
+      timetableImgUrl  = null;
+      timetable2ImgUrl = null;
+    }
   }
 
   if (barakReply && process.env.WHATSAPP_AUTO_REPLY === 'true') {
     if (timetableImgUrl) {
-      // Send timetable image 1 (with caption), then image 2 if available, then a follow-up question.
-      const timetableFollowUp = `ראית משהו שמתאים לך? יספר/י לי איזה יום ושעה בדרך כלל עובדים לך 😊`;
+      // Send timetable image 1 (with caption), then image 2 if available.
+      // No follow-up question — the lead responds naturally after seeing the images.
       sendFileByUrl(fromNorm, timetableImgUrl, 'schedule.png', barakReply)
         .then(async () => {
           store.logEvent('timetable_image_sent', fromNorm, { imageUrl: timetableImgUrl });
@@ -3397,14 +3465,9 @@ async function processInboundWAMessage(msg) {
               .then(() => store.logEvent('timetable2_image_sent', fromNorm, { imageUrl: timetable2ImgUrl }))
               .catch(err => logger.warn('Timetable2 image send failed', { from: fromNorm, error: err.message }));
           }
-          // Follow-up question after all images — always sent so the conversation doesn't stall
-          await sendText(fromNorm, timetableFollowUp)
-            .then(() => store.logEvent('timetable_followup_sent', fromNorm, { preview: timetableFollowUp.slice(0, 60) }))
-            .catch(err => logger.warn('Timetable follow-up send failed', { from: fromNorm, error: err.message }));
-
-          // Record the scheduling exchange in the lead's AI history so follow-up requests
-          // ("שלח שוב", "תמונה") arrive at the AI with full context of the timetable exchange.
-          leadAgent.recordSchedulingExchange(fromNorm, msg.text ?? '', barakReply + '\n' + timetableFollowUp);
+          // Record the scheduling exchange in AI history so follow-up requests
+          // ("תשלח לי את התמונה") arrive with full timetable context.
+          leadAgent.recordSchedulingExchange(fromNorm, msg.text ?? '', barakReply);
         })
         .catch(err => {
           logger.warn('Timetable image send failed — falling back to text reply', { from: fromNorm, error: err.message });

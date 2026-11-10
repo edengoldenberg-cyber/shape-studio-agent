@@ -334,6 +334,21 @@ const UNIVERSAL_STAGE_RULES = [
   `    one question is appropriate.`,
 ].join('\n');
 
+/**
+ * Returns true when qualData already has enough information to skip discovery
+ * stages and move to the call proposal. Used to short-circuit turn-count-driven
+ * stages so a lead who supplies multiple facts in one message doesn't get asked
+ * questions they already answered.
+ */
+function _readyForClose(qualData) {
+  if (qualData.callTimeGiven)        return false; // already closed
+  if (qualData.locationViable === false) return false; // location rejected
+  if (qualData.callProposed)         return false; // already in close mode
+  const hasLocation = qualData.locationViable === true || (qualData.location && qualData.locationCheckNeeded === false);
+  const hasIntent   = !!(qualData.fitnessInterest || qualData.goal);
+  return hasLocation && hasIntent;
+}
+
 function buildStageContext(completedTurns, qualData, msgCount) {
   // ── Build "ALREADY KNOWN" summary — injected into every stage context ─────────
   const knownFacts = [];
@@ -417,6 +432,23 @@ function buildStageContext(completedTurns, qualData, msgCount) {
     ? `Location: "${qualData.location}" ✓ (confirmed convenient)`
     : 'Location not yet confirmed.';
 
+  // Skip turn-count-driven discovery when enough facts are already known.
+  // This prevents re-asking for location or interest a lead supplied in their first message.
+  if (_readyForClose(qualData) && completedTurns >= 1 && !qualData.nameAsked && !qualData.callProposed) {
+    return [
+      UNIVERSAL_STAGE_RULES,
+      ``,
+      knownSection,
+      ``,
+      `FAST-TRACK TO CLOSE — the lead already gave enough information. Reply #${msgCount + 1}.`,
+      `Known: location "${qualData.location ?? '—'}", interest/goal "${qualData.fitnessInterest ?? qualData.goal ?? '—'}".`,
+      `DO NOT ask about location or fitness goal again — both are already known.`,
+      `Acknowledge their last reply in ONE warm sentence, then ask for their first name:`,
+      `"ולפני שנמשיך — איך קוראים לך? 😊"`,
+      `Max 2 sentences.`,
+    ].join('\n');
+  }
+
   if (completedTurns === 1) {
     // Determine what the lead already expressed so we know what to ask next
     const hasGoalOrInterest = !!(qualData.fitnessInterest || qualData.goal);
@@ -448,7 +480,7 @@ function buildStageContext(completedTurns, qualData, msgCount) {
             `     Good: "מה הכי חשוב לך להשיג מהאימונים?"`,
           ].join('\n'),
       ``,
-      `MANDATORY: Your reply MUST end with a question mark. No dead-ends.`,
+      `End with a question only if one is genuinely needed to advance the conversation.`,
       `Max 3 sentences. No pricing. No class list. Do not use their name.`,
     ].join('\n');
   }
@@ -477,7 +509,7 @@ function buildStageContext(completedTurns, qualData, msgCount) {
             `  → Goal not yet captured → ask ONE focused goal question.`,
             `     Good: "מה הכי חשוב לך — חיזוק? גמישות? שיקום?"`,
           ].join('\n'),
-      `MANDATORY: Your reply MUST end with a question mark. No dead-ends.`,
+      `End with a question only if one is genuinely needed to advance the conversation.`,
       `Max 3 sentences. No pricing. No trial offer. Do not use their name.`,
     ].join('\n');
   }
