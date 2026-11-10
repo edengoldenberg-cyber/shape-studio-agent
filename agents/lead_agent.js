@@ -43,12 +43,13 @@ function buildAssetContext() {
     : `## WAZE: not configured — if asked for directions, say "אשלח לך קישור ניווט ישיר"`;
 
   // ── Schedule / timetable rule ──────────────────────────────────────────────
-  // The scheduling pipeline handles actual sending. The AI's job: always say it's coming.
+  // The scheduling pipeline handles actual image sending. AI's job: confirm it's coming.
   const scheduleRule = [
     `## ⚠️ MANDATORY SCHEDULE RULE`,
     `When asked about schedule, opening hours, timetable, or "יש תמונה?":`,
     `  ALWAYS say exactly: "שולח לך את המערכת עכשיו 📅"`,
-    `  Then immediately ask: "אחרי שתראה/י — ספר/י לי איזה יום ושעה בדרך כלל עובדים לך 😊"`,
+    `  Do NOT append a qualification question — the images follow automatically.`,
+    `  After the lead sees the schedule and responds naturally, you may ask about their preferred days/times.`,
     `  FORBIDDEN: "אין לי תמונה" / "הצוות ישלח" / showing a single-day class list as a schedule.`,
     assets.timetableUrl ? `  Timetable URL: ${assets.timetableUrl}` : '',
   ].filter(Boolean).join('\n');
@@ -210,41 +211,16 @@ function postProcessReply(reply, qualData, assets) {
     }
   }
 
-  // 3. Question enforcement / stripping.
-  //
-  //    CLOSE state (callTimeGiven or locationViable=false):
-  //      Strip any trailing question the AI generated. The conversation is done.
-  //      A question after a confirmed callback undoes the closing.
-  //
-  //    Open state:
-  //      Append a fallback question if the reply has no question mark.
+  // 3. CLOSE state — strip trailing question when conversation is finished.
+  //    Open state — the AI decides whether to ask; no forced appending.
   const isClose = !!(qualData.callTimeGiven || qualData.locationViable === false);
   if (isClose) {
     // Strip the last sentence if it ends with a question mark.
-    // Pattern: optional whitespace, then [any text][?], capturing everything before it.
-    // We use a greedy match from the last '?' backward to avoid stripping mid-reply questions.
-    // [\s\S] after the ? allows for trailing emoji, whitespace, or any Unicode char
-    // that the AI adds after the question mark (e.g. "באיזו שעה נוח לך? 😊").
+    // [\s\S] after the ? allows for trailing emoji, whitespace, or any Unicode char.
     const stripped = out.replace(/\s*[^.!?\n]{1,120}\?[\s\S]{0,10}$/u, '').trim();
     if (stripped.length >= 15) {
-      // Replacement produced a sensible confirmation — use it
       if (stripped !== out) ppChanges.push('close_question_stripped');
       out = stripped;
-    }
-    // If stripping left something too short or empty, keep the original
-    // (the prompt-level fix in Fix 1A should prevent the AI from generating one)
-  } else {
-    const trimmed = out.trimEnd();
-    if (!/[?？]/.test(trimmed.slice(-3))) {
-      const fallbackQ = qualData.callProposed
-        ? ' באיזו שעה נוח לך לשיחה קצרה?'
-        : qualData.fitnessInterest
-          ? ' מה הכי חשוב לך להשיג מהאימונים?'
-          : qualData.location
-            ? ' מה מביא אותך לחפש סטודיו עכשיו?'
-            : ' מאיזה אזור את/ה, ומה מחפשים?';
-      out = trimmed + fallbackQ;
-      ppChanges.push('question_appended');
     }
   }
 
@@ -300,11 +276,12 @@ function buildTurnSystemPrompt(completedTurns, qualData, name, from, msgCount) {
       `  → Engage with that interest specifically (1 sentence), then ask where they're from`,
       ``,
       `CASE D — Minimal message ("שלום", "היי", "אשמח לפרטים", just a greeting):`,
-      `  → 1 warm, natural sentence (NOT a cliché opener) + ONE combined question`,
-      `  → The question should feel like a person asking, NOT a dropdown list`,
-      `  → Good: "שלום! מאיזה אזור את/ה ומה מחפשים?"`,
-      `  → Good: "היי! מה מחפשים, ומאיזה אזור?"`,
-      `  → BAD: "שלום! מאיזה אזור את/ה, ומה מחפשים — פילאטיס, כוח, יוגה?" ← the list makes it feel like a form`,
+      `  → 1 warm, natural sentence (NOT a cliché opener) + ONE focused question`,
+      `  → Ask the single most useful unknown: what they're looking for.`,
+      `  → Good: "שלום! מה מחפשים?"`,
+      `  → Good: "היי! ספר/י לי — מה מביא אותך אלינו?"`,
+      `  → Good: "שלום! מה מחפשים בסטודיו?"`,
+      `  → BAD: "מאיזה אזור את/ה ומה מחפשים?" ← two questions combined into one sentence`,
       `  → BAD: any opener that starts with "שמחים", "ברוכים", "כיף", "איזה כיף"`,
       ``,
       `── HARD PROHIBITIONS ──`,
@@ -350,11 +327,11 @@ const UNIVERSAL_STAGE_RULES = [
   `    Do NOT cut the answer short just to push for a callback. Pushing before answering = broken trust.`,
   `U3. NO REPEAT QUESTIONS: If a question was already answered by the lead (location, fitness interest, goal, name),`,
   `    never ask it again. Read the "ALREADY KNOWN" section below before writing anything.`,
-  `U4. NEVER DEAD-END THE CONVERSATION: Every reply MUST end with exactly one forward-moving question`,
-  `    unless the lead confirmed a callback time or explicitly closed the conversation.`,
-  `    If the lead just answered your previous question (confirmed location, said "כן", etc.),`,
-  `    acknowledge in ONE SHORT phrase and IMMEDIATELY ask the next stage question.`,
-  `    A reply that ends without "?" is a failure. Zero exceptions.`,
+  `U4. FORWARD MOVEMENT: When you fulfilled what was explicitly requested (timetable sent,`,
+  `    address given, specific question answered), no follow-up question is required — let`,
+  `    the lead respond. When continuing an open conversation, end with ONE focused question.`,
+  `    Never ask two questions in one message. After a first greeting with no specific request,`,
+  `    one question is appropriate.`,
 ].join('\n');
 
 function buildStageContext(completedTurns, qualData, msgCount) {

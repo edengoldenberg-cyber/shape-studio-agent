@@ -510,9 +510,7 @@ app.post('/webhook/whatsapp', captureRawBody, verifyMetaSignature, async (req, r
   if (!message) return;
 
   logger.info('Inbound WhatsApp message (Meta webhook)', { from: message.from, preview: (message.text ?? '').slice(0, 60) });
-  processInboundWAMessage(message).catch(err => {
-    logger.error('processInboundWAMessage error (Meta webhook)', { error: err.message, from: message.from });
-  });
+  scheduleInboundProcessing(message);
 });
 
 // ── REST API — shared express.json() parser for all /api POST routes ──────────
@@ -2449,6 +2447,82 @@ function _markReplied(phone) {
   _lastReplied.set(phone, Date.now());
 }
 
+// ── Burst accumulator — collect rapid successive messages from one sender ────────
+//
+// When a person sends 3 short messages in quick succession ("שלום" / "אני מחפשת
+// פילאטיס" / "מחדרה") Barak would previously reply after the first message alone,
+// missing the context in messages 2 and 3 and triggering the 10-second cooldown
+// that discards them entirely.
+//
+// This collects all messages that arrive within BURST_WINDOW_MS of each other
+// and processes them as a single combined message.
+//
+// Tradeoff: introduces a 1500ms delay before ANY reply, even single messages.
+// This is acceptable for a business chat — it is imperceptible to users and
+// prevents far worse outcomes (generic reply + silenced follow-up messages).
+//
+// Simulate endpoint calls processInboundWAMessage directly (no debounce needed).
+const _inboundBurst   = new Map(); // phone → { texts, latestMsg, firstMsg, timer }
+const BURST_WINDOW_MS = 1500;
+
+function scheduleInboundProcessing(msg) {
+  const fromNorm = normalizeToE164(msg.from);
+  if (!fromNorm) {
+    // No normalizable phone — process immediately, cannot deduplicate anyway
+    processInboundWAMessage(msg).catch(err =>
+      logger.error('processInboundWAMessage error (immediate)', { error: err.message })
+    );
+    return;
+  }
+
+  const existing = _inboundBurst.get(fromNorm);
+  if (existing) {
+    clearTimeout(existing.timer);
+    if (msg.text) existing.texts.push(msg.text);
+    existing.latestMsg = msg;
+    logger.info('[burst] Extended burst window', { from: fromNorm, pendingCount: existing.texts.length });
+  } else {
+    _inboundBurst.set(fromNorm, {
+      texts:    msg.text ? [msg.text] : [],
+      firstMsg: msg,
+      latestMsg: msg,
+      timer:    null,
+    });
+  }
+
+  const entry = _inboundBurst.get(fromNorm);
+  entry.timer = setTimeout(() => {
+    _inboundBurst.delete(fromNorm);
+
+    // Build combined message: metadata from latest message, text from all.
+    // Keep the FIRST messageId so deduplication stays correct across retries.
+    const combined = {
+      ...entry.latestMsg,
+      messageId: entry.firstMsg.messageId,
+      text: entry.texts.length > 1 ? entry.texts.join('\n') : (entry.latestMsg.text ?? ''),
+    };
+
+    if (entry.texts.length > 1) {
+      logger.info('[burst] Processing combined messages', {
+        from:     fromNorm,
+        count:    entry.texts.length,
+        combined: combined.text.slice(0, 120),
+      });
+    }
+
+    processInboundWAMessage(combined)
+      .then(r => {
+        if (!r) return;
+        broadcastSse('message', { phone: r.inboxEntry.from, name: r.inboxEntry.name ?? null });
+        persist.saveInbox(inbox);
+        persist.saveLeads(store);
+      })
+      .catch(err =>
+        logger.error('processInboundWAMessage error (burst)', { error: err.message, from: fromNorm })
+      );
+  }, BURST_WINDOW_MS);
+}
+
 // ── Internal processor (shared by webhook + simulate) ─────────────────────────
 
 async function processInboundWAMessage(msg) {
@@ -3064,7 +3138,10 @@ async function processInboundWAMessage(msg) {
     return qd.locationCheckAsked === true && qd.locationViable == null;
   })();
 
-  const skipAiReply  = (ackDetected && !awaitingLocation) || inCooldown;
+  // Explicit timetable/image requests bypass the reply cooldown: the person asked
+  // for something specific and must receive it, even if Barak just replied.
+  const isExplicitMediaRequest = isSchedulingMsg;
+  const skipAiReply  = (ackDetected && !awaitingLocation) || (inCooldown && !isExplicitMediaRequest);
 
   if (ackDetected && !awaitingLocation) logger.info('Brief ack — skipping AI reply', { from: fromNorm, text: msg.text?.slice(0, 20) });
   if (awaitingLocation && ackDetected)  logger.info('Brief ack allowed — awaiting location confirmation', { from: fromNorm });
@@ -3173,7 +3250,6 @@ async function processInboundWAMessage(msg) {
         if (leadResult?.reply && /שולח לך את המערכת|שולחת את המערכת/.test(leadResult.reply)) {
           const timetableUrlFromLeadAgent = getActiveTimetableUrl();
           if (timetableUrlFromLeadAgent) {
-            const followUp = `ראית משהו שמתאים לך? יספר/י לי איזה יום ושעה בדרך כלל עובדים לך 😊`;
             sendFileByUrl(fromNorm, timetableUrlFromLeadAgent, 'schedule.png', '')
               .then(async () => {
                 store.logEvent('timetable_image_sent', fromNorm, { imageUrl: timetableUrlFromLeadAgent, via: 'lead_agent' });
@@ -3182,8 +3258,7 @@ async function processInboundWAMessage(msg) {
                   await sendFileByUrl(fromNorm, t2, 'schedule2.png', '')
                     .catch(err => logger.warn('Timetable2 follow-on send failed', { from: fromNorm, error: err.message }));
                 }
-                await sendText(fromNorm, followUp)
-                  .catch(err => logger.warn('Timetable follow-up send failed', { from: fromNorm, error: err.message }));
+                // No follow-up qualification question — let the lead respond naturally.
               })
               .catch(err => logger.warn('Timetable image send failed after lead_agent reply', { from: fromNorm, error: err.message }));
           }
@@ -3372,14 +3447,7 @@ app.post('/api/whatsapp/webhook', captureRawBody, verifyMetaSignature, async (re
 
   logger.info('WA webhook inbound', { from: msg.from, type: msg.type, preview: msg.text?.slice(0, 60) });
 
-  processInboundWAMessage(msg)
-    .then(r => {
-      if (!r) return;
-      broadcastSse('message', { phone: r.inboxEntry.from, name: r.inboxEntry.name ?? null });
-      persist.saveInbox(inbox);
-      persist.saveLeads(store);
-    })
-    .catch(err => logger.error('WA pipeline error', { error: err.message, from: msg.from }));
+  scheduleInboundProcessing(msg);
 });
 
 // ── POST /api/green-api/webhook — inbound messages from Green API ─────────────
@@ -3447,20 +3515,12 @@ app.post('/api/green-api/webhook', (req, res) => {
         preview: msg.text?.slice(0, 60),
       });
 
-      // ── 6. Full CRM pipeline → inbox → SSE → persist ─────────────────────────
-      processInboundWAMessage(msg)
-        .then(r => {
-          if (!r) return;
-          broadcastSse('message', { phone: r.inboxEntry.from, name: r.inboxEntry.name ?? null });
-          persist.saveInbox(inbox);
-          persist.saveLeads(store);
-          logger.info('[green-api/webhook] Message processed and persisted', {
-            from:   r.inboxEntry.from,
-            intent: r.intent,
-            route:  r.route,
-          });
-        })
-        .catch(err => logger.error('[green-api/webhook] Pipeline error', {
+      // ── 6. Full CRM pipeline — via burst accumulator (1500ms window) ────────────
+      logger.info('[green-api/webhook] Scheduling processing', { from: msg.from });
+      scheduleInboundProcessing(msg);
+      // persist / SSE are called inside scheduleInboundProcessing after the burst window.
+      // Legacy catch-all kept for log continuity:
+      void Promise.resolve().catch(err => logger.error('[green-api/webhook] Pipeline error', {
           error: err.message,
           from:  msg.from,
         }));
