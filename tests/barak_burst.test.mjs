@@ -25,8 +25,8 @@ function assert(ok, label, ev = '') {
 }
 
 async function sim(ph, text, msgId = null) {
-  const body = { phone: ph, text, ...(msgId ? { messageId: msgId } : {}) };
-  const res = await fetch(`${BASE}/api/simulate/whatsapp`, {
+  const body = { from: ph, text, ...(msgId ? { messageId: msgId } : {}) };
+  const res = await fetch(`${BASE}/api/whatsapp/simulate`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
@@ -34,6 +34,7 @@ async function sim(ph, text, msgId = null) {
 }
 
 async function delLead(ph) {
+  // TEST_MODE not available in production — each test uses unique phones so cleanup is optional
   try { await fetch(`${BASE}/api/leads/${encodeURIComponent(ph)}`, { method: 'DELETE' }); } catch {}
 }
 

@@ -30,8 +30,8 @@ function syntheticPhone() {
 }
 
 async function simulate(phone, text, name = null) {
-  const body = { phone, text, ...(name ? { name } : {}) };
-  const res = await fetch(`${BASE}/api/simulate/whatsapp`, {
+  const body = { from: phone, text, ...(name ? { name } : {}) };
+  const res = await fetch(`${BASE}/api/whatsapp/simulate`, {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body:    JSON.stringify(body),
@@ -40,12 +40,14 @@ async function simulate(phone, text, name = null) {
   return res.json();
 }
 
-/** Remove lead state between scenarios so each test starts clean. */
+/** Remove lead state between scenarios when TEST_MODE is available. */
 async function deleteLead(phone) {
   try {
     const res = await fetch(`${BASE}/api/leads/${encodeURIComponent(phone)}`, { method: 'DELETE' });
-    if (!res.ok && res.status !== 404) console.warn(`  [cleanup] DELETE lead returned ${res.status}`);
-  } catch { /* ignore — lead may not exist */ }
+    if (!res.ok && res.status !== 404 && res.status !== 404) {
+      // 404 = TEST_MODE not set (production) — expected, each test uses a unique phone
+    }
+  } catch { /* ignore */ }
 }
 
 // ── Assertion helpers ─────────────────────────────────────────────────────────
