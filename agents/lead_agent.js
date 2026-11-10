@@ -481,7 +481,9 @@ function buildStageContext(completedTurns, qualData, msgCount) {
           ].join('\n'),
       ``,
       `End with a question only if one is genuinely needed to advance the conversation.`,
-      `Max 3 sentences. No pricing. No class list. Do not use their name.`,
+      `Max 3 sentences. No class list. Do not use their name.`,
+      `Exception: if the lead just asked about price or cost, answer it (use the price info from the prompt)`,
+      `then continue with the stage question.`,
     ].join('\n');
   }
 
@@ -510,7 +512,8 @@ function buildStageContext(completedTurns, qualData, msgCount) {
             `     Good: "מה הכי חשוב לך — חיזוק? גמישות? שיקום?"`,
           ].join('\n'),
       `End with a question only if one is genuinely needed to advance the conversation.`,
-      `Max 3 sentences. No pricing. No trial offer. Do not use their name.`,
+      `Max 3 sentences. No trial offer. Do not use their name.`,
+      `Exception: if the lead asked about price, answer it then continue with the stage question.`,
     ].join('\n');
   }
 

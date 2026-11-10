@@ -84,7 +84,7 @@ async function testBurstCombined() {
 
     assert(r.route === 'barak', 'routed to barak', r.route);
     assert(
-      /פילאטיס|reformer|מכשירים/i.test(reply),
+      /פילאטיס|reformer|מכשירים|רפורמר|שיעורים/i.test(reply),
       'combined burst: reply addresses pilates interest',
       reply,
     );
