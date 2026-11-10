@@ -497,7 +497,7 @@ app.get('/api/version', (_req, res) => {
       greenApi: !!process.env.GREEN_API_ID_INSTANCE || !!process.env.GREEN_API_INSTANCE_ID,
       metaCloud: !!process.env.WHATSAPP_ACCESS_TOKEN,
     },
-    phoneRegistrySize: phoneRegistry?.size ?? 'unavailable',
+    phoneRegistrySize: (typeof phoneRegistry?.size === 'function') ? phoneRegistry.size() : 'unavailable',
   });
 });
 
