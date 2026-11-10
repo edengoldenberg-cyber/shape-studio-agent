@@ -271,38 +271,69 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.get('/health', (_req, res) => res.json({ status: 'ok', ts: new Date().toISOString() }));
 
 // ── Test instrumentation endpoints ───────────────────────────────────────────
-// These are always available (not gated by NODE_ENV) so integration tests can
-// run against the production-equivalent server config without special env flags.
-// The send log is bounded at 500 entries and contains no PII beyond masked phone.
+// All routes below are gated behind TEST_MODE=true and return 404 in production.
+// TEST_MODE must be set explicitly in .env for local integration testing only.
+// These endpoints must never be deployed to production without this guard.
+//
+// The send log stores only the last-4-digit phone tail and send type — no raw
+// phones, no message content. The events endpoint returns masked phones and
+// event types only.
 
-// GET /api/test/sends — return all recorded outbound send attempts since last clear
-app.get('/api/test/sends', (_req, res) => {
-  res.json({ sends: getTestSendLog(), count: getTestSendLog().length });
+function requireTestMode(req, res, next) {
+  if (process.env.TEST_MODE !== 'true') return res.status(404).end();
+  next();
+}
+
+// GET /api/test/sends — return send counts since last clear (phone tail only)
+app.get('/api/test/sends', requireTestMode, (_req, res) => {
+  const log = getTestSendLog();
+  res.json({ sends: log, count: log.length });
 });
 
 // DELETE /api/test/sends — clear the send log (call before each test)
-app.delete('/api/test/sends', (_req, res) => {
+app.delete('/api/test/sends', requireTestMode, (_req, res) => {
   clearTestSendLog();
   res.json({ ok: true, cleared: true });
 });
 
-// DELETE /api/test/cooldowns — clear the reply cooldown map for all phones.
+// DELETE /api/test/cooldowns — clear the reply cooldown map.
 // The 10-second REPLY_COOLDOWN prevents double-firing in production but
 // causes route='acknowledged' for rapid test-to-test messages on the same phone.
-app.delete('/api/test/cooldowns', (_req, res) => {
+app.delete('/api/test/cooldowns', requireTestMode, (_req, res) => {
   _lastReplied.clear();
   res.json({ ok: true });
 });
 
-// DELETE /api/leads/:phone — remove a lead from the store (test cleanup)
-app.delete('/api/leads/:phone', (req, res) => {
+// GET /api/test/events — recent events for a phone, filtered by type.
+// Returns event type and timestamp only. Phone masked in response.
+// Used to verify agent invocation (message_in = Barak; client_message_in = Tomer).
+app.get('/api/test/events', requireTestMode, (req, res) => {
+  const rawPhone = req.query.phone ? normalizeToE164(req.query.phone) : null;
+  if (!rawPhone) return res.status(400).json({ error: 'phone required' });
+  const since  = req.query.since ? new Date(req.query.since) : null;
+  const events = store.getEvents({ phone: rawPhone, since: since ?? undefined, limit: 50 });
+  res.json({
+    events: events.map(e => ({
+      type: e.type,
+      ts:   e.ts,
+      // Mask phone — never return raw phone in test responses
+      phone: maskPhone(e.phone ?? rawPhone),
+    })),
+    count: events.length,
+  });
+});
+
+// DELETE /api/leads/:phone — remove a lead entirely (test cleanup only).
+// Not an admin feature: communication restrictions and identity records are not
+// preserved on full delete. Exists solely for test isolation.
+app.delete('/api/leads/:phone', requireTestMode, (req, res) => {
   const norm = normalizeToE164(decodeURIComponent(req.params.phone));
   if (!norm) return res.status(400).json({ error: 'invalid phone' });
   const existing = store.getLead(norm);
   if (!existing) return res.status(404).json({ error: 'lead not found' });
   store.deleteLead(norm);
   persist.saveLeads(store);
-  logger.info('[api/leads] Lead deleted', { phone: norm });
+  logger.info('[api/leads] Lead deleted (test cleanup)', { phone: norm });
   res.json({ ok: true, phone: norm });
 });
 

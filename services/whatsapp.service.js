@@ -220,15 +220,15 @@ function isDemoPhone(phone) {
 }
 
 // ── Test send log ─────────────────────────────────────────────────────────────
-// Always-on ring buffer that records every outbound send attempt.
-// Queryable via GET /api/test/sends (see server.js).
-// Never calls real Green API for demo phones — only logs the attempt.
-// Not gated by demoCapture.isActive() so integration tests can inspect counts
-// without putting the system into demo mode.
+// Ring buffer that records outbound send attempts — ONLY when TEST_MODE=true.
+// In production (TEST_MODE not set), all functions are no-ops and the log is empty.
+// Stores a masked phone tail (last 4 digits) and send type. No content, no raw phones.
 const _testSendLog = [];
-function _recordTestSend(to, text, type = 'sendText') {
-  _testSendLog.push({ to, preview: text.slice(0, 200), type, ts: new Date().toISOString() });
-  if (_testSendLog.length > 500) _testSendLog.shift(); // keep bounded
+function _recordTestSend(to, type = 'sendText') {
+  if (process.env.TEST_MODE !== 'true') return;
+  const tail = String(to).replace(/[^\d]/g, '').slice(-4); // last 4 digits only
+  _testSendLog.push({ tail, type, ts: new Date().toISOString() });
+  if (_testSendLog.length > 500) _testSendLog.shift();
 }
 function getTestSendLog() { return [..._testSendLog]; }
 function clearTestSendLog() { _testSendLog.length = 0; }
@@ -237,8 +237,8 @@ async function _dispatch(to, text) {
   const chatId = toChatId(to);
 
   if (isDemoPhone(to) || demoCapture.isActive()) {
-    // Record to both the test log (always-on) and demoCapture (session-based)
-    _recordTestSend(to, text, isDemoPhone(to) ? 'demo_send' : 'demo_capture_send');
+    // Record to both the test log (TEST_MODE only, no content stored) and demoCapture
+    _recordTestSend(to, isDemoPhone(to) ? 'demo_send' : 'demo_capture_send');
     demoCapture.record('whatsapp_send', {
       to:          isDemoPhone(to) ? to : '[owner/staff]',
       preview:     text.slice(0, 400),
@@ -248,7 +248,7 @@ async function _dispatch(to, text) {
     return { idMessage: `demo-${Date.now()}`, demo: true };
   }
 
-  _recordTestSend(to, text, 'real_send');
+  _recordTestSend(to, 'real_send');
 
   let url;
   try {

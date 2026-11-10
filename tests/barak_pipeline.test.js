@@ -54,17 +54,49 @@ async function clearSends() {
   await agent.delete('/api/test/cooldowns').expect(200);
 }
 
-/** Poll the send log until at least minCount sends for phone appear, or timeout. */
+/**
+ * Poll the send log until at least minCount sends for phone appear, or timeout.
+ * Matches by the last 4 digits of the phone (send log stores masked tails only).
+ */
 async function waitForSends(phone, { minCount = 1, timeoutMs = 4000, intervalMs = 80 } = {}) {
+  const tail = phone.slice(-4);
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const res = await agent.get('/api/test/sends').expect(200);
-    const sends = (res.body?.sends ?? []).filter(s => s.to === phone);
+    const sends = (res.body?.sends ?? []).filter(s => s.tail === tail);
     if (sends.length >= minCount) return sends;
     await new Promise(r => setTimeout(r, intervalMs));
   }
   const res = await agent.get('/api/test/sends').expect(200);
-  return (res.body?.sends ?? []).filter(s => s.to === phone);
+  return (res.body?.sends ?? []).filter(s => s.tail === tail);
+}
+
+/**
+ * Poll the event store until an event of the given type appears for phone, or timeout.
+ * Uses GET /api/test/events (TEST_MODE gated). Event type is the discriminator:
+ *   'message_in'        → Barak/lead path ran (step 5b upserted lead record)
+ *   'client_message_in' → Tomer/member path ran (step 5c logged client event)
+ *   'score_update'      → leadAgent.handleInbound completed scoring
+ */
+async function waitForEvent(phone, eventType, { since = null, timeoutMs = 20000, intervalMs = 100 } = {}) {
+  const afterTs = since ?? new Date(Date.now() - 500).toISOString();
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const res = await agent
+      .get(`/api/test/events?phone=${encodeURIComponent(phone)}&since=${encodeURIComponent(afterTs)}`)
+      .expect(200);
+    const match = (res.body?.events ?? []).find(e => e.type === eventType);
+    if (match) return match;
+    await new Promise(r => setTimeout(r, intervalMs));
+  }
+  return null;
+}
+
+/** Count sends in the log for a given phone (by last-4-digit tail). */
+async function countSends(phone) {
+  const tail = phone.slice(-4);
+  const res = await agent.get('/api/test/sends').expect(200);
+  return (res.body?.sends ?? []).filter(s => s.tail === tail).length;
 }
 
 /** Poll inbox for a message received after sentAt, for the given phone. */
@@ -148,12 +180,10 @@ describe('New lead routing → Barak', () => {
   });
   afterEach(async () => { await deleteLead(DEMO_PHONES.newLead); });
 
-  test('schedule query → route=barak, sendText fired, barakReply set', async () => {
+  test('schedule query → route=barak, sendText fired, message_in event logged', async () => {
     skipIfDown();
     // The schedule-query path sets barakReply and calls sendText directly.
-    // Tier-3 Arbox lookup runs first (unknown phone → network call → may take several seconds).
-    // waitForInboxEntry with generous timeout is the primary signal;
-    // the send log is checked after the inbox entry confirms processing completed.
+    // Tier-3 Arbox lookup runs first (unknown phone — may take several seconds).
     const sentAt = Date.now();
     await postWebhook(DEMO_PHONES.newLead, 'מה מערכת השעות?');
 
@@ -163,15 +193,18 @@ describe('New lead routing → Barak', () => {
     expect(entry.route).toBe('barak');
     expect(['opted_out_silent', 'human_owns_hold', 'tomer']).not.toContain(entry.route);
 
-    // After the inbox entry appears, sendText has been called (it runs after the inbox push).
-    // Allow a brief moment for the in-process send log to reflect the call.
+    // Send log confirms sendText was called (send log is TEST_MODE gated)
     const sends = await waitForSends(DEMO_PHONES.newLead, { minCount: 1, timeoutMs: 2000 });
     expect(sends.length).toBeGreaterThanOrEqual(1);
+
+    // Event store confirms the lead path ran (not the member/Tomer path)
+    const ev = await waitForEvent(DEMO_PHONES.newLead, 'message_in', { since: new Date(sentAt).toISOString(), timeoutMs: 3000 });
+    expect(ev).not.toBeNull();
   });
 
-  test('general message → route=barak, sendText fired, lead record created', async () => {
+  test('general message → route=barak, score_update event confirms leadAgent ran', async () => {
     skipIfDown();
-    // AI path: leadAgent.handleInbound calls sendText internally.
+    // AI path: leadAgent.handleInbound calls OpenAI + sendText + logs score_update.
     // Arbox Tier-3 lookup + OpenAI call both run → allow up to 15s.
     const sentAt = Date.now();
     await postWebhook(DEMO_PHONES.newLead, 'מחפש/ת שיעורי פילאטיס');
@@ -181,13 +214,13 @@ describe('New lead routing → Barak', () => {
     expect(entry.route).toBe('barak');
     expect(['opted_out_silent', 'human_owns_hold', 'tomer']).not.toContain(entry.route);
 
-    // sendText fired (AI qualification reply)
-    const sends = await waitForSends(DEMO_PHONES.newLead, { minCount: 1, timeoutMs: 3000 });
-    expect(sends.length).toBeGreaterThanOrEqual(1);
+    // score_update is logged by leadAgent.handleInbound — proves AI agent ran and scored the lead
+    const scoreEv = await waitForEvent(DEMO_PHONES.newLead, 'score_update', { since: new Date(sentAt).toISOString(), timeoutMs: 5000 });
+    expect(scoreEv).not.toBeNull();
 
-    // Lead record exists: leadAgent.handleInbound ran
-    const lead = await getLead(DEMO_PHONES.newLead);
-    expect(lead).not.toBeNull();
+    // sendText was called (the AI qualification reply)
+    const sends = await waitForSends(DEMO_PHONES.newLead, { minCount: 1, timeoutMs: 2000 });
+    expect(sends.length).toBeGreaterThanOrEqual(1);
   });
 });
 
@@ -207,14 +240,12 @@ describe('Known member routing → Tomer, zero Barak sends', () => {
     await deleteLead(DEMO_PHONES.member);
   });
 
-  test('known member general message → route=tomer, Barak sales funnel did not run', async () => {
+  test('known member general message → client_message_in event confirms Tomer path, no score_update', async () => {
     skipIfDown();
-    // Use a message > 20 chars so isBriefAck returns false (brief-ack guard applies to all phones).
-    // 'רוצה לדעת על מערכת השיעורים' (28 chars) is unambiguous.
-    // The message goes to Tomer's AI — no Barak lead upsert, no Barak sendText.
-    // Note: stale lead records for this phone may survive between test runs because
-    //   reclassifyAsConvertedMember preserves opted_out/human_owns status per design.
-    //   Route='tomer' is the authoritative proof that Barak's funnel did not run.
+    // 'רוצה לדעת על מערכת השיעורים' (> 20 chars) does not match isBriefAck.
+    // The member path logs 'client_message_in'; Barak's path logs 'message_in' + 'score_update'.
+    // Asserting client_message_in AND absence of score_update proves leadAgent.handleInbound
+    // was never invoked — not just that the route label says 'tomer'.
     const sentAt = Date.now();
     await postWebhook(DEMO_PHONES.member, 'רוצה לדעת על מערכת השיעורים');
 
@@ -222,28 +253,31 @@ describe('Known member routing → Tomer, zero Barak sends', () => {
     expect(entry).not.toBeNull();
     expect(entry.route).toBe('tomer');
 
-    // No Barak sales send: Barak's leadAgent.handleInbound was never called,
-    // so no Barak-initiated sendText appears in the send log for this phone.
-    // (Tomer may or may not send — both are valid.)
-    const sends = (await agent.get('/api/test/sends').expect(200)).body?.sends ?? [];
-    const barakSalesSends = sends.filter(s => s.to === DEMO_PHONES.member && s.type === 'demo_send');
-    // We cannot distinguish Tomer vs Barak sends by content alone, so we only
-    // assert the route (above). Send count is informational.
-    void barakSalesSends; // informational only
+    // client_message_in confirms the pipeline took the member branch (step 5c)
+    const clientEv = await waitForEvent(DEMO_PHONES.member, 'client_message_in', { since: new Date(sentAt).toISOString(), timeoutMs: 5000 });
+    expect(clientEv).not.toBeNull();
+
+    // score_update is logged by leadAgent.handleInbound — its absence proves Barak never ran
+    const scoreEv = await waitForEvent(DEMO_PHONES.member, 'score_update', { since: new Date(sentAt).toISOString(), timeoutMs: 1000 });
+    expect(scoreEv).toBeNull();
   });
 
-  test('known member schedule query → route=tomer', async () => {
+  test('known member schedule query → route=tomer, client_message_in logged', async () => {
     skipIfDown();
-    // The schedule query for a known member goes to Tomer's scheduling path,
-    // which calls buildSchedulingReply (live Arbox call — may take several seconds).
-    // waitForInboxEntry must wait until the routing block + Arbox call complete
-    // before the inbox push happens.
+    // buildSchedulingReply makes a live Arbox call that can take several seconds.
+    // Inbox push happens after the routing block completes; waitForInboxEntry must wait.
     const sentAt = Date.now();
     await postWebhook(DEMO_PHONES.member, 'מה מערכת השעות?');
 
     const entry = await waitForInboxEntry(DEMO_PHONES.member, { sentAt, timeoutMs: 20000 });
     expect(entry).not.toBeNull();
     expect(entry.route).toBe('tomer');
+
+    const clientEv = await waitForEvent(DEMO_PHONES.member, 'client_message_in', { since: new Date(sentAt).toISOString(), timeoutMs: 5000 });
+    expect(clientEv).not.toBeNull();
+
+    const scoreEv = await waitForEvent(DEMO_PHONES.member, 'score_update', { since: new Date(sentAt).toISOString(), timeoutMs: 1000 });
+    expect(scoreEv).toBeNull();
   });
 });
 
@@ -268,9 +302,7 @@ describe('Opted-out contact → no automated sales send', () => {
     expect(entry.barakReply).toBeNull();
 
     // Zero outbound sends — opted_out returns before any sendText call
-    const sends = (await agent.get('/api/test/sends').expect(200)).body?.sends ?? [];
-    const phoneSends = sends.filter(s => s.to === DEMO_PHONES.optedOut);
-    expect(phoneSends.length).toBe(0);
+    expect(await countSends(DEMO_PHONES.optedOut)).toBe(0);
   });
 });
 
@@ -294,8 +326,7 @@ describe('Human-owned contact → no automated sales send', () => {
     expect(entry.route).toBe('human_owns_hold');
     expect(entry.barakReply).toBeNull();
 
-    const sends = (await agent.get('/api/test/sends').expect(200)).body?.sends ?? [];
-    expect(sends.filter(s => s.to === DEMO_PHONES.humanOwns).length).toBe(0);
+    expect(await countSends(DEMO_PHONES.humanOwns)).toBe(0);
   });
 });
 
@@ -401,8 +432,7 @@ describe('Duplicate webhook deduplication', () => {
     expect(entries[0].barakReply).toBeNull();
 
     // The send log confirms zero outbound sends for this phone
-    const sends = (await agent.get('/api/test/sends').expect(200)).body?.sends ?? [];
-    expect(sends.filter(s => s.to === DEMO_PHONES.dedup).length).toBe(0);
+    expect(await countSends(DEMO_PHONES.dedup)).toBe(0);
   });
 });
 
