@@ -2139,7 +2139,7 @@ const INTENT_PATTERNS = {
   // Keep in sync with SCHEDULE_TIMETABLE_RE in deterministic_reply.js — any phrase
   // that matches that regex but not this one will route through lead_agent instead
   // of the scheduling pipeline's null-URL fallback.
-  schedule_query:   /מערכת שעות|לוח שיעורים|מה יש|מתי יש|יש שיעור|יש מקום|מה קורה|סדר יום|מה הלוח|הלוח שלכם|הלוח שלך|שעות.*הסטודיו|שעות.*שלכם|שעות פעילות|שעות פתיחה|מתי פתוח|מתי פתוחים|לראות.*שעות|רוצה.*לוח|איזה שיעורים|מה התוכנית|מה הוא שיעור|מי מדריך|מי המדריך|מי מלמד|מי מנהל|מי נותן|באיזה שעה|בכמה|מה השעה|שיעור.{0,15}ב(יום|ערב|בוקר|צהריים)|ב(יום\s)?(ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת)|יש לכם.*תמונה|שלח.*תמונה.*לוח|תמונה.*לוח|לוח.*תמונה|יש תמונה|שלח.*מערכת|רוצה.*מערכת|לראות.*מערכת|לוח.*שבוע|שבוע.*לוח|אפשר.*לראות.*לוח|שלח[יה]?\s+לי\s+תמונה|תשלח[יה]?\s+לי\s+תמונה|אפשר\s+תמונה|לשלוח\s+לי\s+תמונה|שלוח\s+לי\s+תמונה/,
+  schedule_query:   /מערכת שעות|לוח שיעורים|מה יש|מתי יש|יש שיעור|יש מקום|מה קורה|סדר יום|מה הלוח|הלוח שלכם|הלוח שלך|שעות.*הסטודיו|שעות.*שלכם|שעות פעילות|שעות פתיחה|מתי פתוח|מתי פתוחים|לראות.*שעות|רוצה.*לוח|איזה שיעורים|מה התוכנית|מה הוא שיעור|מי מדריך|מי המדריך|מי מלמד|מי מנהל|מי נותן|באיזה שעה|בכמה|מה השעה|שיעור.{0,15}ב(יום|ערב|בוקר|צהריים)|ב(יום\s)?(ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת)|יש לכם.*תמונה|שלח.*תמונה.*לוח|תמונה.*לוח|לוח.*תמונה|יש תמונה|שלח.*מערכת|רוצה.*מערכת|לראות.*מערכת|לוח.*שבוע|שבוע.*לוח|אפשר.*לראות.*לוח|שלח[יה]?\s+לי\s+(?:את\s+ה?)?תמונה|תשלח[יה]?\s+לי\s+(?:את\s+ה?)?תמונה|אפשר\s+תמונה|לשלוח\s+לי\s+תמונה|שלוח\s+לי\s+תמונה/,
 };
 
 function detectSchedulingIntent(text) {
@@ -3176,10 +3176,11 @@ async function processInboundWAMessage(msg) {
   //   buildSchedulingReply is shared Arbox infrastructure used by both agents.
   //   The route label reflects the correct persona so the inbox attributes
   //   the reply to the right agent.
-  let route            = 'unhandled';
-  let barakReply       = null;
-  let timetableImgUrl  = null;   // first timetable image URL (sent with caption)
-  let timetable2ImgUrl = null;   // second timetable image URL (sent as follow-up)
+  let route              = 'unhandled';
+  let barakReply         = null;
+  let timetableImgUrl    = null;   // first timetable image URL (sent with caption)
+  let timetable2ImgUrl   = null;   // second timetable image URL (sent as follow-up)
+  let _replyAlreadySent  = false;  // true when leadAgent/tomerAgent sent the reply internally
 
   const isSchedulingMsg  = intent !== 'general';
 
@@ -3300,7 +3301,14 @@ async function processInboundWAMessage(msg) {
           name: msg.name,
           text: msg.text ?? '',
         });
-        _markReplied(fromNorm); // cooldown: lead_agent sends its own reply via sendText
+        _markReplied(fromNorm);
+        // Surface the AI-generated reply in barakReply so the simulate endpoint,
+        // inbox, and late-reply suppression can all see it.
+        // _replyAlreadySent prevents the outer pipeline from double-sending.
+        if (leadResult?.reply) {
+          barakReply        = leadResult.reply;
+          _replyAlreadySent = true;
+        }
 
         // If the AI promised to send the schedule image, actually send it.
         // lead_agent already sent the text reply; now append the image + follow-up.
@@ -3452,7 +3460,7 @@ async function processInboundWAMessage(msg) {
     }
   }
 
-  if (barakReply && process.env.WHATSAPP_AUTO_REPLY === 'true') {
+  if (barakReply && process.env.WHATSAPP_AUTO_REPLY === 'true' && !_replyAlreadySent) {
     if (timetableImgUrl) {
       // Send timetable image 1 (with caption), then image 2 if available.
       // No follow-up question — the lead responds naturally after seeing the images.
