@@ -685,41 +685,91 @@ function computeLeadProfile(lead, qualData, history) {
 
 // ── Reliable handoff alert ────────────────────────────────────────────────────
 //
-// Wraps handoffService.generateHandoffBrief with a 12-second timeout and a
-// direct alertOwner fallback, so the team is ALWAYS notified when a call time
-// is captured, even if the LLM brief fails.
+// Three-phase approach:
+//   1. Persist handoff state to store BEFORE attempting notification.
+//      The brief data is independently useful regardless of delivery.
+//   2. Attempt full LLM brief (10s timeout). Use a sent-flag to prevent the
+//      late-arriving original from sending a duplicate after the fallback fires.
+//      Promise.race does not cancel generateHandoffBrief; the flag guards against
+//      both completing and both sending.
+//   3. Await the fallback alertOwner so callers can observe the outcome.
+//      Update the persistent record with success/failure after every attempt.
 //
-// Call with await; never fire-and-forget for the call-time-captured path.
+// Always called with await at the call site in handleInbound.
 
 async function reliableHandoffAlert(phone, name, history, latestQualData) {
-  let timer;
-  const timeoutPromise = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error('handoff brief timed out after 12s')), 12000);
+  const qd  = latestQualData;
+  const { scoreReadiness } = handoffService;
+  const readiness = scoreReadiness(history, qd);
+
+  // 1. Persist handoff intent before any network call.
+  //    Idempotency: if the same call time was already delivered, skip.
+  const existingMeta = store.getLead(phone)?.meta ?? {};
+  if (existingMeta.handoffAlertSentAt && existingMeta.handoffCallTime === qd.callTimeGiven) {
+    logger.info('[lead_agent] Handoff already sent for this call time — skipping duplicate', { phone });
+    return;
+  }
+  store.upsertLead(phone, {
+    meta: { ...existingMeta, handoffAlertStatus: 'pending', handoffCallTime: qd.callTimeGiven, handoffReadiness: readiness.level },
   });
 
+  // 2. Race the LLM brief against a 10-second timeout.
+  //    notificationSent flag prevents the race loser from sending a second alert.
+  let notificationSent = false;
+  let briefErr = null;
+
   try {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('brief generation timed out after 10s')), 10000);
+    });
     await Promise.race([
-      handoffService.generateHandoffBrief(phone, name, history, latestQualData),
-      timeoutPromise,
+      handoffService.generateHandoffBrief(phone, name, history, qd).then(result => {
+        if (!notificationSent) { notificationSent = true; }
+        clearTimeout(timer);
+        return result;
+      }),
+      timeout.then(() => { clearTimeout(timer); }),
     ]);
-    clearTimeout(timer);
-    logger.info('[lead_agent] Handoff brief sent to team', { phone });
+    if (notificationSent) {
+      logger.info('[lead_agent] Handoff brief sent to team', { phone, readiness: readiness.level });
+    }
   } catch (err) {
-    clearTimeout(timer);
-    logger.warn('[lead_agent] Handoff brief failed — sending direct fallback alert', { phone, error: err.message });
-    const qd = latestQualData;
-    const fallback = [
+    briefErr = err;
+    logger.warn('[lead_agent] Handoff brief failed — sending direct fallback', { phone, error: err.message });
+  }
+
+  // 3. If the full brief was not sent, send an awaited fallback with known qualData.
+  if (!notificationSent) {
+    const fallbackLines = [
       `📋 ליד חדש — ${name ?? phone}`,
       `📱 ${phone}`,
-      qd.callTimeGiven     ? `📞 זמן שיחה: ${qd.callTimeGiven}` : '📞 זמן שיחה: לא נקבע',
-      qd.location          ? `📍 ${qd.location}` : '',
-      qd.fitnessInterest   ? `💪 ענין: ${qd.fitnessInterest}` : '',
-      qd.goal              ? `🎯 מטרה: ${qd.goal}` : '',
-      `\n⚠️ Brief מפורט לא הצליח — בדוק/י ב-dashboard.\nסיבה: ${err.message}`,
+      qd.callTimeGiven   ? `📞 זמן שיחה: ${qd.callTimeGiven}` : '📞 זמן שיחה: לא נקבע',
+      qd.location        ? `📍 ${qd.location}` : '',
+      qd.fitnessInterest ? `💪 ענין: ${qd.fitnessInterest}` : '',
+      qd.goal            ? `🎯 מטרה: ${qd.goal}` : '',
+      `📊 מוכנות: ${readiness.level} — ${readiness.evidence}`,
+      `\n⚠️ Brief מפורט לא הצליח (${briefErr?.message ?? 'unknown'}). בדוק/י ב-dashboard.`,
     ].filter(Boolean).join('\n');
-    alertOwner(`📋 ליד (fallback) — ${name ?? phone}`, fallback)
-      .catch(e => logger.error('[lead_agent] Even fallback handoff alert failed', { phone, error: e.message }));
+    try {
+      await alertOwner(`📋 ליד (fallback) — ${name ?? phone}`, fallbackLines);
+      notificationSent = true;
+      logger.info('[lead_agent] Fallback handoff alert sent', { phone });
+    } catch (alertErr) {
+      logger.error('[lead_agent] Even fallback handoff alert failed', { phone, error: alertErr.message });
+    }
   }
+
+  // 4. Persist the outcome so the team panel reflects delivery status.
+  const updatedMeta = store.getLead(phone)?.meta ?? {};
+  store.upsertLead(phone, {
+    meta: {
+      ...updatedMeta,
+      handoffAlertStatus:   notificationSent ? 'sent' : 'failed',
+      handoffAlertSentAt:   notificationSent ? new Date().toISOString() : null,
+      handoffAlertFailedAt: notificationSent ? null : new Date().toISOString(),
+    },
+  });
 }
 
 // ── Lead brief generation ─────────────────────────────────────────────────────
@@ -1324,11 +1374,12 @@ async function handleInbound({ from, name, text }) {
   }
 
   if (callTimeCapturedNow) {
-    // Reliable handoff: awaited with timeout + direct fallback.
-    // The team MUST be notified when a call time is confirmed — this is not fire-and-forget.
+    // reliableHandoffAlert is awaited so the persistent handoff record reflects the outcome
+    // before handleInbound returns. The lead already has their reply (sent in step 8).
+    // This may add up to ~10s to the handleInbound Promise resolution, which is acceptable
+    // since it runs after the outbound send and does not delay the lead's experience.
     const handoffLead = store.getLead(from);
-    reliableHandoffAlert(from, handoffLead?.name ?? from, history, latestQualData)
-      .catch(err => logger.error('[lead_agent] reliableHandoffAlert threw unexpectedly', { from, error: err.message }));
+    await reliableHandoffAlert(from, handoffLead?.name ?? from, history, latestQualData);
 
     // Save a persistent session summary to the memory store (fire-and-forget is acceptable
     // here — it enriches future conversations but is not required for the team handoff)

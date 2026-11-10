@@ -484,6 +484,23 @@ app.get('/api/leads', (_req, res) => {
   res.json(leads);
 });
 
+// GET /api/version — running code identity, for deployment verification
+// Returns the git commit SHA baked in at build time via RAILWAY_GIT_COMMIT_SHA,
+// plus the active webhook URL so callers can confirm which provider is configured.
+app.get('/api/version', (_req, res) => {
+  res.json({
+    commit:          process.env.RAILWAY_GIT_COMMIT_SHA ?? 'unknown (env not set)',
+    deploymentId:    process.env.RAILWAY_DEPLOYMENT_ID ?? 'unknown',
+    serviceId:       process.env.RAILWAY_SERVICE_ID    ?? 'unknown',
+    startedAt:       process.env._SERVER_START_TS      ?? 'unknown',
+    activeWebhooks: {
+      greenApi: !!process.env.GREEN_API_ID_INSTANCE || !!process.env.GREEN_API_INSTANCE_ID,
+      metaCloud: !!process.env.WHATSAPP_ACCESS_TOKEN,
+    },
+    phoneRegistrySize: phoneRegistry?.size ?? 'unavailable',
+  });
+});
+
 // GET /api/stats — daily stats + system health
 app.get('/api/stats', (_req, res) => {
   res.json({ daily: store.getDailyStats(), health: store.getSystemHealth() });
@@ -1789,27 +1806,48 @@ app.post('/api/leads/:phone/release', jsonBody, (req, res) => {
   const existing = store.getLead(norm);
   if (!existing) return res.status(404).json({ error: 'lead not found' });
 
-  // Restore to previousStatus only when it represents an active automation state.
-  // Terminal states (opted_out, converted_member) and human_owns (which got here by
-  // the same path) are never valid restore targets — fall back to 'cold' instead.
-  const prev = existing.meta?.previousStatus ?? 'cold';
-  const TERMINAL = new Set(['opted_out', 'converted_member', 'human_owns', 'escalated']);
-  const restoreStatus = TERMINAL.has(prev) ? 'cold' : prev;
-  store.upsertLead(norm, {
-    status: restoreStatus,
-    meta: {
-      ...(existing.meta ?? {}),
-      humanOwnsReason:  null,
-      humanOwnsSince:   null,
-      humanOwnsBy:      null,
-      humanReleasedAt:  new Date().toISOString(),
-      previousStatus:   null,
-    },
-  });
+  // Release only clears the human-ownership fields.
+  // Communication restrictions and identity are authoritative and are NOT overridden
+  // by releasing human ownership — they were set by the person or by identity resolution.
+  //
+  // Priority (highest to lowest):
+  //   1. optedOutAt in meta         → restore to opted_out (permanent comms preference)
+  //   2. isConfirmedMember in meta  → restore to converted_member (identity fact)
+  //   3. previousStatus if valid    → restore to that automation state
+  //   4. fallback                   → cold
+  const meta = existing.meta ?? {};
+  const ownershipClear = {
+    humanOwnsReason:  null,
+    humanOwnsSince:   null,
+    humanOwnsBy:      null,
+    humanReleasedAt:  new Date().toISOString(),
+    previousStatus:   null,
+  };
+
+  if (meta.optedOutAt || existing.status === 'opted_out') {
+    store.upsertLead(norm, { status: 'opted_out', meta: { ...meta, ...ownershipClear } });
+    store.logEvent('human_release', norm, { restoredTo: 'opted_out', reason: 'opted_out_preserved' });
+    persist.saveLeads(store);
+    logger.info('[lead-ownership] Released — opted_out preserved', { phone: norm });
+    return res.json({ ok: true, phone: norm, status: 'opted_out', automationResumed: false, reason: 'opted_out_preserved' });
+  }
+
+  if (meta.isConfirmedMember || existing.status === 'converted_member') {
+    store.upsertLead(norm, { status: 'converted_member', meta: { ...meta, ...ownershipClear } });
+    store.logEvent('human_release', norm, { restoredTo: 'converted_member', reason: 'member_identity_preserved' });
+    persist.saveLeads(store);
+    logger.info('[lead-ownership] Released — converted_member preserved', { phone: norm });
+    return res.json({ ok: true, phone: norm, status: 'converted_member', automationResumed: false, reason: 'member_identity_preserved' });
+  }
+
+  const AUTOMATION_STATES = new Set(['new', 'cold', 'warm', 'hot', 'call_scheduled', 'callback_requested']);
+  const prev = meta.previousStatus;
+  const restoreStatus = AUTOMATION_STATES.has(prev) ? prev : 'cold';
+  store.upsertLead(norm, { status: restoreStatus, meta: { ...meta, ...ownershipClear } });
   store.logEvent('human_release', norm, { restoredTo: restoreStatus, wasStatus: prev });
   persist.saveLeads(store);
   logger.info('[lead-ownership] Released — bot resumed', { phone: norm, restoredTo: restoreStatus });
-  res.json({ ok: true, phone: norm, status: restoreStatus, automationResumed: !TERMINAL.has(prev) });
+  return res.json({ ok: true, phone: norm, status: restoreStatus, automationResumed: true });
 });
 
 app.post('/api/leads/:phone/opt-out', jsonBody, (req, res) => {
@@ -4659,6 +4697,7 @@ process.on('SIGTERM', () => {
 // Note: app.listen() opens the port synchronously before the callback fires.
 // The ~1-2s init window is covered by Gate 1 (memberCache) and Gate 2 (operational
 // interceptor) in lead_agent.js — both fire even when the registry is warming up.
+process.env._SERVER_START_TS = new Date().toISOString();
 app.listen(PORT, async () => {
   logger.info(`Shape Studio Agent running — http://localhost:${PORT}`);
 
