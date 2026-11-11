@@ -470,13 +470,20 @@ function buildStageContext(completedTurns, qualData, msgCount) {
     if (qualData.callProposed) {
       // Call was already invited. If they asked a question, answer it first.
       // If they expressed interest but haven't given a time, ask once for a time.
-      // If they explicitly declined (callbackDeclined), do NOT re-invite — offer the trial instead.
+      // Declined — close naturally. No re-invite, no replacement pitch.
       if (qualData.callbackDeclined) {
-        return `The lead declined the callback. Do not invite again. If the conversation is still open, offer the trial: "אפשר להתחיל עם 2 אימונים ב-60 ש״ח — ללא התחייבות."`;
+        return `The lead declined the callback. Close warmly in one sentence. Leave the door open. No pitch, no alternative offer.`;
       }
-      return qualData.confirmedName
-        ? `A callback was invited. If they asked a question, answer it first. If they're positive with no question, ask once: "מתי נוח לך שנחזור אליך?"`
-        : `A callback was invited. Answer any question they have. If they're positive, ask: "מתי נוח לך שנחזור אליך?"`;
+      // Callback was invited. Only ask for a time after CLEAR acceptance.
+      // "מעולה", "תודה", "אחלה תודה רבה" = polite acknowledgment, NOT acceptance.
+      //   → Respond with a warm close. Do NOT ask for a time.
+      // Clear acceptance = "כן", "אשמח", "בבקשה", "נשמע טוב", "בשמחה", etc.
+      //   → Ask once: "מתי נוח לך שנחזור אליך?"
+      // If they asked a question, answer it first. No time request on the same turn as an answer.
+      return `A callback was invited. Next steps:
+  • If they asked a question — answer it. No time request on this turn.
+  • If they clearly accepted ("כן", "אשמח", "בשמחה", "נשמע טוב") — ask once: "מתי נוח לך שנחזור אליך?"
+  • If they said something like "תודה", "אחלה", "מעולה", "תודה רבה" with no explicit yes — this is a polite closing, not acceptance. Reply warmly and close. Do NOT ask for a time and do NOT make another offer.`;
     }
 
     const hasLocation = qualData.locationViable === true || (qualData.location && !qualData.locationCheckNeeded);
