@@ -159,7 +159,12 @@ const demoCapture = require('../utils/demo_capture');
 // answered a question instead.
 
 const CALL_PROPOSAL_RE =
-  /יתקשר|שיחה קצרה|5 דקות|באיזו שעה נוח|מה שעה נוחה|לתאם שיחה|אתקשר אליך|שיצרו קשר/;
+  /יתקשר|שיחה קצרה|5 דקות|באיזו שעה נוח|מה שעה נוחה|לתאם שיחה|אתקשר אליך|שיצרו קשר|נציג.*יחזור אליך|נציג מהסטודיו|לחזור אליך/;
+
+// Callback refusal — lead explicitly declines a callback invitation.
+// Sets callbackDeclined so the invitation is not repeated.
+const CALLBACK_DECLINE_RE =
+  /לא עכשיו|לא צריך|לא מעוניין|לא מעוניינת|תודה לא|לא תודה|לא רוצה שיתקשר|אל תתקשר|אני אחזור|אני אפנה|אבדוק בעצמ/i;
 
 const NAME_ASK_RE =
   /איך קוראים לך|מה שמך|מה השם שלך|ואיך קוראים|קוראים לך\?|שמך\?/;
@@ -463,17 +468,45 @@ function buildStageContext(completedTurns, qualData, msgCount) {
 
   const nextSuggestion = (() => {
     if (qualData.callProposed) {
+      // Call was already invited. If they asked a question, answer it first.
+      // If they expressed interest but haven't given a time, ask once for a time.
+      // If they explicitly declined (callbackDeclined), do NOT re-invite — offer the trial instead.
+      if (qualData.callbackDeclined) {
+        return `The lead declined the callback. Do not invite again. If the conversation is still open, offer the trial: "אפשר להתחיל עם 2 אימונים ב-60 ש״ח — ללא התחייבות."`;
+      }
       return qualData.confirmedName
-        ? `A call was suggested. If they asked a question, answer it. If they're positive with no question, re-invite: "מתי נוח לך שנחזור אליך לשיחה קצרה?"`
-        : `A call was suggested. If they asked a question, answer it. If they explicitly declined, offer the trial (2 sessions / 60₪).`;
+        ? `A callback was invited. If they asked a question, answer it first. If they're positive with no question, ask once: "מתי נוח לך שנחזור אליך?"`
+        : `A callback was invited. Answer any question they have. If they're positive, ask: "מתי נוח לך שנחזור אליך?"`;
     }
 
     const hasLocation = qualData.locationViable === true || (qualData.location && !qualData.locationCheckNeeded);
     const hasIntent   = !!(qualData.fitnessInterest || qualData.goal);
     const hasName     = !!qualData.confirmedName;
+    const callbackDeclined = !!qualData.callbackDeclined;
+
+    // After showing real interest (2+ turns, intent known), offer a contextual callback invite.
+    // Only if: not already proposed/declined/booked, and the reply has a natural pause.
+    // Do NOT append this mechanically — only when no open question remains from the lead.
+    // Do NOT use a fixed sentence. Adapt the wording to the specific topic just answered:
+    //   after a question about Reformer: "רוצה שנציג מהסטודיו יחזור אליך לשיחה קצרה ויעזור לך לבחור?"
+    //   after a question about classes: "רוצה שנציג יחזור אליך ויסביר מה מתאים לך הכי טוב?"
+    //   after a question about schedule: "רוצה שנציג יחזור אליך ונתאם ביחד?"
+    // FORBIDDEN: "אם יש שאלות נוספות אני כאן" — never use this generic closing.
+    if (hasIntent && completedTurns >= 2 && !callbackDeclined) {
+      return [
+        `The lead has shown real interest. After answering their question fully:`,
+        `  • If no open question remains from them, offer a callback naturally — adapt wording to the topic just discussed.`,
+        `    Example: "רוצה שנציג מהסטודיו יחזור אליך לשיחה קצרה ויעזור לך לבחור את המסלול המתאים?"`,
+        `    Vary it: reference the specific class or topic they asked about.`,
+        `  • If their message still has an open question, answer it — do not add the callback invite yet.`,
+        `  • NEVER end with "אם יש שאלות נוספות אני כאן" — that closes the door. The invite opens it.`,
+        `  • ONE question total in this reply (the callback invite counts as the question).`,
+        hasLocation ? '' : `  • Location not yet known — if relevant, weave it in after the callback invite.`,
+      ].filter(Boolean).join('\n');
+    }
 
     if (hasLocation && hasIntent && hasName) {
-      return `All key facts known. When the conversation has a natural pause (no open question from them), propose the team call: "הצעד הבא הוא שיחה קצרה עם הצוות — מתי נוח לך?"`;
+      return `All key facts known. When the conversation has a natural pause (no open question from them), propose the team call: "רוצה שנציג מהסטודיו יחזור אליך לשיחה קצרה ויעזור לך לבחור את המסלול המתאים?"`;
     }
     if (hasLocation && hasIntent && !hasName) {
       return `Location and interest known. If the conversation reaches a natural pause and no question is pending, ask their first name. Otherwise keep helping.`;
@@ -1037,6 +1070,14 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
     // The AI will see [STAGE: reported_booking] and handle gracefully — no forced close.
   }
 
+  // 3a-decline. Detect callback refusal — stop repeating the invitation.
+  if (qualData.callProposed && !qualData.callTimeGiven && !qualData.callbackDeclined
+      && CALLBACK_DECLINE_RE.test(text)) {
+    setQualData(from, { callbackDeclined: true });
+    store.logEvent('callback_declined', from, { preview: text.slice(0, 60) });
+    logger.info('[lead_agent] Callback declined by lead', { from });
+  }
+
   // 3a. Detect callback time in this inbound message
   if (qualData.callProposed && !qualData.callTimeGiven && TIME_PATTERN.test(text)) {
     const callTime = text.trim().slice(0, 80);
@@ -1286,9 +1327,11 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
       setQualData(from, { nameAsked: true });
     }
 
-    // callProposed: set only if the reply actually proposed the team call
-    if (completedTurns >= 3 && !freshQualData.callProposed && !freshQualData.callTimeGiven && locationResolved
-        && freshQualData.nameAsked && CALL_PROPOSAL_RE.test(reply)) {
+    // callProposed: set only if the reply actually contained a callback invitation phrase.
+    // Lowered to completedTurns >= 2 to match the new earlier invite condition.
+    // nameAsked gate removed — invite can happen before name is known.
+    if (completedTurns >= 2 && !freshQualData.callProposed && !freshQualData.callTimeGiven
+        && CALL_PROPOSAL_RE.test(reply)) {
       setQualData(from, { callProposed: true });
     }
 
