@@ -2141,7 +2141,7 @@ const INTENT_PATTERNS = {
   // Keep in sync with SCHEDULE_TIMETABLE_RE in deterministic_reply.js — any phrase
   // that matches that regex but not this one will route through lead_agent instead
   // of the scheduling pipeline's null-URL fallback.
-  schedule_query:   /מערכת שעות|לוח שיעורים|מה יש|מתי יש|יש שיעור|יש מקום|מה קורה|סדר יום|מה הלוח|הלוח שלכם|הלוח שלך|שעות.*הסטודיו|שעות.*שלכם|שעות פעילות|שעות פתיחה|מתי פתוח|מתי פתוחים|לראות.*שעות|רוצה.*לוח|איזה שיעורים|מה התוכנית|מה הוא שיעור|מי מדריך|מי המדריך|מי מלמד|מי מנהל|מי נותן|באיזה שעה|בכמה|מה השעה|שיעור.{0,15}ב(יום|ערב|בוקר|צהריים)|ב(יום\s)?(ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת)|יש לכם.*תמונה|שלח.*תמונה.*לוח|תמונה.*לוח|לוח.*תמונה|יש תמונה|שלח.*מערכת|רוצה.*מערכת|לראות.*מערכת|לוח.*שבוע|שבוע.*לוח|אפשר.*לראות.*לוח|שלח[יה]?\s+לי\s+(?:את\s+ה?)?תמונה|תשלח[יה]?\s+לי\s+(?:את\s+ה?)?תמונה|אפשר\s+תמונה|לשלוח\s+לי\s+תמונה|שלוח\s+לי\s+תמונה/,
+  schedule_query:   /מערכת שעות|לוח שיעורים|מה יש|מתי יש|יש שיעור|יש מקום|סדר יום|מה הלוח|הלוח שלכם|הלוח שלך|שעות.*הסטודיו|שעות.*שלכם|שעות פעילות|שעות פתיחה|מתי פתוח|מתי פתוחים|לראות.*שעות|רוצה.*לוח|איזה שיעורים|מה התוכנית|מה הוא שיעור|מי מדריך|מי המדריך|מי מלמד|מי מנהל|מי נותן|באיזה שעה|בכמה|מה השעה|שיעור.{0,15}ב(יום|ערב|בוקר|צהריים)|ב(יום\s)?(ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת)|יש לכם.*תמונה|שלח.*תמונה.*לוח|תמונה.*לוח|לוח.*תמונה|יש תמונה|שלח.*מערכת|רוצה.*מערכת|לראות.*מערכת|לוח.*שבוע|שבוע.*לוח|אפשר.*לראות.*לוח|שלח[יה]?\s+לי\s+(?:את\s+ה?)?תמונה|תשלח[יה]?\s+לי\s+(?:את\s+ה?)?תמונה|אפשר\s+תמונה|לשלוח\s+לי\s+תמונה|שלוח\s+לי\s+תמונה/,
 };
 
 // Explicit negation of a call/contact — must be checked BEFORE representative.
@@ -2475,8 +2475,9 @@ const REPLY_COOLDOWN  = 10_000; // 10 seconds
 // an HTTP round-trip. 3 seconds ≪ 20 seconds: a staff reply at t+2s is not masked.
 const _botSentIds     = new Map(); // idMessage → { phone, sentAt }
 const _pendingBotSends = new Map(); // phone → [sendStartedAt, ...] (in-flight sends)
-const BOT_SENT_TTL    = 24 * 60 * 60 * 1000;
-const PENDING_SEND_TTL = 3_000; // 3 seconds — HTTP round-trip max
+const BOT_SENT_TTL        = 24 * 60 * 60 * 1000;
+const PENDING_SEND_TTL    = 3_000;  // 3 seconds — HTTP round-trip max
+const OUTGOING_RECONCILE_MS = 300;  // hold unresolved outgoing echo for ID reconciliation
 
 function _markBotSent(phone) {
   // Register that a bot send is now in flight for this phone.
@@ -2525,6 +2526,31 @@ function _isBotSentId(idMessage) {
     return false;
   }
   return true;
+}
+
+// Apply human ownership when an outgoing message is confirmed to be a staff reply.
+// Idempotent — if already human_owns, opted_out, or converted_member, does nothing.
+function _applyStaffTakeover(norm, idMessage, msgText) {
+  const existing  = store.getLead(norm) ?? {};
+  const curStatus = existing.status ?? null;
+  if (['opted_out', 'converted_member', 'human_owns'].includes(curStatus)) return;
+  store.upsertLead(norm, {
+    status: 'human_owns',
+    meta: {
+      ...(existing.meta ?? {}),
+      humanOwnsReason: 'staff_manual_reply',
+      humanOwnsSince:  new Date().toISOString(),
+      humanOwnsBy:     'staff',
+    },
+  });
+  persist.saveLeads(store);
+  store.logEvent('human_takeover_staff_reply', norm, {
+    idMessage, preview: (msgText ?? '').slice(0, 60),
+  });
+  logger.info('[outgoing-webhook] Staff manual reply detected — human_owns set', {
+    phone: norm, idMessage, wasLead: !!existing.status,
+  });
+  broadcastSse('message', { phone: norm, route: 'human_owns', reason: 'staff_reply' });
 }
 
 function _isInCooldown(phone) {
@@ -3792,47 +3818,38 @@ app.post('/api/green-api/webhook', (req, res) => {
         const msgText   = body?.messageData?.textMessageData?.textMessage ?? null;
 
         if (chatId && !chatId.endsWith('@g.us') && idMessage && !_isBotSentId(idMessage)) {
-          // Check if a bot send is still in flight (HTTP not yet returned idMessage).
-          // This covers the rare race where the Green API echo arrives before sendText()
-          // has completed and registered the idMessage via _recordBotSend.
-          // Window is 3 seconds — the HTTP round-trip max. A staff reply at t+2s is NOT
-          // masked here: by that time, any pending send from t=0 is at most 2s old and
-          // could be a genuine race. If attribution is unknown, we err toward NOT setting
-          // human_owns (avoid suppressing a valid bot echo) and let _botSentIds catch it.
           const phone = chatId.replace(/@.*$/, '');
           const norm  = normalizeToE164(phone);
           if (norm) {
             if (_hasPendingBotSend(norm)) {
-              // A bot send is still in flight — this echo is almost certainly the bot's
-              // own message, not a staff reply. Skip.
-              logger.debug('[outgoing-webhook] Bot send in-flight — echo likely bot, skipping human_owns', { phone: norm });
+              // A bot HTTP send is still in-flight when this echo arrived.
+              // Hold for RECONCILE_WINDOW_MS so _recordBotSend can register the
+              // idMessage once the HTTP response lands. After the window, re-check:
+              //   - idMessage now in _botSentIds → confirmed bot echo → skip
+              //   - still unknown → genuine staff reply → set human_owns
+              const capturedId   = idMessage;
+              const capturedNorm = norm;
+              const capturedText = msgText;
+              logger.debug('[outgoing-webhook] Bot send in-flight — deferring echo reconciliation', {
+                phone: capturedNorm, idMessage: capturedId,
+              });
+              setTimeout(() => {
+                if (_isBotSentId(capturedId)) {
+                  logger.debug('[outgoing-webhook] Deferred: confirmed bot echo after reconciliation', {
+                    phone: capturedNorm, idMessage: capturedId,
+                  });
+                  return;
+                }
+                logger.info('[outgoing-webhook] Deferred: id unresolved after window — staff reply', {
+                  phone: capturedNorm, idMessage: capturedId,
+                });
+                _applyStaffTakeover(capturedNorm, capturedId, capturedText);
+              }, OUTGOING_RECONCILE_MS);
               return;
             }
 
-            // idMessage not in _botSentIds AND no pending send → staff manually typed this.
-            // Set human ownership. Works even when there is no existing lead record —
-            // we create a minimal record so the routing gate suppresses any future bot reply.
-            const existing  = store.getLead(norm) ?? {};
-            const curStatus = existing.status ?? null;
-            if (!['opted_out', 'converted_member', 'human_owns'].includes(curStatus)) {
-              store.upsertLead(norm, {
-                status: 'human_owns',
-                meta: {
-                  ...(existing.meta ?? {}),
-                  humanOwnsReason: 'staff_manual_reply',
-                  humanOwnsSince:  new Date().toISOString(),
-                  humanOwnsBy:     'staff',
-                },
-              });
-              persist.saveLeads(store);
-              store.logEvent('human_takeover_staff_reply', norm, {
-                idMessage, preview: (msgText ?? '').slice(0, 60),
-              });
-              logger.info('[outgoing-webhook] Staff manual reply detected — human_owns set', {
-                phone: norm, idMessage, wasLead: !!existing.status,
-              });
-              broadcastSse('message', { phone: norm, route: 'human_owns', reason: 'staff_reply' });
-            }
+            // idMessage not in _botSentIds AND no in-flight send → staff manually typed this.
+            _applyStaffTakeover(norm, idMessage, msgText);
           }
         }
         return;
@@ -4619,6 +4636,27 @@ app.post('/api/tomer/unclassified/:phone/route', jsonBody, (req, res) => {
   }
   store.logEvent('manual_route', phone, { routeTo, source: 'admin_panel' });
   res.json({ ok: true, phone, routeTo });
+});
+
+// GET /api/tomer/member/id/:arboxId — rich member context via stable Arbox member ID.
+// Phone is resolved server-side from Arbox — not exposed in the enriched member list.
+// This endpoint avoids sending real phones to the client via URL parameters.
+app.get('/api/tomer/member/id/:arboxId', async (req, res) => {
+  const arboxId = decodeURIComponent(req.params.arboxId);
+  try {
+    const arboxSvc = require('./services/arbox.service');
+    const member   = await arboxSvc.getMemberById(arboxId).catch(() => null);
+    if (!member) return res.status(404).json({ ok: false, error: 'member not found' });
+    const phone    = member.phone ?? null;
+    const lead     = phone ? store.getLead(phone) : null;
+    const history  = phone ? tomerStore.getMemberHistory(phone) : [];
+    const tasks    = phone ? tomerStore.getTasks({ phone }) : [];
+    const audit    = phone ? tomerStore.getAudit({ phone, limit: 20 }) : [];
+    const inboxThreads = (phone && inbox.getThread) ? inbox.getThread(phone) : [];
+    res.json({ ok: true, arboxId, phone, arbox: member, lead, history, tasks, audit, inboxThreads });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 // GET /api/tomer/member/:phone — rich member context (Arbox + local)

@@ -514,18 +514,26 @@ function renderMembersEnriched(members) {
   }).join('');
 }
 
-// openMemberByArboxId — opens the member drawer using arboxId as the lookup key.
-// Since phones are masked in the enriched list, we store arboxId for the action.
-// The drawer endpoint at /api/tomer/member/:phone still requires the phone, so
-// we keep a local arboxId → masked-phone map populated from the enriched list.
-const _arboxIdToPhone = new Map();
-
-window.openMemberByArboxId = function(arboxId, name) {
-  // The enriched list has masked phones — use them for the drawer
-  const m = _allMembers.find(m => String(m.arboxId) === String(arboxId));
-  if (m) {
-    _arboxIdToPhone.set(arboxId, m.phone ?? '');
-    openMemberDrawer(m.phone ?? arboxId, name);
+// openMemberByArboxId — opens the member drawer using the stable Arbox member ID.
+// Calls /api/tomer/member/id/:arboxId which resolves the real phone server-side,
+// then delegates to openMemberDrawer with the resolved phone for all action buttons.
+window.openMemberByArboxId = async function(arboxId, name) {
+  const drawer = $id('tw-drawer');
+  const body   = $id('tw-drawer-body');
+  const title  = $id('tw-drawer-name');
+  if (!drawer || !body) return;
+  if (title) title.textContent = name || arboxId;
+  body.innerHTML = '<div class="tw-spin">טוען...</div>';
+  drawer.style.display = '';
+  try {
+    const data = await api(`/api/tomer/member/id/${encodeURIComponent(arboxId)}`);
+    if (!data.ok) throw new Error(data.error ?? 'member not found');
+    const resolvedPhone = data.phone ?? arboxId;
+    // openMemberDrawer re-fetches via /api/tomer/member/:phone with the real phone
+    closeDrawer();
+    openMemberDrawer(resolvedPhone, name);
+  } catch (e) {
+    body.innerHTML = `<div class="tw-empty">שגיאה: ${esc(e.message)}</div>`;
   }
 };
 

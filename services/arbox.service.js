@@ -116,6 +116,19 @@ async function getMemberByPhone(phone) {
   }
 }
 
+/**
+ * Find a member by their stable Arbox user_id.
+ * Returns null if not found or on Arbox error.
+ */
+async function getMemberById(arboxId) {
+  try {
+    const all = await getMembers({ limit: 200 });
+    return all.find(m => String(m.user_id) === String(arboxId)) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 // ── Schedule ──────────────────────────────────────────────────────────────────
 
 /**
@@ -565,6 +578,7 @@ module.exports = {
   getMembers,
   getAllUsers,
   getMemberByPhone,
+  getMemberById,
   getMembershipStatus,
   // Detailed membership analytics
   classifyMemberships,
