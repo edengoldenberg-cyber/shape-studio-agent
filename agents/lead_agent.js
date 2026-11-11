@@ -994,7 +994,7 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
       // Single silent acknowledgement; no further messages from any agent.
       const optOutAck = `הסרנו אותך מרשימת ההתקשרויות שלנו. לא נשלח הודעות נוספות.`;
       await sendText(from, optOutAck).catch(() => {});
-      return { reply: optOutAck, score: 0, status: 'opted_out' };
+      return { reply: optOutAck, score: 0, status: 'opted_out', sendState: 'sent' };
     }
     // Already opted_out — stay silent.
     return { reply: null, score: 0, status: 'opted_out' };
@@ -1019,7 +1019,10 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
       `🤝 Human takeover required — ${name ?? from}`,
       `*Contact:* ${name ?? from} (${from})\n*Reason:* frustration\n*Message:* "${text.slice(0, 200)}"\n\nHistory preserved. Release via: POST /api/leads/${encodeURIComponent(from)}/release`
     ).catch(() => {});
-    return { reply: frustMsg, score: 1, status: 'human_owns' };
+    // sendState: 'sent' tells the pipeline the message was already dispatched.
+    // Without it, the late-reply suppression sees human_owns and clears barakReply,
+    // hiding the sent message from logs and the simulate response.
+    return { reply: frustMsg, score: 1, status: 'human_owns', sendState: 'sent' };
   }
 
   // 3a-pre. Reported-booking detector — fires BEFORE call-proposed checks.

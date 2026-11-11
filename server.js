@@ -3641,15 +3641,21 @@ async function processInboundWAMessage(msg) {
 
   // 6. Auto-reply when configured and Barak has a draft
   //
-  // ── LATE REPLY SUPPRESSION (Fix 5) ──────────────────────────────────────────
+  // ── LATE REPLY SUPPRESSION ───────────────────────────────────────────────────
   // Status may have changed DURING async AI generation (concurrent human takeover,
   // opt-out from a parallel message, or status update via API).
   // Re-check just before sending so a reply generated before the status change
   // is never delivered after it.
   //
+  // Guard: only apply when the reply has NOT already been sent internally
+  // (_replyAlreadySent = false). When the reply was sent inside lead_agent.handleInbound
+  // (e.g. the frustration handoff message, opt-out ack), the status change IS the
+  // intended consequence of sending that message — suppressing barakReply would hide
+  // the sent message from the simulate/inbox response without preventing any actual send.
+  //
   // Only applies to the Barak branch (!isExistingClient): Tomer has its own
   // silence classifier and is unaffected by lead stop-statuses.
-  if (barakReply && !isExistingClient) {
+  if (barakReply && !isExistingClient && !_replyAlreadySent) {
     const _lateStatus = store.getLead(fromNorm)?.status;
     if (_lateStatus === 'opted_out' || _lateStatus === 'human_owns') {
       logger.info('[pipeline] Late reply suppression — status changed during AI generation', {
@@ -3659,9 +3665,6 @@ async function processInboundWAMessage(msg) {
       barakReply = null;
     }
     // Stale reply suppression: a newer message arrived during AI generation.
-    // Suppress the outer-pipeline reply so only the more-informed follow-up reply
-    // is sent when the pending message is processed after the lock is released.
-    // Note: AI-internal sends (via leadAgent.handleInbound) cannot be suppressed here.
     if (barakReply && _pendingMessages.has(fromNorm)) {
       logger.info('[pipeline] Outer reply suppressed — newer message pending', { from: fromNorm });
       store.logEvent('reply_suppressed_stale', fromNorm, { pendingCount: _pendingMessages.get(fromNorm).texts.length });

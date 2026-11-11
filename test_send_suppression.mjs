@@ -153,8 +153,8 @@ ok('post-call gate (2d) comes AFTER Tier-4 (2c)', posPostCall > posTier4);
 console.log('\n[6] Late-reply suppression code present in server.js');
 const posLate = serverSrc.indexOf('LATE REPLY SUPPRESSION');
 ok('late-reply suppression block present', posLate > 0);
-ok('checks opted_out in late suppression', serverSrc.slice(posLate, posLate+750).includes('opted_out'));
-ok('checks human_owns in late suppression', serverSrc.slice(posLate, posLate+750).includes('human_owns'));
+ok('checks opted_out in late suppression', serverSrc.slice(posLate, posLate+1200).includes('opted_out'));
+ok('checks human_owns in late suppression', serverSrc.slice(posLate, posLate+1200).includes('human_owns'));
 
 // ── 7. call_scheduled silence on brief ack (code path) ────────────────────────
 console.log('\n[7] call_scheduled / callback_requested block logic from server.js');
