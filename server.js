@@ -4766,7 +4766,14 @@ app.get('/api/tomer/member/id/:arboxId', async (req, res) => {
     const tasks    = phone ? tomerStore.getTasks({ phone }) : [];
     const audit    = phone ? tomerStore.getAudit({ phone, limit: 20 }) : [];
     const inboxThreads = (phone && inbox.getThread) ? inbox.getThread(phone) : [];
-    res.json({ ok: true, arboxId, phone, arbox: member, lead, history, tasks, audit, inboxThreads });
+    let arboxClasses = [];
+    try {
+      arboxClasses = await Promise.race([
+        arboxSvc.getUpcomingClasses({ days: 5, limit: 6 }),
+        new Promise(r => setTimeout(() => r([]), 2500)),
+      ]);
+    } catch { arboxClasses = []; }
+    res.json({ ok: true, arboxId, phone, arbox: member, lead, history, tasks, audit, inboxThreads, arboxClasses });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -4783,7 +4790,14 @@ app.get('/api/tomer/member/:phone', async (req, res) => {
     const tasks     = tomerStore.getTasks({ phone });
     const audit     = tomerStore.getAudit({ phone, limit: 20 });
     const inboxThreads = inbox.getThread ? inbox.getThread(phone) : [];
-    res.json({ ok: true, phone, arbox: member, lead, history, tasks, audit, inboxThreads });
+    let arboxClasses = [];
+    try {
+      arboxClasses = await Promise.race([
+        arboxSvc.getUpcomingClasses({ days: 5, limit: 6 }),
+        new Promise(r => setTimeout(() => r([]), 2500)),
+      ]);
+    } catch { arboxClasses = []; }
+    res.json({ ok: true, phone, arbox: member, lead, history, tasks, audit, inboxThreads, arboxClasses });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -5029,6 +5043,65 @@ app.get('/api/tomer/upcoming', async (req, res) => {
     }
 
     res.json({ ok: true, workflows, ts: new Date() });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// GET /api/tomer/conversations — inbox threads with unanswered inbound messages
+app.get('/api/tomer/conversations', (req, res) => {
+  try {
+    const threads = inbox.getThreads({ limit: 200 });
+    const result  = [];
+    for (const t of threads) {
+      const msgs   = t.messages ?? [];
+      const lastIn = [...msgs].reverse().find(m => m.direction === 'in');
+      if (!lastIn) continue;
+      const lastInIdx = msgs.lastIndexOf(lastIn);
+      const hasReply  = msgs.slice(lastInIdx + 1).some(m => m.direction === 'out');
+      if (hasReply) continue;
+
+      const lead  = store.getLead(t.phone);
+      const ageMs = Date.now() - new Date(lastIn.timestamp).getTime();
+      const ageMin = Math.round(ageMs / 60000);
+      result.push({
+        phone:      maskPhone(t.phone),
+        name:       t.name ?? null,
+        lastText:   (lastIn.text ?? '').slice(0, 120),
+        ageMin,
+        escalate:   ageMin >= 120,
+        owner:      lead?.status === 'human_owns'         ? 'human'
+                  : lead?.status === 'attribution_review' ? 'attribution_review'
+                  : lead?.status === 'opted_out'          ? 'opted_out'
+                  : 'bot',
+        leadStatus: lead?.status ?? null,
+        messages:   msgs.slice(-6).map(m => ({
+          direction: m.direction,
+          text:      (m.text ?? '').slice(0, 200),
+          timestamp: m.timestamp,
+          route:     m.route ?? null,
+        })),
+        lastAt: t.lastAt,
+      });
+    }
+    result.sort((a, b) => b.escalate - a.escalate || b.ageMin - a.ageMin);
+    res.json({ ok: true, conversations: result, total: result.length });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// GET /api/tomer/message-queue — persistent message queue
+app.get('/api/tomer/message-queue', (req, res) => {
+  try {
+    const { status, phone, workflowId, limit } = req.query;
+    const entries = tomerStore.getMessageQueue({
+      status:     status     || undefined,
+      phone:      phone      || undefined,
+      workflowId: workflowId || undefined,
+      limit:      parseInt(limit) || 100,
+    });
+    res.json({ ok: true, entries, total: entries.length });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
