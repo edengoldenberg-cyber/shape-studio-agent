@@ -28,7 +28,10 @@ const logger = require('./logger');
 // All phones stored and looked up in this exact format: "972XXXXXXXXX"
 function normalize(raw) {
   if (!raw) return null;
-  const s = String(raw).replace(/[\s\-\.\(\)\+]/g, '');
+  // Strip all non-digit, non-plus characters — covers spaces, dashes, punctuation,
+  // and invisible Unicode formatting marks (RTL/LTR marks, zero-width spaces, etc.)
+  // that appear in some Arbox phone exports and would cause missed Set lookups.
+  const s = String(raw).replace(/[^\d+]/g, '');
   if (s.startsWith('00972')) return s.slice(2);       // 00972 → 972
   if (s.startsWith('972'))   return s;
   if (s.startsWith('0'))     return '972' + s.slice(1);

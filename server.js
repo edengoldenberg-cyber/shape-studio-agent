@@ -2110,11 +2110,14 @@ app.get('/api/barak/reports/hot-leads', (_req, res) => {
 
 function normalizeToE164(phone) {
   if (!phone) return null;
-  const s = String(phone).replace(/[\s\-\.\(\)\+]/g, ''); // strip +, spaces, dashes, dots, parens
-  if (s.startsWith('00972')) return s.slice(2);            // 00972XXXXXXXXX → 972XXXXXXXXX
-  if (s.startsWith('972'))   return s;                     // already E164
-  if (s.startsWith('0'))     return '972' + s.slice(1);    // 05X → 972 5X
-  if (s.length === 9)        return '972' + s;             // 5XXXXXXXX → 972 5XXXXXXXX
+  // Strip all non-digit, non-plus characters (covers spaces, dashes, dots, parens,
+  // and invisible Unicode formatting marks from Arbox phone exports).
+  const s = String(phone).replace(/[^\d+]/g, '');
+  if (s.startsWith('00972')) return s.replace(/^\+?00/, '');  // 00972XXXXXXXXX → 972XXXXXXXXX
+  if (s.startsWith('+972'))  return s.slice(1);               // +972XXXXXXXXX → 972XXXXXXXXX
+  if (s.startsWith('972'))   return s;                        // already E164
+  if (s.startsWith('0'))     return '972' + s.slice(1);       // 05X → 972 5X
+  if (s.length === 9)        return '972' + s;                // 5XXXXXXXX → 972 5XXXXXXXX
   return s;
 }
 
