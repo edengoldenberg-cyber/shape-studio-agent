@@ -8,3 +8,8 @@ node_modules/
 test_*.js
 meta_webhook_test.js
 data/
+.claude/
+tests/panel_demo_local.js
+tests/panel_check_local.js
+agents/*.bak
+scripts/probe_arbox.mjs
