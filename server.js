@@ -3356,7 +3356,17 @@ async function processInboundWAMessage(msg) {
 
         // If the AI promised to send the schedule image, actually send it.
         // lead_agent already sent the text reply; now append the image + follow-up.
-        if (leadResult?.reply && /שולח לך את המערכת|שולחת את המערכת/.test(leadResult.reply)) {
+        //
+        // Guard: only fire when the text reply was actually sent (sendState='sent').
+        // 'skipped_stale' means a newer message arrived during generation — the text
+        // was not sent, so sending the image without the text would be an orphaned file.
+        // 'failed' means the text send itself errored — no image either.
+        // Also re-check status: human_owns / opted_out may have been set concurrently.
+        const _canSendPromiseImage = leadResult?.sendState === 'sent' &&
+          !_pendingMessages.has(fromNorm) &&
+          store.getLead(fromNorm)?.status !== 'human_owns' &&
+          store.getLead(fromNorm)?.status !== 'opted_out';
+        if (_canSendPromiseImage && leadResult?.reply && /שולח לך את המערכת|שולחת את המערכת/.test(leadResult.reply)) {
           const timetableUrlFromLeadAgent = getActiveTimetableUrl();
           if (timetableUrlFromLeadAgent) {
             sendFileByUrl(fromNorm, timetableUrlFromLeadAgent, 'schedule.png', '')
