@@ -136,6 +136,7 @@ document.querySelectorAll('.tw-tab').forEach(btn => {
     const paneEl = $id('twp-' + pane);
     if (paneEl) paneEl.classList.add('active');
     if (pane === 'today' || pane === 'overview') loadToday();
+    if (pane === 'conversations') loadConversations();
     if (pane === 'upcoming')   loadUpcoming();
     if (pane === 'members')    {} // load on demand
     if (pane === 'tasks')      loadTasks();
@@ -148,6 +149,7 @@ document.querySelectorAll('.tw-tab').forEach(btn => {
 $id('tw-refresh')?.addEventListener('click', () => {
   const active = document.querySelector('.tw-tab.active')?.dataset.pane ?? 'today';
   if (active === 'today' || active === 'overview') loadToday();
+  else if (active === 'conversations') loadConversations();
   else if (active === 'upcoming')   loadUpcoming();
   else if (active === 'members')    loadMembers();
   else if (active === 'tasks')      loadTasks();
@@ -323,17 +325,50 @@ async function loadUpcoming() {
   if (!el) return;
   el.innerHTML = '<div class="tw-empty">טוען...</div>';
   try {
-    const data = await api('/api/tomer/upcoming');
+    const [data, mqData] = await Promise.all([
+      api('/api/tomer/upcoming'),
+      api('/api/tomer/message-queue?limit=20').catch(() => ({ entries: [] })),
+    ]);
     const workflows = data.workflows ?? [];
+    const mqEntries = mqData.entries ?? [];
+
+    // ── Message queue section ────────────────────────────────────────────────
+    let mqHtml = '';
+    if (mqEntries.length) {
+      const statusBadge = s =>
+        s === 'queued'            ? '<span class="badge-warm">⏳ ממתין</span>'
+        : s === 'provider_accepted' ? '<span class="badge-active">✅ ספק אישר</span>'
+        : s === 'failed'            ? '<span class="badge-crisis">❌ נכשל</span>'
+        : `<span>${esc(s)}</span>`;
+      const rows = mqEntries.map(e => `
+        <tr>
+          <td style="white-space:nowrap">${fmtDate(e.queuedAt)}</td>
+          <td>${esc(e.memberName ?? '—')}</td>
+          <td>${esc(e.workflowId ?? '—')}</td>
+          <td title="${esc(e.message)}">${esc((e.message ?? '').slice(0, 60))}</td>
+          <td>${statusBadge(e.status)}</td>
+        </tr>`).join('');
+      mqHtml = `
+        <div class="tw-card" style="margin-bottom:16px">
+          <div class="tw-card-title">📬 תור הודעות — 20 אחרונות</div>
+          <div class="table-wrapper">
+            <table class="leads-table">
+              <thead><tr><th>זמן</th><th>חבר/ה</th><th>ווקפלו</th><th>הודעה</th><th>סטטוס</th></tr></thead>
+              <tbody>${rows}</tbody>
+            </table>
+          </div>
+        </div>`;
+    }
 
     const LABELS = {
       birthday:    '🎂 ברכת יום הולדת',
       onboarding1: '🌱 צ׳ק-אין שבוע 1',
       onboarding2: '🌱 צ׳ק-אין שבוע 2',
       attendance:  '🏋️ היעדרות',
+      feedback:    '💬 פידבק חבר/ה',
     };
 
-    el.innerHTML = workflows.map(wf => {
+    const workflowsHtml = workflows.map(wf => {
       const label = LABELS[wf.id] ?? wf.id;
       const stateTag = {
         disabled:      `<span class="badge-status-cancelled">⏸ מושבת</span>`,
@@ -378,6 +413,58 @@ async function loadUpcoming() {
         </div>`;
     }).join('') || '<div class="tw-empty">אין ווקפלואים מוגדרים</div>';
 
+    el.innerHTML = mqHtml + workflowsHtml;
+
+  } catch (e) {
+    el.innerHTML = `<div class="tw-empty">שגיאה: ${esc(e.message)}</div>`;
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  CONVERSATIONS TAB
+// ════════════════════════════════════════════════════════════════════════════
+
+async function loadConversations() {
+  const el = $id('tw-conv-list');
+  if (!el) return;
+  el.innerHTML = '<div class="tw-empty">טוען...</div>';
+  try {
+    const data  = await api('/api/tomer/conversations');
+    const convs = data.conversations ?? [];
+    // Update badge
+    const badge = $id('tw-badge-conv');
+    const unresolved = convs.filter(c => c.owner !== 'opted_out').length;
+    if (badge) badge.textContent = unresolved > 0 ? String(unresolved) : '';
+
+    if (!convs.length) {
+      el.innerHTML = '<div class="tw-empty tw-all-clear">✅ אין שיחות ממתינות</div>';
+      return;
+    }
+    el.innerHTML = convs.map(c => {
+      const escalateTag = c.escalate ? '<span class="badge-crisis" style="margin-left:4px">⚠️ 2h+</span>' : '';
+      const ownerTag = c.owner === 'human'              ? '<span class="badge-crisis">👤 ידני</span>'
+        : c.owner === 'attribution_review'              ? '<span class="badge-warm">⚠️ ייחוס</span>'
+        : c.owner === 'opted_out'                       ? '<span class="badge-status-cancelled">🔇</span>'
+        : '';
+      const threadHtml = (c.messages ?? []).map(m =>
+        `<div class="conv-msg ${m.direction === 'out' ? 'conv-bot' : 'conv-user'}" dir="rtl">
+           <div class="conv-text">${esc(m.text)}</div>
+           <div class="conv-ts">${fmtDate(m.timestamp)}</div>
+         </div>`
+      ).join('');
+      // Note: c.phone is already masked from the server. For ownership actions we need the real phone.
+      // The takeHumanOwnership/releaseBotOwnership functions accept a masked phone here because
+      // the conversations endpoint returns masked phones — this is a display-only tab.
+      return `<div class="tw-conv-card">
+        <div class="tw-conv-header">
+          <span class="tw-conv-name">${esc(c.name ?? c.phone)}</span>
+          ${escalateTag} ${ownerTag}
+          <span class="tw-ts" style="margin-right:auto">${esc(c.ageMin)} דקות</span>
+        </div>
+        <div class="tw-conv-last">${esc((c.lastText ?? '').slice(0, 100))}</div>
+        <div class="conv-thread tw-conv-thread">${threadHtml}</div>
+      </div>`;
+    }).join('');
   } catch (e) {
     el.innerHTML = `<div class="tw-empty">שגיאה: ${esc(e.message)}</div>`;
   }
@@ -666,12 +753,14 @@ async function loadAutomation() {
       onboarding1: '🌱 צ׳ק-אין שבוע 1',
       onboarding2: '🌱 צ׳ק-אין שבוע 2',
       attendance:  '🏋️ היעדרות ממושכת',
+      feedback:    '💬 פידבק חבר/ה',
     };
     const descs = {
       birthday:    'ברכה ביום ההולדת לפי תאריך Arbox',
       onboarding1: 'הודעה 7 ימים אחרי membership_start_date',
       onboarding2: 'הודעה 14 ימים אחרי membership_start_date',
       attendance:  'פנייה אחרי 14+ ימים ללא נוכחות מקומית',
+      feedback:    'הודעה 30 ימים אחרי membership_start_date — בקשת פידבק',
     };
 
     el.innerHTML = Object.entries(cfg).map(([id, wf]) => {
@@ -766,7 +855,14 @@ async function loadAudit() {
       tbody.innerHTML = '<tr><td colspan="7" class="empty-state">אין נתונים</td></tr>';
       return;
     }
-    tbody.innerHTML = entries.map(e => `
+    tbody.innerHTML = entries.map(e => {
+      const sendStateHtml = !e.sendState ? '—'
+        : e.sendState === 'failed'            ? '<span class="badge-crisis">❌ נכשל</span>'
+        : e.sendState === 'provider_accepted' ? '<span class="badge-active">✅ ספק אישר</span>'
+        : e.sendState === 'sent'              ? '<span class="badge-active">✅ ספק אישר</span>'
+        : e.sendState === 'skipped_stale'     ? '<span class="tw-muted">⏭ דולג</span>'
+        : `<span>${esc(e.sendState)}</span>`;
+      return `
       <tr class="${e.sendState === 'failed' ? 'tw-row-failed' : ''}">
         <td style="white-space:nowrap">${fmtDate(e.ts)}</td>
         <td>${esc(e.memberName ?? maskPhone(e.phone))}</td>
@@ -774,8 +870,9 @@ async function loadAudit() {
         <td title="${esc(e.requestPreview)}">${esc((e.requestPreview ?? '').slice(0, 40))}</td>
         <td title="${esc(e.tomerAction)}">${esc((e.tomerAction ?? '').slice(0, 40))}</td>
         <td title="${esc(e.replyPreview)}">${esc((e.replyPreview ?? '').slice(0, 40))}</td>
-        <td>${esc(e.arboxStatus ?? '—')}</td>
-      </tr>`).join('');
+        <td>${sendStateHtml}</td>
+      </tr>`;
+    }).join('');
   } catch (e) {
     tbody.innerHTML = `<tr><td colspan="7" class="empty-state">שגיאה: ${esc(e.message)}</td></tr>`;
   }
@@ -810,6 +907,7 @@ window.openMemberDrawer = async function(phone, name) {
     const audit = data.audit ?? [];
     const inboxThreads = data.inboxThreads ?? [];
     const history = data.history ?? []; // Tomer AI conv history
+    const arboxClasses = data.arboxClasses ?? [];
 
     // Owner badge
     const ownerBadge = lead.status === 'human_owns'
@@ -885,6 +983,27 @@ window.openMemberDrawer = async function(phone, name) {
             <span>${esc((e.requestPreview??'').slice(0,50))}</span>
             ${e.sendState && e.sendState !== 'sent' ? `<span class="badge-crisis">${esc(e.sendState)}</span>` : ''}
           </div>`).join('') : '<div class="tw-empty">אין פעילות</div>'}
+      </div>
+
+      <div class="tw-drawer-section">
+        <div class="tw-ds-title">לוח שיעורים — הסטודיו (5 ימים הבאים)</div>
+        ${arboxClasses.length
+          ? arboxClasses.map(c => {
+              const d = new Date(c.date + 'T' + (c.start_time ?? '00:00'));
+              const dayName = ['ראשון','שני','שלישי','רביעי','חמישי','שישי','שבת'][d.getDay()] ?? c.date;
+              return `<div class="tw-sched-row">
+                <span class="tw-sched-day">${esc(dayName)}</span>
+                <span class="tw-sched-time">${esc(c.start_time ?? '—')}</span>
+                <span class="tw-sched-name">${esc(c.session_name ?? 'שיעור')}</span>
+                <span class="tw-sched-staff">${esc(c.staff_member?.name ?? '—')}</span>
+                ${c.registration_link ? `<a href="${esc(c.registration_link)}" target="_blank" class="btn-xs">הרשמה</a>` : '<span class="tw-muted">ללא לינק</span>'}
+              </div>`;
+            }).join('')
+          : '<div class="tw-empty">לוח שיעורים לא זמין</div>'}
+        <div class="tw-arbox-limits" style="font-size:11px;color:var(--muted);margin-top:8px;line-height:1.5">
+          <b>מה לא זמין ב-API:</b> הקפאת מנוי, ביטול, רישום לשיעור ספציפי, היסטוריית נוכחות אישית.
+          לפעולות אלו: יש לבצע ב<a href="https://app.arboxapp.com" target="_blank" style="color:var(--accent)">ממשק Arbox</a> או ליצור משימה לעדן.
+        </div>
       </div>
 
       <div class="tw-drawer-section">

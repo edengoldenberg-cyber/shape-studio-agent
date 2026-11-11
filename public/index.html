@@ -418,7 +418,8 @@
         <div class="tw-topbar" dir="rtl">
           <div class="tw-tabs">
             <button class="tw-tab active" data-pane="today">היום <span class="tw-badge" id="tw-badge-today"></span></button>
-            <button class="tw-tab" data-pane="upcoming">הודעות קרובות</button>
+            <button class="tw-tab" data-pane="conversations">שיחות <span class="tw-badge" id="tw-badge-conv"></span></button>
+            <button class="tw-tab" data-pane="upcoming">הודעות מתוזמנות</button>
             <button class="tw-tab" data-pane="members">חברים</button>
             <button class="tw-tab" data-pane="tasks">תורים לעדן <span class="tw-badge" id="tw-badge-tasks"></span></button>
             <button class="tw-tab" data-pane="automation">אוטומציה</button>
@@ -465,6 +466,14 @@
             </div>
             <div id="tw-unclassified-list" class="tw-list"></div>
             <div class="tw-empty" id="tw-unclass-empty">אין מספרים לא מזוהים</div>
+          </div>
+        </div>
+
+        <!-- ── Conversations pane ──────────────────────────────── -->
+        <div class="tw-pane" id="twp-conversations" dir="rtl">
+          <p class="tw-desc">כל השיחות עם הודעה נכנסת שלא נענתה. הצגה מיידית — סימון ⚠️ מופיע אחרי 2 שעות.</p>
+          <div id="tw-conv-list" class="tw-list">
+            <div class="tw-empty">טוען...</div>
           </div>
         </div>
 
@@ -537,7 +546,7 @@
           <div class="table-wrapper" style="margin-top:10px">
             <table class="leads-table">
               <thead><tr>
-                <th>זמן</th><th>חבר/ה</th><th>אירוע</th><th>בקשה</th><th>פעולה</th><th>תגובה</th><th>Arbox</th>
+                <th>זמן</th><th>חבר/ה</th><th>אירוע</th><th>בקשה</th><th>פעולה</th><th>תגובה</th><th>סטטוס שליחה</th>
               </tr></thead>
               <tbody id="tw-audit-tbody"><tr><td colspan="7" class="empty-state">לחץ "טען" לראות ביקורת</td></tr></tbody>
             </table>
