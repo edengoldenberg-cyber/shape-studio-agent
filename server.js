@@ -2459,21 +2459,31 @@ const _lastReplied    = new Map(); // phone → timestamp
 const REPLY_COOLDOWN  = 10_000; // 10 seconds
 
 // ── Bot-sent message tracker ──────────────────────────────────────────────────
-// Two complementary mechanisms prevent bot echoes from triggering false human_owns:
+// Two mechanisms prevent bot echoes from triggering false human_owns:
 //
-// 1. _botSentIds (idMessage ring buffer): records every Green API idMessage we send.
-//    outgoingMessageReceived echoes with this idMessage → confirmed bot send → skip.
+// 1. _botSentIds (idMessage ring buffer): every Green API idMessage we send is
+//    recorded. When an echo arrives with that idMessage → confirmed bot send → skip.
+//    This is the primary and reliable mechanism.
 //
-// 2. _lastBotSendAt (per-phone timestamp): records when we last sent to each phone.
-//    Covers send paths where the idMessage is not (yet) in _botSentIds due to async
-//    registration or fire-and-forget sends. 20-second grace window.
-const _botSentIds    = new Map(); // idMessage → { phone, sentAt }
-const _lastBotSendAt = new Map(); // phone     → timestamp of last bot send
-const BOT_SENT_TTL   = 24 * 60 * 60 * 1000;
-const BOT_SEND_GRACE = 20_000; // 20 seconds — covers async echo delivery lag
+// 2. _pendingBotSends (per-phone in-flight tracker): records sends whose HTTP
+//    request is still in flight (< 3s). Handles the rare case where Green API
+//    delivers the outgoingMessageReceived echo before our sendText() HTTP response
+//    has returned and _recordBotSend has been called.
+//
+// INTENTIONAL LIMITATION: A staff reply arriving within 3 seconds of an in-flight
+// bot send will be temporarily misclassified. This is the minimum viable window for
+// an HTTP round-trip. 3 seconds ≪ 20 seconds: a staff reply at t+2s is not masked.
+const _botSentIds     = new Map(); // idMessage → { phone, sentAt }
+const _pendingBotSends = new Map(); // phone → [sendStartedAt, ...] (in-flight sends)
+const BOT_SENT_TTL    = 24 * 60 * 60 * 1000;
+const PENDING_SEND_TTL = 3_000; // 3 seconds — HTTP round-trip max
 
 function _markBotSent(phone) {
-  if (phone) _lastBotSendAt.set(phone, Date.now());
+  // Register that a bot send is now in flight for this phone.
+  if (!phone) return;
+  const sends = _pendingBotSends.get(phone) ?? [];
+  sends.push(Date.now());
+  _pendingBotSends.set(phone, sends);
 }
 
 function _recordBotSend(idMessage, phone) {
@@ -2484,7 +2494,24 @@ function _recordBotSend(idMessage, phone) {
     const oldestKey = _botSentIds.keys().next().value;
     _botSentIds.delete(oldestKey);
   }
-  _markBotSent(phone);
+  // Remove oldest pending-send entry now that the idMessage is confirmed.
+  const sends = _pendingBotSends.get(phone);
+  if (sends?.length > 0) {
+    sends.shift();
+    if (sends.length === 0) _pendingBotSends.delete(phone);
+  }
+}
+
+function _hasPendingBotSend(phone) {
+  const sends = _pendingBotSends.get(phone);
+  if (!sends || sends.length === 0) return false;
+  const now = Date.now();
+  const active = sends.filter(ts => now - ts < PENDING_SEND_TTL);
+  if (active.length !== sends.length) {
+    if (active.length === 0) _pendingBotSends.delete(phone);
+    else _pendingBotSends.set(phone, active);
+  }
+  return active.length > 0;
 }
 
 function _isBotSentId(idMessage) {
@@ -3076,19 +3103,44 @@ async function processInboundWAMessage(msg) {
     return { inboxEntry: pmtEntry, clientMatch, intent: 'payment', route: 'payment_ack', barakReply: paymentAck };
   }
 
-  // 2b. Lead stop-status gate — runs BEFORE Tier-4.
+  // 2b. Universal ownership and status gate — runs before Tier-4 and before the
+  //     Barak/Tomer routing split.
   //
   //   ORDER IS INTENTIONAL: opted_out / human_owns must block even when Arbox is down.
   //   A person who requested silence or is under human care must not receive an
-  //   arbox_outage_hold message just because the Arbox API was unreachable.
+  //   arbox_outage_hold message, a Barak qualification reply, OR a Tomer service reply.
   //
-  //   Only applies to the Barak branch (!isExistingClient). Tomer handles verified members.
+  //   human_owns applies to ALL contacts including Arbox members. When a staff member
+  //   manually replies to a member's message, Tomer must also stop until ownership is released.
   //
   //   call_scheduled / callback_requested: handled context-aware below — not an early return
   //   because reschedule / schedule-query / opt-out must still be processed.
-  if (!isExistingClient) {
+  {
     const _stopRec    = store.getLead(fromNorm);
     const _stopStatus = _stopRec?.status;
+
+    if (_stopStatus === 'human_owns') {
+      store.logEvent('reply_suppressed_human_owns', fromNorm, {
+        agent: isExistingClient ? 'tomer' : 'barak',
+        preview: (msg.text ?? '').slice(0, 60),
+      });
+      logger.info('[pipeline] Reply suppressed — human_owns (universal)', { from: fromNorm, isExistingClient });
+      const hoEntry = inbox.push({
+        from: fromNorm, fromIsraeli, name: msg.name ?? clientMatch.arboxName ?? null,
+        text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
+        receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
+        clientMatch, intent, route: 'human_owns_hold', barakReply: null,
+      });
+      broadcastSse('message', { phone: hoEntry.from, name: hoEntry.name ?? null, route: 'human_owns' });
+      persist.saveInbox(inbox);
+      return { inboxEntry: hoEntry, clientMatch, intent, route: 'human_owns_hold', barakReply: null };
+    }
+  }
+
+  // 2b-lead. Additional Barak-only stop gate: opted_out.
+  // human_owns is already handled universally above (covers both Barak and Tomer).
+  if (!isExistingClient) {
+    const _stopStatus = store.getLead(fromNorm)?.status;
 
     if (_stopStatus === 'opted_out') {
       store.logEvent('reply_suppressed_opted_out', fromNorm, { preview: (msg.text ?? '').slice(0, 60) });
@@ -3101,20 +3153,6 @@ async function processInboundWAMessage(msg) {
       });
       persist.saveInbox(inbox);
       return { inboxEntry: optEntry, clientMatch, intent, route: 'opted_out_silent', barakReply: null };
-    }
-
-    if (_stopStatus === 'human_owns') {
-      store.logEvent('reply_suppressed_human_owns', fromNorm, { preview: (msg.text ?? '').slice(0, 60) });
-      logger.info('[pipeline] Reply suppressed — human_owns', { from: fromNorm });
-      const hoEntry = inbox.push({
-        from: fromNorm, fromIsraeli, name: msg.name ?? null,
-        text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
-        receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
-        clientMatch, intent, route: 'human_owns_hold', barakReply: null,
-      });
-      broadcastSse('message', { phone: hoEntry.from, name: hoEntry.name ?? null, route: 'human_owns' });
-      persist.saveInbox(inbox);
-      return { inboxEntry: hoEntry, clientMatch, intent, route: 'human_owns_hold', barakReply: null };
     }
   }
 
@@ -3255,13 +3293,14 @@ async function processInboundWAMessage(msg) {
     const _tomerStore  = require('./utils/tomer_store');
     const _existingLead = store.getLead(fromNorm);
     const _hasLeadHistory = !!(_existingLead?.messageCount && _existingLead.messageCount > 0);
-    const SALES_INTENT_RE = /פילאטיס|כושר|שיעור|אימון|להצטרף|מנוי|להתנסות|ניסיון|רפורמר|בארה|קנגו|yoga|יוגה|בריאות|ירידה.*משקל|חיזוק|כוח|גוף|גב|גמישות|שייפ\s*סטודיו|מחיר|כמה.*עולה|שעות.*פעילות|לוח.*שיעורים|מערכת\s*שעות|הצעת\s+היכרות|60\s+ש|60\s+₪/i;
+    // SALES_INTENT_RE: words that unambiguously indicate fitness/studio interest.
+    // Intentionally narrow — common words ("גוף"/"גב"/"כוח"/"מה קורה") must NOT trigger
+    // the funnel. Unknown contacts without clear studio intent go to the unclassified
+    // inbox first; a neutral greeting gives them the chance to clarify.
+    const SALES_INTENT_RE = /פילאטיס|כושר|שיעור|אימון|להצטרף|מנוי|להתנסות|ניסיון|רפורמר|בארה|קנגו|yoga|יוגה|בריאות|ירידה.*משקל|חיזוק|גמישות|שייפ\s*סטודיו|מחיר|כמה.*עולה|שעות.*פעילות|לוח.*שיעורים|מערכת\s*שעות|הצעת\s+היכרות|60\s+ש|60\s+₪/i;
     const _hasSalesIntent = SALES_INTENT_RE.test(msg.text ?? '');
-    // Any non-general intent (schedule query, representative, specialist) establishes
-    // the contact is engaging with studio services — route normally, not to unclassified inbox.
-    const _hasSalesSignal = _hasSalesIntent || intent !== 'general';
 
-    if (!_hasLeadHistory && !_hasSalesSignal && msg.type === 'text') {
+    if (!_hasLeadHistory && !_hasSalesIntent && msg.type === 'text') {
       const _alreadyGreeted = _tomerStore.hasGreetedUnclassified(fromNorm);
       _tomerStore.markUnclassified(fromNorm, { firstMessage: msg.text ?? '' });
 
@@ -3749,18 +3788,29 @@ app.post('/api/green-api/webhook', (req, res) => {
         const msgText   = body?.messageData?.textMessageData?.textMessage ?? null;
 
         if (chatId && !chatId.endsWith('@g.us') && idMessage && !_isBotSentId(idMessage)) {
-          // Staff manually typed this message → take human ownership of the conversation
+          // Check if a bot send is still in flight (HTTP not yet returned idMessage).
+          // This covers the rare race where the Green API echo arrives before sendText()
+          // has completed and registered the idMessage via _recordBotSend.
+          // Window is 3 seconds — the HTTP round-trip max. A staff reply at t+2s is NOT
+          // masked here: by that time, any pending send from t=0 is at most 2s old and
+          // could be a genuine race. If attribution is unknown, we err toward NOT setting
+          // human_owns (avoid suppressing a valid bot echo) and let _botSentIds catch it.
           const phone = chatId.replace(/@.*$/, '');
           const norm  = normalizeToE164(phone);
           if (norm) {
-            // Grace window: covers send paths where _recordBotSend hasn't fired yet
-            // (fire-and-forget sends, lead_agent internal sends, rapid echo delivery).
-            if (Date.now() - (_lastBotSendAt.get(norm) ?? 0) < BOT_SEND_GRACE) {
-              logger.debug('[outgoing-webhook] Bot send grace window active — skipping human_owns', { phone: norm });
+            if (_hasPendingBotSend(norm)) {
+              // A bot send is still in flight — this echo is almost certainly the bot's
+              // own message, not a staff reply. Skip.
+              logger.debug('[outgoing-webhook] Bot send in-flight — echo likely bot, skipping human_owns', { phone: norm });
               return;
             }
-            const existing = store.getLead(norm);
-            if (existing && !['opted_out', 'converted_member'].includes(existing.status)) {
+
+            // idMessage not in _botSentIds AND no pending send → staff manually typed this.
+            // Set human ownership. Works even when there is no existing lead record —
+            // we create a minimal record so the routing gate suppresses any future bot reply.
+            const existing  = store.getLead(norm) ?? {};
+            const curStatus = existing.status ?? null;
+            if (!['opted_out', 'converted_member', 'human_owns'].includes(curStatus)) {
               store.upsertLead(norm, {
                 status: 'human_owns',
                 meta: {
@@ -3770,11 +3820,12 @@ app.post('/api/green-api/webhook', (req, res) => {
                   humanOwnsBy:     'staff',
                 },
               });
+              persist.saveLeads(store);
               store.logEvent('human_takeover_staff_reply', norm, {
                 idMessage, preview: (msgText ?? '').slice(0, 60),
               });
               logger.info('[outgoing-webhook] Staff manual reply detected — human_owns set', {
-                phone: norm, idMessage,
+                phone: norm, idMessage, wasLead: !!existing.status,
               });
               broadcastSse('message', { phone: norm, route: 'human_owns', reason: 'staff_reply' });
             }

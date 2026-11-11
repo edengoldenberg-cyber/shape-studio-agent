@@ -138,7 +138,11 @@ console.log('\n[5] Guard order: opted_out/human_owns before Tier-4 (from server.
 const fs = require('fs');
 const serverSrc = fs.readFileSync('server.js', 'utf8');
 // Find positions of key blocks
-const posStopGate = serverSrc.indexOf('2b. Lead stop-status gate — runs BEFORE Tier-4');
+// Accept either the old or new label — the universal gate still precedes Tier-4.
+const posStopGate = Math.max(
+  serverSrc.indexOf('2b. Lead stop-status gate'),
+  serverSrc.indexOf('2b. Universal ownership and status gate'),
+);
 const posTier4    = serverSrc.indexOf('2c. Tier-4 degraded-mode guard');
 ok('stop-status gate (2b) comes BEFORE Tier-4 (2c) in source', posStopGate < posTier4 && posStopGate > 0 && posTier4 > 0);
 
