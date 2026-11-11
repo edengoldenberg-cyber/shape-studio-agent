@@ -35,6 +35,7 @@ const DATA_DIR = () => (process.env.DATA_DIR ?? path.join(__dirname, '../data'))
 const tasksPath    = () => path.join(DATA_DIR(), 'service_tasks.json');
 const historyPath  = () => path.join(DATA_DIR(), 'tomer_history.json');
 const auditPath    = () => path.join(DATA_DIR(), 'tomer_audit.json');
+const mqPath       = () => path.join(DATA_DIR(), 'message_queue.json');
 
 // ── Atomic write helper ───────────────────────────────────────────────────────
 function _write(file, data) {
@@ -293,6 +294,115 @@ function getAudit({ phone, event, limit = 100 } = {}) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+//  MESSAGE QUEUE
+// ════════════════════════════════════════════════════════════════════════════
+
+/*
+ * Persistent queue of retention/workflow messages.
+ * Shape:
+ * {
+ *   id:          string    — unique e.g. "mq-20261111-abc12"
+ *   workflowId:  string    — which workflow queued this
+ *   phone:       string    — recipient E.164
+ *   memberName:  string    — display name
+ *   message:     string    — full message text
+ *   trigger:     string    — human-readable trigger description
+ *   scheduledFor: string   — ISO when it was scheduled
+ *   status:      string    — 'queued' | 'provider_accepted' | 'failed'
+ *   queuedAt:    string    — ISO when queued
+ *   sentAt:      string?   — ISO when provider accepted
+ *   idMessage:   string?   — provider message ID
+ *   failError:   string?   — error message if failed
+ * }
+ */
+
+let _mq = null; // lazy-loaded
+
+function _loadMQ() {
+  if (_mq !== null) return;
+  _mq = _readJSON(mqPath(), []);
+}
+
+function _saveMQ() {
+  _write(mqPath(), _mq);
+}
+
+function _makeMQId() {
+  const now  = new Date();
+  const date = now.toISOString().slice(0, 10).replace(/-/g, '');
+  const rand = Math.random().toString(36).slice(2, 7);
+  return `mq-${date}-${rand}`;
+}
+
+/** Queue a message for sending. Returns the queue entry. */
+function queueMessage({ workflowId, phone, memberName = null, message, trigger = '', scheduledFor = null }) {
+  _loadMQ();
+  const now   = new Date().toISOString();
+  const entry = {
+    id:          _makeMQId(),
+    workflowId:  workflowId ?? 'unknown',
+    phone:       phone ?? '',
+    memberName:  memberName ?? null,
+    message:     message ?? '',
+    trigger:     trigger ?? '',
+    scheduledFor: scheduledFor ?? now,
+    status:      'queued',
+    queuedAt:    now,
+    sentAt:      null,
+    idMessage:   null,
+    failError:   null,
+  };
+  _mq.push(entry);
+  _saveMQ();
+  return entry;
+}
+
+/** Mark a queued message as sent (provider accepted). */
+function markMessageSent(id, { idMessage = null } = {}) {
+  _loadMQ();
+  const entry = _mq.find(e => e.id === id);
+  if (!entry) return null;
+  entry.status    = 'provider_accepted';
+  entry.sentAt    = new Date().toISOString();
+  entry.idMessage = idMessage ?? null;
+  _saveMQ();
+  return entry;
+}
+
+/** Mark a queued message as failed. */
+function markMessageFailed(id, { error = '' } = {}) {
+  _loadMQ();
+  const entry = _mq.find(e => e.id === id);
+  if (!entry) return null;
+  entry.status    = 'failed';
+  entry.failError = error ?? '';
+  _saveMQ();
+  return entry;
+}
+
+/** Get message queue entries, filtered. Returns newest-first. */
+function getMessageQueue({ phone, workflowId, status, limit = 100 } = {}) {
+  _loadMQ();
+  let result = [..._mq];
+  if (phone)      result = result.filter(e => e.phone === phone);
+  if (workflowId) result = result.filter(e => e.workflowId === workflowId);
+  if (status)     result = result.filter(e => e.status === status);
+  return result
+    .sort((a, b) => new Date(b.queuedAt) - new Date(a.queuedAt))
+    .slice(0, limit);
+}
+
+/** Remove queue entries older than N days (maintenance). */
+function clearOldQueueEntries(olderThanDays = 7) {
+  _loadMQ();
+  const cutoff = Date.now() - olderThanDays * 86400000;
+  const before = _mq.length;
+  _mq = _mq.filter(e => new Date(e.queuedAt).getTime() > cutoff);
+  if (_mq.length !== before) _saveMQ();
+  return before - _mq.length;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 //  UNCLASSIFIED CONTACTS
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -354,6 +464,13 @@ module.exports = {
   // Audit
   appendAudit,
   getAudit,
+
+  // Message queue
+  queueMessage,
+  markMessageSent,
+  markMessageFailed,
+  getMessageQueue,
+  clearOldQueueEntries,
 
   // Unclassified
   markUnclassified,
