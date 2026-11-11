@@ -2458,6 +2458,48 @@ function _isDuplicateInbound(messageId) {
 const _lastReplied    = new Map(); // phone → timestamp
 const REPLY_COOLDOWN  = 10_000; // 10 seconds
 
+// ── Bot-sent message tracker ──────────────────────────────────────────────────
+// Two complementary mechanisms prevent bot echoes from triggering false human_owns:
+//
+// 1. _botSentIds (idMessage ring buffer): records every Green API idMessage we send.
+//    outgoingMessageReceived echoes with this idMessage → confirmed bot send → skip.
+//
+// 2. _lastBotSendAt (per-phone timestamp): records when we last sent to each phone.
+//    Covers send paths where the idMessage is not (yet) in _botSentIds due to async
+//    registration or fire-and-forget sends. 20-second grace window.
+const _botSentIds    = new Map(); // idMessage → { phone, sentAt }
+const _lastBotSendAt = new Map(); // phone     → timestamp of last bot send
+const BOT_SENT_TTL   = 24 * 60 * 60 * 1000;
+const BOT_SEND_GRACE = 20_000; // 20 seconds — covers async echo delivery lag
+
+function _markBotSent(phone) {
+  if (phone) _lastBotSendAt.set(phone, Date.now());
+}
+
+function _recordBotSend(idMessage, phone) {
+  if (!idMessage || typeof idMessage !== 'string') return;
+  if (idMessage.startsWith('demo-') || idMessage.startsWith('blocked-')) return;
+  _botSentIds.set(idMessage, { phone, sentAt: Date.now() });
+  if (_botSentIds.size > 400) {
+    const oldestKey = _botSentIds.keys().next().value;
+    _botSentIds.delete(oldestKey);
+  }
+  _markBotSent(phone);
+}
+
+function _isBotSentId(idMessage) {
+  if (!idMessage) return false;
+  // Demo/blocked IDs are always bot-generated
+  if (idMessage.startsWith('demo-') || idMessage.startsWith('blocked-') || idMessage.startsWith('MOCK-')) return true;
+  const entry = _botSentIds.get(idMessage);
+  if (!entry) return false;
+  if (Date.now() - entry.sentAt > BOT_SENT_TTL) {
+    _botSentIds.delete(idMessage);
+    return false;
+  }
+  return true;
+}
+
 function _isInCooldown(phone) {
   const ts = _lastReplied.get(phone);
   return !!(ts && Date.now() - ts < REPLY_COOLDOWN);
@@ -2491,8 +2533,12 @@ function _markReplied(phone) {
 const _inboundBurst   = new Map(); // phone → { texts, msgIds, firstMsg, latestMsg, startedAt, timer }
 const _processingLock = new Set(); // phones currently being processed by processInboundWAMessage
 const _pendingMessages = new Map(); // phone → { texts, msgIds, firstMsg, latestMsg } — arrived while locked
-const BURST_WINDOW_MS  = 1500;     // collect messages within this window
-const BURST_MAX_WAIT_MS = 5000;    // hard cap: flush after this even during a continuous burst
+// BURST_WINDOW_MS: messages within this window of each other are combined into one context.
+// Empirically: human typing at 2-second intervals fires 3 separate replies at 1500ms.
+// 2500ms catches messages sent with ~2s gap (measured with the screenshot sequence).
+// Configurable via env: BURST_WINDOW_MS=2500 (default). Max effective value: 5000.
+const BURST_WINDOW_MS  = parseInt(process.env.BURST_WINDOW_MS ?? '2500', 10);
+const BURST_MAX_WAIT_MS = 7000;    // hard cap: flush after this even during a continuous burst
 
 function scheduleInboundProcessing(msg) {
   const fromNorm = normalizeToE164(msg.from);
@@ -2819,6 +2865,7 @@ async function processInboundWAMessage(msg) {
     });
     const rescheduleMsg = `בהחלט! באיזו שעה או יום יהיה לך נוח? 🗓️`;
     if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
+      _markBotSent(fromNorm);
       await sendText(fromNorm, rescheduleMsg).catch(() => {});
     }
     const rscInboxEntry = inbox.push({
@@ -2952,6 +2999,7 @@ async function processInboundWAMessage(msg) {
       : `מעולה! השיחה נקבעה ל-${rawTime} ✅\nנציג מהצוות ייצור איתך קשר. יש עוד משהו שאוכל לעזור? 😊`;
 
     if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
+      _markBotSent(fromNorm);
       await sendText(fromNorm, confirmMsg).catch(err =>
         logger.warn('Callback confirm send failed', { error: err.message })
       );
@@ -3000,6 +3048,7 @@ async function processInboundWAMessage(msg) {
     const paymentAck = `תודה רבה! קיבלנו את אישור התשלום ✅ הצוות שלנו יעדכן את המערכת בקרוב. לכל שאלה — אנחנו כאן 😊`;
 
     if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
+      _markBotSent(fromNorm);
       await sendText(fromNorm, paymentAck).catch(err =>
         logger.warn('Payment ack send failed', { from: fromNorm, error: err.message })
       );
@@ -3085,6 +3134,7 @@ async function processInboundWAMessage(msg) {
     logger.warn('[pipeline] TIER-4 DEGRADED MODE — Arbox down, identity unverifiable', { from: fromNorm });
     const holdMsg = `קיבלנו את הודעתך! הצוות שלנו ייצור איתך קשר בהקדם 😊`;
     if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
+      _markBotSent(fromNorm);
       await sendText(fromNorm, holdMsg).catch(() => {});
     }
     alertOwner(
@@ -3143,14 +3193,16 @@ async function processInboundWAMessage(msg) {
         if (timetableUrl) {
           postCallReply = `הנה מערכת השעות של Shape Studio! 🏋️‍♀️`;
           if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
+            _markBotSent(fromNorm);
             sendFileByUrl(fromNorm, timetableUrl, 'schedule.png', postCallReply)
-              .then(() => store.logEvent('timetable_image_sent', fromNorm, { status: _postCallStatus }))
-              .catch(() => sendText(fromNorm, postCallReply).catch(() => {}));
+              .then(res => { if (res?.idMessage) _recordBotSend(res.idMessage, fromNorm); store.logEvent('timetable_image_sent', fromNorm, { status: _postCallStatus }); })
+              .catch(() => { _markBotSent(fromNorm); sendText(fromNorm, postCallReply).catch(() => {}); });
           }
         } else {
           postCallReply = buildSchedulingReply(intent, msg, clientMatch).catch(() => null);
           postCallReply = await postCallReply;
           if (postCallReply && process.env.WHATSAPP_AUTO_REPLY === 'true') {
+            _markBotSent(fromNorm);
             await sendText(fromNorm, postCallReply).catch(() => {});
           }
         }
@@ -3203,16 +3255,20 @@ async function processInboundWAMessage(msg) {
     const _tomerStore  = require('./utils/tomer_store');
     const _existingLead = store.getLead(fromNorm);
     const _hasLeadHistory = !!(_existingLead?.messageCount && _existingLead.messageCount > 0);
-    const SALES_INTENT_RE = /פילאטיס|כושר|שיעור|אימון|להצטרף|מנוי|להתנסות|ניסיון|רפורמר|בארה|קנגו|yoga|יוגה|בריאות|ירידה.*משקל|חיזוק|גב|גמישות|שייפ\s*סטודיו|מחיר|כמה.*עולה|שעות.*פעילות|לוח.*שיעורים|הצעת\s+היכרות|60\s+ש|60\s+₪/i;
+    const SALES_INTENT_RE = /פילאטיס|כושר|שיעור|אימון|להצטרף|מנוי|להתנסות|ניסיון|רפורמר|בארה|קנגו|yoga|יוגה|בריאות|ירידה.*משקל|חיזוק|כוח|גוף|גב|גמישות|שייפ\s*סטודיו|מחיר|כמה.*עולה|שעות.*פעילות|לוח.*שיעורים|מערכת\s*שעות|הצעת\s+היכרות|60\s+ש|60\s+₪/i;
     const _hasSalesIntent = SALES_INTENT_RE.test(msg.text ?? '');
+    // Any non-general intent (schedule query, representative, specialist) establishes
+    // the contact is engaging with studio services — route normally, not to unclassified inbox.
+    const _hasSalesSignal = _hasSalesIntent || intent !== 'general';
 
-    if (!_hasLeadHistory && !_hasSalesIntent && msg.type === 'text') {
+    if (!_hasLeadHistory && !_hasSalesSignal && msg.type === 'text') {
       const _alreadyGreeted = _tomerStore.hasGreetedUnclassified(fromNorm);
       _tomerStore.markUnclassified(fromNorm, { firstMessage: msg.text ?? '' });
 
       let _unclassifiedReply = null;
       if (!_alreadyGreeted && process.env.WHATSAPP_AUTO_REPLY === 'true') {
         _unclassifiedReply = 'שלום! 😊 קיבלנו את הודעתך. כדי שנוכל לעזור — ספר/י לנו מה מחפש/ת.';
+        _markBotSent(fromNorm);
         await sendText(fromNorm, _unclassifiedReply).catch(() => {});
         _tomerStore.markUnclassified(fromNorm, { firstMessage: msg.text ?? '', greetingSent: true });
         _tomerStore.appendAudit({ phone: fromNorm, memberName: msg.name ?? null, event: 'unclassified_greeting',
@@ -3360,7 +3416,7 @@ async function processInboundWAMessage(msg) {
           // the lead reads "sending you the schedule" but nothing arrives.
           // Honest fallback: invite them to tell us their preferred day/time so the
           // conversation advances without claiming an image was sent.
-          barakReply = `הלוח שלנו משתנה לעיתים — הכי קל להגיד לי איזה יום ושעה בדרך כלל עובדים לך, ואמצא לך מה מתאים 😊`;
+          barakReply = `מערכת השעות שלנו מתעדכנת בתדירות — הכי קל להגיד לי איזה יום ושעה בדרך כלל עובדים לך, ואמצא לך מה מתאים 😊`;
         }
       } else {
         // noMatchPassthrough=true: specialist_query with no staff match returns null
@@ -3427,15 +3483,18 @@ async function processInboundWAMessage(msg) {
         if (_canSendPromiseImage && leadResult?.reply && /שולח לך את המערכת|שולחת את המערכת/.test(leadResult.reply)) {
           const timetableUrlFromLeadAgent = getActiveTimetableUrl();
           if (timetableUrlFromLeadAgent) {
+            _markBotSent(fromNorm);
             sendFileByUrl(fromNorm, timetableUrlFromLeadAgent, 'schedule.png', '')
-              .then(async () => {
+              .then(async (res) => {
+                if (res?.idMessage) _recordBotSend(res.idMessage, fromNorm);
                 store.logEvent('timetable_image_sent', fromNorm, { imageUrl: timetableUrlFromLeadAgent, via: 'lead_agent' });
                 const t2 = getActiveTimetable2Url();
                 if (t2) {
+                  _markBotSent(fromNorm);
                   await sendFileByUrl(fromNorm, t2, 'schedule2.png', '')
+                    .then(r2 => { if (r2?.idMessage) _recordBotSend(r2.idMessage, fromNorm); })
                     .catch(err => logger.warn('Timetable2 follow-on send failed', { from: fromNorm, error: err.message }));
                 }
-                // No follow-up qualification question — let the lead respond naturally.
               })
               .catch(err => logger.warn('Timetable image send failed after lead_agent reply', { from: fromNorm, error: err.message }));
           }
@@ -3577,12 +3636,14 @@ async function processInboundWAMessage(msg) {
       // Send timetable image 1 (with caption), then image 2 if available.
       // No follow-up question — the lead responds naturally after seeing the images.
       sendFileByUrl(fromNorm, timetableImgUrl, 'schedule.png', barakReply)
-        .then(async () => {
+        .then(async (sendRes) => {
+          if (sendRes?.idMessage) _recordBotSend(sendRes.idMessage, fromNorm);
           store.logEvent('timetable_image_sent', fromNorm, { imageUrl: timetableImgUrl });
           _markReplied(fromNorm);
           if (timetable2ImgUrl) {
+            _markBotSent(fromNorm);
             await sendFileByUrl(fromNorm, timetable2ImgUrl, 'schedule2.png', '')
-              .then(() => store.logEvent('timetable2_image_sent', fromNorm, { imageUrl: timetable2ImgUrl }))
+              .then(r2 => { if (r2?.idMessage) _recordBotSend(r2.idMessage, fromNorm); store.logEvent('timetable2_image_sent', fromNorm, { imageUrl: timetable2ImgUrl }); })
               .catch(err => logger.warn('Timetable2 image send failed', { from: fromNorm, error: err.message }));
           }
           // Record the scheduling exchange in AI history so follow-up requests
@@ -3591,12 +3652,14 @@ async function processInboundWAMessage(msg) {
         })
         .catch(err => {
           logger.warn('Timetable image send failed — falling back to text reply', { from: fromNorm, error: err.message });
+          _markBotSent(fromNorm);
           sendText(fromNorm, barakReply).catch(() => {});
           leadAgent.recordSchedulingExchange(fromNorm, msg.text ?? '', barakReply);
         });
     } else {
       try {
-        await sendText(fromNorm, barakReply);
+        const sendResult = await sendText(fromNorm, barakReply);
+        if (sendResult?.idMessage) _recordBotSend(sendResult.idMessage, fromNorm);
         _markReplied(fromNorm); // start cooldown window so a quick follow-up doesn't double-fire
         store.logEvent('message_out', fromNorm, {
           preview: barakReply.slice(0, 80),
@@ -3674,10 +3737,55 @@ app.post('/api/green-api/webhook', (req, res) => {
       logger.info('[green-api/webhook] Received', { typeWebhook: rawType });
 
       // ── 4. Route by typeWebhook ───────────────────────────────────────────────
+      //
+      // outgoingMessageReceived: Green API sends this for every message SENT FROM
+      // our WhatsApp number, whether by the bot (via our API) or by staff manually
+      // typing on the phone. We track bot-sent idMessages so we can distinguish:
+      //   - Bot echo (idMessage in _botSentIds) → ignored (avoid false human_owns)
+      //   - Staff manual reply (idMessage NOT in _botSentIds) → human_owns for chat
+      if (rawType === 'outgoingMessageReceived') {
+        const chatId    = body?.senderData?.chatId ?? body?.instanceData?.wid ?? null;
+        const idMessage = body?.idMessage ?? null;
+        const msgText   = body?.messageData?.textMessageData?.textMessage ?? null;
+
+        if (chatId && !chatId.endsWith('@g.us') && idMessage && !_isBotSentId(idMessage)) {
+          // Staff manually typed this message → take human ownership of the conversation
+          const phone = chatId.replace(/@.*$/, '');
+          const norm  = normalizeToE164(phone);
+          if (norm) {
+            // Grace window: covers send paths where _recordBotSend hasn't fired yet
+            // (fire-and-forget sends, lead_agent internal sends, rapid echo delivery).
+            if (Date.now() - (_lastBotSendAt.get(norm) ?? 0) < BOT_SEND_GRACE) {
+              logger.debug('[outgoing-webhook] Bot send grace window active — skipping human_owns', { phone: norm });
+              return;
+            }
+            const existing = store.getLead(norm);
+            if (existing && !['opted_out', 'converted_member'].includes(existing.status)) {
+              store.upsertLead(norm, {
+                status: 'human_owns',
+                meta: {
+                  ...(existing.meta ?? {}),
+                  humanOwnsReason: 'staff_manual_reply',
+                  humanOwnsSince:  new Date().toISOString(),
+                  humanOwnsBy:     'staff',
+                },
+              });
+              store.logEvent('human_takeover_staff_reply', norm, {
+                idMessage, preview: (msgText ?? '').slice(0, 60),
+              });
+              logger.info('[outgoing-webhook] Staff manual reply detected — human_owns set', {
+                phone: norm, idMessage,
+              });
+              broadcastSse('message', { phone: norm, route: 'human_owns', reason: 'staff_reply' });
+            }
+          }
+        }
+        return;
+      }
+
       if (rawType !== 'incomingMessageReceived') {
-        // Non-message events (delivery receipts, state changes, device info, etc.)
+        // Other non-message events (delivery receipts, state changes, device info)
         // are logged above and then discarded — no inbox action needed.
-        // If you need to act on e.g. 'outgoingMessageStatus', add a handler here.
         return;
       }
 

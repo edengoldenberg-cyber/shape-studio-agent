@@ -19,6 +19,36 @@ const SYSTEM_PROMPT = fs.readFileSync(
   'utf8'
 );
 
+// ── Pricing context builder ───────────────────────────────────────────────────
+// Reads subscription_packages.json at call time so price changes take effect
+// without a server restart. Returns a markdown-formatted pricing block.
+function buildPricingContext() {
+  try {
+    const DATA_DIR = (process.env.DATA_DIR ?? path.join(__dirname, '../data')).replace(/\/$/, '');
+    const pkg = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'subscription_packages.json'), 'utf8'));
+    const lines = [];
+    if (pkg.trial) {
+      lines.push(`הצעת היכרות: ${pkg.trial.entries} אימונים ב-${pkg.trial.price_ils} ₪ — ${pkg.trial.description}`);
+    }
+    const configured = (pkg.packages ?? []).filter(p => p.price_ils !== null && p.price_ils !== undefined);
+    const unconfigured = (pkg.packages ?? []).filter(p => p.price_ils === null || p.price_ils === undefined);
+    for (const p of configured) {
+      lines.push(`${p.name}: ${p.price_ils} ₪ לחודש — ${p.description}`);
+    }
+    if (unconfigured.length > 0 && configured.length === 0) {
+      lines.push(`חבילות חודשיות: המחיר תלוי בתדירות. הצוות ישמח לפרט — לא מפורסם אונליין.`);
+    } else if (unconfigured.length > 0) {
+      lines.push(`חבילות נוספות: פנה/י לצוות לפרטים.`);
+    }
+    if (pkg._universal_access) {
+      lines.push(`גישה: ${pkg._universal_access}`);
+    }
+    return lines.length > 0 ? `## מחירים ומנויים\n${lines.join('\n')}` : '';
+  } catch {
+    return '## מחירים ומנויים\nלפרטי מחיר — פנה/י לצוות ישירות.';
+  }
+}
+
 /**
  * Returns a short markdown section with the studio's live asset URLs.
  * Called on every prompt build so dashboard edits take effect immediately.
@@ -293,23 +323,27 @@ function buildTurnSystemPrompt(completedTurns, qualData, name, from, msgCount) {
       `  ✗ Never volunteer class names they did NOT mention`,
       `  ✗ Never volunteer the studio address or Waze link on this turn UNLESS they explicitly asked for directions/address`,
       `     (If they explicitly asked: give address + Waze link verbatim, then ask where THEY are from)`,
-      `  ✗ Never mention pricing, memberships, or trial offer`,
+      `  ✗ Never volunteer studio address or Waze link UNLESS they explicitly asked for it`,
       `  ✗ Never use their WhatsApp display name`,
       `  ✗ Never ask two questions in the same message`,
       `  ✗ Max 3 sentences total`,
+      `  EXCEPTION — if they ask about price on Turn 1: give the confirmed pricing (see Pricing below)`,
       ``,
       `WhatsApp contact name (profile metadata — NOT confirmed): "${name ?? 'unknown'}". Do not use it.`,
       `Phone: ${from}.`,
       ``,
       buildAssetContext(),
+      buildPricingContext(),
       _buildLanguageRule(qualData),
     ].join('\n');
   }
 
-  // Turn 2+: full system prompt + live asset URLs + optional memory block + fresh stage context
-  const memBlock = memoryService.buildMemoryInjection(from, qualData);
-  const memSection = memBlock ? `\n\n${memBlock}` : '';
-  return `${SYSTEM_PROMPT}\n\n${buildAssetContext()}${memSection}\n\n---\n\n## Current Turn Instruction\n\n${buildStageContext(completedTurns, qualData, msgCount)}`;
+  // Turn 2+: full system prompt + live studio data + optional memory block + fresh stage context
+  const memBlock     = memoryService.buildMemoryInjection(from, qualData);
+  const memSection   = memBlock ? `\n\n${memBlock}` : '';
+  const pricingCtx   = buildPricingContext();
+  const pricingSection = pricingCtx ? `\n\n${pricingCtx}` : '';
+  return `${SYSTEM_PROMPT}\n\n${buildAssetContext()}${pricingSection}${memSection}\n\n---\n\n## Current Turn Instruction\n\n${buildStageContext(completedTurns, qualData, msgCount)}`;
 }
 
 // Universal rules injected into every stage context.
@@ -340,261 +374,129 @@ const UNIVERSAL_STAGE_RULES = [
  * stages so a lead who supplies multiple facts in one message doesn't get asked
  * questions they already answered.
  */
-function _readyForClose(qualData) {
-  if (qualData.callTimeGiven)        return false; // already closed
-  if (qualData.locationViable === false) return false; // location rejected
-  if (qualData.callProposed)         return false; // already in close mode
-  const hasLocation = qualData.locationViable === true || (qualData.location && qualData.locationCheckNeeded === false);
-  const hasIntent   = !!(qualData.fitnessInterest || qualData.goal);
-  return hasLocation && hasIntent;
-}
-
 function buildStageContext(completedTurns, qualData, msgCount) {
   // ── Build "ALREADY KNOWN" summary — injected into every stage context ─────────
   const knownFacts = [];
-  if (qualData.location)        knownFacts.push(`📍 אזור: "${qualData.location}" — כבר ידוע, אסור לשאול שוב`);
-  if (qualData.fitnessInterest) knownFacts.push(`💪 ענין כושר: "${qualData.fitnessInterest}" — כבר ידוע, אסור לשאול שוב`);
-  if (qualData.goal)            knownFacts.push(`🎯 מטרה: "${qualData.goal}" — כבר ידוע, אסור לשאול שוב`);
-  if (qualData.workoutStyle)    knownFacts.push(`🏋️ סגנון: "${qualData.workoutStyle}" — כבר ידוע, אסור לשאול שוב`);
-  if (qualData.confirmedName)   knownFacts.push(`👤 שם: "${qualData.confirmedName}" — כבר ידוע`);
+  if (qualData.location)        knownFacts.push(`📍 אזור: "${qualData.location}"`);
+  if (qualData.fitnessInterest) knownFacts.push(`💪 ענין: "${qualData.fitnessInterest}"`);
+  if (qualData.goal)            knownFacts.push(`🎯 מטרה: "${qualData.goal}"`);
+  if (qualData.workoutStyle)    knownFacts.push(`🏋️ סגנון: "${qualData.workoutStyle}"`);
+  if (qualData.confirmedName)   knownFacts.push(`👤 שם: "${qualData.confirmedName}"`);
   const knownSection = knownFacts.length > 0
     ? `⛔ כבר ידוע — אסור לשאול שוב:\n${knownFacts.map(f => `  • ${f}`).join('\n')}`
-    : `⛔ עדיין לא ידוע כלום — שאל בזהירות, שאלה אחת בלבד.`;
+    : `⛔ אין עדיין מידע מאושר.`;
 
-  // ── PRIORITY OVERRIDES: location state takes precedence over turn counter ─────
+  // ── HARD STATE OVERRIDES — these fire regardless of turn count ──────────────
 
-  // Lead confirmed location / travel is not viable — close warmly, nothing more
+  // 0. Reported booking — person already self-reported attending
+  //    Do NOT continue the generic sales funnel; answer helpfully without pushing a call.
+  if (qualData.reportedBookingAt) {
+    return [
+      `STATE: REPORTED_BOOKING.`,
+      `The person said they already have a booking or are coming in. Exact text: "${qualData.reportedBookingText ?? ''}".`,
+      `Do NOT propose another call. Do NOT ask for a callback time.`,
+      `Respond warmly: acknowledge the booking, answer any open question they have.`,
+      `If they ask about something (schedule, what to bring, parking) — answer it.`,
+      `If there is nothing to respond to: respond with SILENCE.`,
+      knownSection,
+    ].join('\n');
+  }
+
+  // 1. Location not viable — close, nothing more
   if (qualData.locationViable === false) {
     return [
-      `LOCATION NOT VIABLE — CLOSE POLITELY. Reply #${msgCount + 1}.`,
-      `The lead indicated the location or travel is a problem for them.`,
-      `Close warmly in one sentence and leave the door open for the future.`,
-      `Example: "מבין/ה לגמרי — אם זה ישתנה בעתיד תמיד ברוכ/ה לפנות! 😊"`,
-      `FORBIDDEN: call proposal, class info, pricing, any next steps.`,
+      `STATE: LOCATION NOT VIABLE.`,
+      `Close warmly in one sentence. Leave the door open.`,
+      `Example: "מבין/ה — אם זה ישתנה בעתיד תמיד ברוכ/ה לפנות 😊"`,
+      `FORBIDDEN: call proposal, class info, pricing, any forward steps.`,
     ].join('\n');
   }
 
-  // ── PRICING OBJECTION OVERRIDE ──────────────────────────────────────────────
-  // When pricingObjection is set and hasn't been handled yet, inject Category
-  // Repositioning guidance directly into the stage context.
+  // 2. Call time confirmed — conversation is finished
+  if (qualData.callTimeGiven) {
+    return [
+      `STATE: CALL TIME CONFIRMED. Conversation is complete.`,
+      `Write 1 warm sentence confirming the call time. No question mark. No new topics.`,
+      `Confirmed time: "${qualData.callTimeGiven}"`,
+      `Example: "מצוין — הצוות יצור קשר ב${qualData.callTimeGiven} 😊"`,
+    ].join('\n');
+  }
+
+  // 3. Pricing objection (not a plain price question — an explicit "it's expensive" signal)
   if (qualData.pricingObjection && !qualData.pricingObjectionHandled) {
     return [
-      UNIVERSAL_STAGE_RULES,
+      `STATE: PRICING CONCERN expressed. Reframe — do not argue or deflect.`,
       ``,
       knownSection,
       ``,
-      `PRICING OBJECTION — CATEGORY REPOSITIONING REQUIRED. Reply #${msgCount + 1}.`,
-      `The lead signalled price concern. Do NOT argue the number or deflect.`,
-      ``,
-      `STEP 1 — Validate + Reframe (say this or close equivalent):`,
-      `"את/ה צודק/ת שכדאי להשוות. מה שאנחנו עושים שונה במהותו: כיתות של עד 8 אנשים`,
-      `על ציוד Reformer מקצועי, עם מדריך/ה שרואה אותך בכל תנועה — לא 30 אנשים בחדר."`,
-      ``,
-      `STEP 2 — Anchor on frequency before any price: ask "כמה פעמים בשבוע?"`,
-      ``,
-      `STEP 3 — Redirect to call as a fit-check (not a sales push):`,
-      `"כדי לראות מה מתאים בדיוק לתקציב ולמטרות שלך — נוח לך שיחה קצרה של 5 דקות?"`,
-      ``,
-      `FORBIDDEN: exact NIS amounts / naming competitors / "אין לי מידע על מחירים".`,
-      `Max 3 sentences. End with the frequency question OR the call proposal.`,
+      `REFRAME: "את/ה צודק/ת שכדאי להשוות. מה שאנחנו עושים שונה: כיתות של עד 8 אנשים`,
+      `על ציוד Reformer מקצועי, עם מדריך/ה שרואה אותך בכל תנועה."`,
+      `Then ask ONE of: "כמה פעמים בשבוע חשבת להגיע?" OR propose a brief call.`,
+      `FORBIDDEN: exact NIS, competitor names, "אין לי מידע על מחירים".`,
     ].join('\n');
   }
 
-  // Location was detected — ask once, then move on.
-  // locationNearby=true  → soft convenience question
-  // locationNearby=false → travel feasibility question
-  // Asked only ONCE (locationCheckAsked flag prevents repeating).
+  // 4. Location check needed (asked once, waiting for confirmation)
   if (qualData.locationCheckNeeded && qualData.locationViable !== true) {
-    if (qualData.locationNearby) {
-      return [
-        UNIVERSAL_STAGE_RULES,
-        ``,
-        `LOCATION CONVENIENCE CHECK — ASK ONCE ONLY. Reply #${msgCount + 1}.`,
-        `Location: "${qualData.location ?? 'nearby area'}". Keep it light and natural.`,
-        `Ask briefly whether דרך השדה 12 is convenient for them.`,
-        `Example: "נחמד! ודרך השדה 12 בפרדס חנה — זה נגיש עבורך?"`,
-        `Max 2 sentences. If they give any positive or neutral reply next turn, proceed to goals.`,
-      ].join('\n');
-    }
     return [
-      UNIVERSAL_STAGE_RULES,
-      ``,
-      `LOCATION FEASIBILITY CHECK — ASK ONCE ONLY. Reply #${msgCount + 1}.`,
-      `Location: "${qualData.location ?? 'distant area'}". Ask whether traveling to Pardes Hanna is realistic.`,
-      `Example: "נשמע שאת/ה קצת רחוק/ה — יש לך אפשרות להגיע לפרדס חנה, או שזה לא ריאלי?"`,
-      `Max 2 sentences. If they give any positive or neutral reply next turn, proceed to goals.`,
-    ].join('\n');
-  }
-
-  // ── NORMAL STAGE FLOW (location confirmed viable, or no location detected yet) ─
-
-  const locNote = qualData.location
-    ? `Location: "${qualData.location}" ✓ (confirmed convenient)`
-    : 'Location not yet confirmed.';
-
-  // Skip turn-count-driven discovery when enough facts are already known.
-  // This prevents re-asking for location or interest a lead supplied in their first message.
-  if (_readyForClose(qualData) && completedTurns >= 1 && !qualData.nameAsked && !qualData.callProposed) {
-    return [
-      UNIVERSAL_STAGE_RULES,
+      qualData.locationNearby
+        ? `STATE: LOCATION CONVENIENCE CHECK. Ask once, lightly.`
+        : `STATE: LOCATION FEASIBILITY CHECK. Ask once, naturally.`,
       ``,
       knownSection,
       ``,
-      `FAST-TRACK TO CLOSE — the lead already gave enough information. Reply #${msgCount + 1}.`,
-      `Known: location "${qualData.location ?? '—'}", interest/goal "${qualData.fitnessInterest ?? qualData.goal ?? '—'}".`,
-      `DO NOT ask about location or fitness goal again — both are already known.`,
-      `Acknowledge their last reply in ONE warm sentence, then ask for their first name:`,
-      `"ולפני שנמשיך — איך קוראים לך? 😊"`,
-      `Max 2 sentences.`,
+      qualData.locationNearby
+        ? `Their area: "${qualData.location}". Ask if דרך השדה 12 is convenient.`
+        : `Their area: "${qualData.location}". Ask if traveling to Pardes Hanna is realistic.`,
+      `Max 2 sentences. If they give any positive or neutral reply, proceed.`,
     ].join('\n');
   }
 
-  if (completedTurns === 1) {
-    // Determine what the lead already expressed so we know what to ask next
-    const hasGoalOrInterest = !!(qualData.fitnessInterest || qualData.goal);
-    const goalKnown = qualData.goal
-      ? `"${qualData.goal}" (goal — natural language)`
-      : qualData.fitnessInterest
-        ? `"${qualData.fitnessInterest}" (specific class interest)`
-        : null;
+  // ── OPEN CONVERSATION — context injection, not scripted stages ───────────────
+  //
+  // The AI decides what to do next based on context. The stage context supplies:
+  //   • what's already confirmed (don't re-ask)
+  //   • the conversation state (call proposed? name known?)
+  //   • a light suggestion for the next appropriate move
+  //
+  // The AI is trusted to answer the actual question first, then advance naturally.
 
-    return [
-      UNIVERSAL_STAGE_RULES,
-      ``,
-      knownSection,
-      ``,
-      `TURN 2 — DEEPER DISCOVERY. Reply #${msgCount + 1}.`,
-      locNote,
-      ``,
-      `CRITICAL: READ "כבר ידוע" ABOVE before writing anything. Never ask about something already there.`,
-      hasGoalOrInterest
-        ? [
-            `  → The lead ALREADY expressed their fitness intent: ${goalKnown}.`,
-            `     DO NOT ask "what are you looking for" or "what brought you here" — they answered it.`,
-            `     Instead: Acknowledge warmly (1 sentence), then ask ONE DEEPER question:`,
-            `     their experience level, specific pain point, or what they've tried before.`,
-          ].join('\n')
-        : [
-            `  → No fitness goal or interest captured yet.`,
-            `     Acknowledge location warmly (1 sentence), then ask ONE open question about their goal.`,
-            `     Good: "מה הכי חשוב לך להשיג מהאימונים?"`,
-          ].join('\n'),
-      ``,
-      `End with a question only if one is genuinely needed to advance the conversation.`,
-      `Max 3 sentences. No class list. Do not use their name.`,
-      `Exception: if the lead just asked about price or cost, answer it (use the price info from the prompt)`,
-      `then continue with the stage question.`,
-    ].join('\n');
-  }
-
-  if (completedTurns === 2) {
-    const hasGoalOrInterest = !!(qualData.fitnessInterest || qualData.goal);
-
-    return [
-      UNIVERSAL_STAGE_RULES,
-      ``,
-      knownSection,
-      ``,
-      `TURN 3 — DISCOVERY CONTINUES. Reply #${msgCount + 1}.`,
-      `If the lead's last message was a location confirmation ("כן", "אין בעיה", "בסדר"):`,
-      `  Acknowledge in ONE short phrase (e.g., "מצוין! 💪") then IMMEDIATELY ask about their goal.`,
-      `  Do NOT send a reply that is ONLY the acknowledgement — always follow with the goal question.`,
-      `Otherwise:`,
-      hasGoalOrInterest
-        ? [
-            `  → Goal/interest already in "כבר ידוע" above. DO NOT re-ask it.`,
-            `     Acknowledge it warmly (1 sentence), then ask ONE question about:`,
-            `     workout style, experience level, or what they've tried before.`,
-            `  → If you mention a class name: close with "האם סגנון כזה מתאים למה שחיפשת?"`,
-          ].join('\n')
-        : [
-            `  → Goal not yet captured → ask ONE focused goal question.`,
-            `     Good: "מה הכי חשוב לך — חיזוק? גמישות? שיקום?"`,
-          ].join('\n'),
-      `End with a question only if one is genuinely needed to advance the conversation.`,
-      `Max 3 sentences. No trial offer. Do not use their name.`,
-      `Exception: if the lead asked about price, answer it then continue with the stage question.`,
-    ].join('\n');
-  }
-
-  if (completedTurns >= 3) {
-    if (qualData.callTimeGiven) {
-      return [
-        `CLOSE — CONVERSATION IS FINISHED. Reply #${msgCount + 1}.`,
-        `Call time confirmed: "${qualData.callTimeGiven}".`,
-        ``,
-        `THIS OVERRIDES ALL OTHER RULES INCLUDING THE UNIVERSAL QUESTION RULE.`,
-        `Write exactly 1–2 sentences: a warm confirmation + tell them to expect the team's call.`,
-        ``,
-        `HARD STOP — FORBIDDEN IN THIS REPLY:`,
-        `  ✗ Any question mark (?)`,
-        `  ✗ Any forward proposal ("מתי נוח לך", "באיזו שעה", "האם...")`,
-        `  ✗ Any class information, pricing, or new topics`,
-        `  ✗ Asking for the call time again (it was already captured)`,
-        ``,
-        `CORRECT example: "מצויין! הצוות שלנו יצור איתך קשר ב${qualData.callTimeGiven}. מחכים לשיחה 😊"`,
-        `WRONG example: "...הצוות יצור קשר. באיזו שעה נוח לך?" ← FORBIDDEN, never do this.`,
-      ].join('\n');
+  const nextSuggestion = (() => {
+    if (qualData.callProposed) {
+      return qualData.confirmedName
+        ? `A call was suggested. If they asked a question, answer it. If they're positive with no question, re-invite: "מתי נוח לך שנחזור אליך לשיחה קצרה?"`
+        : `A call was suggested. If they asked a question, answer it. If they explicitly declined, offer the trial (2 sessions / 60₪).`;
     }
 
-    // Name collection gate — must happen BEFORE proposing the call.
-    // callProposed is only set once nameAsked=true, so this turn runs exactly once.
-    if (!qualData.nameAsked && !qualData.callProposed) {
-      return [
-        `TURN — NAME COLLECTION. Reply #${msgCount + 1}.`,
-        `You have their location, goal, and training preference. Time to ask for their first name.`,
-        `Acknowledge their last answer in ONE warm sentence. Then ask: "ולפני שנמשיך — איך קוראים לך? 😊"`,
-        `Max 2 sentences. Do NOT propose the call yet.`,
-      ].join('\n');
-    }
+    const hasLocation = qualData.locationViable === true || (qualData.location && !qualData.locationCheckNeeded);
+    const hasIntent   = !!(qualData.fitnessInterest || qualData.goal);
+    const hasName     = !!qualData.confirmedName;
 
-    if (!qualData.callProposed) {
-      const nameHint = qualData.confirmedName
-        ? `Their confirmed name is "${qualData.confirmedName}" — you may use it naturally once in this reply.`
-        : '';
-      return [
-        UNIVERSAL_STAGE_RULES,
-        ``,
-        knownSection,
-        ``,
-        `TURN 4 — CLOSE. Reply #${msgCount + 1}.`,
-        nameHint,
-        `READ THE LEAD'S LAST MESSAGE CAREFULLY:`,
-        `  • If they asked a question or said "tell me more / give me details" →`,
-        `    Answer the question FULLY (2-3 sentences). Do NOT propose a call in this message.`,
-        `    The proposal will come next turn, after they feel heard.`,
-        `  • If their last message was a neutral/positive statement with no question →`,
-        `    Connect it to Shape Studio in ONE sentence, then propose:`,
-        `    "מה אם אחד מהצוות יתקשר אליך לשיחה קצרה של 5 דקות? באיזו שעה נוח לך?"`,
-        `Max 4 sentences. Do not list classes. Do not mention pricing.`,
-      ].filter(Boolean).join('\n');
+    if (hasLocation && hasIntent && hasName) {
+      return `All key facts known. When the conversation has a natural pause (no open question from them), propose the team call: "הצעד הבא הוא שיחה קצרה עם הצוות — מתי נוח לך?"`;
     }
-
-    return [
-      UNIVERSAL_STAGE_RULES,
-      ``,
-      knownSection,
-      ``,
-      `FOLLOW-UP — INFORMATION MODE. Reply #${msgCount + 1}.`,
-      `A call was suggested earlier. The lead is still exploring — they haven't committed.`,
-      ``,
-      `YOUR JOB NOW: Be a helpful, knowledgeable friend. Answer every question fully and genuinely.`,
-      ``,
-      `RULES:`,
-      `  • If they asked a question → answer it completely (2-4 sentences). DO NOT end with any call proposal.`,
-      `    The call will come up again naturally when THEY are ready. Forcing it after every answer kills trust.`,
-      `  • If they send a neutral/positive message with no question → you may naturally close:`,
-      `    "אשמח לחבר אותך עם הצוות — מה שעה נוחה לשיחה קצרה?"`,
-      `  • If they explicitly declined a call → offer: "2 אימונים ב-60 ש״ח, בלי התחייבות — רוצה שאשלח פרטים?"`,
-      `  • Never send the same call-proposal sentence twice in a row.`,
-      `Max 4 sentences.`,
-    ].join('\n');
-  }
+    if (hasLocation && hasIntent && !hasName) {
+      return `Location and interest known. If the conversation reaches a natural pause and no question is pending, ask their first name. Otherwise keep helping.`;
+    }
+    if (hasIntent && !hasLocation) {
+      return `Interest known. If location hasn't come up naturally, ask where they're from.`;
+    }
+    if (!hasIntent) {
+      return `Interest/goal not yet clear. ONE focused question: what they're looking for.`;
+    }
+    return `Learn what they need. ONE question. Natural.`;
+  })();
 
   return [
     UNIVERSAL_STAGE_RULES,
     ``,
-    `Reply #${msgCount + 1}. Max 4 sentences. End with one question. Do not use their name.`,
+    knownSection,
+    ``,
+    `GUIDANCE FOR THIS REPLY (Reply #${msgCount + 1}):`,
+    nextSuggestion,
+    ``,
+    `⚠ TOP RULE: Answer what they just asked FIRST. Only then — if appropriate — one suggestion or question.`,
+    `After answering a direct question, adding another question is optional. Zero questions is often right.`,
   ].join('\n');
 }
 
@@ -898,17 +800,38 @@ async function generateLeadBrief(phone, history, callTimeGiven, { alertTeam = fa
 
 // ── Name extraction helper ────────────────────────────────────────────────────
 
+// Words that are never names — used by extractNameFromMessage to reject false captures.
+// Keeps the set small and focused on the patterns that actually appear as 1–2 word messages
+// right after Barak asks "איך קוראים לך?" (price questions, affirmations, time preferences, etc.).
+const _NAME_REJECT_WORDS = new Set([
+  'כמה', 'מה', 'לא', 'כן', 'אין', 'יש', 'יקר', 'זול', 'בסדר',
+  'אוקי', 'אוקיי', 'מחיר', 'עולה', 'שיעורים', 'שעות', 'מנוי',
+  'נוח', 'מחפש', 'מחפשת', 'רוצה', 'מקום', 'סטודיו', 'מיקום',
+  'כתובת', 'בוקר', 'ערב', 'צהריים', 'לילה', 'שבת', 'ראשון',
+  'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'תודה',
+]);
+
 /**
- * Try to extract a first name (1-2 words) from a short freetext reply.
+ * Try to extract a first name (1–2 words) from a short freetext reply.
  * Called when nameAsked=true so the message is expected to be "my name is X".
+ *
+ * Rejects:
+ *   - Messages with a question mark (questions, not names)
+ *   - Messages whose meaningful-word count exceeds 2 after prefix stripping
+ *     (3+ word messages are almost never bare name replies)
+ *   - Messages whose words appear in _NAME_REJECT_WORDS
  */
 function extractNameFromMessage(text) {
-  if (!text || text.trim().length > 60) return null;
-  const stripped = text.trim()
+  if (!text) return null;
+  const t = text.trim();
+  if (t.length > 50) return null;
+  if (/\?/.test(t)) return null; // questions are not names
+  const stripped = t
     .replace(/^(אני\s+|שמי\s+|קוראים לי\s+|שם שלי\s+|שם שלי הוא\s+|אפשר לקרוא לי\s+|הקשר ל\s+)/i, '');
   const heOrLatin = /[א-תװ-״a-zA-Z]/;
-  const words = stripped.split(/[\s,.–—׃]+/).filter(w => w.length >= 2 && heOrLatin.test(w));
-  if (!words.length) return null;
+  const words = stripped.split(/[\s,.–—׃!]+/).filter(w => w.length >= 2 && heOrLatin.test(w));
+  if (!words.length || words.length > 2) return null; // 3+ word messages are not bare name replies
+  if (words.some(w => _NAME_REJECT_WORDS.has(w))) return null;
   const name = words.slice(0, 2).join(' ');
   return name.length >= 2 ? name : null;
 }
@@ -948,7 +871,7 @@ function _isKnownMemberPhone(phone) {
  * Handle an inbound WhatsApp message for lead qualification.
  * Returns { reply, score, status }.
  */
-async function handleInbound({ from, name, text }) {
+async function handleInbound({ from, name, text, _pendingMessages: pendingMap = null }) {
   // ── GATE 1: Member Firewall ───────────────────────────────────────────────────
   // Checks memberCache (in-process, seeded every 15 min from Arbox) first,
   // then known_members.json. Both must miss before we continue.
@@ -1080,7 +1003,7 @@ async function handleInbound({ from, name, text }) {
   // ── Frustration detector ────────────────────────────────────────────────────
   // Signals frustration with the automated flow → human handoff (escalated).
   // History is preserved via reclassifyEscalated; staff can release ownership later.
-  const FRUSTRATION_RE = /תפסיק[יו]?|עצר[ו]?|מה זה בכלל|מה קורה פה|רובוט|בוט|מכונה|לא לאיים|מחריד|מה הבעיה|אל תשלח[יו]? יותר|לא רוצה לקבל הודעות|STOP\b|stop\b|אדם אמיתי|נציג אנושי|לא עונה לשאלה|לא מקשיב[ה]?|לא שומע[ת]?|שטויות|להציק|אל תציק/i;
+  const FRUSTRATION_RE = /תפסיק[יו]?|עצר[ו]?|מה זה בכלל|מה קורה פה|רובוט|בוט|מכונה|לא לאיים|מחריד|מה הבעיה|אל תשלח[יו]? יותר|לא רוצה לקבל הודעות|STOP\b|stop\b|אדם אמיתי|נציג אנושי|לא עונה לשאלה|לא מקשיב[ה]?|לא שומע[ת]?|שטויות|להציק|אל תציק|תעיף.*בוט|הסר.*בוט|בלי.*בוט|לא.*צריך.*בוט|תסגור.*בוט|תבטל.*בוט|עצור.*אוטומט/i;
   if (FRUSTRATION_RE.test(text)) {
     logger.warn('[lead_agent] Frustration detected', { from, preview: text.slice(0, 60) });
     const frustMsg = `מצטער/ת! מעביר אותך עכשיו לנציג מהצוות שייצור קשר ישירות 😊`;
@@ -1097,6 +1020,18 @@ async function handleInbound({ from, name, text }) {
       `*Contact:* ${name ?? from} (${from})\n*Reason:* frustration\n*Message:* "${text.slice(0, 200)}"\n\nHistory preserved. Release via: POST /api/leads/${encodeURIComponent(from)}/release`
     ).catch(() => {});
     return { reply: frustMsg, score: 1, status: 'human_owns' };
+  }
+
+  // 3a-pre. Reported-booking detector — fires BEFORE call-proposed checks.
+  // "קבעתי ליום ראשון", "נרשמתי", "הגעתי בראשון", "אני אגיע ביום שני" etc.
+  // The person is telling us they already have a booking — stop the sales funnel.
+  // We do NOT claim Arbox verification; we record as self-reported.
+  const BOOKING_REPORTED_RE = /(?:קבעתי|נרשמתי|רשמתי\s+(?:את\s+עצמ|לי)|אגיע\s+ב|הגעתי\s+ב|אני\s+אגיע\s+ב|יש\s+לי\s+שיעור\s+ב|קביעה\s+ב|שמרתי\s+מקום|(?:אגיע|הגעתי|רשמתי)\s+(?:ל?יום\s+)?(?:ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת))/i;
+  if (BOOKING_REPORTED_RE.test(text) && !qualData.reportedBookingAt) {
+    logger.info('[lead_agent] Reported booking detected — stopping sales funnel', { from, preview: text.slice(0, 60) });
+    setQualData(from, { reportedBookingAt: new Date().toISOString(), reportedBookingText: text.slice(0, 120) });
+    store.logEvent('booking_reported', from, { preview: text.slice(0, 80) });
+    // The AI will see [STAGE: reported_booking] and handle gracefully — no forced close.
   }
 
   // 3a. Detect callback time in this inbound message
@@ -1167,10 +1102,13 @@ async function handleInbound({ from, name, text }) {
     }
   }
 
-  // 3e. Name capture — when we asked for name last turn, extract it from this message.
+  // 3e. Name capture — when we asked for name, extract it from this message.
+  //     Runs until confirmedName is set so a name given after the call is proposed
+  //     (e.g. lead answers the price question first then gives their name) is still
+  //     captured. The improved extractNameFromMessage rejects non-name inputs.
   {
     const preNameCheck = getQualData(from);
-    if (preNameCheck.nameAsked && !preNameCheck.callProposed) {
+    if (preNameCheck.nameAsked && !preNameCheck.confirmedName) {
       const captured = extractNameFromMessage(text);
       if (captured) {
         store.upsertLead(from, { name: captured });
@@ -1266,6 +1204,15 @@ async function handleInbound({ from, name, text }) {
   if (deterministicResult) {
     _lastDebugCtx = { path: 'deterministic', type: deterministicResult.type, postProcess: { changes: [], clean: true } };
     logger.info('[lead_agent] Deterministic interceptor fired', { from, type: deterministicResult.type });
+    // Stale gate: newer message arrived while we were processing — skip send
+    if (pendingMap?.has(from)) {
+      logger.info('[lead_agent] Stale deterministic send suppressed', { from });
+      history.push({ role: 'user',      content: text });
+      history.push({ role: 'assistant', content: deterministicResult.reply });
+      saveHistory(from, history);
+      store.logEvent('reply_suppressed_stale', from, { path: 'deterministic', preview: deterministicResult.reply.slice(0, 60) });
+      return { reply: deterministicResult.reply, score: 0, status: 'cold', sendState: 'skipped_stale' };
+    }
     try {
       await sendText(from, deterministicResult.reply);
     } catch (sendErr) {
@@ -1273,7 +1220,7 @@ async function handleInbound({ from, name, text }) {
       alertOwner('⚠️ WhatsApp send failure — lead got no reply',
         `Phone: ${from}\nMessage: "${text.slice(0, 100)}"\nError: ${sendErr.message}`
       ).catch(() => {});
-      return { reply: null, score: 0, status: 'send_error' };
+      return { reply: deterministicResult.reply, score: 0, status: 'send_error', sendState: 'failed' };
     }
     store.logEvent('message_out',          from, { preview: deterministicResult.reply.slice(0, 80) });
     store.logEvent('deterministic_reply',  from, { type: deterministicResult.type });
@@ -1321,8 +1268,11 @@ async function handleInbound({ from, name, text }) {
     // requires the AI's actual text to contain the relevant phrase.
     const locationResolved = !freshQualData.locationCheckNeeded && freshQualData.locationViable !== false;
 
-    // nameAsked: set only if the reply actually asked for the lead's name
-    if (completedTurns >= 2 && !freshQualData.nameAsked && !freshQualData.callProposed && locationResolved
+    // nameAsked: set any time the AI's actual reply asks for the lead's name.
+    // No turn-count guard — the AI won't ask for the name on Turn 1 in practice
+    // (the Turn 1 minimal prompt doesn't include it), and removing the guard lets
+    // fast-track paths that ask on Turn 2 (completedTurns=1) be recorded correctly.
+    if (!freshQualData.nameAsked && !freshQualData.callProposed && locationResolved
         && NAME_ASK_RE.test(reply)) {
       setQualData(from, { nameAsked: true });
     }
@@ -1372,13 +1322,23 @@ async function handleInbound({ from, name, text }) {
 
   // 8. Send reply
   //    sendText is outside the OpenAI try/catch because a WhatsApp API failure
-  //    is a different class of error from an OpenAI failure.  Wrapping it here
-  //    prevents a Green API outage or expired session from causing complete
-  //    silence — the owner is alerted so the conversation can be recovered.
+  //    is a different class of error from an OpenAI failure.
+
+  // Stale gate: newer message arrived while the AI was generating. Skip the send
+  // so the pending burst (which has full context) generates the authoritative reply.
+  // History is already saved above; the follow-up will see this turn's exchange.
+  if (pendingMap?.has(from)) {
+    logger.info('[lead_agent] Stale AI send suppressed — newer message pending', { from });
+    store.logEvent('reply_suppressed_stale', from, { path: 'ai', preview: reply.slice(0, 60) });
+    return { reply, score, status, sendState: 'skipped_stale' };
+  }
+
+  let sendState = 'sent';
   try {
     await sendText(from, reply);
     store.logEvent('message_out', from, { preview: reply.slice(0, 80) });
   } catch (sendErr) {
+    sendState = 'failed';
     logger.error('[lead_agent] sendText failed — lead did not receive reply', {
       from,
       error:   sendErr.message,
@@ -1388,10 +1348,6 @@ async function handleInbound({ from, name, text }) {
       '⚠️ WhatsApp send failure — lead got no reply',
       `Phone: ${from}\nMessage: "${text.slice(0, 100)}"\nDraft reply: "${reply.slice(0, 200)}"\nError: ${sendErr.message}\n\nCheck Green API instance state.`
     ).catch(() => {});
-    // Return the generated reply even though it could not be sent.
-    // The outer pipeline sets _replyAlreadySent=true, preventing a double-send attempt.
-    // The reply text is preserved in barakReply for inbox visibility and diagnostics.
-    return { reply, score, status };
   }
 
   // 9. Fire-and-forget brief + memory pipeline when entering Stage 3 or when a
@@ -1425,7 +1381,7 @@ async function handleInbound({ from, name, text }) {
       .catch(err => logger.warn('[lead_agent] Session summary error', { from, error: err.message }));
   }
 
-  return { reply, score, status };
+  return { reply, score, status, sendState };
 }
 
 // ── Lead scoring ──────────────────────────────────────────────────────────────

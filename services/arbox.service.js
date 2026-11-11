@@ -53,7 +53,7 @@ client.interceptors.response.use(
  *                    lead_status, lead_source, created_time }
  */
 async function getLeads({ limit = 100, status } = {}) {
-  const params = { location_id: LOC(), limit };
+  const params = { location_id: LOC(), limit: Math.min(limit, 200) };
   if (status) params.lead_status = status;
   const { data } = await client.get('/v3/leads', { params });
   return data?.data ?? [];
@@ -64,7 +64,7 @@ async function getLeads({ limit = 100, status } = {}) {
  */
 async function getLeadByPhone(phone) {
   try {
-    const all = await getLeads({ limit: 500 });
+    const all = await getLeads({ limit: 200 });
     const norm = (phone ?? '').replace(/\s|\+/g, '');
     return all.find(l => (l.phone ?? '').replace(/\s|\+/g, '') === norm) ?? null;
   } catch {
@@ -97,7 +97,7 @@ async function createLead({ firstName, lastName, phone, email, source = 'WhatsAp
  *                    active, membership_start_date, membership_end_date, user_role }
  */
 async function getMembers({ limit = 100, activeOnly = true } = {}) {
-  const params = { location_id: LOC(), limit };
+  const params = { location_id: LOC(), limit: Math.min(limit, 200) };
   if (activeOnly) params.active = 1;
   const { data } = await client.get('/v3/users', { params });
   return data?.data ?? [];
@@ -108,7 +108,7 @@ async function getMembers({ limit = 100, activeOnly = true } = {}) {
  */
 async function getMemberByPhone(phone) {
   try {
-    const all = await getMembers({ limit: 500 });
+    const all = await getMembers({ limit: 200 });
     const norm = (phone ?? '').replace(/\s|\+/g, '');
     return all.find(m => (m.phone ?? '').replace(/\s|\+/g, '') === norm) ?? null;
   } catch {
@@ -303,9 +303,11 @@ async function getDetailedMembers({ daysWarning = 30, limit = 500 } = {}) {
 async function getAllUsers({ limit: pageSize = 200 } = {}) {
   const all  = [];
   let   page = 1;
+  // Arbox v3 rejects limit >= 500 — cap at 200 regardless of what callers request.
+  const effectivePageSize = Math.min(pageSize, 200);
   while (true) {
     const { data } = await client.get('/v3/users', {
-      params: { location_id: LOC(), limit: pageSize, page },
+      params: { location_id: LOC(), limit: effectivePageSize, page },
     });
     const batch = data?.data ?? [];
     all.push(...batch);
