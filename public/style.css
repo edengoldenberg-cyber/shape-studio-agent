@@ -2871,3 +2871,6 @@ input:checked + .toggle-slider::before { transform: translateX(16px); }
 .wf-preview-msg { background:#f8fafc; border-right:3px solid var(--primary);
   padding:8px 12px; border-radius:6px; font-size:13px; color:var(--text);
   margin-bottom:12px; white-space:pre-wrap; }
+
+/* ── Workflow history line ────────────────────────────────────────────────── */
+.tw-wf-hist { font-size:11px; color:var(--muted); margin-top:4px; }

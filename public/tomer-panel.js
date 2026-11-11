@@ -184,6 +184,13 @@ async function loadOverview() {
     setTxt('twk-failed', s.failedActions ?? 0);
     setTxt('twk-arbox',  data.arboxHealth ? '✅ OK' : '⚠️ Error');
 
+    // Aging conversations KPI (inject dynamically if element exists)
+    const agingEl = $id('twk-aging');
+    if (agingEl) agingEl.textContent = s.agingConversations ?? 0;
+
+    // Render aging conversations list
+    _renderAgingConversations(data.agingConversations ?? []);
+
     // Badge on Tasks tab
     const badge = $id('tw-badge-tasks');
     if (badge) badge.textContent = s.openTasks > 0 ? String(s.openTasks) : '';
@@ -216,6 +223,25 @@ function _renderOpenTasksList(tasks) {
       <span class="tw-task-time">${fmtDate(t.createdAt)}</span>
       <div class="tw-task-actions">
         <button class="btn-xs" onclick="openTaskActions('${esc(t.id)}')">פעולות</button>
+      </div>
+    </div>`).join('');
+}
+
+function _renderAgingConversations(convs) {
+  const el = $id('tw-aging-list');
+  if (!el) return;
+  if (!convs.length) {
+    el.innerHTML = '<div class="tw-empty">אין שיחות עומדות</div>';
+    return;
+  }
+  el.innerHTML = convs.map(c => `
+    <div class="tw-list-row">
+      <span class="tw-uc-phone">${maskPhone(c.phone)}</span>
+      <span class="tw-uc-msg">${esc((c.lastText ?? '').slice(0, 50))}</span>
+      <span class="tw-ts">${esc(c.ageH)}ש׳ ללא מענה</span>
+      <span class="badge-crisis" style="font-size:10px">${esc(c.route ?? '—')}</span>
+      <div class="tw-uc-actions">
+        <button class="btn-xs" onclick="takeHumanOwnership('${esc(c.phone)}','')">👤 קח בעלות</button>
       </div>
     </div>`).join('');
 }
@@ -482,8 +508,12 @@ async function loadAutomation() {
   if (!el) return;
   el.innerHTML = '<div class="tw-spin">טוען...</div>';
   try {
-    const data = await api('/api/tomer/retention/config');
-    const cfg  = data.config ?? {};
+    const [data, histData] = await Promise.all([
+      api('/api/tomer/retention/config'),
+      api('/api/tomer/retention/history').catch(() => ({ summary: {} })),
+    ]);
+    const cfg     = data.config ?? {};
+    const history = histData.summary ?? {};
 
     const labels = {
       birthday:    '🎂 ברכת יום הולדת',
@@ -498,7 +528,12 @@ async function loadAutomation() {
       attendance:  'פנייה אחרי 14+ ימים ללא נוכחות מקומית',
     };
 
-    el.innerHTML = Object.entries(cfg).map(([id, wf]) => `
+    el.innerHTML = Object.entries(cfg).map(([id, wf]) => {
+      const h = history[id] ?? {};
+      const histHtml = h.lastRun
+        ? `<div class="tw-wf-hist">הרצה אחרונה: ${fmtDate(h.lastRun)} · ${h.count} שליחות מאז הפעלה</div>`
+        : `<div class="tw-wf-hist tw-muted">טרם הורץ</div>`;
+      return `
       <div class="tw-workflow-card">
         <div class="tw-wf-header">
           <span class="tw-wf-label">${esc(labels[id] ?? id)}</span>
@@ -508,12 +543,14 @@ async function loadAutomation() {
           </label>
         </div>
         <div class="tw-wf-desc">${esc(descs[id] ?? '')}</div>
-        <div class="tw-wf-status ${wf.enabled ? 'tw-wf-on' : 'tw-wf-off'}">${wf.enabled ? 'פעיל' : 'מושבת'}</div>
+        <div class="tw-wf-status ${wf.enabled ? 'tw-wf-on' : 'tw-wf-off'}">${wf.enabled ? '✅ פעיל' : '⏸ מושבת'}</div>
+        ${histHtml}
         <div class="tw-wf-actions">
           <button class="btn-xs" onclick="previewWorkflow('${esc(id)}')">👁️ תצוגה מקדימה</button>
           <button class="btn-xs btn-xs-sec" onclick="runWorkflowNow('${esc(id)}')">▶ הרץ עכשיו</button>
         </div>
-      </div>`).join('');
+      </div>`;
+    }).join('');
 
     // Wire toggles
     el.querySelectorAll('.tw-wf-toggle').forEach(cb => {

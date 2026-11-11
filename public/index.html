@@ -435,6 +435,7 @@
           <div class="tw-kpi-row" id="tw-kpis">
             <div class="tw-kpi"><span class="tw-kpi-val" id="twk-open">—</span><span class="tw-kpi-lbl">משימות פתוחות</span></div>
             <div class="tw-kpi urgent"><span class="tw-kpi-val" id="twk-high">—</span><span class="tw-kpi-lbl">עדיפות גבוהה</span></div>
+            <div class="tw-kpi urgent"><span class="tw-kpi-val" id="twk-aging">—</span><span class="tw-kpi-lbl">שיחות ממתינות</span></div>
             <div class="tw-kpi"><span class="tw-kpi-val" id="twk-unclass">—</span><span class="tw-kpi-lbl">לא מזוהים</span></div>
             <div class="tw-kpi"><span class="tw-kpi-val" id="twk-failed">—</span><span class="tw-kpi-lbl">פעולות נכשלו</span></div>
             <div class="tw-kpi"><span class="tw-kpi-val" id="twk-arbox">—</span><span class="tw-kpi-lbl">Arbox</span></div>
@@ -452,12 +453,18 @@
             </div>
           </div>
 
-          <div class="tw-card" style="margin-top:12px">
-            <div class="tw-card-title">❓ לא מזוהים — ממתינים לניתוב
-              <span class="tw-badge-sm" id="tw-unclass-count"></span>
+          <div class="tw-two-col" style="margin-top:12px">
+            <div class="tw-card">
+              <div class="tw-card-title">⏳ שיחות ממתינות מענה (2+ שעות)</div>
+              <div id="tw-aging-list" class="tw-list"><div class="tw-empty">טוען...</div></div>
             </div>
-            <div id="tw-unclassified-list" class="tw-list"></div>
-            <div class="tw-empty" id="tw-unclass-empty">אין מספרים לא מזוהים</div>
+            <div class="tw-card">
+              <div class="tw-card-title">❓ לא מזוהים — ממתינים לניתוב
+                <span class="tw-badge-sm" id="tw-unclass-count"></span>
+              </div>
+              <div id="tw-unclassified-list" class="tw-list"></div>
+              <div class="tw-empty" id="tw-unclass-empty">אין מספרים לא מזוהים</div>
+            </div>
           </div>
         </div>
 

@@ -4595,6 +4595,29 @@ app.get('/api/tomer/overview', async (req, res) => {
     const tasksByPriority = { high: 0, normal: 0, low: 0 };
     openTasks.forEach(t => { tasksByPriority[t.priority] = (tasksByPriority[t.priority] ?? 0) + 1; });
 
+    // Aging conversations: inbox threads with no bot reply in the last 2 hours
+    const AGE_THRESHOLD = 2 * 60 * 60 * 1000; // 2 hours
+    const now = Date.now();
+    const allInbox = inbox.getAll?.() ?? [];
+    // Group by phone, find last entry per phone, check for silence
+    const phoneLastEntry = new Map();
+    for (const e of allInbox) {
+      const existing = phoneLastEntry.get(e.from);
+      if (!existing || new Date(e.receivedAt ?? e.timestamp) > new Date(existing.receivedAt ?? existing.timestamp)) {
+        phoneLastEntry.set(e.from, e);
+      }
+    }
+    const agingConversations = [];
+    for (const [phone, last] of phoneLastEntry) {
+      const msgAge = now - new Date(last.receivedAt ?? last.timestamp).getTime();
+      if (msgAge < AGE_THRESHOLD) continue; // too recent
+      if (msgAge > 24 * 60 * 60 * 1000) continue; // too old (> 24h not actionable)
+      const route = last.route ?? '';
+      if (['opted_out_silent', 'post_call_silent', 'acknowledged', 'spam_filtered', 'staff_bypass'].includes(route)) continue;
+      if (last.barakReply) continue; // bot did reply
+      agingConversations.push({ phone, route, ageH: Math.round(msgAge / 3600000), lastText: (last.text ?? '').slice(0, 60) });
+    }
+
     res.json({
       ok: true,
       service: {
@@ -4603,10 +4626,12 @@ app.get('/api/tomer/overview', async (req, res) => {
         recentActivity:    recentAudit.filter(e => e.event === 'tomer_responded').length,
         failedActions:     recentAudit.filter(e => e.sendState === 'failed').length,
         unclassified:      unclassified.length,
+        agingConversations: agingConversations.length,
       },
       arboxHealth: arboxOk,
       openTasks:   openTasks.slice(0, 10),
       recentAudit: recentAudit.slice(0, 10),
+      agingConversations: agingConversations.slice(0, 10),
       ts: new Date(),
     });
   } catch (err) {
@@ -4643,6 +4668,34 @@ app.post('/api/tomer/retention/run/:workflowId', async (req, res) => {
   try {
     const result = await retentionWorker.runWorkflow(req.params.workflowId);
     res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// GET /api/tomer/retention/history — last-run summary per workflow
+app.get('/api/tomer/retention/history', (req, res) => {
+  try {
+    const logPath = require('path').join(
+      (process.env.DATA_DIR ?? require('path').join(__dirname, 'data')).replace(/[/\\]$/, ''),
+      'retention_log.json'
+    );
+    const log = require('fs').existsSync(logPath)
+      ? JSON.parse(require('fs').readFileSync(logPath, 'utf8'))
+      : {};
+
+    // Summarize: last run per workflow + count of executions
+    const summary = {};
+    for (const [key, entry] of Object.entries(log)) {
+      if (key.startsWith('activation:')) continue;
+      const workflow = key.split(':')[0];
+      if (!summary[workflow]) summary[workflow] = { count: 0, lastRun: null };
+      summary[workflow].count++;
+      if (!summary[workflow].lastRun || entry.ts > summary[workflow].lastRun) {
+        summary[workflow].lastRun = entry.ts;
+      }
+    }
+    res.json({ ok: true, summary });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
