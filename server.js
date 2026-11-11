@@ -4930,36 +4930,48 @@ app.get('/api/tomer/today', async (req, res) => {
     const audit24h  = tomerStore.getAudit({ limit: 100 });
     const failedSends = audit24h.filter(e => e.sendState === 'failed');
 
-    // Aging conversations: inbox threads where member sent something with no bot reply, 2–24h ago
+    // Aging conversations — threads where the last inbound message has no reply, 2–24h ago.
+    //
+    // Source: inbox._threads (loaded from persist on startup), NOT inbox._msgs (the flat
+    // ring buffer that is empty after a restart). Using _threads means this view is
+    // consistent with /api/tomer/conversations and survives deploys without synthesizing
+    // duplicate message objects.
+    //
+    // "Unanswered" definition (same as /api/tomer/conversations):
+    //   find the last direction='in' message in the thread; skip if any direction='out'
+    //   message follows it. No separate barakReply check needed — outbound direction is
+    //   the authoritative answered/unanswered signal in the thread model.
     const AGE_MIN = 2 * 3600000, AGE_MAX = 24 * 3600000;
-    const allInbox = inbox.getAll?.() ?? [];
-    const phoneLastEntry = new Map();
-    for (const e of allInbox) {
-      const existing = phoneLastEntry.get(e.from);
-      const ts = new Date(e.receivedAt ?? e.timestamp).getTime();
-      if (!existing || ts > new Date(existing.receivedAt ?? existing.timestamp).getTime()) {
-        phoneLastEntry.set(e.from, e);
-      }
-    }
     const awaitingReply = [];
-    for (const [phone, last] of phoneLastEntry) {
-      const age = now - new Date(last.receivedAt ?? last.timestamp).getTime();
+    const _agingThreads = inbox.getThreads ? inbox.getThreads({ limit: 200 }) : [];
+    for (const t of _agingThreads) {
+      const msgs = t.messages ?? [];
+      let lastInMsg = null, lastInIdx = -1;
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i].direction === 'in') { lastInMsg = msgs[i]; lastInIdx = i; break; }
+      }
+      if (!lastInMsg) continue;
+      if (msgs.slice(lastInIdx + 1).some(m => m.direction === 'out')) continue;
+
+      const ts  = new Date(lastInMsg.timestamp).getTime();
+      const age = now - ts;
       if (age < AGE_MIN || age > AGE_MAX) continue;
-      const route = last.route ?? '';
+
+      const route = lastInMsg.route ?? '';
       if (['opted_out_silent','post_call_silent','acknowledged','spam_filtered','staff_bypass'].includes(route)) continue;
-      if (last.barakReply) continue;
-      const lead = store.getLead(phone) ?? {};
+
+      const lead = store.getLead(t.phone) ?? {};
       awaitingReply.push({
-        phone:      maskPhone(phone),
-        name:       last.name ?? null,
-        lastText:   (last.text ?? '').slice(0, 80),
+        phone:      maskPhone(t.phone),
+        name:       t.name ?? null,
+        lastText:   (lastInMsg.text ?? '').slice(0, 80),
         route,
         ageMin:     Math.round(age / 60000),
         owner:      lead.status === 'human_owns'        ? 'human'
                   : lead.status === 'attribution_review' ? 'attribution_review'
                   :                                        'bot',
         leadStatus: lead.status ?? null,
-        receivedAt: last.receivedAt ?? last.timestamp,
+        receivedAt: lastInMsg.timestamp,
       });
     }
 

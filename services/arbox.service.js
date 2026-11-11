@@ -65,7 +65,7 @@ async function getLeads({ limit = 100, status } = {}) {
 async function getLeadByPhone(phone) {
   try {
     const all = await getLeads({ limit: 200 });
-    const norm = (phone ?? '').replace(/\s|\+/g, '');
+    const norm = (phone ?? '').replace(/[^\d+]/g, '');
     return all.find(l => (l.phone ?? '').replace(/\s|\+/g, '') === norm) ?? null;
   } catch {
     return null;
@@ -109,7 +109,7 @@ async function getMembers({ limit = 100, activeOnly = true } = {}) {
 async function getMemberByPhone(phone) {
   try {
     const all = await getMembers({ limit: 200 });
-    const norm = (phone ?? '').replace(/\s|\+/g, '');
+    const norm = (phone ?? '').replace(/[^\d+]/g, '');
     return all.find(m => (m.phone ?? '').replace(/\s|\+/g, '') === norm) ?? null;
   } catch {
     return null;
@@ -189,7 +189,7 @@ async function classifyMemberships({ daysWarning = 30, recentDays = 90, limit = 
     _status:   status,
     _daysLeft: daysLeft,
     _name:     `${u.first_name ?? ''} ${u.last_name ?? ''}`.trim(),
-    _phone:    u.phone ?? null,
+    _phone:    u.phone ? u.phone.replace(/[^\d+]/g, '') || null : null,
   });
 
   const activeClients    = [];
