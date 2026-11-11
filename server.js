@@ -2142,8 +2142,16 @@ const INTENT_PATTERNS = {
   schedule_query:   /מערכת שעות|לוח שיעורים|מה יש|מתי יש|יש שיעור|יש מקום|מה קורה|סדר יום|מה הלוח|הלוח שלכם|הלוח שלך|שעות.*הסטודיו|שעות.*שלכם|שעות פעילות|שעות פתיחה|מתי פתוח|מתי פתוחים|לראות.*שעות|רוצה.*לוח|איזה שיעורים|מה התוכנית|מה הוא שיעור|מי מדריך|מי המדריך|מי מלמד|מי מנהל|מי נותן|באיזה שעה|בכמה|מה השעה|שיעור.{0,15}ב(יום|ערב|בוקר|צהריים)|ב(יום\s)?(ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת)|יש לכם.*תמונה|שלח.*תמונה.*לוח|תמונה.*לוח|לוח.*תמונה|יש תמונה|שלח.*מערכת|רוצה.*מערכת|לראות.*מערכת|לוח.*שבוע|שבוע.*לוח|אפשר.*לראות.*לוח|שלח[יה]?\s+לי\s+(?:את\s+ה?)?תמונה|תשלח[יה]?\s+לי\s+(?:את\s+ה?)?תמונה|אפשר\s+תמונה|לשלוח\s+לי\s+תמונה|שלוח\s+לי\s+תמונה/,
 };
 
+// Explicit negation of a call/contact — must be checked BEFORE representative.
+// "לא רוצה שיתקשרו" contains שיתקשרו which representative matches, but the
+// intent is the opposite: the lead is declining a call, not requesting one.
+const CALL_DECLINED_RE =
+  /(?:(?:לא|אין)\s+רוצ[הה]|אל\s+ת)\s*ש(?:יתקשרו|יחזרו|יצרו\s+קשר)|רק\s+(?:וואטסאפ|מסרונים?|הודעות?)(?:\s|[,!.?]|$)/i;
+
 function detectSchedulingIntent(text) {
   if (!text) return 'general';
+  // call_declined: explicit negation of a callback — route to AI, not representative path
+  if (CALL_DECLINED_RE.test(text))                   return 'general';
   if (INTENT_PATTERNS.representative.test(text))     return 'representative';
   if (INTENT_PATTERNS.reschedule.test(text))         return 'reschedule';
   if (INTENT_PATTERNS.fixed_booking.test(text))      return 'fixed_booking';
@@ -2224,7 +2232,12 @@ function extractClassFilter(text) {
   return null;
 }
 
-async function buildSchedulingReply(intent, msg, clientMatch) {
+/**
+ * @param {boolean} [opts.noMatchPassthrough] - When true, specialist_query with no
+ *   staff match returns null (lets Barak AI handle it) rather than a dead-end "no info"
+ *   string. Use for new-lead callers that have an AI fallthrough path.
+ */
+async function buildSchedulingReply(intent, msg, clientMatch, { noMatchPassthrough = false } = {}) {
   const msgText = msg.text ?? '';
 
   // ── Reschedule / appointment-change request ───────────────────────────────────
@@ -2246,7 +2259,7 @@ async function buildSchedulingReply(intent, msg, clientMatch) {
 
   // ── Specialist instructor query ──────────────────────────────────────────────
   if (intent === 'specialist_query') {
-    const { matched, all } = barakAgent.findInstructorsBySpecialty(msgText);
+    const { matched } = barakAgent.findInstructorsBySpecialty(msgText);
     if (matched.length) {
       const lines = matched.map(s => {
         const specs = s.specialties?.length ? s.specialties.join(' | ') : '';
@@ -2259,7 +2272,11 @@ async function buildSchedulingReply(intent, msg, clientMatch) {
       }).join('\n');
       return `יש לנו מדריכ/ה מתאים/ה:\n\n${lines}\n\nרוצה לתאם שיעור?`;
     }
-    // No match in directory → transparent answer
+    // No match in directory.
+    // For new leads (noMatchPassthrough=true): return null so Barak AI handles
+    // the conversation naturally with an empathetic, non-dead-end response.
+    // For existing clients: give a direct honest answer.
+    if (noMatchPassthrough) return null;
     return `נכון לעכשיו אין לנו מידע מלא על מדריכים בהתמחות זו. אפשר לפנות לסטודיו ישירות כדי לקבל תשובה מדויקת.`;
   }
 
@@ -2459,10 +2476,13 @@ function _markReplied(phone) {
 //   4. Full message-ID deduplication: each msgId in a burst is tracked; if Green
 //      API retries any individual message it is discarded, not re-processed.
 //
-// Stale reply suppression: processInboundWAMessage checks _pendingMessages before
-// sending the outer-pipeline reply. If a newer message arrived during AI generation,
-// the outer reply is suppressed so only the more-informed follow-up reply is sent.
-// (AI-internal sends via leadAgent cannot be suppressed without a larger refactor.)
+// Stale reply suppression operates at two levels:
+//   1. AI-internal (lead_agent.js): handleInbound checks _pendingMessages before
+//      calling sendText. If a newer message arrived during OpenAI generation, the
+//      draft is discarded (sendState='skipped_stale') and sendText is never called.
+//   2. Outer pipeline (processInboundWAMessage): checks _pendingMessages before
+//      the outer auto-reply send. Also catches status changes (opted_out, human_owns).
+// Together these ensure an outdated draft cannot be sent after a newer message arrives.
 //
 // Simulate endpoint calls processInboundWAMessage directly — no debounce.
 
@@ -3203,7 +3223,7 @@ async function processInboundWAMessage(msg) {
 
   if (ackDetected && !awaitingLocation) logger.info('Brief ack — skipping AI reply', { from: fromNorm, text: msg.text?.slice(0, 20) });
   if (awaitingLocation && ackDetected)  logger.info('Brief ack allowed — awaiting location confirmation', { from: fromNorm });
-  if (inCooldown)   logger.warn('Reply cooldown — skipping AI reply', { from: fromNorm });
+  if (inCooldown)   logger.info('Reply cooldown active — genuine follow-ups still proceed', { from: fromNorm });
 
   if (skipAiReply) {
     // Message stored in inbox (step 4); neither agent is invoked.
@@ -3285,7 +3305,26 @@ async function processInboundWAMessage(msg) {
           barakReply = `הלוח שלנו משתנה לעיתים — הכי קל להגיד לי איזה יום ושעה בדרך כלל עובדים לך, ואמצא לך מה מתאים 😊`;
         }
       } else {
-        try { barakReply = await buildSchedulingReply(intent, msg, clientMatch); } catch { /* non-fatal */ }
+        // noMatchPassthrough=true: specialist_query with no staff match returns null
+        // so Barak AI handles it conversationally instead of returning a dead-end "no info".
+        try { barakReply = await buildSchedulingReply(intent, msg, clientMatch, { noMatchPassthrough: true }); } catch { /* non-fatal */ }
+        // Fallthrough: if buildSchedulingReply returned null (e.g. specialist_query with no
+        // staff directory, or any scheduling intent without an Arbox answer), route to AI so
+        // the lead still receives a contextual reply rather than silence.
+        if (!barakReply && !timetableImgUrl) {
+          try {
+            const leadResult = await leadAgent.handleInbound({
+              from: fromNorm, name: msg.name, text: msg.text ?? '', _pendingMessages,
+            });
+            _markReplied(fromNorm);
+            if (leadResult?.reply) {
+              barakReply        = leadResult.reply;
+              _replyAlreadySent = leadResult.sendState === 'sent' || leadResult.sendState === 'skipped_stale';
+            }
+          } catch (fallErr) {
+            logger.error('[pipeline] scheduling fallthrough to AI failed', { error: fallErr.message, from: fromNorm });
+          }
+        }
       }
       if (intent === 'representative') {
         const clientName = msg.name ?? fromIsraeli ?? fromNorm;
@@ -3297,17 +3336,22 @@ async function processInboundWAMessage(msg) {
       // General / sales qualification → lead_agent (Barak's AI persona)
       try {
         const leadResult = await leadAgent.handleInbound({
-          from: fromNorm,
-          name: msg.name,
-          text: msg.text ?? '',
+          from:             fromNorm,
+          name:             msg.name,
+          text:             msg.text ?? '',
+          _pendingMessages, // stale-send gate: handleInbound checks before sendText
         });
         _markReplied(fromNorm);
-        // Surface the AI-generated reply in barakReply so the simulate endpoint,
-        // inbox, and late-reply suppression can all see it.
-        // _replyAlreadySent prevents the outer pipeline from double-sending.
         if (leadResult?.reply) {
-          barakReply        = leadResult.reply;
-          _replyAlreadySent = true;
+          barakReply = leadResult.reply;
+          // _replyAlreadySent: only true when handleInbound actually sent or the send
+          // was consciously skipped (stale). Failed sends leave it false so logs show
+          // "generated but not sent" rather than "already sent".
+          _replyAlreadySent = leadResult.sendState === 'sent' ||
+                              leadResult.sendState === 'skipped_stale';
+          if (leadResult.sendState && leadResult.sendState !== 'sent') {
+            logger.info('[pipeline] AI send state', { from: fromNorm, sendState: leadResult.sendState });
+          }
         }
 
         // If the AI promised to send the schedule image, actually send it.

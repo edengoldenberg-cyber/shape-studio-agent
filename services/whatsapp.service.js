@@ -85,7 +85,10 @@ function buildSendUrl(method = 'sendMessage') {
   if (/greenapi\.com/i.test(host) && !/green-api\.com/i.test(host)) {
     logger.warn('[Green API] Host looks incorrect — domain should be green-api.com (with hyphen), got: ' + host);
   }
-  return `https://${host}/waInstance${instanceId}/${method}/${token}`;
+  // Use plain HTTP for localhost/127.x — the test mock server runs on HTTP.
+  // All production Green API servers use HTTPS.
+  const protocol = /^(localhost|127\.|0\.0\.0\.0)/.test(host) ? 'http' : 'https';
+  return `${protocol}://${host}/waInstance${instanceId}/${method}/${token}`;
 }
 
 // Keep the old name so existing callers inside this file still work.
@@ -214,9 +217,36 @@ async function releaseQueuedMessages() {
 // Phones in the range 972000000001–972000000009 are reserved for the local
 // simulator (/demo).  Messages to these numbers are silently swallowed so the
 // real Green API is never called during sandbox testing.
-const DEMO_PHONE_RE = /^97200000000[1-9]$/;
+// Matches any 12–14-digit number starting with 9720000000 (8 zeros after 972).
+// Covers single-digit suffixes (97200000001–9) and double-digit test phones (972000000011–99).
+const DEMO_PHONE_RE = /^9720{7}[0-9]{2,4}$/;
 function isDemoPhone(phone) {
   return DEMO_PHONE_RE.test(String(phone).replace(/[^\d]/g, ''));
+}
+
+// ── TEST_MODE default-deny ────────────────────────────────────────────────────
+// When TEST_MODE=true the ONLY numbers allowed through to the real Green API
+// are:
+//   • demo phones (97200000000[1-9]) — already intercepted above
+//   • phones listed in TEST_ALLOWLIST_PHONES (comma-separated env var)
+//
+// All other send attempts are blocked and logged.  This prevents synthetic test
+// phone numbers from receiving real WhatsApp messages when a developer runs
+// barak_conversation / barak_burst tests against a locally-running server that
+// happens to have live Green API credentials configured.
+//
+// Set TEST_ALLOWLIST_PHONES=972XXXXXXXXX in .env for approved manual test recipients.
+function _getTestAllowlist() {
+  const raw = process.env.TEST_ALLOWLIST_PHONES ?? '';
+  return new Set(raw.split(',').map(p => p.trim().replace(/^\+/, '')).filter(Boolean));
+}
+
+function _isTestModeBlocked(phone) {
+  if (process.env.TEST_MODE !== 'true') return false; // production — no block
+  const norm = String(phone).replace(/[^\d]/g, '');
+  if (isDemoPhone(norm)) return false;                 // demo phones always allowed
+  if (_getTestAllowlist().has(norm)) return false;     // explicitly allowlisted
+  return true;                                         // everything else: blocked
 }
 
 // ── Test send log ─────────────────────────────────────────────────────────────
@@ -246,6 +276,17 @@ async function _dispatch(to, text) {
     });
     logger.info('[Green API] DEMO — message intercepted (not sent)', { to: isDemoPhone(to) ? to : '***', preview: text.slice(0, 60) });
     return { idMessage: `demo-${Date.now()}`, demo: true };
+  }
+
+  // TEST_MODE default-deny: block real sends to any phone not in the allowlist.
+  // This prevents synthetic test phones from receiving real WhatsApp messages.
+  if (_isTestModeBlocked(to)) {
+    _recordTestSend(to, 'test_blocked');
+    logger.warn('[TEST_MODE] ⛔ Blocked real send — phone not in allowlist', {
+      tail: String(to).slice(-4),
+      hint: 'Add phone to TEST_ALLOWLIST_PHONES env var to allow intentional test sends',
+    });
+    return { idMessage: `blocked-${Date.now()}`, blocked: true, testMode: true };
   }
 
   _recordTestSend(to, 'real_send');
@@ -318,6 +359,7 @@ async function _dispatch(to, text) {
  */
 async function sendFileByUrl(to, fileUrl, fileName, caption = '') {
   if (isDemoPhone(to) || demoCapture.isActive()) {
+    _recordTestSend(to, isDemoPhone(to) ? 'demo_file' : 'demo_capture_file');
     demoCapture.record('file_sent', {
       to:       isDemoPhone(to) ? to : '[owner/staff]',
       fileName,
@@ -327,6 +369,16 @@ async function sendFileByUrl(to, fileUrl, fileName, caption = '') {
     logger.info('[Green API] DEMO — file send intercepted', { to: isDemoPhone(to) ? to : '***', fileName });
     return { idMessage: `demo-file-${Date.now()}`, demo: true };
   }
+
+  if (_isTestModeBlocked(to)) {
+    _recordTestSend(to, 'test_blocked_file');
+    logger.warn('[TEST_MODE] ⛔ Blocked real file send — phone not in allowlist', {
+      tail: String(to).slice(-4), fileName,
+    });
+    return { idMessage: `blocked-file-${Date.now()}`, blocked: true, testMode: true };
+  }
+
+  _recordTestSend(to, 'real_file_send');
   const url = buildSendUrl('sendFileByUrl'); // uses same dual-name credential resolution
   try {
     const { data } = await axios.post(url, {

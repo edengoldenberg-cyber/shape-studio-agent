@@ -370,3 +370,164 @@ describe('Cross-turn state accumulation', () => {
     expect(lead?.meta?.qualProfile?.nextBestAction).toBeTruthy();
   });
 });
+
+// ── 11. Weight-loss goal ──────────────────────────────────────────────────────
+describe('11 — Weight-loss goal', () => {
+  test('goal captured from natural-language weight-loss phrase', async () => {
+    mockCreate.mockResolvedValueOnce(aiResponse('בהחלט! ירידה במשקל עם כיף — מה מביא אותך עכשיו?'));
+    await handleInbound({ from: '972501110015', name: 'נעמה', text: 'אני רוצה לרדת במשקל ולהרגיש טוב' });
+
+    const qd = store.getLead('972501110015')?.meta?.qualData ?? {};
+    expect(qd.goal).toBeTruthy();
+    expect(sentMessages).toHaveLength(1);
+    // Should not list all studio classes unprompted
+    expect(sentMessages[0].text).not.toMatch(/רפורמר.*strength.*barre.*kangoo/i);
+  });
+});
+
+// ── 12. Refuses phone call ────────────────────────────────────────────────────
+describe('12 — Refuses call, stays in info mode', () => {
+  test('explicit call refusal → bot does not re-push call in same reply', async () => {
+    // Turn 1: build context
+    mockCreate.mockResolvedValueOnce(aiResponse('חיזוק הגב — בדיוק מה הרפורמר עושה. מה שמך?'));
+    await handleInbound({ from: '972501110016', name: 'רון', text: 'פילאטיס מחדרה, כאב גב' });
+
+    // Turn 2: lead gives name
+    mockCreate.mockResolvedValueOnce(aiResponse('שמחתי, רון! הצעד הבא הוא שיחה קצרה עם הצוות — מתי נוח לך?'));
+    await handleInbound({ from: '972501110016', name: 'רון', text: 'רון' });
+
+    // Turn 3: explicitly declines the call
+    mockCreate.mockResolvedValueOnce(aiResponse('מבין לגמרי — אפשר גם להתחיל עם הצעת ניסיון שלנו: 2 אימונים ב-60 ש״ח, בלי התחייבות. תרצה שאשלח פרטים?'));
+    await handleInbound({ from: '972501110016', name: 'רון', text: 'לא רוצה שיתקשרו אלי' });
+
+    const reply = sentMessages[sentMessages.length - 1]?.text ?? '';
+    // Should NOT re-push "שיחה קצרה" after explicit decline
+    expect(reply).not.toMatch(/שיחה קצרה.*מתי נוח/i);
+    // May offer the trial instead
+    expect(sentMessages.length).toBeGreaterThanOrEqual(3);
+  });
+});
+
+// ── 13. Name extraction edge cases ───────────────────────────────────────────
+describe('13 — Name extraction safety', () => {
+  test('price question after name-ask is not extracted as name', async () => {
+    const phone = '972501110017';
+
+    // Seed the lead with a resolved location (location check already done) so the
+    // nameAsked flag can be set when the AI actually asks for the name on Turn 2.
+    store.upsertLead(phone, {
+      status: 'warm',
+      meta: {
+        qualData: {
+          location:            'חדרה',
+          fitnessInterest:     'פילאטיס',
+          locationViable:      true,
+          locationCheckNeeded: false,
+        },
+      },
+      history: [
+        { role: 'user',      content: 'פילאטיס מחדרה' },
+        { role: 'assistant', content: 'הרפורמר שלנו הוא 8 אנשים — מה מביא אותך אליו?' },
+      ],
+    });
+
+    // Turn 1 of this test (Turn 2 of the conversation): AI asks for name
+    mockCreate.mockResolvedValueOnce(aiResponse('ולפני שנמשיך — איך קוראים לך? 😊'));
+    await handleInbound({ from: phone, name: null, text: 'לחיזוק ויציבה' });
+
+    const qd1 = store.getLead(phone)?.meta?.qualData ?? {};
+    expect(qd1.nameAsked).toBe(true); // AI asked for name → flag should be set
+
+    // Turn 2: lead asks about price instead of giving name
+    mockCreate.mockResolvedValueOnce(aiResponse('המחיר תלוי בתדירות. כמה פעמים בשבוע?'));
+    await handleInbound({ from: phone, name: null, text: 'כמה עולה מנוי?' });
+
+    // confirmedName must NOT be "כמה עולה" or similar
+    const qd2 = store.getLead(phone)?.meta?.qualData ?? {};
+    expect(qd2.confirmedName).toBeFalsy();
+
+    // Turn 3: gives real name
+    mockCreate.mockResolvedValueOnce(aiResponse('תודה, שירה! מתי נוח לך?'));
+    await handleInbound({ from: phone, name: null, text: 'שירה' });
+
+    const qd3 = store.getLead(phone)?.meta?.qualData ?? {};
+    expect(qd3.confirmedName).toBe('שירה');
+    expect(store.getLead(phone)?.name).toBe('שירה');
+  });
+
+  test('time preference after name-ask is not extracted as name', async () => {
+    // Turn 1: fast-track asks for name
+    mockCreate.mockResolvedValueOnce(aiResponse('ולפני שנמשיך — איך קוראים לך? 😊'));
+    await handleInbound({ from: '972501110018', name: null, text: 'פילאטיס מחדרה' });
+
+    // Turn 2: gives time instead of name
+    mockCreate.mockResolvedValueOnce(aiResponse('בוקר זה מצוין! ואיך קוראים לך?'));
+    await handleInbound({ from: '972501110018', name: null, text: 'בוקר נוח לי' });
+
+    // "בוקר נוח" is in the reject-words list — confirmedName must NOT be set
+    const qd = store.getLead('972501110018')?.meta?.qualData ?? {};
+    expect(qd.confirmedName).toBeFalsy();
+  });
+});
+
+// ── 14. Returning lead with existing history ─────────────────────────────────
+describe('14 — Returning lead', () => {
+  test('existing history preserved and goal not re-asked on return visit', async () => {
+    const phone = '972501110019';
+
+    // Seed a lead with prior conversation history (simulates a returning lead)
+    store.upsertLead(phone, {
+      name: 'ורד',
+      status: 'warm',
+      score: 6,
+      history: [
+        { role: 'user',      content: 'שלום, אני מחדרה, מחפשת פילאטיס' },
+        { role: 'assistant', content: 'הרפורמר שלנו הוא 8 אנשים — מה מביא אותך אליו?' },
+      ],
+      meta: {
+        qualData: {
+          location:        'חדרה',
+          fitnessInterest: 'פילאטיס',
+          locationViable:  true,
+        },
+      },
+    });
+
+    // Returning message
+    mockCreate.mockResolvedValueOnce(aiResponse('ורד, זוכר שדיברנו על פילאטיס — עדיין מתעניינת?'));
+    await handleInbound({ from: phone, name: 'ורד', text: 'שלום שוב' });
+
+    // History should now have 4 entries (2 original + user msg + assistant reply)
+    const history = store.getLead(phone)?.history ?? [];
+    expect(history.length).toBe(4);
+
+    // Reply must NOT re-ask for location or interest (already known)
+    const reply = sentMessages[0]?.text ?? '';
+    expect(reply).not.toMatch(/מאיזה אזור|מה מחפשת/i);
+  });
+});
+
+// ── 15. Short / ambiguous answers ────────────────────────────────────────────
+describe('15 — Short or ambiguous messages', () => {
+  test('single-word "כן" does not cause a re-qualification loop', async () => {
+    const phone = '972501110020';
+
+    // Establish some context first
+    store.upsertLead(phone, {
+      status: 'warm',
+      meta: { qualData: { location: 'חדרה', locationViable: true, locationCheckNeeded: false } },
+      history: [
+        { role: 'user',      content: 'אני מחדרה' },
+        { role: 'assistant', content: 'נחמד! מה מחפשת?' },
+      ],
+    });
+
+    // "כן" should proceed, not loop back to location
+    mockCreate.mockResolvedValueOnce(aiResponse('מה הכיוון — חיזוק, גמישות, שיקום?'));
+    await handleInbound({ from: phone, name: null, text: 'כן' });
+
+    const reply = sentMessages[0]?.text ?? '';
+    expect(reply).not.toMatch(/מאיזה אזור|מה מחפשת\?/i);
+    expect(sentMessages).toHaveLength(1);
+  });
+});

@@ -159,6 +159,32 @@ ok('post_call_silent route present (brief ack → silent)', posPostCallGate > 0)
 ok('post_call_staff_hold route present (new question → staff)', serverSrc.includes('post_call_staff_hold'));
 ok('post_call_schedule route present (schedule query → image)', serverSrc.includes('post_call_schedule'));
 
+// ── 8. TEST_MODE default-deny in whatsapp.service ────────────────────────────
+console.log('\n[8] TEST_MODE default-deny gate in whatsapp.service');
+const waSrc = fs.readFileSync('services/whatsapp.service.js', 'utf8');
+ok('_isTestModeBlocked helper present', waSrc.includes('_isTestModeBlocked'));
+ok('TEST_ALLOWLIST_PHONES env var checked', waSrc.includes('TEST_ALLOWLIST_PHONES'));
+ok('blocked send logged as [TEST_MODE]', waSrc.includes('[TEST_MODE]'));
+ok('sendFileByUrl has test-block guard', (() => {
+  const sfbPos = waSrc.indexOf('async function sendFileByUrl');
+  const blockPos = waSrc.indexOf('_isTestModeBlocked', sfbPos);
+  return sfbPos > 0 && blockPos > sfbPos;
+})());
+
+// Verify _isTestModeBlocked logic is correct (source-level)
+const blockFnStart = waSrc.indexOf('function _isTestModeBlocked');
+const blockFnEnd   = waSrc.indexOf('\n}', blockFnStart) + 2;
+const blockFnSrc   = waSrc.slice(blockFnStart, blockFnEnd);
+ok('_isTestModeBlocked returns false for demo phones', blockFnSrc.includes('isDemoPhone'));
+ok('_isTestModeBlocked returns false in production (no TEST_MODE)', blockFnSrc.includes("TEST_MODE !== 'true'"));
+ok('_isTestModeBlocked checks allowlist', blockFnSrc.includes('_getTestAllowlist'));
+
+// ── 9. sendFileByUrl records test sends ──────────────────────────────────────
+console.log('\n[9] sendFileByUrl records to test send log');
+ok('sendFileByUrl calls _recordTestSend for demo', waSrc.includes('_recordTestSend(to, isDemoPhone'));
+ok('sendFileByUrl calls _recordTestSend for real', waSrc.includes("'real_file_send'"));
+ok('sendFileByUrl calls _recordTestSend for blocked', waSrc.includes("'test_blocked_file'"));
+
 // ── Summary ──────────────────────────────────────────────────────────────────
 console.log('\n─────────────────────────────────────');
 console.log('Send-suppression tests: PASS=' + pass + '  FAIL=' + fail);
