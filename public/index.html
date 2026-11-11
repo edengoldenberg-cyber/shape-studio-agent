@@ -417,56 +417,67 @@
         <!-- ── Workspace nav bar ─────────────────────────────── -->
         <div class="tw-topbar" dir="rtl">
           <div class="tw-tabs">
-            <button class="tw-tab active" data-pane="overview">סקירה</button>
+            <button class="tw-tab active" data-pane="today">היום <span class="tw-badge" id="tw-badge-today"></span></button>
+            <button class="tw-tab" data-pane="upcoming">הודעות קרובות</button>
             <button class="tw-tab" data-pane="members">חברים</button>
             <button class="tw-tab" data-pane="tasks">תורים לעדן <span class="tw-badge" id="tw-badge-tasks"></span></button>
             <button class="tw-tab" data-pane="automation">אוטומציה</button>
-            <button class="tw-tab" data-pane="audit">ביקורת</button>
+            <button class="tw-tab" data-pane="audit">היסטוריה</button>
           </div>
           <div class="tw-actions">
             <button class="btn btn-secondary" id="tw-refresh" title="רענן">🔄</button>
-            <button class="btn btn-primary" id="btn-tomer-checks">▶ הרץ בדיקות</button>
-            <div id="tomer-checks-result" class="tool-result" style="display:none"></div>
+            <div id="tw-last-refresh" class="tw-last-refresh"></div>
           </div>
         </div>
 
-        <!-- ── Overview pane ─────────────────────────────────── -->
-        <div class="tw-pane active" id="twp-overview" dir="rtl">
-          <div class="tw-kpi-row" id="tw-kpis">
+        <!-- ── Today's Work pane ─────────────────────────────── -->
+        <div class="tw-pane active" id="twp-today" dir="rtl">
+
+          <!-- KPI bar -->
+          <div class="tw-kpi-row">
+            <div class="tw-kpi urgent"><span class="tw-kpi-val" id="twk-high">—</span><span class="tw-kpi-lbl">דורש עדן</span></div>
+            <div class="tw-kpi urgent"><span class="tw-kpi-val" id="twk-await">—</span><span class="tw-kpi-lbl">ממתינים למענה</span></div>
             <div class="tw-kpi"><span class="tw-kpi-val" id="twk-open">—</span><span class="tw-kpi-lbl">משימות פתוחות</span></div>
-            <div class="tw-kpi urgent"><span class="tw-kpi-val" id="twk-high">—</span><span class="tw-kpi-lbl">עדיפות גבוהה</span></div>
-            <div class="tw-kpi urgent"><span class="tw-kpi-val" id="twk-aging">—</span><span class="tw-kpi-lbl">שיחות ממתינות</span></div>
-            <div class="tw-kpi"><span class="tw-kpi-val" id="twk-unclass">—</span><span class="tw-kpi-lbl">לא מזוהים</span></div>
-            <div class="tw-kpi"><span class="tw-kpi-val" id="twk-failed">—</span><span class="tw-kpi-lbl">פעולות נכשלו</span></div>
+            <div class="tw-kpi"><span class="tw-kpi-val" id="twk-failed">—</span><span class="tw-kpi-lbl">שגיאות שליחה</span></div>
             <div class="tw-kpi"><span class="tw-kpi-val" id="twk-arbox">—</span><span class="tw-kpi-lbl">Arbox</span></div>
           </div>
 
-          <div class="tw-two-col">
-            <div class="tw-card">
-              <div class="tw-card-title">🔴 מחכים לעדן</div>
-              <div id="tw-open-tasks-list" class="tw-list"></div>
-              <div class="tw-empty" id="tw-tasks-empty" style="display:none">אין משימות פתוחות</div>
-            </div>
-            <div class="tw-card">
-              <div class="tw-card-title">📋 פעילות אחרונה</div>
-              <div id="tw-recent-audit" class="tw-list"></div>
+          <!-- Action items (unified prioritized list) -->
+          <div class="tw-card" style="margin-top:14px">
+            <div class="tw-card-title">⚡ פעולות נדרשות — ממוינות לפי דחיפות</div>
+            <div id="tw-action-list" class="tw-action-list">
+              <div class="tw-empty">טוען...</div>
             </div>
           </div>
 
-          <div class="tw-two-col" style="margin-top:12px">
-            <div class="tw-card">
-              <div class="tw-card-title">⏳ שיחות ממתינות מענה (2+ שעות)</div>
-              <div id="tw-aging-list" class="tw-list"><div class="tw-empty">טוען...</div></div>
-            </div>
-            <div class="tw-card">
-              <div class="tw-card-title">❓ לא מזוהים — ממתינים לניתוב
-                <span class="tw-badge-sm" id="tw-unclass-count"></span>
-              </div>
-              <div id="tw-unclassified-list" class="tw-list"></div>
-              <div class="tw-empty" id="tw-unclass-empty">אין מספרים לא מזוהים</div>
+          <!-- Upcoming automated sends today -->
+          <div class="tw-card" style="margin-top:12px">
+            <div class="tw-card-title" id="tw-upcoming-title">📅 הודעות אוטומטיות — ריצה הבאה: <span id="tw-next-run">—</span></div>
+            <div id="tw-upcoming-mini" class="tw-list">
+              <div class="tw-empty">טוען...</div>
             </div>
           </div>
+
+          <!-- Unclassified contacts -->
+          <div class="tw-card" style="margin-top:12px">
+            <div class="tw-card-title">❓ לא מזוהים — ממתינים לניתוב
+              <span class="tw-badge-sm" id="tw-unclass-count"></span>
+            </div>
+            <div id="tw-unclassified-list" class="tw-list"></div>
+            <div class="tw-empty" id="tw-unclass-empty">אין מספרים לא מזוהים</div>
+          </div>
         </div>
+
+        <!-- ── Upcoming Messages pane ─────────────────────────── -->
+        <div class="tw-pane" id="twp-upcoming" dir="rtl">
+          <p class="tw-desc">הודעות אוטומטיות שתומר ישלח בריצה הבאה. תצוגה מקדימה בלבד — לא נשלח כלום עד הרצה.</p>
+          <div id="tw-upcoming-workflows" class="tw-upcoming-list">
+            <div class="tw-empty">טוען...</div>
+          </div>
+        </div>
+
+        <!-- (legacy overview pane kept for backward compat — hidden) -->
+        <div class="tw-pane" id="twp-overview" dir="rtl" style="display:none"></div>
 
         <!-- ── Members pane ───────────────────────────────────── -->
         <div class="tw-pane" id="twp-members" dir="rtl">

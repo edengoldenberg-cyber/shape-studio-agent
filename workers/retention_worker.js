@@ -375,7 +375,16 @@ async function previewWorkflow(workflowId, limit = 20) {
     if (eligible.length >= limit) break;
   }
 
-  return { workflow: workflowId, enabled: cfg.enabled, eligible };
+  // Build a sample message so the panel can preview what will actually be sent.
+  const sampleName = eligible[0]?.name?.split(/\s/)[0] ?? 'שם';
+  const sampleMsg = {
+    birthday:    `${sampleName}, יום הולדת שמח! 🎂 שמחים שאת/ה איתנו ב-Shape Studio — תהיי/יהיה שנה מלאת בריאות ואנרגיה 💪`,
+    onboarding1: `${sampleName}, שלום! 👋 שבוע אחד ב-Shape Studio — איך הולך? יש שאלות על השיעורים?`,
+    onboarding2: `${sampleName}, שבועיים עברו 🙂 מקווים שאת/ה מרגיש/ה כבר כמו בבית. נשמח לפידבק קצר.`,
+    attendance:  `${sampleName}, לא ראינו אותך קצת זמן 😊 הכל בסדר? נשמח לראות אותך בסטודיו שוב.`,
+  }[workflowId] ?? null;
+
+  return { workflow: workflowId, enabled: cfg.enabled, eligible, messageTemplate: sampleMsg };
 }
 
 module.exports = {

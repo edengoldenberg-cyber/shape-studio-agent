@@ -4752,6 +4752,180 @@ app.get('/api/tomer/retention/history', (req, res) => {
   }
 });
 
+// GET /api/tomer/today — "Today's Work" action items for Eden's daily workspace
+// Returns prioritized list: Eden tasks, aging conversations, failed sends, upcoming sends.
+app.get('/api/tomer/today', async (req, res) => {
+  try {
+    const now       = Date.now();
+    const openTasks = tomerStore.getOpenTasks();
+    const audit24h  = tomerStore.getAudit({ limit: 100 });
+    const failedSends = audit24h.filter(e => e.sendState === 'failed');
+
+    // Aging conversations: inbox threads where member sent something with no bot reply, 2–24h ago
+    const AGE_MIN = 2 * 3600000, AGE_MAX = 24 * 3600000;
+    const allInbox = inbox.getAll?.() ?? [];
+    const phoneLastEntry = new Map();
+    for (const e of allInbox) {
+      const existing = phoneLastEntry.get(e.from);
+      const ts = new Date(e.receivedAt ?? e.timestamp).getTime();
+      if (!existing || ts > new Date(existing.receivedAt ?? existing.timestamp).getTime()) {
+        phoneLastEntry.set(e.from, e);
+      }
+    }
+    const awaitingReply = [];
+    for (const [phone, last] of phoneLastEntry) {
+      const age = now - new Date(last.receivedAt ?? last.timestamp).getTime();
+      if (age < AGE_MIN || age > AGE_MAX) continue;
+      const route = last.route ?? '';
+      if (['opted_out_silent','post_call_silent','acknowledged','spam_filtered','staff_bypass'].includes(route)) continue;
+      if (last.barakReply) continue;
+      const lead = store.getLead(phone) ?? {};
+      awaitingReply.push({
+        phone:      maskPhone(phone),
+        name:       last.name ?? null,
+        lastText:   (last.text ?? '').slice(0, 80),
+        route,
+        ageMin:     Math.round(age / 60000),
+        owner:      lead.status === 'human_owns' ? 'human' : 'bot',
+        leadStatus: lead.status ?? null,
+        receivedAt: last.receivedAt ?? last.timestamp,
+      });
+    }
+
+    // Upcoming workflow summary (enabled workflows only)
+    const cfg = retentionWorker.getConfig();
+    const CRON_HOURS = [0, 4, 8, 12, 16, 20];
+    const nowIL = new Date(now);
+    const ilHour = parseInt(nowIL.toLocaleString('sv-SE', { timeZone: 'Asia/Jerusalem', hour: 'numeric', hour12: false }), 10);
+    const nextCronH = CRON_HOURS.find(h => h > ilHour) ?? (CRON_HOURS[0] + 24);
+    const nextRunLabel = nextCronH < 24
+      ? `${String(nextCronH).padStart(2,'0')}:00 היום`
+      : `${String(CRON_HOURS[0]).padStart(2,'0')}:00 מחר`;
+
+    const upcomingWorkflows = Object.entries(cfg)
+      .filter(([,wf]) => wf.enabled)
+      .map(([id]) => ({ id, nextRun: nextRunLabel, eligibleCount: null }));
+    // Fetch eligible counts async (non-blocking — may return 0 if Arbox is slow)
+    for (const wf of upcomingWorkflows) {
+      try {
+        const preview = await Promise.race([
+          retentionWorker.previewWorkflow(wf.id, 5),
+          new Promise(r => setTimeout(() => r({ eligible: [] }), 2000)),
+        ]);
+        wf.eligibleCount = (preview.eligible ?? []).length;
+        wf.workflow = preview.workflow ?? wf.id;
+      } catch { wf.eligibleCount = null; }
+    }
+
+    res.json({
+      ok: true,
+      openTasks:      openTasks.slice(0, 20),
+      awaitingReply:  awaitingReply.slice(0, 20),
+      failedSends:    failedSends.slice(0, 10),
+      upcomingWorkflows,
+      counts: {
+        openTasks:     openTasks.length,
+        highPriority:  openTasks.filter(t => t.priority === 'high').length,
+        awaitingReply: awaitingReply.length,
+        failedSends:   failedSends.length,
+      },
+      ts: new Date(),
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// GET /api/tomer/upcoming — Upcoming automated messages per workflow
+// Returns each workflow's: state, eligible members, message template, next scheduled run.
+app.get('/api/tomer/upcoming', async (req, res) => {
+  try {
+    const cfg = retentionWorker.getConfig();
+    const now     = Date.now();
+    const CRON_H  = [0, 4, 8, 12, 16, 20];
+    const ilHour  = parseInt(new Date(now).toLocaleString('sv-SE', {
+      timeZone: 'Asia/Jerusalem', hour: 'numeric', hour12: false,
+    }), 10);
+    const nextH   = CRON_H.find(h => h > ilHour);
+    const nextRun = nextH != null
+      ? new Date(new Date(now).toLocaleDateString('sv-SE', { timeZone: 'Asia/Jerusalem' }) + `T${String(nextH).padStart(2,'0')}:00:00+02:00`)
+      : null;
+
+    const workflows = [];
+    for (const [id, wf] of Object.entries(cfg)) {
+      const entry = { id, enabled: wf.enabled, nextRun: nextRun?.toISOString() ?? null, eligible: [], totalEligible: 0, messageTemplate: null, state: 'disabled' };
+
+      if (wf.enabled) {
+        try {
+          const preview = await Promise.race([
+            retentionWorker.previewWorkflow(id, 10),
+            new Promise(r => setTimeout(() => r({ eligible: [], workflow: id }), 3000)),
+          ]);
+          entry.eligible      = (preview.eligible ?? []).map(m => ({ name: m.name, phone: maskPhone(m.phone ?? '') }));
+          entry.totalEligible = entry.eligible.length;
+          entry.messageTemplate = preview.messageTemplate ?? preview.sampleMessage ?? null;
+          entry.state = entry.totalEligible > 0 ? 'eligible' : 'no_eligible';
+          entry.workflow = preview.workflow ?? id;
+        } catch { entry.state = 'preview_error'; }
+      }
+      workflows.push(entry);
+    }
+
+    res.json({ ok: true, workflows, ts: new Date() });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// GET /api/tomer/members-enriched — Arbox member list with server-side ownership/task join.
+// Phones are NEVER sent to the client. Members are identified by arboxId or display-safe
+// masked-phone. The join is done server-side using the full (unmasked) phone internally.
+app.get('/api/tomer/members-enriched', async (req, res) => {
+  try {
+    const arboxSvc = require('./services/arbox.service');
+    const detailed = await arboxSvc.getDetailedMembers?.().catch(() => null);
+    if (!detailed) return res.json({ ok: true, members: [] });
+
+    const all = [
+      ...(detailed.active ?? []).map(m => ({ ...m, _statusKey: 'active' })),
+      ...(detailed.expiringSoon ?? []).map(m => ({ ...m, _statusKey: 'expiring' })),
+      ...(detailed.expired ?? []).map(m => ({ ...m, _statusKey: 'expired' })),
+    ];
+
+    // Build open-task count per phone
+    const openTasks = tomerStore.getOpenTasks();
+    const taskCountByPhone = {};
+    openTasks.forEach(t => { if (t.phone) taskCountByPhone[t.phone] = (taskCountByPhone[t.phone] ?? 0) + 1; });
+
+    const enriched = all.map(m => {
+      const lead    = m.phone ? store.getLead(m.phone) : null;
+      const tasks   = m.phone ? taskCountByPhone[m.phone] ?? 0 : 0;
+      const ownerSt = lead?.status ?? null;
+      return {
+        arboxId:    m.user_id,
+        name:       `${m.first_name ?? ''} ${m.last_name ?? ''}`.trim() || null,
+        phone:      maskPhone(m.phone ?? ''),           // masked for display
+        _phone:     m.phone ?? null,                    // INTERNAL ONLY — never expose in public response
+        statusKey:  m._statusKey,
+        memberEnd:  m.membership_end_date?.slice(0, 10) ?? null,
+        active:     m.active ?? false,
+        birthday:   m.birthday?.slice(0, 10) ?? null,
+        allowSms:   m.allow_sms ?? null,
+        owner:      ownerSt === 'human_owns' ? 'human' : ownerSt === 'opted_out' ? 'opted_out' : 'bot',
+        openTasks:  tasks,
+        leadStatus: ownerSt,
+        lastContact: lead?.meta?.lastContactAt ?? null,
+      };
+    });
+
+    // Strip internal _phone before sending — never send real phones to client
+    const safe = enriched.map(({ _phone, ...m }) => m);
+    res.json({ ok: true, members: safe });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // GET /api/tomer/member/:phone/history — Tomer's AI conversation history for a member
 app.delete('/api/tomer/member/:phone/history', (req, res) => {
   const phone = decodeURIComponent(req.params.phone);

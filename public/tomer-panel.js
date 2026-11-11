@@ -15,7 +15,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!_tomerAutoRefresh) {
           _tomerAutoRefresh = setInterval(() => {
             const activePane = document.querySelector('.tw-tab.active')?.dataset?.pane;
-            if (activePane === 'overview') loadOverview();
+            if (activePane === 'today' || activePane === 'overview') loadToday();
           }, 60_000);
         }
       } else {
@@ -135,7 +135,8 @@ document.querySelectorAll('.tw-tab').forEach(btn => {
     const pane = btn.dataset.pane;
     const paneEl = $id('twp-' + pane);
     if (paneEl) paneEl.classList.add('active');
-    if (pane === 'overview')   loadOverview();
+    if (pane === 'today' || pane === 'overview') loadToday();
+    if (pane === 'upcoming')   loadUpcoming();
     if (pane === 'members')    {} // load on demand
     if (pane === 'tasks')      loadTasks();
     if (pane === 'automation') loadAutomation();
@@ -143,119 +144,240 @@ document.querySelectorAll('.tw-tab').forEach(btn => {
   });
 });
 
-// ── Global refresh + run checks ───────────────────────────────────────────────
+// ── Global refresh ────────────────────────────────────────────────────────────
 $id('tw-refresh')?.addEventListener('click', () => {
-  const active = document.querySelector('.tw-tab.active')?.dataset.pane ?? 'overview';
-  if (active === 'overview')   loadOverview();
-  if (active === 'members')    loadMembers();
-  if (active === 'tasks')      loadTasks();
-  if (active === 'automation') loadAutomation();
-  if (active === 'audit')      loadAudit();
+  const active = document.querySelector('.tw-tab.active')?.dataset.pane ?? 'today';
+  if (active === 'today' || active === 'overview') loadToday();
+  else if (active === 'upcoming')   loadUpcoming();
+  else if (active === 'members')    loadMembers();
+  else if (active === 'tasks')      loadTasks();
+  else if (active === 'automation') loadAutomation();
+  else if (active === 'audit')      loadAudit();
 });
 
-$id('btn-tomer-checks')?.addEventListener('click', async () => {
-  const btn = $id('btn-tomer-checks');
-  const res = $id('tomer-checks-result');
-  btn.disabled = true;
-  if (res) { res.style.display = 'block'; res.textContent = 'מריץ...'; }
+// ════════════════════════════════════════════════════════════════════════════
+//  TODAY'S WORK
+// ════════════════════════════════════════════════════════════════════════════
+
+// loadOverview is kept as an alias so existing code doesn't break
+async function loadOverview() { return loadToday(); }
+
+async function loadToday() {
+  const listEl = $id('tw-action-list');
+  if (listEl) listEl.innerHTML = '<div class="tw-empty">טוען...</div>';
+
   try {
-    const data = await api('/api/tomer/run-checks', { method: 'POST' });
-    if (res) res.textContent = JSON.stringify(data, null, 2);
-    toast('בדיקות הושלמו ✓');
+    const [todayData, overviewData] = await Promise.all([
+      api('/api/tomer/today'),
+      api('/api/tomer/overview').catch(() => ({ ok: false })),
+    ]);
+
+    // ── KPIs ──────────────────────────────────────────────────────────────────
+    const c = todayData.counts ?? {};
+    setTxt('twk-high',   c.highPriority  ?? 0);
+    setTxt('twk-await',  c.awaitingReply ?? 0);
+    setTxt('twk-open',   c.openTasks     ?? 0);
+    setTxt('twk-failed', c.failedSends   ?? 0);
+    setTxt('twk-arbox',  overviewData.arboxHealth ? '✅ OK' : '⚠️ Error');
+
+    // Badge on Today tab + Tasks tab
+    const badgeToday = $id('tw-badge-today');
+    const total = (c.highPriority ?? 0) + (c.awaitingReply ?? 0);
+    if (badgeToday) badgeToday.textContent = total > 0 ? String(total) : '';
+    const badgeTasks = $id('tw-badge-tasks');
+    if (badgeTasks) badgeTasks.textContent = c.openTasks > 0 ? String(c.openTasks) : '';
+
+    // ── Unified action list ────────────────────────────────────────────────────
+    const items = [];
+
+    // 1. High-priority Eden tasks
+    (todayData.openTasks ?? [])
+      .filter(t => t.priority === 'high')
+      .forEach(t => items.push({
+        urgency: 10,
+        icon: '🔴',
+        title: typeHe(t.type),
+        who: t.memberName ?? maskPhone(t.phone ?? ''),
+        detail: (t.summary ?? t.detail ?? '').slice(0, 80),
+        time: t.createdAt,
+        type: 'eden_task',
+        id: t.id,
+        actions: `<button class="btn-xs" onclick="resolveTask('${esc(t.id)}')">פתור</button>
+                  <button class="btn-xs btn-xs-sec" onclick="viewTaskDetail('${esc(t.id)}')">פרטים</button>`,
+      }));
+
+    // 2. Awaiting reply (aging conversations)
+    (todayData.awaitingReply ?? [])
+      .forEach(c => items.push({
+        urgency: c.ageMin > 240 ? 8 : 5,
+        icon: '💬',
+        title: `ממתין/ה למענה — ${c.ageMin} דקות`,
+        who: c.name ?? c.phone,
+        detail: (c.lastText ?? '').slice(0, 80),
+        time: c.receivedAt,
+        type: 'awaiting_reply',
+        phone: c.phone,
+        owner: c.owner,
+        actions: c.owner === 'human'
+          ? `<span class="badge-status-eden_assigned">👤 בטיפול ידני</span>`
+          : `<button class="btn-xs" onclick="takeHumanOwnership('${esc(c.phone)}','${esc(c.name??'')}')">👤 קח בעלות</button>`,
+      }));
+
+    // 3. Normal-priority Eden tasks
+    (todayData.openTasks ?? [])
+      .filter(t => t.priority !== 'high')
+      .forEach(t => items.push({
+        urgency: 3,
+        icon: '📋',
+        title: typeHe(t.type),
+        who: t.memberName ?? maskPhone(t.phone ?? ''),
+        detail: (t.summary ?? '').slice(0, 80),
+        time: t.createdAt,
+        type: 'eden_task',
+        id: t.id,
+        actions: `<button class="btn-xs" onclick="resolveTask('${esc(t.id)}')">פתור</button>
+                  <button class="btn-xs btn-xs-sec" onclick="viewTaskDetail('${esc(t.id)}')">פרטים</button>`,
+      }));
+
+    // 4. Failed sends
+    (todayData.failedSends ?? [])
+      .forEach(f => items.push({
+        urgency: 4,
+        icon: '⚠️',
+        title: 'שליחה נכשלה',
+        who: f.memberName ?? maskPhone(f.phone ?? ''),
+        detail: (f.tomerAction ?? f.requestPreview ?? '').slice(0, 80),
+        time: f.ts,
+        type: 'failed_send',
+        actions: '',
+      }));
+
+    // Sort by urgency desc, then time asc
+    items.sort((a, b) => b.urgency - a.urgency || new Date(a.time) - new Date(b.time));
+
+    if (!items.length) {
+      if (listEl) listEl.innerHTML = '<div class="tw-empty tw-all-clear">✅ אין פעולות נדרשות כרגע — הכל תקין</div>';
+    } else if (listEl) {
+      listEl.innerHTML = items.map(item => `
+        <div class="tw-action-item tw-action-${item.type}">
+          <span class="tw-action-icon">${item.icon}</span>
+          <div class="tw-action-body">
+            <div class="tw-action-title">${esc(item.title)}</div>
+            <div class="tw-action-who">${esc(item.who)}</div>
+            ${item.detail ? `<div class="tw-action-detail">${esc(item.detail)}</div>` : ''}
+          </div>
+          <div class="tw-action-meta">
+            <div class="tw-ts">${fmtDate(item.time)}</div>
+            <div class="tw-action-btns">${item.actions}</div>
+          </div>
+        </div>`).join('');
+    }
+
+    // ── Upcoming mini-view ─────────────────────────────────────────────────────
+    const upMini = $id('tw-upcoming-mini');
+    const nextRun = $id('tw-next-run');
+    const workflows = todayData.upcomingWorkflows ?? [];
+    if (nextRun && workflows.length > 0) nextRun.textContent = workflows[0]?.nextRun ?? '—';
+    else if (nextRun) nextRun.textContent = '—';
+
+    if (upMini) {
+      if (!workflows.length) {
+        upMini.innerHTML = '<div class="tw-empty">כל הווקפלואים מושבתים</div>';
+      } else {
+        upMini.innerHTML = workflows.map(wf => {
+          const count = wf.eligibleCount;
+          const countLabel = count === null ? '(טוען...)' : count === 0 ? 'אין זכאים' : `${count} חבר/ה`;
+          const dot = count > 0 ? 'dot-active' : 'dot-idle';
+          return `<div class="tw-upcoming-mini-row">
+            <span class="tw-dot ${dot}"></span>
+            <span class="tw-wf-label">${esc(wf.workflow ?? wf.id)}</span>
+            <span class="tw-ts">${esc(countLabel)}</span>
+            <span class="tw-ts">${esc(wf.nextRun ?? '—')}</span>
+          </div>`;
+        }).join('');
+      }
+    }
+
+    // ── Unclassified ───────────────────────────────────────────────────────────
+    _loadAndRenderUnclassified();
+
+    // Update refresh timestamp
+    const lastEl = $id('tw-last-refresh');
+    if (lastEl) lastEl.textContent = `עודכן: ${new Date().toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' })}`;
+
   } catch (e) {
-    if (res) res.textContent = 'שגיאה: ' + e.message;
-    toast('שגיאה בהרצת בדיקות', false);
-  } finally { btn.disabled = false; }
-});
+    console.error('loadToday', e);
+    if (listEl) listEl.innerHTML = `<div class="tw-empty">שגיאה: ${esc(e.message)}</div>`;
+  }
+}
 
 // ════════════════════════════════════════════════════════════════════════════
-//  OVERVIEW
+//  UPCOMING MESSAGES
 // ════════════════════════════════════════════════════════════════════════════
 
-async function loadOverview() {
+async function loadUpcoming() {
+  const el = $id('tw-upcoming-workflows');
+  if (!el) return;
+  el.innerHTML = '<div class="tw-empty">טוען...</div>';
   try {
-    const data = await api('/api/tomer/overview');
-    if (!data.ok) return;
-    const s = data.service ?? {};
+    const data = await api('/api/tomer/upcoming');
+    const workflows = data.workflows ?? [];
 
-    setTxt('twk-open',   s.openTasks    ?? 0);
-    setTxt('twk-high',   s.highPriorityTasks ?? 0);
-    setTxt('twk-unclass',s.unclassified ?? 0);
-    setTxt('twk-failed', s.failedActions ?? 0);
-    setTxt('twk-arbox',  data.arboxHealth ? '✅ OK' : '⚠️ Error');
+    const LABELS = {
+      birthday:    '🎂 ברכת יום הולדת',
+      onboarding1: '🌱 צ׳ק-אין שבוע 1',
+      onboarding2: '🌱 צ׳ק-אין שבוע 2',
+      attendance:  '🏋️ היעדרות',
+    };
 
-    // Aging conversations KPI (inject dynamically if element exists)
-    const agingEl = $id('twk-aging');
-    if (agingEl) agingEl.textContent = s.agingConversations ?? 0;
+    el.innerHTML = workflows.map(wf => {
+      const label = LABELS[wf.id] ?? wf.id;
+      const stateTag = {
+        disabled:      `<span class="badge-status-cancelled">⏸ מושבת</span>`,
+        eligible:      `<span class="badge-active">✅ ${wf.totalEligible} זכאים</span>`,
+        no_eligible:   `<span class="tw-muted">אין זכאים לריצה הבאה</span>`,
+        preview_error: `<span class="badge-crisis">שגיאה בתצוגה מקדימה</span>`,
+      }[wf.state] ?? `<span>${esc(wf.state)}</span>`;
 
-    // Render aging conversations list
-    _renderAgingConversations(data.agingConversations ?? []);
+      const eligibleList = wf.eligible?.length
+        ? `<div class="tw-upcoming-eligible">
+             <b>זכאים:</b> ${wf.eligible.map(m => esc(m.name || m.phone)).join(' · ')}
+             ${wf.totalEligible > wf.eligible.length ? ` + עוד ${wf.totalEligible - wf.eligible.length}` : ''}
+           </div>`
+        : '';
 
-    // Badge on Tasks tab
-    const badge = $id('tw-badge-tasks');
-    if (badge) badge.textContent = s.openTasks > 0 ? String(s.openTasks) : '';
+      const msgPreview = wf.messageTemplate
+        ? `<div class="wf-preview-msg" title="תבנית הודעה — לא נשלח עד הרצה">${esc(wf.messageTemplate)}</div>`
+        : '';
 
-    // Open tasks list
-    _renderOpenTasksList(data.openTasks ?? []);
-    // Recent audit
-    _renderRecentAudit(data.recentAudit ?? []);
-    // Unclassified
-    await _loadAndRenderUnclassified();
-  } catch (e) { console.error('loadOverview', e); }
-}
+      const emptyReason = wf.state === 'disabled'
+        ? '<p class="tw-wf-empty-reason">הפעל בלשונית "אוטומציה" אחרי בדיקת קהל, טקסט ושעות שקטות.</p>'
+        : wf.state === 'no_eligible'
+          ? '<p class="tw-wf-empty-reason">אין חברים העומדים בקריטריון ביום זה.</p>'
+          : '';
 
-function _renderOpenTasksList(tasks) {
-  const el = $id('tw-open-tasks-list');
-  const emp = $id('tw-tasks-empty');
-  if (!el) return;
-  if (!tasks.length) {
-    el.innerHTML = '';
-    if (emp) emp.style.display = '';
-    return;
+      return `
+        <div class="tw-upcoming-card ${wf.state === 'disabled' ? 'tw-upcoming-disabled' : ''}">
+          <div class="tw-upcoming-header">
+            <span class="tw-wf-label">${esc(label)}</span>
+            ${stateTag}
+          </div>
+          ${wf.state !== 'disabled' ? `<div class="tw-upcoming-next">ריצה הבאה: <b>${esc(wf.nextRun ?? '—')}</b></div>` : ''}
+          ${msgPreview}
+          ${eligibleList}
+          ${emptyReason}
+          <div class="tw-wf-actions">
+            ${wf.state !== 'disabled'
+              ? `<button class="btn-xs" onclick="previewWorkflow('${esc(wf.id)}')">👁️ תצוגה מקדימה</button>
+                 <button class="btn-xs btn-xs-sec" onclick="runWorkflowNow('${esc(wf.id)}')">▶ הרץ עכשיו</button>`
+              : `<button class="btn-xs btn-xs-sec" onclick="document.querySelector('[data-pane=automation]').click()">הגדר בלשונית אוטומציה →</button>`}
+          </div>
+        </div>`;
+    }).join('') || '<div class="tw-empty">אין ווקפלואים מוגדרים</div>';
+
+  } catch (e) {
+    el.innerHTML = `<div class="tw-empty">שגיאה: ${esc(e.message)}</div>`;
   }
-  if (emp) emp.style.display = 'none';
-  el.innerHTML = tasks.slice(0, 8).map(t => `
-    <div class="tw-list-row tw-task-row" data-task-id="${esc(t.id)}">
-      <span class="tw-task-type">${typeHe(t.type)}</span>
-      <span class="tw-task-who">${esc(t.memberName ?? maskPhone(t.phone))}</span>
-      <span class="tw-task-summary">${esc(t.summary?.slice(0,60))}</span>
-      <span class="tw-task-pri ${t.priority === 'high' ? 'tw-pri-high' : ''}">${priorityHe(t.priority)}</span>
-      <span class="tw-task-time">${fmtDate(t.createdAt)}</span>
-      <div class="tw-task-actions">
-        <button class="btn-xs" onclick="openTaskActions('${esc(t.id)}')">פעולות</button>
-      </div>
-    </div>`).join('');
-}
-
-function _renderAgingConversations(convs) {
-  const el = $id('tw-aging-list');
-  if (!el) return;
-  if (!convs.length) {
-    el.innerHTML = '<div class="tw-empty">אין שיחות עומדות</div>';
-    return;
-  }
-  el.innerHTML = convs.map(c => `
-    <div class="tw-list-row">
-      <span class="tw-uc-phone">${maskPhone(c.phone)}</span>
-      <span class="tw-uc-msg">${esc((c.lastText ?? '').slice(0, 50))}</span>
-      <span class="tw-ts">${esc(c.ageH)}ש׳ ללא מענה</span>
-      <span class="badge-crisis" style="font-size:10px">${esc(c.route ?? '—')}</span>
-      <div class="tw-uc-actions">
-        <button class="btn-xs" onclick="takeHumanOwnership('${esc(c.phone)}','')">👤 קח בעלות</button>
-      </div>
-    </div>`).join('');
-}
-
-function _renderRecentAudit(entries) {
-  const el = $id('tw-recent-audit');
-  if (!el) return;
-  el.innerHTML = entries.slice(0, 8).map(e => `
-    <div class="tw-list-row">
-      <span class="tw-audit-event ${e.sendState === 'failed' ? 'tw-failed' : ''}">${esc(e.event)}</span>
-      <span class="tw-audit-who">${esc(e.memberName ?? maskPhone(e.phone))}</span>
-      <span class="tw-audit-preview">${esc((e.requestPreview ?? '').slice(0, 50))}</span>
-      <span class="tw-audit-time">${fmtDate(e.ts)}</span>
-    </div>`).join('') || '<div class="tw-empty">אין פעילות אחרונה</div>';
 }
 
 async function _loadAndRenderUnclassified() {
@@ -313,13 +435,12 @@ async function loadMembers() {
   const tbody = $id('tw-members-tbody');
   if (tbody) tbody.innerHTML = '<tr><td colspan="7" class="empty-state">טוען...</td></tr>';
   try {
-    const data = await api('/api/arbox/detailed-members');
-    _allMembers = [
-      ...(data.active ?? []).map(m => ({ ...m, _statusKey: 'active' })),
-      ...(data.expiringSoon ?? []).map(m => ({ ...m, _statusKey: 'expiring' })),
-      ...(data.expired ?? []).map(m => ({ ...m, _statusKey: 'expired' })),
-    ];
-    await renderMembers(_allMembers);
+    // Use the enriched endpoint which does the phone join server-side.
+    // /api/tomer/members-enriched returns ownership + open task count per member,
+    // with phones already masked — no client-side join needed.
+    const data = await api('/api/tomer/members-enriched');
+    _allMembers = data.members ?? [];
+    renderMembersEnriched(_allMembers);
   } catch (e) {
     if (tbody) tbody.innerHTML = `<tr><td colspan="7" class="empty-state">שגיאה: ${esc(e.message)}</td></tr>`;
   } finally {
@@ -340,61 +461,73 @@ function filterMembers() {
   renderMembers(filtered).catch(() => {});
 }
 
-async function renderMembers(members) {
+function filterMembers() {
+  const q   = ($id('tw-member-search')?.value ?? '').trim().toLowerCase();
+  const st  = $id('tw-member-status')?.value ?? '';
+  const filtered = _allMembers.filter(m => {
+    const name  = (m.name ?? '').toLowerCase();
+    const phone = String(m.phone ?? '').toLowerCase();
+    const matchQ = !q || name.includes(q) || phone.includes(q);
+    const matchS = !st || m.statusKey === st;
+    return matchQ && matchS;
+  });
+  renderMembersEnriched(filtered);
+}
+
+function renderMembersEnriched(members) {
   const tbody = $id('tw-members-tbody');
   if (!tbody) return;
   if (!members.length) {
     tbody.innerHTML = '<tr><td colspan="7" class="empty-state">אין תוצאות</td></tr>';
     return;
   }
-  const statusHebrew = { active: '<span class="badge-active">פעיל</span>',
+  const statusHebrew = {
+    active:   '<span class="badge-active">פעיל</span>',
     expiring: '<span class="badge-warm">עומד לפוג</span>',
-    expired:  '<span class="badge-crisis">פג</span>' };
-  // Load lead-store data once for enrichment (non-blocking — degrade gracefully)
-  const leadMap = {}; // phone → { status, openTaskCount, lastContact }
-  try {
-    const ld = await api('/api/leads');
-    if (Array.isArray(ld)) {
-      ld.forEach(l => {
-        leadMap[l.phone] = {
-          status: l.status,
-          openTasks: 0,  // enriched below if tasks API available
-          lastContact: l.meta?.lastContactAt ?? null,
-        };
-      });
-    }
-  } catch { /* non-fatal */ }
-  try {
-    const td = await api('/api/tomer/tasks?status=open');
-    (td.tasks ?? []).forEach(t => {
-      if (t.phone && leadMap[t.phone]) leadMap[t.phone].openTasks = (leadMap[t.phone].openTasks ?? 0) + 1;
-    });
-  } catch { /* non-fatal */ }
-
+    expired:  '<span class="badge-crisis">פג</span>',
+  };
   tbody.innerHTML = members.slice(0, 100).map(m => {
-    const name    = `${m.first_name ?? ''} ${m.last_name ?? ''}`.trim() || '—';
-    const endDate = m.membership_end_date?.slice(0, 10) ?? '—';
-    const badge   = statusHebrew[m._statusKey] ?? m._statusKey ?? '';
-    const ld      = leadMap[m.phone] ?? {};
-    const ownerHtml = ld.status === 'human_owns'
+    const name    = m.name ?? '—';
+    const endDate = m.memberEnd ?? '—';
+    const badge   = statusHebrew[m.statusKey] ?? '';
+    const ownerHtml = m.owner === 'human'
       ? '<span class="badge-crisis">👤 ידני</span>'
-      : ld.status === 'opted_out'
+      : m.owner === 'opted_out'
         ? '<span class="badge-status-cancelled">🔇</span>'
-        : '<span class="badge-active">🤖</span>';
-    const openTaskHtml = ld.openTasks > 0
-      ? `<span class="badge-crisis">${ld.openTasks}</span>`
+        : m.leadStatus
+          ? '<span class="badge-active">🤖</span>'
+          : '<span class="tw-muted">—</span>';
+    const openTaskHtml = (m.openTasks ?? 0) > 0
+      ? `<span class="badge-crisis">${m.openTasks}</span>`
       : '<span class="tw-muted">—</span>';
+    // phone is already masked from the server; arboxId used as drawer key
+    const drawerKey = String(m.arboxId ?? '');
     return `<tr>
       <td>${esc(name)}</td>
-      <td>${maskPhone(m.phone)}</td>
+      <td>${esc(m.phone ?? '—')}</td>
       <td>${badge}</td>
       <td>${esc(endDate)}</td>
       <td>${ownerHtml}</td>
       <td>${openTaskHtml}</td>
-      <td><button class="btn-xs" onclick="openMemberDrawer('${esc(m.phone)}','${esc(name)}')">פרופיל</button></td>
+      <td><button class="btn-xs" onclick="openMemberByArboxId('${esc(drawerKey)}','${esc(name)}')">פרופיל</button></td>
     </tr>`;
   }).join('');
 }
+
+// openMemberByArboxId — opens the member drawer using arboxId as the lookup key.
+// Since phones are masked in the enriched list, we store arboxId for the action.
+// The drawer endpoint at /api/tomer/member/:phone still requires the phone, so
+// we keep a local arboxId → masked-phone map populated from the enriched list.
+const _arboxIdToPhone = new Map();
+
+window.openMemberByArboxId = function(arboxId, name) {
+  // The enriched list has masked phones — use them for the drawer
+  const m = _allMembers.find(m => String(m.arboxId) === String(arboxId));
+  if (m) {
+    _arboxIdToPhone.set(arboxId, m.phone ?? '');
+    openMemberDrawer(m.phone ?? arboxId, name);
+  }
+};
 
 // ════════════════════════════════════════════════════════════════════════════
 //  EDEN TASKS
@@ -837,14 +970,14 @@ if (typeof initMiniChat === 'function') {
   initMiniChat('tomer-chat-input', 'tomer-send', 'tomer-chat-msgs', '/api/tomer/chat');
 }
 
-// ── Auto-load overview when Tomer tab is active ───────────────────────────────
+// ── Auto-load Today's Work when Tomer tab is active ──────────────────────────
 document.querySelectorAll('.tab-btn').forEach(btn => {
   if (btn.dataset.tab === 'tomer') {
-    btn.addEventListener('click', () => setTimeout(loadOverview, 50));
+    btn.addEventListener('click', () => setTimeout(loadToday, 50));
   }
 });
 
 // Initial load if Tomer tab is active on page load
 if (document.querySelector('.tab-btn[data-tab="tomer"].active')) {
-  loadOverview();
+  loadToday();
 }
