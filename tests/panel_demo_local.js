@@ -270,7 +270,30 @@ setTimeout(async () => {
 
   // ── 4. Enable onboarding1 workflow (רונית is eligible — joined 7 days ago) ──
   retentionWorker.enableWorkflow('onboarding1');
-  console.log('[demo] onboarding1 workflow enabled');
+  retentionWorker.enableWorkflow('birthday');  // נועה has birthday today
+  console.log('[demo] onboarding1 + birthday workflows enabled');
+
+  // ── 4b. Seed a message queue entry (simulates a sent retention message) ───
+  const mqEntry = tomerStore.queueMessage({
+    workflowId:   'birthday',
+    phone:        P_NOA,
+    memberName:   '[DEMO] נועה אביב',
+    message:      'נועה, יום הולדת שמח! 🎂 שמחות שאת איתנו ב-Shape Studio — תהיי שנה מלאת בריאות ואנרגיה 💪',
+    trigger:      'birthday eligibility met',
+    scheduledFor: new Date().toISOString(),
+  });
+  tomerStore.markMessageSent(mqEntry.id, { idMessage: 'demo-green-api-birthday-noa' });
+
+  const mqFail = tomerStore.queueMessage({
+    workflowId:   'onboarding1',
+    phone:        P_RONIT,
+    memberName:   '[DEMO] רונית שמיר',
+    message:      'רונית, שלום! 👋 שבוע אחד ב-Shape Studio — איך הולך?',
+    trigger:      'onboarding1 eligibility met',
+    scheduledFor: new Date().toISOString(),
+  });
+  tomerStore.markMessageFailed(mqFail.id, { error: '[DEMO] provider_error: temporary Green API outage' });
+  console.log('[demo] Message queue entries seeded (1 sent, 1 failed)');
 
   // ── 5. Verify key APIs before printing checklist ──────────────────────────
   const checkUrl = (url) => new Promise((resolve) => {
@@ -310,35 +333,24 @@ setTimeout(async () => {
   console.log('    לאה מזרחי   (non-Arbox) — warm lead, aging convo 2h+ ago');
   console.log('\n─'.repeat(62));
   console.log('\n  WHAT TO CHECK IN EACH TAB:\n');
-  console.log('  היום (Today):');
-  console.log('    • 🔴 High-priority task: דנה — הקפאת מנוי — ניתוח');
-  console.log('    • 💬 Aging conv: לאה — "שלחת לי מחירון?" (2h+ ago)');
-  console.log('    • ⚠️  Failed send: רונית — onboarding1 (1 provider error)');
-  console.log('    KPIs: high-priority, awaiting reply, open tasks, failed sends');
-  console.log('\n  הודעות קרובות (Upcoming):');
-  console.log('    • onboarding1: ✅ 1 זכאים (רונית — joined 7d ago)');
-  console.log('    • Other workflows: ⏸ מושבת');
-  console.log('    Click 👁️ תצוגה מקדימה on onboarding1 to see eligible member list');
-  console.log('\n  חברים (Members):');
-  console.log('    • 5 members load from Arbox mock');
-  console.log('    • דנה: 👤 ידני  רונית: ⚠️ בחינה  others: 🤖');
-  console.log('    Click "פרופיל" on דנה → drawer shows:');
-  console.log('      - Arbox profile, 3-message conversation thread');
-  console.log('      - 1 open task (freeze_request HIGH)');
-  console.log('      - "אשר ידני" / "שחרר לבוט" action buttons');
-  console.log('\n  משימות (Eden Tasks):');
-  console.log('    • ❄️ הקפאה — דנה — גבוה 🔴  (assigned to Eden)');
-  console.log('    • 🚫 ביטול מנוי — שרה — רגיל 🟡');
-  console.log('    Click "פרטים" to see full detail + member message');
-  console.log('\n  אוטומציה (Automation):');
-  console.log('    • onboarding1: ✅ פעיל (toggle it off → Today count changes)');
-  console.log('    • birthday, onboarding2, attendance: ⏸ מושבת');
-  console.log('\n  ביקורת (Audit):');
-  console.log('    • failed row: רונית — onboarding1_sent — provider error');
-  console.log('    • sent row: נועה — birthday_sent');
-  console.log('    • sent row: שרה — cancel_request_detected');
+  console.log('  היום — KPIs, action list, aging convos, failed sends');
+  console.log('  שיחות [NEW] — ALL unanswered threads, no 2h gate; ⚠️ after 2h');
+  console.log('    • לאה: 💬 2h+ — inline thread preview, takeover button');
+  console.log('    • דנה: 👤 human_owns — visible, release-to-bot button');
+  console.log('  הודעות מתוזמנות [renamed + queue]:');
+  console.log('    Queue: נועה birthday ✅ ספק אישר | רונית onboarding1 ❌ נכשל');
+  console.log('    Eligibility: onboarding1 ✅ 1 זכאים | birthday ✅ | feedback ⏸ (new)');
+  console.log('  חברים — 5 Arbox members; click פרופיל on דנה:');
+  console.log('    drawer: Arbox profile + 3-msg thread + freeze task (HIGH)');
+  console.log('    + studio schedule (5d) + limitations: הקפאה/ביטול/רישום → Arbox');
+  console.log('  משימות — ❄️ הקפאה דנה (HIGH, eden_assigned) + 🚫 ביטול שרה');
+  console.log('    "פרטים" shows member verbatim request + requested dates');
+  console.log('  אוטומציה — onboarding1 ✅ birthday ✅ | onboarding2/attendance/feedback ⏸');
+  console.log('  היסטוריה — "✅ ספק אישר" (not "נמסר") | "❌ נכשל" for failures');
   console.log('\n─'.repeat(62));
   console.log('\n  API cross-checks (browser address bar or curl):');
+  console.log(`    http://localhost:${APP_PORT}/api/tomer/conversations  ← new: no 2h gate`);
+  console.log(`    http://localhost:${APP_PORT}/api/tomer/message-queue  ← new: sent/failed queue`);
   console.log(`    http://localhost:${APP_PORT}/api/tomer/today`);
   console.log(`    http://localhost:${APP_PORT}/api/tomer/tasks`);
   console.log(`    http://localhost:${APP_PORT}/api/tomer/audit`);
