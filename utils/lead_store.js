@@ -72,11 +72,13 @@ class LeadStore {
   reclassifyAsConvertedMember(phone, { name = null, source = 'unknown' } = {}) {
     const existing = this._leads.get(phone);
     if (!existing) return null;
-    // Never overwrite opted_out with converted_member: opted_out carries a communication
-    // preference that must survive even when membership is confirmed. The person is both
-    // a member AND wants no automated messages — both facts must be preserved.
-    // human_owns: staff may still be in a conversation; don't silently change ownership.
-    if (existing.status === 'opted_out' || existing.status === 'human_owns') {
+    // Never overwrite stop-statuses that reflect active ownership or communication
+    // preferences. Membership identity and conversation ownership must not overwrite
+    // each other during startup or reactive reclassification.
+    //   opted_out:          communication preference — survives membership confirmation.
+    //   human_owns:         staff is in an active conversation; don't silently change ownership.
+    //   attribution_review: echo attribution unresolved; changing status would lose the hold.
+    if (['opted_out', 'human_owns', 'attribution_review'].includes(existing.status)) {
       // Stamp the member fact in meta without changing the stop-status.
       const protected_ = {
         ...existing,
