@@ -195,16 +195,17 @@ console.log('\n── Suite 0: Source-level assertions (SRC) ──');
   const scheduleQueryLine = src.match(/schedule_query:\s+\/[^\n]+/)?.[0] ?? '';
   assert(!scheduleQueryLine.includes('מה קורה'), '(SRC) "מה קורה" absent from schedule_query regex', scheduleQueryLine.slice(0, 80));
 
-  // Fix 2: Deferred reconciliation in outgoing handler
+  // Fix 2: Deferred reconciliation — re-defer loop
   assert(src.includes('OUTGOING_RECONCILE_MS'), '(SRC) OUTGOING_RECONCILE_MS constant defined');
   assert(src.includes('_applyStaffTakeover'), '(SRC) _applyStaffTakeover helper defined');
-  // Look for setTimeout+OUTGOING_RECONCILE_MS in the outgoingMessageReceived handler specifically
+  // _scheduleEchoReconcile encapsulates the re-defer loop; handler calls it.
+  assert(src.includes('_scheduleEchoReconcile'), '(SRC) _scheduleEchoReconcile re-defer function defined');
   const outgoingPos   = src.indexOf("rawType === 'outgoingMessageReceived'");
   const outgoingBlock = outgoingPos >= 0 ? src.slice(outgoingPos, outgoingPos + 2000) : '';
   assert(
-    outgoingBlock.includes('setTimeout') && outgoingBlock.includes('OUTGOING_RECONCILE_MS'),
-    '(SRC) deferred reconciliation setTimeout+OUTGOING_RECONCILE_MS in outgoing handler',
-    outgoingBlock.slice(0, 60)
+    outgoingBlock.includes('_scheduleEchoReconcile'),
+    '(SRC) _scheduleEchoReconcile called in outgoing handler',
+    outgoingBlock.slice(0, 80)
   );
 
   // Fix 2: stale gate present
@@ -412,64 +413,67 @@ console.log('\n── Suite 4: Sales-path race + deferred reconciliation ──'
   assert(sendsFor(ph).length === 0,  '4a: no bot send after human_owns set during generation', sendsFor(ph).length);
 }
 
-// 4b: Genuine bot echo with ordinary provider-style ID, arriving before delayed provider
-//     response → NOT human_owns. Tests that _botSentIds (not MOCK- shortcut) resolves
-//     the echo before the deferred reconciliation window fires.
+// 4b: Genuine bot echo with ordinary provider-style ID where the provider response
+//     is SLOWER than the reconciliation window (1000ms > OUTGOING_RECONCILE_MS 300ms).
 //
-// _gaDelay (100ms) < OUTGOING_RECONCILE_MS (300ms): GA responds and _recordBotSend
-// runs before the deferred callback fires, so the ID is confirmed as a bot echo.
+// The re-defer loop in _scheduleEchoReconcile keeps extending the window while
+// _hasPendingBotSend is true. Once the provider responds and _recordBotSend fires,
+// the next deferred iteration sees _isBotSentId → true and exits without takeover.
 {
   const ph        = '972509960011'; // fresh phone → unclassified path (_markBotSent called)
   const botId4b   = `realbot-${Date.now()}-4b`;
   _gaNextId       = botId4b;
-  _gaDelay        = 100; // shorter than OUTGOING_RECONCILE_MS (300ms)
+  _gaDelay        = 1000; // > OUTGOING_RECONCILE_MS (300ms) — tests re-defer path
   clearSends();
   store.deleteLead(ph);
 
-  // Unclassified path: _markBotSent → sendText(delayed 100ms) → _recordBotSend(botId4b)
+  // Unclassified path: _markBotSent → sendText(delayed 1000ms) → _recordBotSend(botId4b)
   await inboundWebhook(ph, 'שלום רב', `deferred-4b-${Date.now()}`);
 
-  // Wait for burst (300ms) + ~50ms pipeline start → sendText is now in-flight.
+  // Wait for burst (300ms) + ~80ms pipeline start → sendText is now in-flight.
   await wait(380);
 
-  // Echo with the SAME id the bot will send: arrives while GA HTTP is still pending.
-  // _isBotSentId → false (not in _botSentIds yet, no MOCK- shortcut).
-  // _hasPendingBotSend → true → deferred for OUTGOING_RECONCILE_MS (300ms).
+  // Echo with the SAME id arrives while the 1000ms GA delay is still running.
+  // _hasPendingBotSend → true → _scheduleEchoReconcile called.
+  // Loop fires at 300ms intervals; GA responds at ~1000ms after burst fires (~1300ms total).
+  // After GA responds, the next loop iteration sees _isBotSentId(botId4b) → true → skip.
   await outgoingWebhook(ph, botId4b, 'bot message');
 
-  // Wait: GA responds at ~400ms (100ms after sendText) → _recordBotSend fires.
-  // Deferred fires at ~680ms (380ms+300ms) → _isBotSentId(botId4b) → true → skip.
-  await wait(500);
+  // Wait long enough for: GA response (~1300ms from t=0) + one more reconcile tick (300ms).
+  await wait(2000);
 
   const status4b = store.getLead(ph)?.status ?? null;
-  assert(status4b !== 'human_owns', '4b: bot echo with ordinary ID resolved via _botSentIds → NOT human_owns', status4b ?? '(no lead)');
+  assert(status4b !== 'human_owns', '4b: bot echo with slow provider — NOT human_owns after re-deferred reconciliation', status4b ?? '(no lead)');
   _gaDelay  = 0;
   _gaNextId = null;
 }
 
-// 4c: Genuine staff message echo with ordinary ID during the same in-flight window
-//     → DOES trigger human_owns. The staff ID is never recorded in _botSentIds, so
-//     the deferred reconciliation correctly identifies it as a staff reply.
+// 4c: Genuine staff message echo with ordinary ID during the same 1000ms provider delay.
+//     Staff ID is never in _botSentIds; re-defer loop finds no pending send once the
+//     provider responds → _applyStaffTakeover → human_owns. Verify it persists after
+//     the unclassified pipeline finishes (no subsequent status overwrite).
 {
   const ph        = '972509960012'; // fresh phone → unclassified path
   const botId4c   = `realbot-${Date.now()}-4c`;
   const staffId4c = `staffmsg-${Date.now()}-4c`;
   _gaNextId       = botId4c;
-  _gaDelay        = 100;
+  _gaDelay        = 1000;
   clearSends();
   store.deleteLead(ph);
 
   await inboundWebhook(ph, 'שלום רב', `deferred-4c-${Date.now()}`);
   await wait(380); // burst fires, sendText in-flight
 
-  // Staff echo: a DIFFERENT id (not what the bot sent).
-  // _isBotSentId(staffId4c) → false. _hasPendingBotSend → true → deferred.
-  // After 300ms, _isBotSentId(staffId4c) still false → _applyStaffTakeover → human_owns.
+  // Staff echo: DIFFERENT id from what the bot sends.
+  // Re-defer loop runs until provider responds at ~1300ms, then
+  // _hasPendingBotSend → false (cleared by _recordBotSend) → _applyStaffTakeover.
   await outgoingWebhook(ph, staffId4c, 'אני אטפל בזה — staff');
-  await wait(500);
+
+  // Wait for: GA response (~1300ms) + reconcile tick (300ms) + settle.
+  await wait(2000);
 
   const status4c = store.getLead(ph)?.status ?? null;
-  assert(status4c === 'human_owns', '4c: genuine staff echo during in-flight → human_owns after deferred window', status4c ?? '(no lead)');
+  assert(status4c === 'human_owns', '4c: genuine staff echo with slow provider → human_owns after re-deferred reconciliation', status4c ?? '(no lead)');
   _gaDelay  = 0;
   _gaNextId = null;
 }

@@ -2529,6 +2529,27 @@ function _isBotSentId(idMessage) {
 }
 
 // Apply human ownership when an outgoing message is confirmed to be a staff reply.
+// Deferred echo reconciliation: fires every OUTGOING_RECONCILE_MS while the bot's
+// HTTP send is still in-flight. Terminates when:
+//   (a) the idMessage is confirmed in _botSentIds → bot echo, done; or
+//   (b) no pending bot send remains (provider responded or TTL expired) → staff reply.
+// This handles providers that are slower than OUTGOING_RECONCILE_MS (e.g. 1s+ delays).
+function _scheduleEchoReconcile(norm, idMessage, msgText) {
+  setTimeout(() => {
+    if (_isBotSentId(idMessage)) {
+      logger.debug('[outgoing-webhook] Deferred: confirmed bot echo', { phone: norm, idMessage });
+      return;
+    }
+    if (_hasPendingBotSend(norm)) {
+      logger.debug('[outgoing-webhook] Deferred: bot send still in-flight — extending window', { phone: norm, idMessage });
+      _scheduleEchoReconcile(norm, idMessage, msgText);
+      return;
+    }
+    logger.info('[outgoing-webhook] Deferred: id unresolved, no pending send — staff reply', { phone: norm, idMessage });
+    _applyStaffTakeover(norm, idMessage, msgText);
+  }, OUTGOING_RECONCILE_MS);
+}
+
 // Idempotent — if already human_owns, opted_out, or converted_member, does nothing.
 function _applyStaffTakeover(norm, idMessage, msgText) {
   const existing  = store.getLead(norm) ?? {};
@@ -3824,28 +3845,13 @@ app.post('/api/green-api/webhook', (req, res) => {
           if (norm) {
             if (_hasPendingBotSend(norm)) {
               // A bot HTTP send is still in-flight when this echo arrived.
-              // Hold for RECONCILE_WINDOW_MS so _recordBotSend can register the
-              // idMessage once the HTTP response lands. After the window, re-check:
-              //   - idMessage now in _botSentIds → confirmed bot echo → skip
-              //   - still unknown → genuine staff reply → set human_owns
-              const capturedId   = idMessage;
-              const capturedNorm = norm;
-              const capturedText = msgText;
+              // Schedule a re-deferring reconciliation loop that keeps checking
+              // every OUTGOING_RECONCILE_MS until the provider responds or the
+              // pending-send TTL expires (handles slow providers > 300ms).
               logger.debug('[outgoing-webhook] Bot send in-flight — deferring echo reconciliation', {
-                phone: capturedNorm, idMessage: capturedId,
+                phone: norm, idMessage,
               });
-              setTimeout(() => {
-                if (_isBotSentId(capturedId)) {
-                  logger.debug('[outgoing-webhook] Deferred: confirmed bot echo after reconciliation', {
-                    phone: capturedNorm, idMessage: capturedId,
-                  });
-                  return;
-                }
-                logger.info('[outgoing-webhook] Deferred: id unresolved after window — staff reply', {
-                  phone: capturedNorm, idMessage: capturedId,
-                });
-                _applyStaffTakeover(capturedNorm, capturedId, capturedText);
-              }, OUTGOING_RECONCILE_MS);
+              _scheduleEchoReconcile(norm, idMessage, msgText);
               return;
             }
 
