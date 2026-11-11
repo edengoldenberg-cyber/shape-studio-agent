@@ -4495,6 +4495,26 @@ app.get('/api/tomer/tasks', (req, res) => {
   res.json({ ok: true, tasks, openCount: open.length, ts: new Date() });
 });
 
+// POST /api/tomer/tasks — manually create an Eden task from the panel
+app.post('/api/tomer/tasks', jsonBody, (req, res) => {
+  const { phone, action, detail, memberName } = req.body ?? {};
+  if (!phone || !action) return res.status(400).json({ error: 'phone and action required' });
+  const { task, isNew } = tomerAgent.createEdenTask({
+    type:          action,
+    phone,
+    memberName:    memberName ?? null,
+    arboxId:       null,
+    memberMessage: detail ?? '',
+    detail:        detail ?? '',
+    requestedDates: null,
+  });
+  if (!isNew && !task) {
+    return res.status(409).json({ ok: false, error: 'Duplicate open task of this type already exists' });
+  }
+  store.logEvent('manual_task_created', phone, { type: action, detail: (detail ?? '').slice(0, 80) });
+  res.json({ ok: true, task });
+});
+
 // POST /api/tomer/tasks/:id/assign — assign to Eden
 app.post('/api/tomer/tasks/:id/assign', jsonBody, (req, res) => {
   const task = tomerStore.assignTask(req.params.id, req.body?.assignedTo ?? 'Eden');
