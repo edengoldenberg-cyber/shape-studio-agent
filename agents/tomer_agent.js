@@ -1,304 +1,374 @@
+'use strict';
+
+/**
+ * tomer_agent.js — Shape Studio member-service agent.
+ *
+ * Responsibilities:
+ *   - Handle inbound WhatsApp from confirmed Arbox members.
+ *   - Classify message intent (service request vs. social vs. silence).
+ *   - Inject real Arbox context (subscription status, upcoming schedule, member profile).
+ *   - Create durable Eden tasks for requests that require human authority.
+ *   - Maintain per-member conversation history keyed by phone (no global shared array).
+ *
+ * API limitations (honest):
+ *   - Cannot book or cancel a specific class (Arbox public API v3 has no booking endpoint).
+ *   - Cannot view a member's personal booking list or attendance history.
+ *   - Cannot see or modify freeze/block status.
+ *   - Cannot approve membership freezes or cancellations (Eden only).
+ */
+
 require('dotenv').config();
 const fs     = require('fs');
 const path   = require('path');
 const OpenAI = require('openai');
 const logger = require('../utils/logger');
 const store  = require('../utils/lead_store');
-const { sendText } = require('../services/whatsapp.service');
+const tomerStore = require('../utils/tomer_store');
+const { sendText, alertOwner } = require('../services/whatsapp.service');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-const BUSINESS_CONTEXT = fs.readFileSync(
-  path.join(__dirname, '../prompts/business_context.md'), 'utf8'
-);
-const TOMER_PROMPT = BUSINESS_CONTEXT + '\n\n---\n\n' + fs.readFileSync(
-  path.join(__dirname, '../prompts/tomer_prompt.md'), 'utf8'
-);
-
-let tomerHistory = [];
-
-// ── Inbound message classification ───────────────────────────────────────────
-// Decides whether Tomer should reply or stay completely silent.
-
-// Brief social responses that need no reply
-const SILENCE_RE = /^(תודה( רבה)?|תנקיו|thanks?|ok[ay]?|אוקיי?|סבבה?|בסדר( גמור)?|קיבלתי|הבנתי|ברור|מעולה|נהדר|מצוין|חמוד|מגניב|יופי|שמעתי|פה|כאן|ביי|bye|ciao|😊|👍|🙏|❤️|✅|🙂|😁|💪|🎉)\.?!*$/iu;
-
-// Short chitchat with no studio context
-const CHITCHAT_RE = /^(היי|hey|hi|hola|מה שלומך|מה נשמע|מה קורה|תהיה טוב|יהיה בסדר|בהצלחה|להתראות)!*$/iu;
-
-// Keywords that signal the member actually needs something from the studio
-const ACTIONABLE_RE = /ביטול|לבטל|לשנות|שעה|שיעור|לוח|מנוי|חידוש|תשלום|כניסה|להגיע|מגיע[ה]?|להירשם|בעיה|שאלה|עזרה|אימון|להצטרף|לקבוע|תיאום|סיום|הארכה|הפסקה|חזרה|חסרתי|לא הגעתי/i;
-
-function classifyMemberMessage(text) {
-  if (!text || !text.trim()) return { decision: 'silence', reason: 'empty' };
-  const t = text.trim();
-  if (t.length <= 25 && SILENCE_RE.test(t))  return { decision: 'silence', reason: 'brief-ack' };
-  if (t.length <= 50 && CHITCHAT_RE.test(t)) return { decision: 'silence', reason: 'chitchat' };
-  if (t.length <= 70 && !ACTIONABLE_RE.test(t)) return { decision: 'silence', reason: 'no-action-needed' };
-  return { decision: 'respond', reason: 'actionable' };
+// ── Lazy-load Arbox to avoid circular deps at module load ─────────────────────
+let _arbox = null;
+function arbox() {
+  if (!_arbox) _arbox = require('../services/arbox.service');
+  return _arbox;
 }
 
-/**
- * Handle an inbound message from a verified existing studio member.
- * Returns { reply: string|null, decision, reason }.
- * reply===null → Tomer chose silence; caller must NOT send any WhatsApp message.
- */
-async function handleInboundMember({ name, text, phone, clientMatch }) {
-  const memberName = name ?? clientMatch?.arboxName ?? 'חבר/ת';
-  const { decision, reason } = classifyMemberMessage(text ?? '');
+// ── Prompt loading ─────────────────────────────────────────────────────────────
+const TOMER_PROMPT = (() => {
+  try {
+    const ctx   = fs.readFileSync(path.join(__dirname, '../prompts/business_context.md'), 'utf8');
+    const tomer = fs.readFileSync(path.join(__dirname, '../prompts/tomer_prompt.md'), 'utf8');
+    return `${ctx}\n\n---\n\n${tomer}`;
+  } catch {
+    return fs.readFileSync(path.join(__dirname, '../prompts/tomer_prompt.md'), 'utf8');
+  }
+})();
+
+// ════════════════════════════════════════════════════════════════════════════
+//  MESSAGE CLASSIFICATION
+// ════════════════════════════════════════════════════════════════════════════
+
+const SILENCE_RE  = /^(תודה( רבה)?|תנקיו|thanks?|ok[ay]?|אוקיי?|סבבה?|בסדר( גמור)?|קיבלתי|הבנתי|ברור|מעולה|נהדר|מצוין|חמוד|מגניב|יופי|שמעתי|פה|כאן|ביי|bye|ciao|😊|👍|🙏|❤️|✅|🙂|😁|💪|🎉|👌|🫡|🌸|⭐)\.?!*$/iu;
+const CHITCHAT_RE = /^(היי|hey|hi|hola|מה שלומך|מה נשמע|מה קורה|תהיה טוב|יהיה בסדר|בהצלחה|להתראות|שבת שלום|חג שמח|בוקר טוב|לילה טוב)!*[\p{Emoji}]?$/iu;
+const ACTIONABLE_RE = /ביטול|לבטל|לשנות|שעה|שיעור|לוח|מנוי|חידוש|תשלום|כניסה|להגיע|מגיע[ה]?|להירשם|בעיה|שאלה|עזרה|אימון|להצטרף|לקבוע|תיאום|סיום|הארכה|הפסקה|הקפאה|חזרה|חסרתי|לא הגעתי|קרה משהו|רשמי|תרשמי|תבטל|שינוי|לשנות|מתי|היכן|איפה|מחיר|כמה|מה כולל|לא עובד|שגיאה|לא הצלח/i;
+
+// FREEZE_RE: matches הקפאה/הקפיא/להקפיא variants and compound phrases
+const FREEZE_RE    = /הקפא[הית]?|להקפיא|הקפאת?\s+מנוי|לעצור\s+מנוי|pause|freeze/i;
+// CANCEL_RE: matches cancellation regardless of filler words between לבטל and מנוי
+// Note: \b doesn't work with Hebrew chars — use \s to anchor after לבטל
+const CANCEL_RE    = /לבטל\s[^.?!]{0,25}מנוי|ביטול\s+מנוי|לסיים\s+מנוי|לעזוב\s+את\s+הסטודיו|cancel\s+membership|לצאת\s+מה?מנוי/i;
+// COMPLAINT_RE: "בעיה עם" alone is a service query, not a complaint — require stronger signals
+const COMPLAINT_RE = /תלונה|מתלונן|לא מרוצה|אכזבתם|שירות גרוע|לא הסכמנו|חוויה גרועה|מאוכזב|ציפיתי|הבטחתם|לא קיבלתי מה שהובטח/i;
+
+function classifyMessage(text) {
+  if (!text?.trim()) return 'silence';
+  const t = text.trim();
+
+  if (t.length <= 25 && SILENCE_RE.test(t))  return 'silence';
+  if (t.length <= 60 && CHITCHAT_RE.test(t)) return 'chitchat';
+
+  if (CANCEL_RE.test(t))    return 'cancel_request';
+  if (FREEZE_RE.test(t))    return 'freeze_request';
+  if (COMPLAINT_RE.test(t)) return 'complaint';
+
+  if (/לוח\s+שיעורים|מערכת\s+שעות|מה\s+יש\s+היום|מה\s+יש\s+מחר|שעות\s+פעילות|מתי\s+יש\s+שיעור/i.test(t))
+    return 'schedule_query';
+  if (/מנוי|חידוש|כניסות|כמה\s+כניסות|תוקף|מתי\s+פג|מתי\s+מסתיים/i.test(t))
+    return 'subscription_query';
+
+  if (t.length <= 50 && !ACTIONABLE_RE.test(t)) return 'chitchat';
+  return 'general';
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ARBOX CONTEXT BUILDER
+// ════════════════════════════════════════════════════════════════════════════
+
+async function buildMemberContext(phone, clientMatch = {}) {
+  const lines = ['[MEMBER_CONTEXT]'];
+
+  try {
+    let member = null;
+    if (clientMatch.arboxId) {
+      try {
+        const all = await arbox().getAllUsers({ limit: 500 });
+        member = all.find(u => String(u.user_id) === String(clientMatch.arboxId)) ?? null;
+      } catch { /* fall through to phone lookup */ }
+    }
+    if (!member) {
+      member = await arbox().getMemberByPhone(phone).catch(() => null);
+    }
+
+    if (member) {
+      const name = `${member.first_name ?? ''} ${member.last_name ?? ''}`.trim();
+      const end  = member.membership_end_date?.slice(0, 10) ?? null;
+      const now  = new Date();
+
+      lines.push(`שם ב-Arbox: ${name || '(לא צוין)'}`);
+      lines.push(`מזהה Arbox: ${member.user_id}`);
+      lines.push(`סטטוס: ${member.active ? 'מנוי פעיל' : 'לא פעיל'}`);
+      if (member.membership_start_date) lines.push(`הצטרף/ה: ${member.membership_start_date.slice(0, 10)}`);
+      if (end) {
+        const daysLeft = Math.ceil((new Date(end) - now) / 86400000);
+        if (daysLeft > 0) {
+          lines.push(`תוקף מנוי: ${end} (עוד ${daysLeft} ימים)${daysLeft <= 30 ? ' ⚠️ פג בקרוב' : ''}`);
+        } else {
+          lines.push(`תוקף מנוי: ${end} (פג לפני ${Math.abs(daysLeft)} ימים)`);
+        }
+      }
+      if (member.gender)   lines.push(`מגדר: ${member.gender === 'female' ? 'נקבה' : member.gender === 'male' ? 'זכר' : member.gender}`);
+      if (member.birthday) lines.push(`יום הולדת: ${(member.birthday ?? '').slice(0, 10)}`);
+      lines.push(`תקשורת: SMS=${member.allow_sms ? 'כן' : 'לא'}, דוא"ל=${member.allow_email ? 'כן' : 'לא'}`);
+    } else {
+      lines.push('אין נתוני Arbox עבור מספר זה.');
+      if (clientMatch.arboxName) lines.push(`שם ממקור אחר: ${clientMatch.arboxName}`);
+    }
+
+    // Studio schedule (not member-specific — Arbox public API v3 has no per-member bookings)
+    try {
+      const classes = await arbox().getUpcomingClasses({ days: 5, limit: 8 });
+      if (classes.length > 0) {
+        lines.push('', 'לוח שיעורים קרוב (כל הסטודיו):');
+        const dayNames = ['ראשון','שני','שלישי','רביעי','חמישי','שישי','שבת'];
+        classes.forEach(c => {
+          const d    = new Date(c.date + 'T' + (c.start_time ?? '00:00'));
+          const day  = dayNames[d.getDay()] ?? c.date;
+          const link = c.registration_link ? ` | 🔗 ${c.registration_link}` : '';
+          const cap  = c.max_participants ? ` (מקס ${c.max_participants})` : '';
+          lines.push(`  • ${day} ${c.start_time ?? ''} — ${c.session_name ?? 'שיעור'}${cap} | ${c.staff_member?.name ?? '—'}${link}`);
+        });
+        lines.push('(הרשמה: דרך אפליקציית Arbox או הלינקים לעיל)');
+      }
+    } catch { /* non-fatal */ }
+
+  } catch (err) {
+    logger.warn('[tomer_agent] buildMemberContext failed', { phone, error: err.message });
+    lines.push('(Arbox לא זמין כרגע)');
+  }
+
+  lines.push('[/MEMBER_CONTEXT]');
+  return lines.join('\n');
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  EDEN TASK CREATOR
+// ════════════════════════════════════════════════════════════════════════════
+
+function createEdenTask({ type, phone, memberName, arboxId, memberMessage, detail, requestedDates }) {
+  if (tomerStore.hasOpenTask(phone, type)) {
+    logger.info('[tomer_agent] Duplicate task suppressed', { phone, type });
+    return { task: null, isNew: false };
+  }
+
+  const summaries = {
+    freeze_request:     'בקשת הקפאת מנוי',
+    cancel_request:     'בקשת ביטול מנוי',
+    complaint:          'תלונה / בעיה שלא נפתרה',
+    unsupported_action: 'פעולה שאינה נתמכת',
+    billing_question:   'שאלת חיוב',
+    other:              'פניית שירות כללית',
+  };
+  const summary  = (summaries[type] ?? 'פניית שירות') + (requestedDates ? ` — ${requestedDates}` : '');
+  const priority = type === 'complaint' || type === 'cancel_request' ? 'high' : 'normal';
+
+  const task = tomerStore.createTask({
+    type, phone, memberName, arboxId,
+    summary, detail, requestedDates, memberMessage, priority,
+  });
+
+  if (priority === 'high') {
+    alertOwner(
+      `🚨 תומר: ${summary} — ${memberName ?? phone.slice(-4)}`,
+      `*חבר/ה:* ${memberName ?? '(לא ידוע)'}\n*טלפון:* ${phone}\n*בקשה:* ${(memberMessage ?? detail ?? '—').slice(0, 200)}\n*מזהה:* ${task.id}`
+    ).catch(err => logger.warn('[tomer_agent] Eden alert failed', { error: err.message }));
+  }
+
+  return { task, isNew: true };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  MAIN INBOUND HANDLER
+// ════════════════════════════════════════════════════════════════════════════
+
+async function handleInboundMember({ name, text, phone, clientMatch = {}, _pendingMessages = null }) {
+  const memberName = clientMatch.arboxName ?? name ?? null;
+  const arboxId    = clientMatch.arboxId ?? null;
+  const msgText    = (text ?? '').trim();
+
+  const msgClass = classifyMessage(msgText);
 
   store.logEvent(
-    decision === 'silence' ? 'tomer_silent' : 'tomer_responded',
-    phone ?? null,
-    { decision, reason, preview: (text ?? '').slice(0, 60), senderName: memberName }
+    msgClass === 'silence' || msgClass === 'chitchat' ? 'tomer_silent' : 'tomer_responded',
+    phone,
+    { class: msgClass, preview: msgText.slice(0, 60), memberName }
   );
 
-  if (decision === 'silence') {
-    logger.info('[tomer] Silent on member message', { reason, preview: (text ?? '').slice(0, 40) });
-    return { reply: null, decision: 'silence', reason };
+  if (msgClass === 'silence' || msgClass === 'chitchat') {
+    logger.info('[tomer] Silent', { class: msgClass, phone });
+    tomerStore.appendAudit({ phone, memberName, event: 'tomer_silent',
+      requestPreview: msgText.slice(0, 100), tomerAction: `silent:${msgClass}`, owner: 'tomer' });
+    return { reply: null, decision: 'silence', reason: msgClass };
   }
 
-  const supportPrompt =
-    `הודעה נכנסת מחבר/ת סטודיו פעיל/ה: "${text}"\n` +
-    `שם: ${memberName}\n\n` +
-    `ענה בעברית — 1-2 משפטים מקסימום, חם ולעניין. ` +
-    `אם ההודעה לא מצריכה תגובה (שיחת חולין, תודה, אוקיי וכד') — ענה SILENCE. ` +
-    `אסור לשאול על מטרות כושר, להציע מכירות, או לשלוח שאלות פתיחה.`;
+  // ── Eden task for escalation-required requests ───────────────────────────
+  let taskCreated = null;
+  if (msgClass === 'freeze_request' || msgClass === 'cancel_request' || msgClass === 'complaint') {
+    const datesMatch = msgText.match(/\d{1,2}[\s./\-]\d{1,2}(?:[\s./\-]\d{2,4})?/g);
+    const { task, isNew } = createEdenTask({
+      type: msgClass, phone, memberName, arboxId,
+      memberMessage: msgText,
+      detail: msgText.slice(0, 300),
+      requestedDates: datesMatch ? datesMatch.join(' — ') : null,
+    });
+    if (isNew && task) taskCreated = task;
+  }
 
-  let aiReply;
+  // ── Arbox context (3-second timeout) ─────────────────────────────────────
+  let memberContext;
   try {
-    aiReply = await chat(supportPrompt);
+    memberContext = await Promise.race([
+      buildMemberContext(phone, clientMatch),
+      new Promise(r => setTimeout(() => r('(Arbox timeout)'), 3000)),
+    ]);
+  } catch { memberContext = '(Arbox error)'; }
+
+  // ── Stage hints for escalated requests ───────────────────────────────────
+  const stageHints = {
+    freeze_request:  '\n\n[STAGE] פתחתי משימה לעדן. ענה על הבקשה, ציין שהעברתי לעדן, שאל לתאריכים אם לא סופקו (שאלה אחת).',
+    cancel_request:  '\n\n[STAGE] פתחתי משימה לעדן. ציין שהעברתי לעדן ואל תאשר ביטול.',
+    complaint:       '\n\n[STAGE] פתחתי משימה לעדן. קבל את הדברים ברצינות ואמור שעדן תחזור.',
+  };
+
+  const history   = tomerStore.getMemberHistory(phone);
+  const systemMsg = `${TOMER_PROMPT}\n\n${memberContext}${stageHints[msgClass] ?? ''}`;
+
+  // ── OpenAI ────────────────────────────────────────────────────────────────
+  let reply;
+  try {
+    const completion = await openai.chat.completions.create({
+      model:    process.env.OPENAI_MODEL ?? 'gpt-4o',
+      messages: [
+        { role: 'system', content: systemMsg },
+        ...history,
+        { role: 'user', content: msgText },
+      ],
+      temperature: 0.5,
+      max_tokens:  350,
+    });
+    reply = completion.choices[0].message.content.trim();
   } catch (err) {
-    logger.error('[tomer] handleInboundMember AI error', { error: err.message });
-    return { reply: null, decision: 'silence', reason: 'ai-error' };
+    logger.error('[tomer_agent] OpenAI error', { phone, error: err.message });
+    // Safe fallback for requests where silence would abandon the member
+    if (msgClass === 'freeze_request' || msgClass === 'cancel_request') {
+      reply = 'קיבלתי את הבקשה שלך — העברתי לעדן ותחזור אליך בהקדם.';
+    } else {
+      return { reply: null, decision: 'silence', reason: 'ai-error', taskCreated };
+    }
   }
 
-  if (!aiReply || /^SILENCE$/i.test(aiReply.trim())) {
-    store.logEvent('tomer_silent', phone ?? null, { decision: 'ai-silence', reason: 'ai-decided', senderName: memberName });
-    return { reply: null, decision: 'silence', reason: 'ai-decided' };
+  if (!reply || /^SILENCE$/i.test(reply.trim())) {
+    tomerStore.appendAudit({ phone, memberName, event: 'tomer_ai_silence',
+      requestPreview: msgText.slice(0, 100), tomerAction: 'ai returned SILENCE', owner: 'tomer' });
+    return { reply: null, decision: 'silence', reason: 'ai-decided', taskCreated };
   }
 
-  logger.info('[tomer] Responded to member message', { preview: aiReply.slice(0, 60) });
-  return { reply: aiReply, decision: 'respond', reason };
+  // ── Stale gate ────────────────────────────────────────────────────────────
+  if (_pendingMessages?.has(phone)) {
+    logger.info('[tomer_agent] Stale reply suppressed', { phone });
+    store.logEvent('reply_suppressed_stale', phone, { agent: 'tomer' });
+    return { reply, decision: 'silence', reason: 'stale', sendState: 'skipped_stale', taskCreated };
+  }
+
+  // ── Send ──────────────────────────────────────────────────────────────────
+  let sendState = 'sent';
+  try {
+    await sendText(phone, reply);
+  } catch (sendErr) {
+    logger.error('[tomer_agent] sendText failed', { phone, error: sendErr.message });
+    sendState = 'failed';
+  }
+
+  tomerStore.appendMemberHistory(phone, 'user',      msgText);
+  tomerStore.appendMemberHistory(phone, 'assistant', reply);
+
+  tomerStore.appendAudit({
+    phone, memberName, event: 'tomer_responded',
+    requestPreview: msgText.slice(0, 100),
+    tomerAction:    `replied (${msgClass})${taskCreated ? ` task:${taskCreated.id}` : ''}`,
+    replyPreview:   reply.slice(0, 100),
+    arboxStatus:    memberContext.includes('timeout') || memberContext.includes('error') ? 'degraded' : 'ok',
+    owner: 'tomer', taskId: taskCreated?.id ?? null, sendState,
+  });
+
+  logger.info('[tomer] Responded', { phone, class: msgClass, sendState, task: taskCreated?.id ?? null });
+  return { reply, decision: 'respond', reason: msgClass, sendState, taskCreated };
 }
 
-// ── Chat interface ─────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+//  ADMIN CHAT  (admin panel chat box)
+// ════════════════════════════════════════════════════════════════════════════
+
+let _adminHistory = [];
 
 async function chat(userMessage) {
-  const context = buildContext();
-  tomerHistory.push({ role: 'user', content: userMessage });
+  _adminHistory.push({ role: 'user', content: userMessage });
+
+  const openTasks = tomerStore.getOpenTasks();
+  const ctx = [
+    `## מצב שירות — ${new Date().toLocaleString('he-IL', { timeZone: 'Asia/Jerusalem' })}`,
+    `משימות פתוחות לעדן: ${openTasks.length}`,
+    openTasks.slice(0, 5).map(t =>
+      `  • [${t.priority}] ${t.type} — ${t.memberName ?? t.phone?.slice(-4)} (${t.createdAt.slice(0,10)})`
+    ).join('\n') || '  (אין)',
+  ].join('\n');
 
   let reply;
   try {
     const completion = await openai.chat.completions.create({
-      model:       process.env.OPENAI_MODEL ?? 'gpt-4o',
-      messages:    [
-        { role: 'system', content: TOMER_PROMPT },
-        { role: 'system', content: context },
-        ...tomerHistory,
+      model:    process.env.OPENAI_MODEL ?? 'gpt-4o',
+      messages: [
+        { role: 'system', content: TOMER_PROMPT + '\n\n' + ctx },
+        ..._adminHistory,
       ],
       temperature: 0.6,
-      max_tokens:  500,
+      max_tokens:  600,
     });
     reply = completion.choices[0].message.content.trim();
   } catch (err) {
-    logger.error('OpenAI error in tomer_agent', { error: err.message });
-    reply = 'שגיאה טכנית. בדוק את מפתח ה-OPENAI_API_KEY.';
+    logger.error('[tomer_agent] admin chat error', { error: err.message });
+    reply = 'שגיאה טכנית.';
   }
 
-  tomerHistory.push({ role: 'assistant', content: reply });
-  tomerHistory = tomerHistory.slice(-30);
+  _adminHistory.push({ role: 'assistant', content: reply });
+  _adminHistory = _adminHistory.slice(-30);
   return reply;
 }
 
-// ── Daily re-engagement checks ────────────────────────────────────────────────
+function clearHistory() { _adminHistory = []; }
 
-/**
- * Run Tomer's daily re-engagement pass over all leads in the store.
- * Sends WhatsApp messages to leads who are dormant or have unredeemed intro offers.
- * Returns a summary object.
- */
+// ════════════════════════════════════════════════════════════════════════════
+//  LEGACY SHIM — runDailyChecks (delegates to retention_worker)
+// ════════════════════════════════════════════════════════════════════════════
+
 async function runDailyChecks() {
-  // getActiveLeads() excludes converted_member records — reclassified members
-  // must never receive Tomer's re-engagement messages.
-  const leads  = store.getActiveLeads();
-  const result = { reEngaged: 0, introFollowUps: 0, skipped: 0, errors: 0 };
-
-  // Load member identity guards (lazy requires to avoid circular deps at module load).
-  // memberCache.isKnownMemberFile reads known_members.json directly — no server.js closure needed.
-  let memberCache, isMemberPhoneSync;
+  logger.info('[tomer_agent] runDailyChecks — delegating to retention_worker');
   try {
-    memberCache       = require('../utils/member_cache');
-    isMemberPhoneSync = require('../utils/conversion_detector').isMemberPhoneSync;
-  } catch { /* non-fatal — guards are best-effort if modules unavailable */ }
-
-  for (const lead of leads) {
-    try {
-      if (lead.status === 'crisis')            { result.skipped++; continue; }
-      if (lead.status === 'converted_member')  { result.skipped++; continue; }
-      if (!lead.phone)                         { result.skipped++; continue; }
-
-      // Guard: never re-engage a lead that has silently converted to an Arbox member.
-      // Checks both the in-process cache (< 1ms) AND known_members.json (< 2ms).
-      if (memberCache && isMemberPhoneSync) {
-        const isNowMember = isMemberPhoneSync(lead.phone, memberCache, memberCache.isKnownMemberFile);
-        if (isNowMember) {
-          logger.info('[tomer] Skipping re-engagement — lead is a confirmed member', { phone: lead.phone });
-          result.skipped++;
-          continue;
-        }
-      }
-
-      const dormantDays    = daysSince(lead.lastActivity);
-      const lastEngDays    = daysSince(lead.lastReEngagementAt);
-      const firstName      = (lead.name ?? '').split(' ')[0] || 'שלום';
-
-      // ── Re-engagement sequence ───────────────────────────────────────────
-      if (lead.status !== 'hot') {
-        if (dormantDays >= 3 && lead.reEngagementCount === 0) {
-          await sendReEngagement(lead.phone, firstName, 1);
-          bumpReEngagement(lead.phone);
-          result.reEngaged++;
-          continue;
-        }
-        if (dormantDays >= 7 && lead.reEngagementCount === 1 && lastEngDays >= 3) {
-          await sendReEngagement(lead.phone, firstName, 2);
-          bumpReEngagement(lead.phone);
-          result.reEngaged++;
-          continue;
-        }
-        if (dormantDays >= 14 && lead.reEngagementCount === 2 && lastEngDays >= 5) {
-          await sendReEngagement(lead.phone, firstName, 3);
-          bumpReEngagement(lead.phone);
-          result.reEngaged++;
-          continue;
-        }
-      }
-
-      // ── Intro offer follow-up (sent but not redeemed after 2 days) ───────
-      if (lead.introOfferSent && !lead.introOfferRedeemed && dormantDays >= 2 && lead.reEngagementCount === 0) {
-        await sendIntroFollowUp(lead.phone, firstName);
-        bumpReEngagement(lead.phone);
-        result.introFollowUps++;
-        continue;
-      }
-
-      result.skipped++;
-    } catch (err) {
-      logger.error('Tomer daily check error', { phone: lead.phone, error: err.message });
-      result.errors++;
-    }
+    const rw = require('../workers/retention_worker');
+    return await rw.runAllWorkflows();
+  } catch (err) {
+    logger.warn('[tomer_agent] retention_worker unavailable', { error: err.message });
+    return { reEngaged: 0, skipped: 0, errors: 1 };
   }
-
-  logger.info('Tomer daily checks complete', result);
-  return result;
 }
 
-// ── Gender detection ──────────────────────────────────────────────────────────
-// Infers lead gender from first name so messages use correct Hebrew forms.
-// Returns 'male' | 'female'. Defaults to 'female' (studio's primary audience).
-
-const MALE_FIRST_NAMES = new Set([
-  'עדן', 'eden', 'אמיר', 'amir', 'יוסי', 'yossi', 'דוד', 'david', 'ניר', 'nir',
-  'גל', 'gal', 'רון', 'ron', 'עמית', 'amit', 'נועם', 'noam', 'אבי', 'avi',
-  'יוני', 'joni', 'אלון', 'alon', 'שחר', 'shahar', 'אריאל', 'ariel', 'אורי', 'uri',
-  'ליאור', 'lior', 'רועי', 'roi', 'אסף', 'assaf', 'עמר', 'omer', 'תמיר', 'tamir',
-  'ינון', 'yanon', 'אייל', 'eyal', 'שלומי', 'shlomi', 'מתן', 'matan', 'ניצן', 'nitzan',
-]);
-
-function detectGender(lead) {
-  const firstName = (lead.name ?? '').trim().split(/\s+/)[0].toLowerCase();
-  return MALE_FIRST_NAMES.has(firstName) ? 'male' : 'female';
-}
-
-// ── Message senders ───────────────────────────────────────────────────────────
-
-async function sendReEngagement(phone, firstName, touchNumber) {
-  const lead   = store.getLead(phone);
-  const gender = detectGender(lead ?? { name: firstName });
-
-  const messages = {
-    1: {
-      female: `${firstName}, שלום! 😊 קצת שקט — רציתי לבדוק שהכל בסדר. אנחנו פה ב-Shape Studio. הגיע הזמן לנסות? 💪`,
-      male:   `${firstName}, שלום! 😊 קצת שקט מצידך — רציתי לבדוק שהכל בסדר. אנחנו פה ב-Shape Studio. הגיע הזמן לנסות? 💪`,
-    },
-    2: {
-      female: `${firstName}, שבוע עבר! עדיין רוצים לראות אותך. אולי שיעור אחר יתאים יותר? ספרי לי מה מעניין אותך ואמצא לך זמן. 🧘‍♀️`,
-      male:   `${firstName}, שבוע עבר! עדיין רוצים לראות אותך. אולי שיעור אחר יתאים יותר? ספר לי מה מעניין אותך ואמצא לך זמן. 💪`,
-    },
-    3: {
-      female: `${firstName}, לא רוצה להעיק 🙂 אם עדיין מתלבטת, אשמח לענות על שאלות. ואם שינית כיוון — אין בעיה. תמיד מוזמנת. 🙏`,
-      male:   `${firstName}, לא רוצה להעיק 🙂 אם עדיין מתלבט, אשמח לענות על שאלות. ואם שינית כיוון — אין בעיה. תמיד מוזמן. 🙏`,
-    },
-  };
-
-  const set = messages[touchNumber] ?? messages[1];
-  await sendText(phone, set[gender]);
-  store.logEvent('re_engagement_sent', phone, { touchNumber, gender });
-  logger.info('Re-engagement sent', { phone, touchNumber, gender });
-}
-
-async function sendIntroFollowUp(phone, firstName) {
-  const msg = `${firstName}, שלחנו לך לאחרונה הצעת היכרות — 2 אימונים ב-60 ש״ח. עדיין תקפה! רוצה לקבוע? 🎯`;
-  await sendText(phone, msg);
-  store.logEvent('re_engagement_sent', phone, { type: 'intro_followup' });
-  logger.info('Intro offer follow-up sent', { phone });
-}
-
-function bumpReEngagement(phone) {
-  const lead = store.getLead(phone);
-  store.upsertLead(phone, {
-    reEngagementCount:  (lead?.reEngagementCount ?? 0) + 1,
-    lastReEngagementAt: new Date(),
-  });
-}
-
-// ── Context builder for chat ──────────────────────────────────────────────────
-
-function buildContext() {
-  const all        = store.getAllLeads();
-  const now        = new Date().toLocaleString('he-IL', { timeZone: 'Asia/Jerusalem' });
-  const stats      = store.getDailyStats();
-
-  const dormant = all.filter(l =>
-    l.status !== 'crisis' &&
-    daysSince(l.lastActivity) >= 3
-  ).sort((a, b) => daysSince(b.lastActivity) - daysSince(a.lastActivity));
-
-  const introNotRedeemed = all.filter(l =>
-    l.introOfferSent && !l.introOfferRedeemed
-  );
-
-  const fmtLead = (l) => {
-    const d    = Math.floor(daysSince(l.lastActivity));
-    const reng = l.reEngagementCount > 0 ? ` | re-eng: ${l.reEngagementCount}` : '';
-    const intr = l.introOfferSent ? ' | intro-sent' : '';
-    return `  • ${l.name ?? l.phone} | score ${l.score}/10 | silent ${d}d${reng}${intr}`;
-  };
-
-  return [
-    `## תור השימור של תומר — ${now}`,
-    '',
-    `### לידים רדומים (3+ ימים ללא פעילות) — ${dormant.length}`,
-    ...dormant.map(fmtLead),
-    '',
-    `### הצעת היכרות שנשלחה ולא נוצלה — ${introNotRedeemed.length}`,
-    ...introNotRedeemed.map(l => `  • ${l.name ?? l.phone} | score ${l.score}/10 | re-eng: ${l.reEngagementCount}`),
-    '',
-    '### סטטיסטיקות היום',
-    `  - לידים שנוצרו: ${stats.reEngagedToday}`,
-    `  - הצעות שנשלחו: ${stats.introOffersSent}`,
-    `  - סה"כ לידים רדומים: ${dormant.length}`,
-  ].join('\n');
-}
-
-// ── Utils ──────────────────────────────────────────────────────────────────────
-
-function daysSince(date) {
-  if (!date) return Infinity;
-  return (Date.now() - new Date(date).getTime()) / 86400000;
-}
-
-function clearHistory() { tomerHistory = []; }
-
-module.exports = { chat, runDailyChecks, clearHistory, handleInboundMember, classifyMemberMessage };
+module.exports = {
+  handleInboundMember,
+  classifyMessage,
+  chat,
+  clearHistory,
+  runDailyChecks,
+  buildMemberContext,
+  createEdenTask,
+};

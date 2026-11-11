@@ -48,6 +48,8 @@ const calendarSvc                      = require('./services/calendar.service');
 const notifySvc                        = require('./services/notification.service');
 const greenApiSvc                      = require('./services/greenapi.service');
 const persist                          = require('./utils/persist');
+const tomerStore                       = require('./utils/tomer_store');
+const retentionWorker                  = require('./workers/retention_worker');
 const studioAssets                     = require('./utils/studio_assets');
 const memberCache                      = require('./utils/member_cache');
 const { detectAndMarkConversions, isMemberPhoneSync } = require('./utils/conversion_detector');
@@ -3182,6 +3184,54 @@ async function processInboundWAMessage(msg) {
     }
   }
 
+  // 2e. UNCLASSIFIED HOLD — unknown contact with no identity evidence.
+  //
+  //   An unknown WhatsApp number is NOT automatically a sales lead.
+  //   Before routing to Barak, we require at least one of:
+  //     (a) prior lead history (the phone has been in the pipeline before), OR
+  //     (b) explicit fitness/sales intent in the current message.
+  //
+  //   If neither condition holds, the contact receives one neutral warm greeting
+  //   and is placed in the unclassified inbox. Subsequent messages follow the same
+  //   rule: if they then express fitness intent → Barak. Otherwise → inbox only.
+  //
+  //   This prevents suppliers, friends, staff with new numbers, and unrelated
+  //   contacts from entering the sales qualification funnel.
+  //
+  //   Override: manual assignment via admin panel always routes correctly.
+  if (!isExistingClient) {
+    const _tomerStore  = require('./utils/tomer_store');
+    const _existingLead = store.getLead(fromNorm);
+    const _hasLeadHistory = !!(_existingLead?.messageCount && _existingLead.messageCount > 0);
+    const SALES_INTENT_RE = /פילאטיס|כושר|שיעור|אימון|להצטרף|מנוי|להתנסות|ניסיון|רפורמר|בארה|קנגו|yoga|יוגה|בריאות|ירידה.*משקל|חיזוק|גב|גמישות|שייפ\s*סטודיו|מחיר|כמה.*עולה|שעות.*פעילות|לוח.*שיעורים|הצעת\s+היכרות|60\s+ש|60\s+₪/i;
+    const _hasSalesIntent = SALES_INTENT_RE.test(msg.text ?? '');
+
+    if (!_hasLeadHistory && !_hasSalesIntent && msg.type === 'text') {
+      const _alreadyGreeted = _tomerStore.hasGreetedUnclassified(fromNorm);
+      _tomerStore.markUnclassified(fromNorm, { firstMessage: msg.text ?? '' });
+
+      let _unclassifiedReply = null;
+      if (!_alreadyGreeted && process.env.WHATSAPP_AUTO_REPLY === 'true') {
+        _unclassifiedReply = 'שלום! 😊 קיבלנו את הודעתך. כדי שנוכל לעזור — ספר/י לנו מה מחפש/ת.';
+        await sendText(fromNorm, _unclassifiedReply).catch(() => {});
+        _tomerStore.markUnclassified(fromNorm, { firstMessage: msg.text ?? '', greetingSent: true });
+        _tomerStore.appendAudit({ phone: fromNorm, memberName: msg.name ?? null, event: 'unclassified_greeting',
+          requestPreview: (msg.text ?? '').slice(0, 100), tomerAction: 'neutral greeting sent', owner: 'unclassified' });
+      }
+      logger.info('[pipeline] UNCLASSIFIED — no lead history, no sales intent', { from: fromNorm, greeted: !_alreadyGreeted });
+      store.logEvent('unclassified_hold', fromNorm, { greeted: !_alreadyGreeted, preview: (msg.text ?? '').slice(0, 60) });
+
+      const _ucEntry = inbox.push({
+        from: fromNorm, fromIsraeli, name: msg.name ?? null,
+        text: msg.text ?? '', messageId: msg.messageId,
+        timestamp: msg.timestamp, receivedAt: new Date(),
+        mediaType: msg.type, mediaCaption: msg.mediaCaption ?? null, mediaId: msg.mediaId ?? null,
+        clientMatch, intent, route: 'unclassified', barakReply: _unclassifiedReply,
+      });
+      return { inboxEntry: _ucEntry, clientMatch, intent, route: 'unclassified', barakReply: _unclassifiedReply };
+    }
+  }
+
   // 3. Routing decision — strict Barak / Tomer boundary
   //
   //   The primary split is ALWAYS membership status, never intent.
@@ -3259,15 +3309,23 @@ async function processInboundWAMessage(msg) {
       // Existing member general message → Tomer silence classifier (strict rules)
       try {
         const result = await tomerAgent.handleInboundMember({
-          name:         msg.name,
-          text:         msg.text,
-          phone:        fromNorm,
+          name:            msg.name,
+          text:            msg.text,
+          phone:           fromNorm,
           clientMatch,
-          isAggregator, // hint: ClassPass/Gympass member — potential direct-membership convert
+          isAggregator,    // hint: ClassPass/Gympass member — potential direct-membership convert
+          _pendingMessages, // stale-send gate: Tomer checks before sendText
         });
-        if (result.reply) barakReply = result.reply;
+        if (result.reply) {
+          barakReply = result.reply;
+          // Tomer sends its own reply internally — mark so outer pipeline doesn't double-send.
+          if (result.sendState === 'sent' || result.sendState === 'skipped_stale') {
+            _replyAlreadySent = true;
+          }
+        }
         // result.reply === null → Tomer chose silence; no WhatsApp message is sent
-        logger.info('[tomer] Inbound decision', { decision: result.decision, reason: result.reason, from: fromNorm });
+        logger.info('[tomer] Inbound decision', { decision: result.decision, reason: result.reason, from: fromNorm,
+          task: result.taskCreated?.id ?? null });
       } catch (err) {
         logger.warn('Tomer inbound handler failed', { error: err.message, from: fromNorm });
       }
@@ -4317,6 +4375,158 @@ app.post('/api/tomer/action', jsonBody, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
+// TOMER WORKSPACE API — Service tasks, member context, audit, unclassified
+// ══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/tomer/tasks — Eden task queue
+app.get('/api/tomer/tasks', (req, res) => {
+  const { status, phone, type } = req.query;
+  const tasks = tomerStore.getTasks({ status, phone, type, limit: 200 });
+  const open  = tomerStore.getOpenTasks();
+  res.json({ ok: true, tasks, openCount: open.length, ts: new Date() });
+});
+
+// POST /api/tomer/tasks/:id/assign — assign to Eden
+app.post('/api/tomer/tasks/:id/assign', jsonBody, (req, res) => {
+  const task = tomerStore.assignTask(req.params.id, req.body?.assignedTo ?? 'Eden');
+  if (!task) return res.status(404).json({ ok: false, error: 'Task not found' });
+  res.json({ ok: true, task });
+});
+
+// POST /api/tomer/tasks/:id/resolve — resolve a task
+app.post('/api/tomer/tasks/:id/resolve', jsonBody, (req, res) => {
+  const { resolutionNote, resolvedBy } = req.body ?? {};
+  const task = tomerStore.resolveTask(req.params.id, { resolutionNote, resolvedBy });
+  if (!task) return res.status(404).json({ ok: false, error: 'Task not found' });
+  res.json({ ok: true, task });
+});
+
+// POST /api/tomer/tasks/:id/update — update any task fields
+app.post('/api/tomer/tasks/:id/update', jsonBody, (req, res) => {
+  const task = tomerStore.updateTask(req.params.id, req.body ?? {});
+  if (!task) return res.status(404).json({ ok: false, error: 'Task not found' });
+  res.json({ ok: true, task });
+});
+
+// GET /api/tomer/audit — action audit log
+app.get('/api/tomer/audit', (req, res) => {
+  const { phone, event, limit } = req.query;
+  const entries = tomerStore.getAudit({ phone, event, limit: parseInt(limit) || 100 });
+  res.json({ ok: true, entries, count: entries.length, ts: new Date() });
+});
+
+// GET /api/tomer/unclassified — inbox of unknown contacts pending routing
+app.get('/api/tomer/unclassified', (req, res) => {
+  const contacts = tomerStore.getAllUnclassified();
+  res.json({ ok: true, contacts, count: contacts.length, ts: new Date() });
+});
+
+// POST /api/tomer/unclassified/:phone/route — manually route an unclassified contact
+app.post('/api/tomer/unclassified/:phone/route', jsonBody, (req, res) => {
+  const phone = decodeURIComponent(req.params.phone);
+  const { routeTo } = req.body ?? {}; // 'barak' | 'tomer' | 'ignore'
+  tomerStore.resolveUnclassified(phone, routeTo ?? 'manual');
+  if (routeTo === 'barak') {
+    // Seed a lead record so the next message routes to Barak naturally
+    store.upsertLead(phone, {
+      messageCount: 1,
+      meta: { manuallyRoutedToBarak: true, routedAt: Date.now() },
+    });
+  }
+  store.logEvent('manual_route', phone, { routeTo, source: 'admin_panel' });
+  res.json({ ok: true, phone, routeTo });
+});
+
+// GET /api/tomer/member/:phone — rich member context (Arbox + local)
+app.get('/api/tomer/member/:phone', async (req, res) => {
+  const phone = decodeURIComponent(req.params.phone);
+  try {
+    const arboxSvc  = require('./services/arbox.service');
+    const member    = await arboxSvc.getMemberByPhone(phone).catch(() => null);
+    const lead      = store.getLead(phone);
+    const history   = tomerStore.getMemberHistory(phone);
+    const tasks     = tomerStore.getTasks({ phone });
+    const audit     = tomerStore.getAudit({ phone, limit: 20 });
+    const inboxThreads = inbox.getThread ? inbox.getThread(phone) : [];
+    res.json({ ok: true, phone, arbox: member, lead, history, tasks, audit, inboxThreads });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// GET /api/tomer/overview — service overview for the panel home
+app.get('/api/tomer/overview', async (req, res) => {
+  try {
+    const openTasks    = tomerStore.getOpenTasks();
+    const recentAudit  = tomerStore.getAudit({ limit: 20 });
+    const unclassified = tomerStore.getAllUnclassified();
+    const arboxSvc     = require('./services/arbox.service');
+    const arboxOk      = await arboxSvc.testConnection().then(r => r.ok).catch(() => false);
+
+    const tasksByPriority = { high: 0, normal: 0, low: 0 };
+    openTasks.forEach(t => { tasksByPriority[t.priority] = (tasksByPriority[t.priority] ?? 0) + 1; });
+
+    res.json({
+      ok: true,
+      service: {
+        openTasks:         openTasks.length,
+        highPriorityTasks: tasksByPriority.high,
+        recentActivity:    recentAudit.filter(e => e.event === 'tomer_responded').length,
+        failedActions:     recentAudit.filter(e => e.sendState === 'failed').length,
+        unclassified:      unclassified.length,
+      },
+      arboxHealth: arboxOk,
+      openTasks:   openTasks.slice(0, 10),
+      recentAudit: recentAudit.slice(0, 10),
+      ts: new Date(),
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// GET /api/tomer/retention/config — workflow configuration
+app.get('/api/tomer/retention/config', (req, res) => {
+  res.json({ ok: true, config: retentionWorker.getConfig() });
+});
+
+// POST /api/tomer/retention/toggle — enable/disable a workflow
+app.post('/api/tomer/retention/toggle', jsonBody, (req, res) => {
+  const { workflowId, enabled } = req.body ?? {};
+  if (!workflowId) return res.status(400).json({ error: 'workflowId required' });
+  if (enabled === true) retentionWorker.enableWorkflow(workflowId);
+  else retentionWorker.disableWorkflow(workflowId);
+  res.json({ ok: true, workflowId, enabled: retentionWorker.getConfig()[workflowId]?.enabled });
+});
+
+// GET /api/tomer/retention/preview/:workflowId — dry run eligible members
+app.get('/api/tomer/retention/preview/:workflowId', async (req, res) => {
+  try {
+    const preview = await retentionWorker.previewWorkflow(req.params.workflowId, 20);
+    res.json({ ok: true, ...preview });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// POST /api/tomer/retention/run/:workflowId — run a single workflow now
+app.post('/api/tomer/retention/run/:workflowId', async (req, res) => {
+  try {
+    const result = await retentionWorker.runWorkflow(req.params.workflowId);
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// GET /api/tomer/member/:phone/history — Tomer's AI conversation history for a member
+app.delete('/api/tomer/member/:phone/history', (req, res) => {
+  const phone = decodeURIComponent(req.params.phone);
+  tomerStore.clearMemberHistory(phone);
+  res.json({ ok: true, phone, cleared: true });
+});
+
 // KNOWLEDGE MANAGEMENT — Admin API
 // Allows the dashboard to view, edit, and hot-reload agent knowledge
 // (staff directory, subscription packages) without a server restart.

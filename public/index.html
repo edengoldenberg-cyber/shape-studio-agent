@@ -408,177 +408,149 @@
       </div>
     </section>
 
-    <!-- ══════════════════════════════════════════════════════════════════════
-         TOMER — Retention & Follow-up
-    ══════════════════════════════════════════════════════════════════════════ -->
+    <!-- ═══════════════════════════════════════════════════
+         TOMER — Member Service Workspace
+    ════════════════════════════════════════════════════════ -->
     <section id="tab-tomer" class="tab-panel">
-      <div class="agent-layout">
+      <div id="tomer-ws">
 
-        <!-- Sidebar -->
-        <aside class="agent-sidebar panel">
-          <div class="panel-header">
-            <div class="agent-profile-sm">
-              <div class="agent-avatar-sm" style="background:linear-gradient(135deg,#10b981,#0ea5e9)">T</div>
-              <div>
-                <div class="agent-name-sm">תומר</div>
-                <div class="agent-role-sm">שימור ופולו-אפ</div>
-              </div>
+        <!-- ── Workspace nav bar ─────────────────────────────── -->
+        <div class="tw-topbar" dir="rtl">
+          <div class="tw-tabs">
+            <button class="tw-tab active" data-pane="overview">סקירה</button>
+            <button class="tw-tab" data-pane="members">חברים</button>
+            <button class="tw-tab" data-pane="tasks">תורים לעדן <span class="tw-badge" id="tw-badge-tasks"></span></button>
+            <button class="tw-tab" data-pane="automation">אוטומציה</button>
+            <button class="tw-tab" data-pane="audit">ביקורת</button>
+          </div>
+          <div class="tw-actions">
+            <button class="btn btn-secondary" id="tw-refresh" title="רענן">🔄</button>
+            <button class="btn btn-primary" id="btn-tomer-checks">▶ הרץ בדיקות</button>
+            <div id="tomer-checks-result" class="tool-result" style="display:none"></div>
+          </div>
+        </div>
+
+        <!-- ── Overview pane ─────────────────────────────────── -->
+        <div class="tw-pane active" id="twp-overview" dir="rtl">
+          <div class="tw-kpi-row" id="tw-kpis">
+            <div class="tw-kpi"><span class="tw-kpi-val" id="twk-open">—</span><span class="tw-kpi-lbl">משימות פתוחות</span></div>
+            <div class="tw-kpi urgent"><span class="tw-kpi-val" id="twk-high">—</span><span class="tw-kpi-lbl">עדיפות גבוהה</span></div>
+            <div class="tw-kpi"><span class="tw-kpi-val" id="twk-unclass">—</span><span class="tw-kpi-lbl">לא מזוהים</span></div>
+            <div class="tw-kpi"><span class="tw-kpi-val" id="twk-failed">—</span><span class="tw-kpi-lbl">פעולות נכשלו</span></div>
+            <div class="tw-kpi"><span class="tw-kpi-val" id="twk-arbox">—</span><span class="tw-kpi-lbl">Arbox</span></div>
+          </div>
+
+          <div class="tw-two-col">
+            <div class="tw-card">
+              <div class="tw-card-title">🔴 מחכים לעדן</div>
+              <div id="tw-open-tasks-list" class="tw-list"></div>
+              <div class="tw-empty" id="tw-tasks-empty" style="display:none">אין משימות פתוחות</div>
+            </div>
+            <div class="tw-card">
+              <div class="tw-card-title">📋 פעילות אחרונה</div>
+              <div id="tw-recent-audit" class="tw-list"></div>
             </div>
           </div>
-          <div class="agent-sidebar-body">
-            <div class="agent-mini-stats" id="tomer-mini-stats">
-              <div class="mini-stat"><div class="mini-stat-val" id="ts-dormant">—</div><div class="mini-stat-lbl">רדומים</div></div>
-              <div class="mini-stat"><div class="mini-stat-val" id="ts-intro">—</div><div class="mini-stat-lbl">הצעה לא נוצלה</div></div>
-              <div class="mini-stat"><div class="mini-stat-val" id="ts-today">—</div><div class="mini-stat-lbl">טופלו היום</div></div>
-            </div>
 
-            <div class="tool-section">
-              <button class="btn btn-primary tool-btn" id="btn-tomer-checks">▶ הרץ בדיקות יומיות</button>
-              <div id="tomer-checks-result" class="tool-result" style="display:none"></div>
+          <div class="tw-card" style="margin-top:12px">
+            <div class="tw-card-title">❓ לא מזוהים — ממתינים לניתוב
+              <span class="tw-badge-sm" id="tw-unclass-count"></span>
             </div>
+            <div id="tw-unclassified-list" class="tw-list"></div>
+            <div class="tw-empty" id="tw-unclass-empty">אין מספרים לא מזוהים</div>
+          </div>
+        </div>
 
-            <div class="tool-section" style="border-top:1px solid var(--border);padding-top:16px">
-              <div class="tool-title">💬 שוחח עם תומר</div>
-              <div class="mini-chat">
-                <div class="mini-chat-msgs" id="tomer-chat-msgs"></div>
-                <div class="mini-chat-row">
-                  <input type="text" id="tomer-chat-input" class="field-input" placeholder="שאלי את תומר..." autocomplete="off"/>
-                  <button class="mini-send-btn" id="tomer-send">›</button>
-                </div>
-              </div>
+        <!-- ── Members pane ───────────────────────────────────── -->
+        <div class="tw-pane" id="twp-members" dir="rtl">
+          <div class="tw-search-row">
+            <input type="search" id="tw-member-search" placeholder="חפש לפי שם או טלפון..." class="field-input" style="max-width:280px"/>
+            <select id="tw-member-status" class="field-input" style="max-width:160px">
+              <option value="">כל הסטטוסים</option>
+              <option value="active">פעיל</option>
+              <option value="expiring">עומד לפוג</option>
+              <option value="expired">פג תוקף</option>
+            </select>
+            <button class="btn btn-secondary" id="tw-members-load">טען מ-Arbox</button>
+          </div>
+          <div class="table-wrapper" style="margin-top:10px">
+            <table class="leads-table">
+              <thead><tr>
+                <th>שם</th><th>טלפון (מוסתר)</th><th>סטטוס</th><th>תוקף מנוי</th>
+                <th>בעלות</th><th>בקשה פתוחה</th><th></th>
+              </tr></thead>
+              <tbody id="tw-members-tbody"><tr><td colspan="7" class="empty-state">לחץ "טען מ-Arbox" לטעינת חברים</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- ── Eden Tasks pane ────────────────────────────────── -->
+        <div class="tw-pane" id="twp-tasks" dir="rtl">
+          <div class="tw-filter-row">
+            <button class="filter-btn active" data-tf="open">פתוח</button>
+            <button class="filter-btn" data-tf="eden_assigned">הוקצה לעדן</button>
+            <button class="filter-btn" data-tf="resolved">נפתר</button>
+            <button class="filter-btn" data-tf="">הכל</button>
+          </div>
+          <div class="table-wrapper" style="margin-top:10px">
+            <table class="leads-table">
+              <thead><tr>
+                <th>חבר/ה</th><th>סוג</th><th>תקציר</th>
+                <th>עדיפות</th><th>סטטוס</th><th>נוצר</th><th>פעולות</th>
+              </tr></thead>
+              <tbody id="tw-tasks-tbody"><tr><td colspan="7" class="empty-state">אין משימות</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- ── Automation pane ────────────────────────────────── -->
+        <div class="tw-pane" id="twp-automation" dir="rtl">
+          <p class="tw-desc">כל הווקפלואים מושבתים כברירת מחדל. הפעל לאחר בדיקת קהל, טקסט, וזמינות שעות שקטות.</p>
+          <div id="tw-workflows" class="tw-workflow-list"></div>
+          <button class="btn btn-secondary" id="tw-workflows-load" style="margin-top:12px">טען קונפיגורציה</button>
+        </div>
+
+        <!-- ── Audit pane ──────────────────────────────────────── -->
+        <div class="tw-pane" id="twp-audit" dir="rtl">
+          <div class="tw-filter-row">
+            <input type="search" id="tw-audit-phone" placeholder="סינון לפי טלפון..." class="field-input" style="max-width:220px"/>
+            <button class="btn btn-secondary" id="tw-audit-load">טען</button>
+          </div>
+          <div class="table-wrapper" style="margin-top:10px">
+            <table class="leads-table">
+              <thead><tr>
+                <th>זמן</th><th>חבר/ה</th><th>אירוע</th><th>בקשה</th><th>פעולה</th><th>תגובה</th><th>Arbox</th>
+              </tr></thead>
+              <tbody id="tw-audit-tbody"><tr><td colspan="7" class="empty-state">לחץ "טען" לראות ביקורת</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- ── Member detail drawer ───────────────────────────── -->
+        <div id="tw-drawer" class="tw-drawer" style="display:none" dir="rtl">
+          <div class="tw-drawer-overlay" id="tw-drawer-overlay"></div>
+          <div class="tw-drawer-panel">
+            <div class="tw-drawer-header">
+              <span id="tw-drawer-name">פרופיל חבר/ה</span>
+              <button class="tw-drawer-close" id="tw-drawer-close">✕</button>
+            </div>
+            <div class="tw-drawer-body" id="tw-drawer-body">
+              <div class="tw-spin">טוען...</div>
             </div>
           </div>
-        </aside>
+        </div>
 
-        <!-- Main: 5-segment Customer Success panel -->
-        <div class="agent-main">
-          <div class="panel">
+        <!-- ── Floating admin chat ────────────────────────────── -->
+        <div class="tw-chat-bubble" id="tw-chat-toggle" title="שוחח עם תומר">💬</div>
+        <div class="tw-chat-panel" id="tw-chat-panel" style="display:none" dir="rtl">
+          <div class="tw-chat-title">שוחח עם תומר <button class="tw-drawer-close" id="tw-chat-close">✕</button></div>
+          <div class="mini-chat-msgs" id="tomer-chat-msgs"></div>
+          <div class="mini-chat-row">
+            <input type="text" id="tomer-chat-input" class="field-input" placeholder="שאל את תומר..." autocomplete="off"/>
+            <button class="mini-send-btn" id="tomer-send">›</button>
+          </div>
+        </div>
 
-            <!-- Segment sub-nav with live badge counts -->
-            <div class="panel-header" style="flex-wrap:wrap;gap:8px;padding-bottom:0">
-              <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
-                <button class="subnav-btn active" data-tseg="onboarding">🌱 היכרות <span class="seg-badge" id="badge-onboarding">—</span></button>
-                <button class="subnav-btn" data-tseg="churn_risk">⚠️ סיכון נטישה <span class="seg-badge risk" id="badge-churn">—</span></button>
-                <button class="subnav-btn" data-tseg="renewals">💳 חידוש מנוי <span class="seg-badge" id="badge-renewals">—</span></button>
-                <button class="subnav-btn" data-tseg="birthdays">🎉 ימי הולדת <span class="seg-badge" id="badge-birthdays">—</span></button>
-                <button class="subnav-btn" data-tseg="win_back">🔄 שימור חוזר <span class="seg-badge" id="badge-winback">—</span></button>
-                <button class="subnav-btn" data-tseg="activity">📊 פעילות וניטור <span class="seg-badge" id="badge-activity">—</span></button>
-              </div>
-              <button class="btn btn-secondary" id="btn-tomer-refresh" style="font-size:13px;padding:6px 14px">🔄 רענן</button>
-            </div>
-
-            <!-- ── Segment: Onboarding ───────────────────────────────────── -->
-            <div id="tseg-onboarding" class="tseg-panel">
-              <div class="seg-desc-bar">חברים חדשים שהצטרפו ב-14 הימים האחרונים — הזדמנות ל-Onboarding פעיל לפני שמאבדים אותם.</div>
-              <div class="table-wrapper">
-                <table class="leads-table">
-                  <thead><tr><th>שם</th><th>הצטרף/ה לפני</th><th>תאריך הצטרפות</th><th>פעולה</th></tr></thead>
-                  <tbody id="tseg-onboarding-tbody"><tr><td colspan="4" class="empty-state">לחץ "רענן" לטעינה</td></tr></tbody>
-                </table>
-              </div>
-              <div class="panel-footer"><span class="refresh-tag" id="tomer-seg-updated"></span></div>
-            </div>
-
-            <!-- ── Segment: Churn Risk ────────────────────────────────────── -->
-            <div id="tseg-churn_risk" class="tseg-panel" style="display:none">
-              <div class="seg-desc-bar">חברים פעילים שרמת הנוכחות שלהם ירדה משמעותית — לפני שהם עוזבים.</div>
-              <div class="table-wrapper">
-                <table class="leads-table">
-                  <thead><tr><th>שם</th><th>מידע</th><th>רמת סיכון</th><th>פעולה</th></tr></thead>
-                  <tbody id="tseg-churn_risk-tbody"><tr><td colspan="4" class="empty-state">לחץ "רענן" לטעינה</td></tr></tbody>
-                </table>
-              </div>
-            </div>
-
-            <!-- ── Segment: Renewals ─────────────────────────────────────── -->
-            <div id="tseg-renewals" class="tseg-panel" style="display:none">
-              <div class="seg-desc-bar">מנויים שפגים בקרוב — חלון ההזדמנות לחידוש לפני שמתנתקים.</div>
-              <h4 style="margin:12px 20px 6px;font-size:13px;color:var(--warm)">⏳ פגים תוך 30 יום</h4>
-              <div class="table-wrapper">
-                <table class="leads-table">
-                  <thead><tr><th>שם</th><th>תאריך פקיעה</th><th>ימים שנותרו</th><th>פעולה</th></tr></thead>
-                  <tbody id="tseg-renew-soon-tbody"><tr><td colspan="4" class="empty-state">לחץ "רענן" לטעינה</td></tr></tbody>
-                </table>
-              </div>
-              <h4 style="margin:16px 20px 6px;font-size:13px;color:var(--hot)">❌ פגו לאחרונה (≤90 ימים)</h4>
-              <div class="table-wrapper">
-                <table class="leads-table">
-                  <thead><tr><th>שם</th><th>תאריך פקיעה</th><th>ימים שעברו</th><th>פעולה</th></tr></thead>
-                  <tbody id="tseg-renew-expired-tbody"><tr><td colspan="4" class="empty-state">לחץ "רענן" לטעינה</td></tr></tbody>
-                </table>
-              </div>
-            </div>
-
-            <!-- ── Segment: Birthdays ────────────────────────────────────── -->
-            <div id="tseg-birthdays" class="tseg-panel" style="display:none">
-              <div class="seg-desc-bar">חברים עם יום הולדת החודש — רגע מושלם לחיזוק הקשר.</div>
-              <div id="tseg-birthday-note" style="display:none;margin:8px 20px;padding:10px 14px;background:var(--surface);border-radius:8px;font-size:12px;color:var(--muted)"></div>
-              <div class="table-wrapper">
-                <table class="leads-table">
-                  <thead><tr><th>שם</th><th>תאריך לידה</th><th>פעולה</th></tr></thead>
-                  <tbody id="tseg-birthdays-tbody"><tr><td colspan="3" class="empty-state">לחץ "רענן" לטעינה</td></tr></tbody>
-                </table>
-              </div>
-            </div>
-
-            <!-- ── Segment: Win-Back ─────────────────────────────────────── -->
-            <div id="tseg-win_back" class="tseg-panel" style="display:none">
-              <div class="seg-desc-bar">חברים שהמנוי שלהם פג ב-90 הימים האחרונים — פוטנציאל גבוה לחזרה.</div>
-              <div class="table-wrapper">
-                <table class="leads-table">
-                  <thead><tr><th>שם</th><th>תאריך פקיעה</th><th>ימים ממועד עזיבה</th><th>פעולה</th></tr></thead>
-                  <tbody id="tseg-winback-tbody"><tr><td colspan="4" class="empty-state">לחץ "רענן" לטעינה</td></tr></tbody>
-                </table>
-              </div>
-            </div>
-
-            <!-- ── Segment: Activity & Monitor ─────────────────────────── -->
-            <div id="tseg-activity" class="tseg-panel" style="display:none">
-              <div class="seg-desc-bar">פעולות תומר בזמן אמת — מתי ענה, מתי שתק, ורשימת לקוחות ידועים לעקיפת Arbox.</div>
-
-              <!-- Stats row -->
-              <div style="display:flex;gap:12px;padding:12px 20px 4px;flex-wrap:wrap">
-                <div class="arbox-ov-card" style="flex:1;min-width:90px;padding:12px 8px">
-                  <div class="arbox-ov-icon">🤫</div>
-                  <div class="arbox-ov-val" id="tact-silenced">—</div>
-                  <div class="arbox-ov-lbl">שתיקות</div>
-                </div>
-                <div class="arbox-ov-card" style="flex:1;min-width:90px;padding:12px 8px">
-                  <div class="arbox-ov-icon">💬</div>
-                  <div class="arbox-ov-val" id="tact-responded">—</div>
-                  <div class="arbox-ov-lbl">תשובות</div>
-                </div>
-                <div class="arbox-ov-card" style="flex:1;min-width:90px;padding:12px 8px">
-                  <div class="arbox-ov-icon">📤</div>
-                  <div class="arbox-ov-val" id="tact-auto">—</div>
-                  <div class="arbox-ov-lbl">אוטו׳</div>
-                </div>
-              </div>
-
-              <!-- Known Members -->
-              <h4 style="margin:12px 20px 6px;font-size:13px;color:var(--warm)">👥 לקוחות ידועים (עוקפי Arbox)</h4>
-              <div style="margin:0 20px 10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-                <input type="text" id="km-phone-input" class="field-input" placeholder="972501234567" style="width:155px;font-size:12px"/>
-                <input type="text" id="km-name-input"  class="field-input" placeholder="שם (אופציונלי)" style="width:140px;font-size:12px"/>
-                <button class="btn btn-primary" id="btn-km-add" style="font-size:12px;padding:6px 14px">+ הוסף</button>
-              </div>
-              <div id="km-list-wrap" style="margin:0 20px 16px;min-height:24px">
-                <div id="km-list" style="font-size:12px;color:var(--muted)">טוען...</div>
-              </div>
-
-              <!-- Activity Feed -->
-              <h4 style="margin:4px 20px 6px;font-size:13px;color:var(--warm)">📋 יומן פעילות תומר</h4>
-              <div class="table-wrapper">
-                <table class="leads-table">
-                  <thead><tr><th>זמן</th><th>שולח/ת</th><th>החלטה</th><th>סיבה</th><th>תצוגה מקדימה</th></tr></thead>
-                  <tbody id="tact-feed-tbody"><tr><td colspan="5" class="empty-state">לחץ "רענן" לטעינה</td></tr></tbody>
-                </table>
-              </div>
-              <div class="panel-footer"><span class="refresh-tag" id="tact-updated"></span></div>
-            </div>
-
-          </div><!-- /panel -->
-        </div><!-- /agent-main -->
       </div>
     </section>
 
@@ -1383,5 +1355,6 @@
   </main>
 
   <script src="app.js"></script>
+  <script src="tomer-panel.js"></script>
 </body>
 </html>
