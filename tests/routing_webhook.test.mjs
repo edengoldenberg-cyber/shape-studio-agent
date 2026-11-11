@@ -113,7 +113,7 @@ process.env.TEST_ALLOWLIST_PHONES = [
   '972509960005','972509960006','972509960007','972509960008',
   '972509960009','972509960010',
   '972509960011','972509960012','972509960013',
-  '972509960014','972509960015',
+  '972509960014','972509960015','972509960016',
 ].join(',');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -212,6 +212,8 @@ console.log('\n── Suite 0: Source-level assertions (SRC) ──');
   assert(src.includes('_hasUnresolvedEcho'), '(SRC) _hasUnresolvedEcho helper defined');
   assert(src.includes('UNRESOLVED_GRACE_MS'), '(SRC) UNRESOLVED_GRACE_MS grace period defined');
   assert(src.includes('echo_attribution_hold'), "(SRC) 'echo_attribution_hold' pipeline gate present");
+  assert(src.includes('_applyAttributionReview'), '(SRC) _applyAttributionReview defined — grace expiry does not set human_owns');
+  assert(src.includes('attribution_review'), "(SRC) 'attribution_review' status referenced — explicit review state");
   const outgoingPos   = src.indexOf("rawType === 'outgoingMessageReceived'");
   const outgoingBlock = outgoingPos >= 0 ? src.slice(outgoingPos, outgoingPos + 2000) : '';
   assert(
@@ -485,7 +487,9 @@ console.log('\n── Suite 4: Sales-path race + deferred reconciliation ──'
   await wait(2000);
 
   const status4c = store.getLead(ph)?.status ?? null;
-  assert(status4c === 'human_owns', '4c: genuine staff echo with slow provider → human_owns after re-deferred reconciliation', status4c ?? '(no lead)');
+  // Grace expiry is not proof of staff authorship — status must be attribution_review,
+  // not human_owns. Staff confirms ownership via the takeover API.
+  assert(status4c === 'attribution_review', '4c: genuine staff echo → attribution_review after grace (not human_owns — elapsed time alone is not proof)', status4c ?? '(no lead)');
   _gaDelay  = 0;
   _gaNextId = null;
 }
@@ -565,10 +569,60 @@ console.log('\n── Suite 4e: Failed bot send + genuine staff echo → human_o
   const status4e = store.getLead(ph)?.status ?? null;
   const unrEvts  = store.getEvents({ type: 'echo_attribution_unresolved', phone: ph });
   assert(unrEvts.length >= 1, '4e-unresolved: unresolved event logged (TTL expiry ≠ staff proof)', unrEvts.length);
-  assert(status4e === 'human_owns', '4e: failed send + genuine staff echo → human_owns after grace', status4e ?? '(no lead)');
+  // Grace expiry does NOT auto-confirm staff authorship → attribution_review, not human_owns.
+  // Staff uses the takeover API to confirm genuine ownership if needed.
+  assert(status4e === 'attribution_review', '4e: failed send → attribution_review after grace (not human_owns)', status4e ?? '(no lead)');
+  assert(status4e !== 'human_owns', '4e: elapsed time alone does not prove staff authorship', status4e);
   // No echo_attributed_to_bot event (send never confirmed).
   const botAttrEvts = store.getEvents({ type: 'echo_attributed_to_bot', phone: ph });
   assert(botAttrEvts.length === 0, '4e: no bot attribution when send failed', botAttrEvts.length);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Suite 4f: Bot echo delayed beyond BOTH PENDING_SEND_TTL and UNRESOLVED_GRACE_MS.
+//            Verify it is NEVER falsely labelled as a staff message.
+//            Late _recordBotSend clears attribution_review and confirms bot.
+// ════════════════════════════════════════════════════════════════════════════
+console.log('\n── Suite 4f: Bot echo delayed beyond TTL + grace — never human_owns ──');
+{
+  const ph      = '972509960016'; // fresh phone → unclassified path
+  const botId4f = `realbot-${Date.now()}-4f`;
+  _gaNextId     = botId4f;
+  // _gaDelay exceeds TTL (100ms) + grace (1500ms). The echo enters attribution_review
+  // before the provider responds. When _recordBotSend finally fires it must clear review.
+  _gaDelay      = 2500;
+  clearSends();
+  store.deleteLead(ph);
+
+  await inboundWebhook(ph, 'שלום רב', `deferred-4f-${Date.now()}`);
+  await wait(380); // burst fires, sendText in-flight but TTL already expired
+  await outgoingWebhook(ph, botId4f, 'bot message');
+
+  // Wait for attribution_review to be set (grace fires ~300ms after unresolved, 1500ms after that).
+  // Unresolved at ~t=685ms; grace at ~t=2185ms.
+  const reviewSet = await pollUntil(
+    () => store.getLead(ph)?.status === 'attribution_review',
+    6000, 300,
+  );
+  assert(reviewSet,                                '4f-review: attribution_review entered after grace expiry');
+  assert(store.getLead(ph)?.status !== 'human_owns', '4f-not-human: grace expiry did NOT set human_owns');
+  const reviewEvts = store.getEvents({ type: 'echo_attribution_review', phone: ph });
+  assert(reviewEvts.length >= 1,                   '4f-review-event: echo_attribution_review event logged');
+
+  // Now wait for the late _recordBotSend (burst 300ms + _gaDelay 2500ms = ~2800ms from t=0).
+  // _recordBotSend clears _unresolvedEchoes and reverts attribution_review.
+  const botCleared = await pollUntil(
+    () => store.getEvents({ type: 'echo_attributed_to_bot', phone: ph }).length >= 1,
+    6000, 300,
+  );
+  assert(botCleared,                                     '4f-cleared: late _recordBotSend cleared attribution_review');
+  assert(store.getLead(ph)?.status !== 'human_owns',     '4f: NOT human_owns after late reconciliation');
+  assert(store.getLead(ph)?.status !== 'attribution_review', '4f: attribution_review cleared by late bot confirmation');
+  const botEvts4f = store.getEvents({ type: 'echo_attributed_to_bot', phone: ph });
+  assert(botEvts4f.length >= 1,                          '4f: echo_attributed_to_bot event present');
+
+  _gaDelay  = 0;
+  _gaNextId = null;
 }
 
 // ════════════════════════════════════════════════════════════════════════════

@@ -2501,11 +2501,19 @@ function _recordBotSend(idMessage, phone) {
     _botSentIds.delete(oldestKey);
   }
   // If this phone has an unresolved echo waiting on exactly this idMessage,
-  // the provider finally responded — cancel the grace timer and confirm it as a bot echo.
+  // the provider finally responded. Clear the entry and cancel any pending grace timer.
+  // If grace already fired and set attribution_review, revert it to the pre-review status.
+  // Never touch human_owns — that reflects genuine staff action, not auto-attribution.
   const unresolved = _unresolvedEchoes.get(phone);
   if (unresolved && unresolved.idMessage === idMessage) {
-    clearTimeout(unresolved.graceTimer);
+    if (unresolved.graceTimer) clearTimeout(unresolved.graceTimer);
     _unresolvedEchoes.delete(phone);
+    const curStatus = store.getLead(phone)?.status;
+    if (curStatus === 'attribution_review') {
+      const prev = unresolved.prevStatus ?? 'cold';
+      store.upsertLead(phone, { status: prev });
+      logger.info('[reconcile] attribution_review reverted — late bot send confirmed', { phone, prevStatus: prev });
+    }
     logger.info('[reconcile] Late _recordBotSend cleared unresolved echo — confirmed bot send', { phone, idMessage });
     store.logEvent('echo_attributed_to_bot', phone, { idMessage });
   }
@@ -2546,15 +2554,15 @@ function _isBotSentId(idMessage) {
   return true;
 }
 
-// Apply human ownership when an outgoing message is confirmed to be a staff reply.
 // Deferred echo reconciliation: fires every OUTGOING_RECONCILE_MS while the bot's
 // HTTP send is still in-flight. Three termination cases:
 //   (a) idMessage confirmed in _botSentIds → bot echo, done.
 //   (b) pending send still active → provider still in-flight, re-defer.
-//   (c) PENDING_SEND_TTL expired (no pending send) → attribution unresolved.
-//       Enter grace period (UNRESOLVED_GRACE_MS): allow slow providers time to deliver
-//       _recordBotSend. If _recordBotSend arrives → clears unresolved (bot confirmed).
-//       If grace expires without _recordBotSend → genuine staff reply → human_owns.
+//   (c) PENDING_SEND_TTL expired (no pending send) → attribution unresolved:
+//       Wait UNRESOLVED_GRACE_MS for _recordBotSend (slow provider). If it arrives →
+//       bot confirmed, entry cleared. If grace expires without confirmation → enter
+//       attribution_review (NOT human_owns — elapsed time alone does not prove staff).
+//       The entry persists past grace so a late _recordBotSend can still clear review.
 function _scheduleEchoReconcile(norm, idMessage, msgText) {
   setTimeout(() => {
     if (_isBotSentId(idMessage)) {
@@ -2566,25 +2574,56 @@ function _scheduleEchoReconcile(norm, idMessage, msgText) {
       _scheduleEchoReconcile(norm, idMessage, msgText);
       return;
     }
-    // PENDING_SEND_TTL expired and idMessage unconfirmed.
-    // This may be a very slow provider or a failed send with a concurrent staff reply.
-    // Do not immediately call _applyStaffTakeover — enter unresolved grace period instead.
     if (_unresolvedEchoes.has(norm)) return; // already holding for this phone, idempotent
     logger.info('[outgoing-webhook] TTL expired — attribution unresolved, entering grace period', {
       phone: norm, idMessage,
     });
     store.logEvent('echo_attribution_unresolved', norm, { idMessage });
+    const prevStatus = store.getLead(norm)?.status ?? null;
     const graceTimer = setTimeout(() => {
       const entry = _unresolvedEchoes.get(norm);
       if (!entry || entry.idMessage !== idMessage) return; // cleared by _recordBotSend
-      _unresolvedEchoes.delete(norm);
-      logger.info('[outgoing-webhook] Grace expired — no bot confirmation, treating as staff reply', {
+      // Keep entry active after grace so a late _recordBotSend can still reconcile.
+      _unresolvedEchoes.set(norm, { ...entry, graceTimer: null });
+      logger.info('[outgoing-webhook] Grace expired — attribution still unresolved, entering review', {
         phone: norm, idMessage,
       });
-      _applyStaffTakeover(norm, idMessage, msgText);
+      _applyAttributionReview(norm, idMessage, msgText, entry.prevStatus);
     }, UNRESOLVED_GRACE_MS);
-    _unresolvedEchoes.set(norm, { idMessage, msgText, graceTimer });
+    _unresolvedEchoes.set(norm, { idMessage, msgText, graceTimer, prevStatus });
   }, OUTGOING_RECONCILE_MS);
+}
+
+// Enter explicit attribution review: the echo cannot yet be attributed to bot or staff.
+// Sets status to 'attribution_review' so the conversation is paused for manual resolution.
+// A late _recordBotSend will clear this. Human takeover via API confirms staff authorship.
+// Does NOT set human_owns — elapsed time alone is not evidence of staff authorship.
+function _applyAttributionReview(norm, idMessage, msgText, prevStatus = null) {
+  const existing  = store.getLead(norm) ?? {};
+  const curStatus = existing.status ?? null;
+  // Don't overwrite genuine human stop-statuses set by staff action.
+  if (['opted_out', 'converted_member', 'human_owns'].includes(curStatus)) {
+    logger.info('[reconcile] Attribution review skipped — existing stop-status preserved', {
+      phone: norm, curStatus,
+    });
+    return;
+  }
+  store.upsertLead(norm, {
+    status: 'attribution_review',
+    meta: {
+      ...(existing.meta ?? {}),
+      attributionReviewSince:      new Date().toISOString(),
+      attributionReviewIdMessage:  idMessage,
+      attributionReviewReason:     'grace_expired_unresolved',
+      attributionReviewPrevStatus: prevStatus,
+    },
+  });
+  persist.saveLeads(store);
+  store.logEvent('echo_attribution_review', norm, { idMessage, prevStatus });
+  logger.info('[outgoing-webhook] Attribution review entered — grace expired without bot confirmation', {
+    phone: norm, idMessage,
+  });
+  broadcastSse('message', { phone: norm, route: 'attribution_review', reason: 'grace_expired' });
 }
 
 // Idempotent — if already human_owns, opted_out, or converted_member, does nothing.
@@ -3240,22 +3279,34 @@ async function processInboundWAMessage(msg) {
     }
   }
 
-  // 2b-echo. Echo attribution hold.
-  //   An outgoing echo arrived but couldn't be confirmed as bot or staff before
-  //   PENDING_SEND_TTL expired (slow/failed provider). Automated replies are
-  //   suppressed until _recordBotSend resolves the echo or the grace period
-  //   expires and declares a staff takeover.
-  if (_hasUnresolvedEcho(fromNorm)) {
-    store.logEvent('reply_held_unresolved_echo', fromNorm, { preview: (msg.text ?? '').slice(0, 60) });
-    logger.info('[pipeline] Reply held — outgoing echo attribution unresolved', { from: fromNorm });
-    const heldEntry = inbox.push({
-      from: fromNorm, fromIsraeli, name: msg.name ?? clientMatch.arboxName ?? null,
-      text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
-      receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
-      clientMatch, intent, route: 'echo_attribution_hold', barakReply: null,
-    });
-    persist.saveInbox(inbox);
-    return { inboxEntry: heldEntry, clientMatch, intent, route: 'echo_attribution_hold', barakReply: null };
+  // 2b-echo. Echo attribution hold — in-memory unresolved state (active session).
+  //   Also catches attribution_review status set by grace expiry (survives restarts).
+  //   Both states preserve inbound messages for review and block automated replies.
+  {
+    const _arStatus = store.getLead(fromNorm)?.status;
+    const _inHold   = _hasUnresolvedEcho(fromNorm) || _arStatus === 'attribution_review';
+    if (_inHold) {
+      const _holdReason = _hasUnresolvedEcho(fromNorm) ? 'unresolved_echo' : 'attribution_review';
+      store.logEvent('reply_held_unresolved_echo', fromNorm, {
+        reason: _holdReason, preview: (msg.text ?? '').slice(0, 60),
+      });
+      logger.info('[pipeline] Reply held — attribution unresolved', { from: fromNorm, reason: _holdReason });
+      // Preserve the message in the lead record — do not silently lose it.
+      const _exHold = store.getLead(fromNorm) ?? {};
+      store.upsertLead(fromNorm, {
+        name:         msg.name ?? _exHold.name,
+        messageCount: (_exHold.messageCount ?? 0) + 1,
+        meta: { ...(_exHold.meta ?? {}), lastHeldMessageAt: new Date().toISOString() },
+      });
+      const heldEntry = inbox.push({
+        from: fromNorm, fromIsraeli, name: msg.name ?? clientMatch.arboxName ?? null,
+        text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
+        receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
+        clientMatch, intent, route: 'echo_attribution_hold', barakReply: null,
+      });
+      persist.saveInbox(inbox);
+      return { inboxEntry: heldEntry, clientMatch, intent, route: 'echo_attribution_hold', barakReply: null };
+    }
   }
 
   // 2c. Tier-4 degraded-mode guard.
