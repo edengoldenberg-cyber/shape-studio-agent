@@ -3293,11 +3293,12 @@ async function processInboundWAMessage(msg) {
     const _tomerStore  = require('./utils/tomer_store');
     const _existingLead = store.getLead(fromNorm);
     const _hasLeadHistory = !!(_existingLead?.messageCount && _existingLead.messageCount > 0);
-    // SALES_INTENT_RE: words that unambiguously indicate fitness/studio interest.
-    // Intentionally narrow — common words ("גוף"/"גב"/"כוח"/"מה קורה") must NOT trigger
+    // SALES_INTENT_RE: phrases that unambiguously indicate fitness/studio interest.
+    // Intentionally narrow — generic words ("גוף"/"גב"/"כוח"/"מה קורה") must NOT trigger
     // the funnel. Unknown contacts without clear studio intent go to the unclassified
     // inbox first; a neutral greeting gives them the chance to clarify.
-    const SALES_INTENT_RE = /פילאטיס|כושר|שיעור|אימון|להצטרף|מנוי|להתנסות|ניסיון|רפורמר|בארה|קנגו|yoga|יוגה|בריאות|ירידה.*משקל|חיזוק|גמישות|שייפ\s*סטודיו|מחיר|כמה.*עולה|שעות.*פעילות|לוח.*שיעורים|מערכת\s*שעות|הצעת\s+היכרות|60\s+ש|60\s+₪/i;
+    // Weight-loss phrases: "להוריד 20 קילו" / "לרדת במשקל" are fitness-specific in this context.
+    const SALES_INTENT_RE = /פילאטיס|כושר|שיעור|אימון|להצטרף|מנוי|להתנסות|ניסיון|רפורמר|בארה|קנגו|yoga|יוגה|בריאות|ירידה.*משקל|להוריד.*(?:קילו|משקל)|לרדת.*(?:קילו|משקל|במשקל)|חיזוק|גמישות|שייפ\s*סטודיו|מחיר|כמה.*עולה|שעות.*פעילות|לוח.*שיעורים|מערכת\s*שעות|הצעת\s+היכרות|60\s+ש|60\s+₪/i;
     const _hasSalesIntent = SALES_INTENT_RE.test(msg.text ?? '');
 
     if (!_hasLeadHistory && !_hasSalesIntent && msg.type === 'text') {
