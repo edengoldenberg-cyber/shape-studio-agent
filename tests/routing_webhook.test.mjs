@@ -39,9 +39,10 @@ const MOCK_PORT = 20061;
 const APP_PORT  = 20060;
 
 // ── Mock server state ─────────────────────────────────────────────────────────
-const _sends   = [];      // { to, text, idMessage }
-let _gaDelay   = 0;       // artificial sendMessage delay (ms)
-let _gaNextId  = null;    // override next idMessage if set
+const _sends     = [];    // { to, text, idMessage }
+let _gaDelay     = 0;     // artificial sendMessage delay (ms)
+let _gaNextId    = null;  // override next idMessage if set
+let _gaErrorMode = false; // when true, sendMessage returns 500 (simulates failed/timed-out send)
 
 // ── Canned Arbox member (used by Suite 6) ─────────────────────────────────────
 const MOCK_MEMBER = {
@@ -59,6 +60,11 @@ const mockServer = http.createServer((req, res) => {
     let parsed = {}; try { parsed = JSON.parse(body); } catch {}
 
     if (req.url.includes('sendMessage')) {
+      if (_gaErrorMode) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'mock provider error — _gaErrorMode=true' }));
+        return;
+      }
       const to    = parsed.chatId?.replace('@c.us', '') ?? '';
       const idMsg = _gaNextId ?? `MOCK-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
       _gaNextId   = null;
@@ -99,12 +105,15 @@ process.env.ARBOX_BASE_URL           = `http://localhost:${MOCK_PORT}/arbox`;
 process.env.BURST_WINDOW_MS          = '300';   // fast burst for tests
 delete process.env.OPENAI_API_KEY;              // no real AI calls
 process.env.TEST_AI_DELAY_MS         = '400';   // simulate generation latency for race tests
+process.env.TEST_PENDING_SEND_TTL_MS = '100';   // shorten 3s TTL so unresolved tests run fast
+process.env.TEST_UNRESOLVED_GRACE_MS = '1500';  // shorten 5s grace to 1.5s
 
 process.env.TEST_ALLOWLIST_PHONES = [
   '972509960001','972509960002','972509960003','972509960004',
   '972509960005','972509960006','972509960007','972509960008',
   '972509960009','972509960010',
   '972509960011','972509960012','972509960013',
+  '972509960014','972509960015',
 ].join(',');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -195,11 +204,14 @@ console.log('\n── Suite 0: Source-level assertions (SRC) ──');
   const scheduleQueryLine = src.match(/schedule_query:\s+\/[^\n]+/)?.[0] ?? '';
   assert(!scheduleQueryLine.includes('מה קורה'), '(SRC) "מה קורה" absent from schedule_query regex', scheduleQueryLine.slice(0, 80));
 
-  // Fix 2: Deferred reconciliation — re-defer loop
+  // Fix 2: Deferred reconciliation — re-defer loop + unresolved grace period
   assert(src.includes('OUTGOING_RECONCILE_MS'), '(SRC) OUTGOING_RECONCILE_MS constant defined');
   assert(src.includes('_applyStaffTakeover'), '(SRC) _applyStaffTakeover helper defined');
-  // _scheduleEchoReconcile encapsulates the re-defer loop; handler calls it.
   assert(src.includes('_scheduleEchoReconcile'), '(SRC) _scheduleEchoReconcile re-defer function defined');
+  assert(src.includes('_unresolvedEchoes'), '(SRC) _unresolvedEchoes map defined');
+  assert(src.includes('_hasUnresolvedEcho'), '(SRC) _hasUnresolvedEcho helper defined');
+  assert(src.includes('UNRESOLVED_GRACE_MS'), '(SRC) UNRESOLVED_GRACE_MS grace period defined');
+  assert(src.includes('echo_attribution_hold'), "(SRC) 'echo_attribution_hold' pipeline gate present");
   const outgoingPos   = src.indexOf("rawType === 'outgoingMessageReceived'");
   const outgoingBlock = outgoingPos >= 0 ? src.slice(outgoingPos, outgoingPos + 2000) : '';
   assert(
@@ -476,6 +488,87 @@ console.log('\n── Suite 4: Sales-path race + deferred reconciliation ──'
   assert(status4c === 'human_owns', '4c: genuine staff echo with slow provider → human_owns after re-deferred reconciliation', status4c ?? '(no lead)');
   _gaDelay  = 0;
   _gaNextId = null;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Suite 4d: Provider delay > PENDING_SEND_TTL — bot echo must NOT set human_owns
+//            and new automated sends must be held during the grace period.
+// ════════════════════════════════════════════════════════════════════════════
+console.log('\n── Suite 4d: Bot echo with provider delay > PENDING_SEND_TTL ──');
+{
+  const ph      = '972509960014'; // fresh phone → unclassified path
+  const botId4d = `realbot-${Date.now()}-4d`;
+  _gaNextId     = botId4d;
+  _gaDelay      = 1000; // > PENDING_SEND_TTL (100ms in test) — forces unresolved state
+  clearSends();
+  store.deleteLead(ph);
+
+  // Unclassified path fires: _markBotSent → sendText(1000ms delay) → eventually _recordBotSend.
+  await inboundWebhook(ph, 'שלום רב', `deferred-4d-${Date.now()}`);
+  await wait(380); // burst fires, sendText in-flight but TTL (100ms) has already expired
+
+  // Bot echo arrives — cannot be confirmed yet (_hasPendingBotSend false, _botSentIds miss).
+  // _scheduleEchoReconcile enters unresolved grace period (1500ms), does NOT call _applyStaffTakeover.
+  await outgoingWebhook(ph, botId4d, 'bot message');
+
+  // Wait for first deferred tick (300ms) to fire, entering unresolved state.
+  await wait(400);
+
+  // Verify: a new inbound during unresolved state is held (no AI, no reply).
+  const holdRes = await post('/api/whatsapp/simulate', { from: ph, text: 'שאלה נוספת' });
+  assert(holdRes.body?.route === 'echo_attribution_hold', '4d-hold: new inbound held during unresolved attribution', holdRes.body?.route);
+
+  // Verify: unresolved event was logged.
+  const unresolvedEvts = store.getEvents({ type: 'echo_attribution_unresolved', phone: ph });
+  assert(unresolvedEvts.length >= 1, '4d-unresolved: echo_attribution_unresolved event logged', unresolvedEvts.length);
+
+  // Now wait for the provider to respond (1000ms after burst ~300ms = ~1300ms total),
+  // then one more reconcile tick (300ms) + settle.
+  await wait(1200);
+
+  // _recordBotSend fired → cleared unresolved → echo_attributed_to_bot event present.
+  const botEvts = store.getEvents({ type: 'echo_attributed_to_bot', phone: ph });
+  assert(botEvts.length >= 1, '4d: echo_attributed_to_bot event — late _recordBotSend cleared unresolved', botEvts.length);
+  assert(store.getLead(ph)?.status !== 'human_owns', '4d: bot echo with slow provider — NOT human_owns', store.getLead(ph)?.status ?? '(no lead)');
+  _gaDelay  = 0;
+  _gaNextId = null;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Suite 4e: Failed/timed-out bot send + genuine staff echo.
+//            Unresolved state → grace period expires → human_owns.
+//            TTL expiry alone does not prove staff; the grace period does.
+// ════════════════════════════════════════════════════════════════════════════
+console.log('\n── Suite 4e: Failed bot send + genuine staff echo → human_owns after grace ──');
+{
+  const ph        = '972509960015'; // fresh phone → unclassified path
+  const staffId4e = `staffmsg-${Date.now()}-4e`;
+  _gaErrorMode    = true;  // bot send fails → _recordBotSend never called
+  clearSends();
+  store.deleteLead(ph);
+
+  // Unclassified path: _markBotSent → sendText → 500 error → null → _recordBotSend NOT called.
+  // _pendingBotSends has entry until PENDING_SEND_TTL (100ms) expires.
+  // _gaErrorMode stays true through the wait so the burst (300ms) fires while it's set.
+  await inboundWebhook(ph, 'שלום רב', `deferred-4e-${Date.now()}`);
+  await wait(380); // burst fires at ~300ms with _gaErrorMode=true → send fails → _pendingBotSends not cleared
+  _gaErrorMode = false; // restore after pipeline has run
+
+  // Genuine staff echo: DIFFERENT id (not what any bot sent).
+  // _hasPendingBotSend false (TTL expired) → first deferred tick → unresolved → grace timer.
+  await outgoingWebhook(ph, staffId4e, 'כן, אני אטפל — staff');
+
+  // Wait for: first deferred tick (300ms) → unresolved state → grace expires (1500ms) → human_owns.
+  // Total: 300 + 1500 + 200 buffer = 2000ms after the echo.
+  await wait(2200);
+
+  const status4e = store.getLead(ph)?.status ?? null;
+  const unrEvts  = store.getEvents({ type: 'echo_attribution_unresolved', phone: ph });
+  assert(unrEvts.length >= 1, '4e-unresolved: unresolved event logged (TTL expiry ≠ staff proof)', unrEvts.length);
+  assert(status4e === 'human_owns', '4e: failed send + genuine staff echo → human_owns after grace', status4e ?? '(no lead)');
+  // No echo_attributed_to_bot event (send never confirmed).
+  const botAttrEvts = store.getEvents({ type: 'echo_attributed_to_bot', phone: ph });
+  assert(botAttrEvts.length === 0, '4e: no bot attribution when send failed', botAttrEvts.length);
 }
 
 // ════════════════════════════════════════════════════════════════════════════

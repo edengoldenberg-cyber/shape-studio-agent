@@ -2475,8 +2475,13 @@ const REPLY_COOLDOWN  = 10_000; // 10 seconds
 // an HTTP round-trip. 3 seconds ≪ 20 seconds: a staff reply at t+2s is not masked.
 const _botSentIds     = new Map(); // idMessage → { phone, sentAt }
 const _pendingBotSends = new Map(); // phone → [sendStartedAt, ...] (in-flight sends)
+const _unresolvedEchoes = new Map(); // phone → { idMessage, msgText, graceTimer }
 const BOT_SENT_TTL        = 24 * 60 * 60 * 1000;
-const PENDING_SEND_TTL    = 3_000;  // 3 seconds — HTTP round-trip max
+// Allow shorter TTL in tests (TEST_PENDING_SEND_TTL_MS) while keeping 3s in production.
+const PENDING_SEND_TTL    = Number(process.env.TEST_PENDING_SEND_TTL_MS) || 3_000;
+// Grace period after PENDING_SEND_TTL expires: gives slow providers time to deliver
+// _recordBotSend before concluding a staff reply. TEST_UNRESOLVED_GRACE_MS shortens it.
+const UNRESOLVED_GRACE_MS = Number(process.env.TEST_UNRESOLVED_GRACE_MS) || 5_000;
 const OUTGOING_RECONCILE_MS = 300;  // hold unresolved outgoing echo for ID reconciliation
 
 function _markBotSent(phone) {
@@ -2495,12 +2500,25 @@ function _recordBotSend(idMessage, phone) {
     const oldestKey = _botSentIds.keys().next().value;
     _botSentIds.delete(oldestKey);
   }
+  // If this phone has an unresolved echo waiting on exactly this idMessage,
+  // the provider finally responded — cancel the grace timer and confirm it as a bot echo.
+  const unresolved = _unresolvedEchoes.get(phone);
+  if (unresolved && unresolved.idMessage === idMessage) {
+    clearTimeout(unresolved.graceTimer);
+    _unresolvedEchoes.delete(phone);
+    logger.info('[reconcile] Late _recordBotSend cleared unresolved echo — confirmed bot send', { phone, idMessage });
+    store.logEvent('echo_attributed_to_bot', phone, { idMessage });
+  }
   // Remove oldest pending-send entry now that the idMessage is confirmed.
   const sends = _pendingBotSends.get(phone);
   if (sends?.length > 0) {
     sends.shift();
     if (sends.length === 0) _pendingBotSends.delete(phone);
   }
+}
+
+function _hasUnresolvedEcho(phone) {
+  return _unresolvedEchoes.has(phone);
 }
 
 function _hasPendingBotSend(phone) {
@@ -2530,10 +2548,13 @@ function _isBotSentId(idMessage) {
 
 // Apply human ownership when an outgoing message is confirmed to be a staff reply.
 // Deferred echo reconciliation: fires every OUTGOING_RECONCILE_MS while the bot's
-// HTTP send is still in-flight. Terminates when:
-//   (a) the idMessage is confirmed in _botSentIds → bot echo, done; or
-//   (b) no pending bot send remains (provider responded or TTL expired) → staff reply.
-// This handles providers that are slower than OUTGOING_RECONCILE_MS (e.g. 1s+ delays).
+// HTTP send is still in-flight. Three termination cases:
+//   (a) idMessage confirmed in _botSentIds → bot echo, done.
+//   (b) pending send still active → provider still in-flight, re-defer.
+//   (c) PENDING_SEND_TTL expired (no pending send) → attribution unresolved.
+//       Enter grace period (UNRESOLVED_GRACE_MS): allow slow providers time to deliver
+//       _recordBotSend. If _recordBotSend arrives → clears unresolved (bot confirmed).
+//       If grace expires without _recordBotSend → genuine staff reply → human_owns.
 function _scheduleEchoReconcile(norm, idMessage, msgText) {
   setTimeout(() => {
     if (_isBotSentId(idMessage)) {
@@ -2545,8 +2566,24 @@ function _scheduleEchoReconcile(norm, idMessage, msgText) {
       _scheduleEchoReconcile(norm, idMessage, msgText);
       return;
     }
-    logger.info('[outgoing-webhook] Deferred: id unresolved, no pending send — staff reply', { phone: norm, idMessage });
-    _applyStaffTakeover(norm, idMessage, msgText);
+    // PENDING_SEND_TTL expired and idMessage unconfirmed.
+    // This may be a very slow provider or a failed send with a concurrent staff reply.
+    // Do not immediately call _applyStaffTakeover — enter unresolved grace period instead.
+    if (_unresolvedEchoes.has(norm)) return; // already holding for this phone, idempotent
+    logger.info('[outgoing-webhook] TTL expired — attribution unresolved, entering grace period', {
+      phone: norm, idMessage,
+    });
+    store.logEvent('echo_attribution_unresolved', norm, { idMessage });
+    const graceTimer = setTimeout(() => {
+      const entry = _unresolvedEchoes.get(norm);
+      if (!entry || entry.idMessage !== idMessage) return; // cleared by _recordBotSend
+      _unresolvedEchoes.delete(norm);
+      logger.info('[outgoing-webhook] Grace expired — no bot confirmation, treating as staff reply', {
+        phone: norm, idMessage,
+      });
+      _applyStaffTakeover(norm, idMessage, msgText);
+    }, UNRESOLVED_GRACE_MS);
+    _unresolvedEchoes.set(norm, { idMessage, msgText, graceTimer });
   }, OUTGOING_RECONCILE_MS);
 }
 
@@ -3201,6 +3238,24 @@ async function processInboundWAMessage(msg) {
       persist.saveInbox(inbox);
       return { inboxEntry: optEntry, clientMatch, intent, route: 'opted_out_silent', barakReply: null };
     }
+  }
+
+  // 2b-echo. Echo attribution hold.
+  //   An outgoing echo arrived but couldn't be confirmed as bot or staff before
+  //   PENDING_SEND_TTL expired (slow/failed provider). Automated replies are
+  //   suppressed until _recordBotSend resolves the echo or the grace period
+  //   expires and declares a staff takeover.
+  if (_hasUnresolvedEcho(fromNorm)) {
+    store.logEvent('reply_held_unresolved_echo', fromNorm, { preview: (msg.text ?? '').slice(0, 60) });
+    logger.info('[pipeline] Reply held — outgoing echo attribution unresolved', { from: fromNorm });
+    const heldEntry = inbox.push({
+      from: fromNorm, fromIsraeli, name: msg.name ?? clientMatch.arboxName ?? null,
+      text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
+      receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
+      clientMatch, intent, route: 'echo_attribution_hold', barakReply: null,
+    });
+    persist.saveInbox(inbox);
+    return { inboxEntry: heldEntry, clientMatch, intent, route: 'echo_attribution_hold', barakReply: null };
   }
 
   // 2c. Tier-4 degraded-mode guard.
