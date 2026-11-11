@@ -3233,8 +3233,11 @@ async function processInboundWAMessage(msg) {
   //   A person who requested silence or is under human care must not receive an
   //   arbox_outage_hold message, a Barak qualification reply, OR a Tomer service reply.
   //
-  //   human_owns applies to ALL contacts including Arbox members. When a staff member
+  //   human_owns: applies to ALL contacts including Arbox members. When a staff member
   //   manually replies to a member's message, Tomer must also stop until ownership is released.
+  //
+  //   opted_out: also universal — a member who requested silence must not receive Tomer
+  //   automated messages any more than Barak messages. The old Barak-only gate was a bug.
   //
   //   call_scheduled / callback_requested: handled context-aware below — not an early return
   //   because reschedule / schedule-query / opt-out must still be processed.
@@ -3258,18 +3261,15 @@ async function processInboundWAMessage(msg) {
       persist.saveInbox(inbox);
       return { inboxEntry: hoEntry, clientMatch, intent, route: 'human_owns_hold', barakReply: null };
     }
-  }
-
-  // 2b-lead. Additional Barak-only stop gate: opted_out.
-  // human_owns is already handled universally above (covers both Barak and Tomer).
-  if (!isExistingClient) {
-    const _stopStatus = store.getLead(fromNorm)?.status;
 
     if (_stopStatus === 'opted_out') {
-      store.logEvent('reply_suppressed_opted_out', fromNorm, { preview: (msg.text ?? '').slice(0, 60) });
-      logger.info('[pipeline] Reply suppressed — opted_out', { from: fromNorm });
+      store.logEvent('reply_suppressed_opted_out', fromNorm, {
+        agent: isExistingClient ? 'tomer' : 'barak',
+        preview: (msg.text ?? '').slice(0, 60),
+      });
+      logger.info('[pipeline] Reply suppressed — opted_out (universal)', { from: fromNorm, isExistingClient });
       const optEntry = inbox.push({
-        from: fromNorm, fromIsraeli, name: msg.name ?? null,
+        from: fromNorm, fromIsraeli, name: msg.name ?? clientMatch.arboxName ?? null,
         text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
         receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
         clientMatch, intent, route: 'opted_out_silent', barakReply: null,
