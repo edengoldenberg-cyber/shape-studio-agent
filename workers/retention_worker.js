@@ -64,6 +64,7 @@ const WORKFLOW_DEFAULTS = {
   onboarding1: { enabled: false, dayAfter: 7,  quietStart: 22, quietEnd: 8 },
   onboarding2: { enabled: false, dayAfter: 14, quietStart: 22, quietEnd: 8 },
   attendance:  { enabled: false, inactiveDays: 14, quietStart: 22, quietEnd: 8 },
+  feedback:    { enabled: false, dayAfter: 30, quietStart: 22, quietEnd: 8 },
 };
 
 // Runtime config — can be toggled via admin panel API
@@ -160,14 +161,24 @@ async function _runBirthday(members, log, result) {
       ? `${name}, יום הולדת שמח! 🎂 שמחים שאתה איתנו ב-Shape Studio — יהיה שנה מלאת בריאות, שמחה ואנרגיה 💪`
       : `${name}, יום הולדת שמח! 🎂 שמחות שאת איתנו ב-Shape Studio — תהיי שנה מלאת בריאות, שמחה ואנרגיה 💪`;
 
+    const qEntry = tomerStore.queueMessage({
+      workflowId:   'birthday',
+      phone:        m.phone,
+      memberName:   name,
+      message,
+      trigger:      'birthday eligibility met',
+      scheduledFor: new Date().toISOString(),
+    });
     try {
-      await sendText()(m.phone, message);
+      const sendResult = await sendText()(m.phone, message).catch(err => { throw err; });
+      tomerStore.markMessageSent(qEntry.id, { idMessage: sendResult?.idMessage ?? null });
       _markRun(log, key, { name, workflow: 'birthday' });
       tomerStore.appendAudit({ phone: m.phone, memberName: name, event: 'retention_sent',
         tomerAction: 'birthday greeting', replyPreview: message.slice(0, 80), owner: 'tomer' });
       result.sent++;
       logger.info('[retention] Birthday sent', { phone: m.phone, name });
     } catch (err) {
+      tomerStore.markMessageFailed(qEntry.id, { error: err.message });
       result.errors++;
       logger.warn('[retention] Birthday send failed', { phone: m.phone, error: err.message });
     }
@@ -209,14 +220,24 @@ async function _runOnboarding(members, log, result, dayAfter, workflowId) {
         : `${name}, שבועיים עברו 🙂 מקווים שאת כבר מרגישה כמו בבית. יש לנו עניין לשמוע איך היה עד כה — נשמח לפידבק קצר.`;
     }
 
+    const qEntry = tomerStore.queueMessage({
+      workflowId:   workflowId,
+      phone:        m.phone,
+      memberName:   name,
+      message,
+      trigger:      `${workflowId} eligibility met`,
+      scheduledFor: new Date().toISOString(),
+    });
     try {
-      await sendText()(m.phone, message);
+      const sendResult = await sendText()(m.phone, message).catch(err => { throw err; });
+      tomerStore.markMessageSent(qEntry.id, { idMessage: sendResult?.idMessage ?? null });
       _markRun(log, key, { name, workflow: workflowId, dayAfter });
       tomerStore.appendAudit({ phone: m.phone, memberName: name, event: 'retention_sent',
         tomerAction: `onboarding day ${dayAfter}`, replyPreview: message.slice(0, 80), owner: 'tomer' });
       result.sent++;
       logger.info('[retention] Onboarding sent', { phone: m.phone, name, dayAfter });
     } catch (err) {
+      tomerStore.markMessageFailed(qEntry.id, { error: err.message });
       result.errors++;
       logger.warn('[retention] Onboarding send failed', { phone: m.phone, error: err.message });
     }
@@ -264,16 +285,78 @@ async function _runAttendanceDrop(members, log, result) {
       ? `${name}, שלום! לא ראינו אותך בזמן האחרון — הכל בסדר? 🙂 אם יש משהו שנוכל לעזור, אנחנו כאן.`
       : `${name}, שלום! לא ראינו אותך בזמן האחרון — הכל בסדר? 🙂 אם יש משהו שנוכל לעזור, אנחנו כאן.`;
 
+    const qEntry = tomerStore.queueMessage({
+      workflowId:   'attendance',
+      phone:        m.phone,
+      memberName:   name,
+      message,
+      trigger:      'attendance eligibility met',
+      scheduledFor: new Date().toISOString(),
+    });
     try {
-      await sendText()(m.phone, message);
+      const sendResult = await sendText()(m.phone, message).catch(err => { throw err; });
+      tomerStore.markMessageSent(qEntry.id, { idMessage: sendResult?.idMessage ?? null });
       _markRun(log, key, { name, workflow: 'attendance', daysSince });
       tomerStore.appendAudit({ phone: m.phone, memberName: name, event: 'retention_sent',
         tomerAction: `attendance drop (${daysSince}d)`, replyPreview: message.slice(0, 80), owner: 'tomer' });
       result.sent++;
       logger.info('[retention] Attendance outreach sent', { phone: m.phone, name, daysSince });
     } catch (err) {
+      tomerStore.markMessageFailed(qEntry.id, { error: err.message });
       result.errors++;
       logger.warn('[retention] Attendance send failed', { phone: m.phone, error: err.message });
+    }
+  }
+}
+
+/**
+ * Feedback workflow — 30 days after membership_start_date.
+ * Distinct from onboarding2 (14d) — this is a longer check-in asking for feedback.
+ */
+async function _runFeedback(members, log, result) {
+  const cfg = _config.feedback;
+  if (!cfg.enabled) { result.skipped += members.length; return; }
+
+  _getOrSetActivationDate(log, 'feedback');
+
+  for (const m of members) {
+    if (!m.membership_start_date || !m.phone) { result.skipped++; continue; }
+    if (!m.active)             { result.skipped++; continue; }
+    if (m.allow_sms === false) { result.skipped++; continue; }
+
+    const daysSince = _daysDiff(m.membership_start_date);
+    // Fire on day 30 (window: 30–31)
+    if (daysSince < 30 || daysSince > 31) { result.skipped++; continue; }
+
+    const key = _dedupKey('feedback', m.phone, m.membership_start_date.slice(0, 10));
+    if (_hasRun(log, key)) { result.skipped++; continue; }
+
+    const name   = `${m.first_name ?? ''}`.trim() || 'חבר/ה';
+    const gender = m.gender === 'male' ? 'male' : 'female';
+    const message = gender === 'male'
+      ? `${name}, כחבר ותיק ב-Shape Studio, הדעה שלך חשובה לנו 💙 מה הדבר שהכי אהבת עד כה, ומה היית משנה? תשובה קצרה עוזרת לנו לשפר.`
+      : `${name}, כחברה וותיקה ב-Shape Studio, הדעה שלך חשובה לנו 💙 מה הדבר שהכי אהבת עד כה, ומה היית משנה? תשובה קצרה עוזרת לנו לשפר.`;
+
+    const qEntry = tomerStore.queueMessage({
+      workflowId:   'feedback',
+      phone:        m.phone,
+      memberName:   name,
+      message,
+      trigger:      'feedback eligibility met',
+      scheduledFor: new Date().toISOString(),
+    });
+    try {
+      const sendResult = await sendText()(m.phone, message).catch(err => { throw err; });
+      tomerStore.markMessageSent(qEntry.id, { idMessage: sendResult?.idMessage ?? null });
+      _markRun(log, key, { name, workflow: 'feedback', daysSince });
+      tomerStore.appendAudit({ phone: m.phone, memberName: name, event: 'retention_sent',
+        tomerAction: 'feedback request (30d)', replyPreview: message.slice(0, 80), owner: 'tomer' });
+      result.sent++;
+      logger.info('[retention] Feedback sent', { phone: m.phone, name, daysSince });
+    } catch (err) {
+      tomerStore.markMessageFailed(qEntry.id, { error: err.message });
+      result.errors++;
+      logger.warn('[retention] Feedback send failed', { phone: m.phone, error: err.message });
     }
   }
 }
@@ -299,6 +382,7 @@ async function runWorkflow(workflowId) {
     if (workflowId === 'onboarding1') await _runOnboarding(members, log, result, 7,  'onboarding1');
     if (workflowId === 'onboarding2') await _runOnboarding(members, log, result, 14, 'onboarding2');
     if (workflowId === 'attendance')  await _runAttendanceDrop(members, log, result);
+    if (workflowId === 'feedback')    await _runFeedback(members, log, result);
 
     _writeLog(log);
   } catch (err) {
@@ -348,7 +432,7 @@ async function previewWorkflow(workflowId, limit = 20) {
   if (!cfg) return { error: `Unknown workflow: ${workflowId}` };
 
   const eligible = [];
-  const dayAfter = workflowId === 'onboarding1' ? 7 : workflowId === 'onboarding2' ? 14 : null;
+  const dayAfter = workflowId === 'onboarding1' ? 7 : workflowId === 'onboarding2' ? 14 : workflowId === 'feedback' ? 30 : null;
 
   for (const m of members) {
     if (!m.phone) continue;
@@ -372,6 +456,15 @@ async function previewWorkflow(workflowId, limit = 20) {
       eligible.push({ phone: m.phone.slice(-4), name: `${m.first_name} ${m.last_name}`.trim(), startDate: m.membership_start_date, daysSince });
     }
 
+    if (workflowId === 'feedback' && dayAfter) {
+      if (!m.membership_start_date || !m.active) continue;
+      const daysSince = _daysDiff(m.membership_start_date);
+      if (daysSince < 30 || daysSince > 31) continue;
+      const key = _dedupKey('feedback', m.phone, m.membership_start_date.slice(0, 10));
+      if (_hasRun(log, key)) continue;
+      eligible.push({ phone: m.phone.slice(-4), name: `${m.first_name} ${m.last_name}`.trim(), startDate: m.membership_start_date, daysSince });
+    }
+
     if (eligible.length >= limit) break;
   }
 
@@ -382,6 +475,7 @@ async function previewWorkflow(workflowId, limit = 20) {
     onboarding1: `${sampleName}, שלום! 👋 שבוע אחד ב-Shape Studio — איך הולך? יש שאלות על השיעורים?`,
     onboarding2: `${sampleName}, שבועיים עברו 🙂 מקווים שאת/ה מרגיש/ה כבר כמו בבית. נשמח לפידבק קצר.`,
     attendance:  `${sampleName}, לא ראינו אותך קצת זמן 😊 הכל בסדר? נשמח לראות אותך בסטודיו שוב.`,
+    feedback:    `${sampleName}, כחבר/ה ב-Shape Studio, הדעה שלך חשובה לנו 💙 מה הדבר שהכי אהבת עד כה, ומה היית משנה?`,
   }[workflowId] ?? null;
 
   return { workflow: workflowId, enabled: cfg.enabled, eligible, messageTemplate: sampleMsg };
