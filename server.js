@@ -4941,7 +4941,9 @@ app.get('/api/tomer/today', async (req, res) => {
         lastText:   (last.text ?? '').slice(0, 80),
         route,
         ageMin:     Math.round(age / 60000),
-        owner:      lead.status === 'human_owns' ? 'human' : 'bot',
+        owner:      lead.status === 'human_owns'        ? 'human'
+                  : lead.status === 'attribution_review' ? 'attribution_review'
+                  :                                        'bot',
         leadStatus: lead.status ?? null,
         receivedAt: last.receivedAt ?? last.timestamp,
       });
@@ -5066,7 +5068,10 @@ app.get('/api/tomer/members-enriched', async (req, res) => {
         active:     m.active ?? false,
         birthday:   m.birthday?.slice(0, 10) ?? null,
         allowSms:   m.allow_sms ?? null,
-        owner:      ownerSt === 'human_owns' ? 'human' : ownerSt === 'opted_out' ? 'opted_out' : 'bot',
+        owner:      ownerSt === 'human_owns'         ? 'human'
+                  : ownerSt === 'opted_out'           ? 'opted_out'
+                  : ownerSt === 'attribution_review'  ? 'attribution_review'
+                  :                                     'bot',
         openTasks:  tasks,
         leadStatus: ownerSt,
         lastContact: lead?.meta?.lastContactAt ?? null,
@@ -5729,8 +5734,20 @@ process.on('SIGTERM', () => {
 // The ~1-2s init window is covered by Gate 1 (memberCache) and Gate 2 (operational
 // interceptor) in lead_agent.js — both fire even when the registry is warming up.
 process.env._SERVER_START_TS = new Date().toISOString();
+
+// Read the deployed git SHA from revision.json (written by the deploy script before
+// railway up). Falls back to RAILWAY_GIT_COMMIT_SHA if the file is absent.
+let _deployedRevision = process.env.RAILWAY_GIT_COMMIT_SHA?.slice(0, 8) ?? null;
+try {
+  const _rev = JSON.parse(fs.readFileSync(path.join(__dirname, 'revision.json'), 'utf8'));
+  _deployedRevision = _rev.sha?.slice(0, 8) ?? _deployedRevision;
+} catch { /* revision.json absent in development — not an error */ }
+
 app.listen(PORT, async () => {
-  logger.info(`Shape Studio Agent running — http://localhost:${PORT}`);
+  logger.info(`Shape Studio Agent running — http://localhost:${PORT}`, {
+    revision:   _deployedRevision ?? 'unknown',
+    deployedAt: (() => { try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'revision.json'), 'utf8')).deployedAt; } catch { return null; } })(),
+  });
 
   // ── Persistence: guarantee DATA_DIR exists, then hydrate stores ─────────────
   //

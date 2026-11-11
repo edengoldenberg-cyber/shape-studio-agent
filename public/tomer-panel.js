@@ -220,7 +220,10 @@ async function loadToday() {
         owner: c.owner,
         actions: c.owner === 'human'
           ? `<span class="badge-status-eden_assigned">👤 בטיפול ידני</span>`
-          : `<button class="btn-xs" onclick="takeHumanOwnership('${esc(c.phone)}','${esc(c.name??'')}')">👤 קח בעלות</button>`,
+          : c.owner === 'attribution_review'
+            ? `<span class="badge-warm" style="margin-left:4px">⚠️ ייחוס בבדיקה</span>
+               <button class="btn-xs" onclick="takeHumanOwnership('${esc(c.phone)}','${esc(c.name??'')}')">אשר ידני</button>`
+            : `<button class="btn-xs" onclick="takeHumanOwnership('${esc(c.phone)}','${esc(c.name??'')}')">👤 קח בעלות</button>`,
       }));
 
     // 3. Normal-priority Eden tasks
@@ -492,11 +495,13 @@ function renderMembersEnriched(members) {
     const badge   = statusHebrew[m.statusKey] ?? '';
     const ownerHtml = m.owner === 'human'
       ? '<span class="badge-crisis">👤 ידני</span>'
-      : m.owner === 'opted_out'
-        ? '<span class="badge-status-cancelled">🔇</span>'
-        : m.leadStatus
-          ? '<span class="badge-active">🤖</span>'
-          : '<span class="tw-muted">—</span>';
+      : m.owner === 'attribution_review'
+        ? '<span class="badge-warm" title="ייחוס בבדיקה — לחץ לנהוג ידנית">⚠️ בחינה</span>'
+        : m.owner === 'opted_out'
+          ? '<span class="badge-status-cancelled">🔇</span>'
+          : m.leadStatus
+            ? '<span class="badge-active">🤖</span>'
+            : '<span class="tw-muted">—</span>';
     const openTaskHtml = (m.openTasks ?? 0) > 0
       ? `<span class="badge-crisis">${m.openTasks}</span>`
       : '<span class="tw-muted">—</span>';

@@ -113,7 +113,7 @@ process.env.TEST_ALLOWLIST_PHONES = [
   '972509960005','972509960006','972509960007','972509960008',
   '972509960009','972509960010',
   '972509960011','972509960012','972509960013',
-  '972509960014','972509960015','972509960016',
+  '972509960014','972509960015','972509960016','972509960017',
 ].join(',');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -239,6 +239,8 @@ console.log('\n── Suite 0: Source-level assertions (SRC) ──');
   // Fix 5: openMemberByArboxId uses new endpoint, _arboxIdToPhone removed
   assert(panelSrc.includes('/api/tomer/member/id/'), '(SRC) tomer-panel.js calls /api/tomer/member/id/');
   assert(!panelSrc.includes('_arboxIdToPhone'), '(SRC) _arboxIdToPhone map removed from tomer-panel.js');
+  assert(panelSrc.includes('attribution_review'), "(SRC) tomer-panel.js shows attribution_review badge");
+  assert(panelSrc.includes('אשר ידני'), "(SRC) tomer-panel.js shows manual confirmation action for attribution_review");
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -388,6 +390,57 @@ console.log('\n── Suite 3: Outgoing webhook — bot echo vs staff reply ─�
   const status = store.getLead(ph)?.status ?? null;
   assert(status === 'opted_out', '3d: opted_out preserved — outgoing echo does not override', status);
   store.deleteLead(ph);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Suite 3e: Staff-message acceptance — four explicit invariants
+//
+//  3a (above): confirmed bot echo → NOT human_owns  [via MOCK- shortcut, pre-existing]
+//  3b (above): ordinary staff message, no competing send → human_owns immediately
+//  3c+4c (above): ambiguous attribution → attribution_review (visible for review)
+//  3e (new):   late bot confirmation → must NEVER clear genuine human_owns
+// ════════════════════════════════════════════════════════════════════════════
+console.log('\n── Suite 3e: Late bot confirmation does not clear genuine human_owns ──');
+{
+  // Scenario: a bot send is in-flight (1000ms), an unresolved echo enters the
+  // grace window, staff takes ownership via API DURING that window, then the
+  // provider finally responds. _recordBotSend must confirm the bot echo but
+  // must NOT revert human_owns back to the pre-review status.
+  const ph      = '972509960017';
+  const botId3e = `realbot-${Date.now()}-3e`;
+  _gaNextId     = botId3e;
+  _gaDelay      = 1000; // bot send takes 1000ms, > TTL (100ms)
+  clearSends();
+  store.deleteLead(ph);
+
+  await inboundWebhook(ph, 'שלום רב', `deferred-3e-${Date.now()}`);
+  await wait(380); // burst fires, sendText in-flight; bot echo arrives now
+
+  // Echo with the bot's id — enters _scheduleEchoReconcile (pending send in-flight).
+  await outgoingWebhook(ph, botId3e, 'bot message');
+
+  // Wait for first deferred tick (300ms) → TTL(100ms) expired → _unresolvedEchoes set.
+  await wait(400);
+
+  // Staff manually takes ownership via API while the echo is still unresolved.
+  const takeRes = await fetch(`${BASE}/api/leads/${encodeURIComponent(ph)}/takeover`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reason: '3e_concurrent_takeover', staffName: 'TestStaff' }),
+  });
+  assert(takeRes.ok, '3e-setup: takeover during unresolved window → 2xx', takeRes.status);
+
+  // GA finally responds (burst 300ms + 1000ms delay = ~1300ms from start).
+  // _recordBotSend clears _unresolvedEchoes and logs echo_attributed_to_bot,
+  // but must NOT overwrite human_owns with prevStatus.
+  const botConfirmed = await pollUntil(
+    () => store.getEvents({ type: 'echo_attributed_to_bot', phone: ph }).length >= 1,
+    4000, 200,
+  );
+  assert(botConfirmed, '3e: echo_attributed_to_bot event — late bot send confirmed');
+  assert(store.getLead(ph)?.status === 'human_owns', '3e: human_owns preserved — late bot confirmation does not clear genuine staff takeover', store.getLead(ph)?.status ?? '(no lead)');
+
+  _gaDelay  = 0;
+  _gaNextId = null;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
