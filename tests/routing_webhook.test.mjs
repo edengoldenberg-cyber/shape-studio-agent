@@ -98,11 +98,13 @@ process.env.PORT                     = String(APP_PORT);
 process.env.ARBOX_BASE_URL           = `http://localhost:${MOCK_PORT}/arbox`;
 process.env.BURST_WINDOW_MS          = '300';   // fast burst for tests
 delete process.env.OPENAI_API_KEY;              // no real AI calls
+process.env.TEST_AI_DELAY_MS         = '400';   // simulate generation latency for race tests
 
 process.env.TEST_ALLOWLIST_PHONES = [
   '972509960001','972509960002','972509960003','972509960004',
   '972509960005','972509960006','972509960007','972509960008',
   '972509960009','972509960010',
+  '972509960011','972509960012','972509960013',
 ].join(',');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -268,17 +270,47 @@ console.log('\n── Suite 1: Burst batching via /api/green-api/webhook ──'
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  Suite 2: Consecutive messages — only one automated send
+//  Suite 2: Burst — exactly one automated send for the combined burst
 // ════════════════════════════════════════════════════════════════════════════
-console.log('\n── Suite 2: Burst — single send for burst window ──');
+console.log('\n── Suite 2: Burst — exactly 1 send for 3-message burst ──');
 {
   const ph = '972509960002'; // same phone as Suite 1
-  // Poll until at least 1 send has arrived for this phone (or no send if AI fails)
-  await wait(2000); // give AI time to fail and pipeline to complete
+  // Wait for burst+AI pipeline to complete (burst 300ms + TEST_AI_DELAY_MS 400ms + buffer)
+  await wait(2000);
   const sentCount = sendsFor(ph).length;
-  // With no OpenAI key the bot may still send a fallback or nothing.
-  // What matters: not 3 separate sends (one per message).
-  assert(sentCount <= 1, '2a: at most 1 send for 3-message burst (not 3 separate sends)', sentCount);
+  // The 3-message burst produces exactly 1 combined reply — not 3 separate sends.
+  assert(sentCount === 1, '2a: exactly 1 send for 3-message burst', sentCount);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Suite 2b: Stale gate — newer inbound during generation suppresses outdated reply
+// ════════════════════════════════════════════════════════════════════════════
+console.log('\n── Suite 2b: Stale gate — newer inbound during AI generation ──');
+{
+  const ph = '972509960013';
+  clearSends();
+
+  // M1: sales-intent message → general intent → Barak → lead_agent → TEST_AI_DELAY_MS (400ms)
+  // Using plain greeting + pilates interest so intent stays 'general' (no scheduling path).
+  await inboundWebhook(ph, 'שלום, מחפשת פילאטיס, מחדרה', `stale-m1-${Date.now()}`);
+
+  // Wait past burst window (300ms) and 100ms into the AI delay, then send M2.
+  // _processingLock is held during the pipeline → M2 queues in _pendingMessages.
+  await wait(400);
+  await inboundWebhook(ph, 'שלום שוב', `stale-m2-${Date.now()}`);
+
+  // Wait for the stale gate event (M1 pipeline: burst 300ms + identity + AI delay ~1200ms).
+  const staleAppeared = await pollUntil(
+    () => store.getEvents({ type: 'reply_suppressed_stale', phone: ph }).length >= 1,
+    8000, 300,
+  );
+  // Stale gate fires inside lead_agent (pendingMap.has(from) → skipped_stale).
+  assert(staleAppeared, '2b: stale gate event logged — M1 reply suppressed by M2');
+
+  // Wait for M2 pipeline to complete and send its reply (another identity + AI delay ~1200ms).
+  const m2Sent = await pollUntil(() => sendsFor(ph).length >= 1, 8000, 300);
+  assert(m2Sent,              '2c: M2 reply sent after stale suppression', sendsFor(ph).length);
+  assert(sendsFor(ph).length === 1, '2d: exactly 1 send total (M1 suppressed, M2 only)', sendsFor(ph).length);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -344,61 +376,100 @@ console.log('\n── Suite 3: Outgoing webhook — bot echo vs staff reply ─�
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  Suite 4: Deferred reconciliation — in-flight bot send
+//  Suite 4: Sales-path race + deferred reconciliation with real IDs
 // ════════════════════════════════════════════════════════════════════════════
-console.log('\n── Suite 4: Deferred reconciliation ──');
+console.log('\n── Suite 4: Sales-path race + deferred reconciliation ──');
 
-// 4a: Staff reply echo during in-flight bot send → human_owns after reconciliation window.
+// 4a: Staff takeover via API during Barak AI generation → human_owns preserved after
+//     pipeline finishes. No bot send is delivered after takeover.
 //
-// Setup: use a text that triggers the UNCLASSIFIED path (new phone, no sales intent).
-// The unclassified path calls _markBotSent BEFORE await sendText, so the HTTP call
-// is in-flight when our echo arrives. The pipeline then returns WITHOUT any further
-// store.upsertLead({ status }) call, so human_owns is not overwritten.
+// Tests the race fixed in lead_agent: score/status write after generation must not
+// overwrite human_owns, and the pre-send status check suppresses the reply.
 {
   const ph = '972509960007';
   clearSends();
+  store.deleteLead(ph); // remove any human_owns left from previous runs
 
-  _gaDelay = 500; // slow mock GA → bot HTTP in-flight during echo
+  // Message with explicit sales intent → routes to Barak (lead_agent), not unclassified.
+  await inboundWebhook(ph, 'אני מחפשת פילאטיס, מחדרה', `race-4a-${Date.now()}`);
 
-  // Trigger unclassified greeting via inbound webhook (goes through burst accumulator)
-  // "שלום רב" has no sales intent → unclassified path → _markBotSent called
-  await inboundWebhook(ph, 'שלום רב', `deferred-4a-${Date.now()}`);
+  // Wait past burst window (300ms) and 100ms into TEST_AI_DELAY_MS (400ms).
+  // Pipeline is now inside lead_agent awaiting the simulated generation delay.
+  await wait(400);
 
-  // Wait for burst (300ms) + pipeline start + _markBotSent call (~100ms)
-  await wait(500);
+  // Set human_owns via the API — concurrent with AI generation.
+  const tRes = await fetch(`${BASE}/api/leads/${encodeURIComponent(ph)}/takeover`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reason: 'staff_during_generation_test', staffName: 'TestStaff' }),
+  });
+  assert(tRes.ok, '4a-setup: takeover API during generation → 2xx', tRes.status);
 
-  // Staff reply echo: different id from whatever the bot will send
-  const staffId = `STAFF-DEFERRED-${Date.now()}`;
-  await outgoingWebhook(ph, staffId, 'אני אטפל בזה');
+  // Wait for pipeline to finish (remaining ~300ms AI delay + processing + burst buffer).
+  await wait(1200);
 
-  // Wait > OUTGOING_RECONCILE_MS (300ms) + GA delay (500ms) + buffer
-  await wait(1000);
-
-  const status = store.getLead(ph)?.status ?? null;
-  assert(status === 'human_owns', '4a: staff reply during in-flight → human_owns after deferred window', status ?? '(no lead)');
-  _gaDelay = 0;
+  const status4a = store.getLead(ph)?.status ?? null;
+  assert(status4a === 'human_owns', '4a: human_owns preserved after pipeline — not overwritten by score write', status4a ?? '(no lead)');
+  assert(sendsFor(ph).length === 0,  '4a: no bot send after human_owns set during generation', sendsFor(ph).length);
 }
 
-// 4b: Bot echo during in-flight (preknown MOCK- id) → NOT human_owns
+// 4b: Genuine bot echo with ordinary provider-style ID, arriving before delayed provider
+//     response → NOT human_owns. Tests that _botSentIds (not MOCK- shortcut) resolves
+//     the echo before the deferred reconciliation window fires.
+//
+// _gaDelay (100ms) < OUTGOING_RECONCILE_MS (300ms): GA responds and _recordBotSend
+// runs before the deferred callback fires, so the ID is confirmed as a bot echo.
 {
-  const ph         = '972509960008';
-  const preknownId = `MOCK-PRE-${Date.now()}`;
-  _gaNextId        = preknownId;
-  _gaDelay         = 400;
+  const ph        = '972509960011'; // fresh phone → unclassified path (_markBotSent called)
+  const botId4b   = `realbot-${Date.now()}-4b`;
+  _gaNextId       = botId4b;
+  _gaDelay        = 100; // shorter than OUTGOING_RECONCILE_MS (300ms)
+  clearSends();
+  store.deleteLead(ph);
 
-  post('/api/whatsapp/simulate', { from: ph, text: 'מה השעות?' }).catch(() => {});
-  await wait(80);
+  // Unclassified path: _markBotSent → sendText(delayed 100ms) → _recordBotSend(botId4b)
+  await inboundWebhook(ph, 'שלום רב', `deferred-4b-${Date.now()}`);
 
-  // Echo for the same preknown id arrives while HTTP is pending
-  await outgoingWebhook(ph, preknownId, 'bot message');
+  // Wait for burst (300ms) + ~50ms pipeline start → sendText is now in-flight.
+  await wait(380);
 
-  // Wait for GA to respond + reconciliation window
-  await wait(800);
+  // Echo with the SAME id the bot will send: arrives while GA HTTP is still pending.
+  // _isBotSentId → false (not in _botSentIds yet, no MOCK- shortcut).
+  // _hasPendingBotSend → true → deferred for OUTGOING_RECONCILE_MS (300ms).
+  await outgoingWebhook(ph, botId4b, 'bot message');
 
-  const status = store.getLead(ph)?.status ?? null;
-  // MOCK-* prefix makes _isBotSentId return true unconditionally
-  assert(status !== 'human_owns', '4b: MOCK-* bot echo during in-flight → NOT human_owns', status ?? '(no lead)');
+  // Wait: GA responds at ~400ms (100ms after sendText) → _recordBotSend fires.
+  // Deferred fires at ~680ms (380ms+300ms) → _isBotSentId(botId4b) → true → skip.
+  await wait(500);
 
+  const status4b = store.getLead(ph)?.status ?? null;
+  assert(status4b !== 'human_owns', '4b: bot echo with ordinary ID resolved via _botSentIds → NOT human_owns', status4b ?? '(no lead)');
+  _gaDelay  = 0;
+  _gaNextId = null;
+}
+
+// 4c: Genuine staff message echo with ordinary ID during the same in-flight window
+//     → DOES trigger human_owns. The staff ID is never recorded in _botSentIds, so
+//     the deferred reconciliation correctly identifies it as a staff reply.
+{
+  const ph        = '972509960012'; // fresh phone → unclassified path
+  const botId4c   = `realbot-${Date.now()}-4c`;
+  const staffId4c = `staffmsg-${Date.now()}-4c`;
+  _gaNextId       = botId4c;
+  _gaDelay        = 100;
+  clearSends();
+  store.deleteLead(ph);
+
+  await inboundWebhook(ph, 'שלום רב', `deferred-4c-${Date.now()}`);
+  await wait(380); // burst fires, sendText in-flight
+
+  // Staff echo: a DIFFERENT id (not what the bot sent).
+  // _isBotSentId(staffId4c) → false. _hasPendingBotSend → true → deferred.
+  // After 300ms, _isBotSentId(staffId4c) still false → _applyStaffTakeover → human_owns.
+  await outgoingWebhook(ph, staffId4c, 'אני אטפל בזה — staff');
+  await wait(500);
+
+  const status4c = store.getLead(ph)?.status ?? null;
+  assert(status4c === 'human_owns', '4c: genuine staff echo during in-flight → human_owns after deferred window', status4c ?? '(no lead)');
   _gaDelay  = 0;
   _gaNextId = null;
 }

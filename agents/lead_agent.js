@@ -1230,9 +1230,12 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
     history.push({ role: 'user',      content: text });
     history.push({ role: 'assistant', content: deterministicResult.reply });
     saveHistory(from, history);
-    const score  = scoreLeadFromHistory(history, freshQualData);
-    const status = score >= 8 ? 'hot' : score >= 5 ? 'warm' : 'cold';
-    store.upsertLead(from, { score, status });
+    const score       = scoreLeadFromHistory(history, freshQualData);
+    const _rawStatDet = score >= 8 ? 'hot' : score >= 5 ? 'warm' : 'cold';
+    const _curStDet   = store.getLead(from)?.status;
+    const _protDet    = ['human_owns', 'opted_out', 'converted_member'].includes(_curStDet);
+    const status      = _protDet ? _curStDet : _rawStatDet;
+    store.upsertLead(from, _protDet ? { score } : { score, status });
     store.logEvent('score_update', from, { score, status });
     logger.info('[lead_agent] Score (deterministic)', { from, score, status });
     return { reply: deterministicResult.reply, score, status };
@@ -1247,6 +1250,9 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
 
   // 5. Generate AI reply
   _lastDebugCtx = { path: 'openai', completedTurns, model: process.env.OPENAI_MODEL ?? 'gpt-4o', postProcess: { changes: [], clean: true } };
+  // Test hook: TEST_AI_DELAY_MS simulates generation latency so tests can inject
+  // concurrent events (human takeover, newer inbound) during "generation".
+  if (process.env.TEST_AI_DELAY_MS) await new Promise(r => setTimeout(r, Number(process.env.TEST_AI_DELAY_MS)));
   let reply;
   try {
     const completion = await openai.chat.completions.create({
@@ -1302,10 +1308,15 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
   }
 
   // 7. Score the lead (history already has user+assistant appended above)
-  const prevScore = store.getLead(from)?.score ?? 4;
-  const score     = scoreLeadFromHistory(history, freshQualData);
-  const status    = score >= 8 ? 'hot' : score >= 5 ? 'warm' : 'cold';
-  store.upsertLead(from, { score, status });
+  const prevScore  = store.getLead(from)?.score ?? 4;
+  const score      = scoreLeadFromHistory(history, freshQualData);
+  const _rawStat   = score >= 8 ? 'hot' : score >= 5 ? 'warm' : 'cold';
+  // Guard: don't overwrite a stop-status (human_owns, opted_out, converted_member)
+  // that was set during AI generation (e.g. concurrent staff takeover via outgoing webhook).
+  const _curSt1    = store.getLead(from)?.status;
+  const _protect1  = ['human_owns', 'opted_out', 'converted_member'].includes(_curSt1);
+  const status     = _protect1 ? _curSt1 : _rawStat;
+  store.upsertLead(from, _protect1 ? { score } : { score, status });
   store.logEvent('score_update', from, { score, status });
   logger.info('[lead_agent] Score', { from, score, status });
   if (score !== prevScore) demoCapture.record('score_changed', { previous: prevScore, current: score, status });
@@ -1334,6 +1345,16 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
     logger.info('[lead_agent] Stale AI send suppressed — newer message pending', { from });
     store.logEvent('reply_suppressed_stale', from, { path: 'ai', preview: reply.slice(0, 60) });
     return { reply, score, status, sendState: 'skipped_stale' };
+  }
+
+  // Guard: status was set to human_owns or opted_out during generation (e.g. concurrent
+  // staff reply via outgoing webhook while AI was running). Suppress the send so no
+  // bot message follows a staff takeover.
+  const _preSendSt = store.getLead(from)?.status;
+  if (['human_owns', 'opted_out'].includes(_preSendSt)) {
+    logger.info('[lead_agent] Send suppressed — status changed during generation', { from, status: _preSendSt });
+    store.logEvent('reply_suppressed_status_change', from, { status: _preSendSt });
+    return { reply, score, status: _preSendSt, sendState: 'skipped_status_changed' };
   }
 
   let sendState = 'sent';

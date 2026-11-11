@@ -3335,7 +3335,8 @@ async function processInboundWAMessage(msg) {
       if (!_alreadyGreeted && process.env.WHATSAPP_AUTO_REPLY === 'true') {
         _unclassifiedReply = 'שלום! 😊 קיבלנו את הודעתך. כדי שנוכל לעזור — ספר/י לנו מה מחפש/ת.';
         _markBotSent(fromNorm);
-        await sendText(fromNorm, _unclassifiedReply).catch(() => {});
+        const _ucSendRes = await sendText(fromNorm, _unclassifiedReply).catch(() => null);
+        if (_ucSendRes?.idMessage) _recordBotSend(_ucSendRes.idMessage, fromNorm);
         _tomerStore.markUnclassified(fromNorm, { firstMessage: msg.text ?? '', greetingSent: true });
         _tomerStore.appendAudit({ phone: fromNorm, memberName: msg.name ?? null, event: 'unclassified_greeting',
           requestPreview: (msg.text ?? '').slice(0, 100), tomerAction: 'neutral greeting sent', owner: 'unclassified' });
