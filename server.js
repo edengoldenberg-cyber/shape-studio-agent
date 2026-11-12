@@ -339,6 +339,25 @@ app.delete('/api/leads/:phone', requireTestMode, (req, res) => {
   res.json({ ok: true, phone: norm });
 });
 
+// POST /api/test/flush — immediately persist both stores to disk (TEST_MODE only).
+// Without this, the 60s periodic save means persistence can't be verified in short tests.
+app.post('/api/test/flush', requireTestMode, (_req, res) => {
+  persist.saveAll(store, inbox);
+  res.json({ ok: true, flushedAt: new Date().toISOString() });
+});
+
+// GET /api/test/lead/:phone — return full (unmasked) lead record for test assertions.
+// TEST_MODE only — never exposes real phone data in production.
+app.get('/api/test/lead/:phone', requireTestMode, (req, res) => {
+  const norm = normalizeToE164(decodeURIComponent(req.params.phone));
+  if (!norm) return res.status(400).json({ ok: false, error: 'invalid phone' });
+  const lead = store.getLead(norm);
+  if (!lead) return res.status(404).json({ ok: false, error: 'not found' });
+  // Return history length only — not full content — to minimise data exposure.
+  const { history, ...rest } = lead;
+  res.json({ ok: true, lead: { ...rest, historyLength: history?.length ?? 0 } });
+});
+
 // GET /api/health/registry — phone registry and timetable facts (no assumptions)
 app.get('/api/health/registry', (_req, res) => {
   const ageMs  = phoneRegistry.age();
@@ -517,6 +536,20 @@ app.post('/webhook/whatsapp', captureRawBody, verifyMetaSignature, async (req, r
 
 // ── REST API — shared express.json() parser for all /api POST routes ──────────
 const jsonBody = express.json();
+
+// POST /api/leads/:phone/set-qual — directly set qualData fields (TEST_MODE only).
+// Lets tests seed callProposed=true without depending on OpenAI output.
+app.post('/api/leads/:phone/set-qual', requireTestMode, jsonBody, (req, res) => {
+  const norm = normalizeToE164(decodeURIComponent(req.params.phone));
+  if (!norm) return res.status(400).json({ ok: false, error: 'invalid phone' });
+  if (!store.getLead(norm)) store.upsertLead(norm, {});
+  const existing = store.getLead(norm);
+  const meta     = existing?.meta ?? {};
+  const current  = meta.qualData ?? {};
+  store.upsertLead(norm, { meta: { ...meta, qualData: { ...current, ...req.body } } });
+  persist.saveLeads(store);
+  res.json({ ok: true, qualData: store.getLead(norm)?.meta?.qualData ?? {} });
+});
 
 // GET /api/leads — all leads (history stripped, phone masked)
 // Runtime member filter: confirmed members are stripped from every response.
@@ -3409,9 +3442,30 @@ async function processInboundWAMessage(msg) {
         });
         return { inboxEntry: scEntry, clientMatch, intent, route: 'post_call_schedule', barakReply: postCallReply };
 
-      } else {
-        // New question or message after call completion → staff alert, no bot reply.
-        // Staff should follow up. Bot stays silent to avoid false promises.
+      } else if (_postCallRec?.meta?.qualData?.nameAsked && !_postCallRec?.meta?.qualData?.confirmedName) {
+        // The bot asked for a name after confirming the callback time (new behaviour).
+        // If this short message looks like a first name, capture it silently.
+        // Any longer or ambiguous message falls through to the staff-alert path.
+        const { extractNameFromMessage } = require('./agents/lead_agent');
+        const capturedName = extractNameFromMessage(msgText);
+        if (capturedName) {
+          const _nm = _postCallRec?.meta ?? {};
+          store.upsertLead(fromNorm, {
+            name: capturedName,
+            meta: { ..._nm, qualData: { ...(_nm.qualData ?? {}), confirmedName: capturedName, nameConfirmed: true } },
+          });
+          persist.saveLeads(store);
+          store.logEvent('name_captured_post_call', fromNorm, { name: capturedName, status: _postCallStatus });
+          logger.info('[pipeline] Post-call name captured — silent', { from: fromNorm, name: capturedName });
+          const nmEntry = inbox.push({
+            from: fromNorm, fromIsraeli, name: msg.name ?? null,
+            text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
+            receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
+            clientMatch, intent, route: 'post_call_name_captured', barakReply: null,
+          });
+          return { inboxEntry: nmEntry, clientMatch, intent, route: 'post_call_name_captured', barakReply: null };
+        }
+        // Fall through to staff-alert path for non-name messages
         alertOwner(
           `📬 הודעה אחרי ${_postCallStatus === 'call_scheduled' ? 'תיאום' : 'בקשת חזרה'} — ${msg.name ?? fromNorm}`,
           `*${msg.name ?? fromNorm}* (${fromNorm})\n*סטטוס:* ${_postCallStatus}\n*הודעה:* "${msgText.slice(0, 200)}"\n\nהאדם כתב אחרי שהתיאום הושלם. אנא בדוק ידנית.`
@@ -4058,6 +4112,13 @@ app.post('/api/whatsapp/simulate', jsonBody, async (req, res) => {
   try {
     const result = await processInboundWAMessage(msg);
     broadcastSse('message', { phone: result.inboxEntry.from, name: result.inboxEntry.name ?? null });
+    // TEST_MODE: include store state for test assertions without a second round-trip
+    const _simLead = process.env.TEST_MODE === 'true' ? (() => {
+      const l = store.getLead(normalizeToE164(from));
+      if (!l) return null;
+      const { history, ...rest } = l;
+      return { ...rest, historyLength: history?.length ?? 0 };
+    })() : undefined;
     res.json({
       ok: true,
       inboxId:     result.inboxEntry.id,
@@ -4066,6 +4127,7 @@ app.post('/api/whatsapp/simulate', jsonBody, async (req, res) => {
       clientMatch: result.clientMatch,
       barakReply:  result.barakReply,
       processedAt: new Date(),
+      _lead:       _simLead,
     });
   } catch (err) {
     logger.error('WA simulate error', { error: err.message });

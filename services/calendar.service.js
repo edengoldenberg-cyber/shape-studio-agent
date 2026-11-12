@@ -200,12 +200,18 @@ async function updateGoogleCalendarEvent(eventId, patch) {
  * Parse a Hebrew free-text time reference into a JS Date using OpenAI.
  * Returns null when parsing fails or OPENAI_API_KEY is not set.
  * Examples: "מחר בשעה 15:00", "ביום שלישי בשעה 10 בבוקר", "בעוד שעתיים"
+ *
+ * @param {string}    rawText       - Hebrew time text
+ * @param {Date|null} referenceTime - anchor for relative dates ("מחר"); defaults to
+ *   now. Pass the original message timestamp (meta.callTimeGivenAt) so "מחר" is
+ *   resolved against the moment the lead sent the message, not a later parse time.
  */
-async function parseHebrewTime(rawText) {
+async function parseHebrewTime(rawText, referenceTime = null) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey || !rawText) return null;
 
-  const nowIL = new Date().toLocaleString('en-US', { timeZone: 'Asia/Jerusalem' });
+  const ref   = (referenceTime instanceof Date && !isNaN(referenceTime)) ? referenceTime : new Date();
+  const nowIL = ref.toLocaleString('en-US', { timeZone: 'Asia/Jerusalem' });
 
   try {
     const { data } = await axios.post(

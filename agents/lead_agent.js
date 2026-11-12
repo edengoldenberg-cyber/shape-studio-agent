@@ -13,8 +13,6 @@ const memoryService = require('../services/memory.service');
 const handoffService = require('../services/handoff.service');
 const memberCache   = require('../utils/member_cache');
 const { checkOperationalIntent } = require('../utils/operational_interceptor');
-const aptStore      = require('../utils/appointment_store');
-const calendarSvc   = require('../services/calendar.service');
 
 const SYSTEM_PROMPT = fs.readFileSync(
   path.join(__dirname, '../prompts/system_prompt.md'),
@@ -248,9 +246,13 @@ function postProcessReply(reply, qualData, assets) {
     }
   }
 
-  // 3. CLOSE state — strip trailing question when conversation is finished.
-  //    Open state — the AI decides whether to ask; no forced appending.
-  const isClose = !!(qualData.callTimeGiven || qualData.locationViable === false);
+  // 3. CLOSE state — strip trailing question when conversation is fully finished.
+  //    Not closed if callTimeGiven but confirmedName is still missing: the AI is
+  //    expected to ask one more question (the name), so the question must not be stripped.
+  const isClose = !!(
+    (qualData.callTimeGiven && qualData.confirmedName) ||
+    qualData.locationViable === false
+  );
   if (isClose) {
     // Strip the last sentence if it ends with a question mark.
     // [\s\S] after the ? allows for trailing emoji, whitespace, or any Unicode char.
@@ -419,13 +421,27 @@ function buildStageContext(completedTurns, qualData, msgCount) {
     ].join('\n');
   }
 
-  // 2. Call time confirmed — conversation is finished
+  // 2. Call time confirmed.
+  //    If the name is still unknown: confirm the time and ask their first name naturally
+  //    in the same message — one final step before closing. Do NOT close without a name.
+  //    If the name is already known: close warmly with no question.
   if (qualData.callTimeGiven) {
+    if (!qualData.confirmedName) {
+      return [
+        `STATE: CALL TIME CONFIRMED — awaiting first name before handoff.`,
+        `Warm reply: confirm the time in one short sentence, then ask their first name.`,
+        `Ask naturally — not formally. ONE question only.`,
+        `Confirmed time: "${qualData.callTimeGiven}"`,
+        `Example: "מצוין — מחר בשעה 12 😊 ואיך קוראים לך?"`,
+        `Example: "מעולה! הצוות יצור קשר ${qualData.callTimeGiven} 🙏 ואיך קוראים לך?"`,
+        `FORBIDDEN: asking for more than the first name. FORBIDDEN: re-asking about time or location.`,
+      ].join('\n');
+    }
     return [
       `STATE: CALL TIME CONFIRMED. Conversation is complete.`,
-      `Write 1 warm sentence confirming the call time. No question mark. No new topics.`,
-      `Confirmed time: "${qualData.callTimeGiven}"`,
-      `Example: "מצוין — הצוות יצור קשר ב${qualData.callTimeGiven} 😊"`,
+      `Write 1 warm sentence confirming the call. No question mark. No new topics.`,
+      `Confirmed time: "${qualData.callTimeGiven}" | Name: "${qualData.confirmedName}"`,
+      `Example: "מצוין ${qualData.confirmedName} — הצוות יצור קשר ב${qualData.callTimeGiven} 😊"`,
     ].join('\n');
   }
 
@@ -561,10 +577,23 @@ const CRISIS_PATTERNS = [
 ];
 
 // Regex to detect a callback time in the user's message.
-// Covers: day names, HH:MM, time-of-day words, AM/PM, "מחר"/"היום",
-// "בשעה N" (bare hour without colon — the most common Israeli WhatsApp form).
+//
+// \b works for ASCII (HH:MM, English day names, AM/PM) but NOT for Hebrew,
+// because Hebrew characters are \W in JS regex. Hebrew patterns use:
+//   (?<![א-ת])…(?![א-ת])  — not adjacent to another Hebrew letter
+// or lookahead-only where the word can carry common prefixes (ל/ב/מ/כ/ה):
+//   מחר(?![א-ת])  — matches "מחר" and "למחר" but not "מחרתיים"
+//   בוקר(?![א-ת]) — matches "בוקר" and "בבוקר" (ב + בוקר)
 const TIME_PATTERN =
-  /\b(ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת|sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b|\b\d{1,2}:\d{2}\b|\b(בוקר|ערב|צהריים|אחה"צ|אחרי עבודה)\b|\b\d{1,2}\s*(am|pm)\b|\bמחר\b|\bהיום\b|\bבשעה\s+\d{1,2}\b/i;
+  /\b\d{1,2}:\d{2}\b|\b(?:sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b|\b\d{1,2}\s*(?:am|pm)\b|(?<![א-ת])(?:ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת)(?![א-ת])|(?:בוקר|ערב|צהריים)(?![א-ת])|אחה"צ|אחרי עבודה|מחר(?![א-ת])|היום(?![א-ת])|שעה\s+\d{1,2}(?!\d)/i;
+
+// Reject callback capture when the lead is declining/negating a time.
+// "מחר לא מתאים", "לא מחר", "לא היום" must not set callTimeGiven even
+// though TIME_PATTERN matches "מחר"/"היום".
+// Note: "לא, מחר ב12 מתאים" (comma between לא and מחר) does NOT match
+// because \s+ requires whitespace, so the rejection correctly does not fire.
+const TIME_REJECTION_RE =
+  /(?:מחר|היום)\s+לא\s+(?:מתאים|נוח|אפשר|יכול[הת]?)|לא\s+(?:מתאים|נוח)\s+(?:מחר|היום)|לא\s+מחר|לא\s+היום/i;
 
 // ── Qualification data helpers ────────────────────────────────────────────────
 
@@ -1089,10 +1118,17 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
     logger.info('[lead_agent] Callback declined by lead', { from });
   }
 
-  // 3a. Detect callback time in this inbound message
-  if (qualData.callProposed && !qualData.callTimeGiven && TIME_PATTERN.test(text)) {
-    const callTime = text.trim().slice(0, 80);
-    setQualData(from, { callTimeGiven: callTime });
+  // 3a. Detect callback time in this inbound message.
+  // TIME_REJECTION_RE prevents "מחר לא מתאים" / "לא מחר" from being captured
+  // as a time even though TIME_PATTERN matches the keyword.
+  if (qualData.callProposed && !qualData.callTimeGiven
+      && TIME_PATTERN.test(text) && !TIME_REJECTION_RE.test(text)) {
+    const callTime    = text.trim().slice(0, 80);
+    const capturedAt  = new Date().toISOString();
+    // callTimeGivenAt preserves the message timestamp so parseHebrewTime can
+    // resolve relative references ("מחר") against the original send time, not
+    // a later processing time.
+    setQualData(from, { callTimeGiven: callTime, callTimeGivenAt: capturedAt });
     // Mark callback_requested (NOT call_scheduled):
     //   • Tomer/Barak workers skip this lead (getSendableLeads excludes callback_requested)
     //   • This is the AI qualification path — team was alerted via handoffService but
@@ -1104,7 +1140,8 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
       meta: {
         ...(store.getLead(from)?.meta ?? {}),
         callbackTime:         callTime,
-        callbackRequestedAt:  new Date().toISOString(),
+        callbackRequestedAt:  capturedAt,
+        callTimeGivenAt:      capturedAt,
         awaitingCallbackTime: false,
       },
     });
@@ -1285,7 +1322,8 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
     const score       = scoreLeadFromHistory(history, freshQualData);
     const _rawStatDet = score >= 8 ? 'hot' : score >= 5 ? 'warm' : 'cold';
     const _curStDet   = store.getLead(from)?.status;
-    const _protDet    = ['human_owns', 'opted_out', 'converted_member'].includes(_curStDet);
+    const _protDet    = ['human_owns', 'opted_out', 'converted_member',
+                          'callback_requested', 'call_scheduled'].includes(_curStDet);
     const status      = _protDet ? _curStDet : _rawStatDet;
     store.upsertLead(from, _protDet ? { score } : { score, status });
     store.logEvent('score_update', from, { score, status });
@@ -1366,9 +1404,12 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
   const score      = scoreLeadFromHistory(history, freshQualData);
   const _rawStat   = score >= 8 ? 'hot' : score >= 5 ? 'warm' : 'cold';
   // Guard: don't overwrite a stop-status (human_owns, opted_out, converted_member)
-  // that was set during AI generation (e.g. concurrent staff takeover via outgoing webhook).
+  // or a pipeline milestone (callback_requested, call_scheduled) set during this same
+  // turn (e.g. step 3a captured callTimeGiven → callback_requested; scoring must not
+  // then overwrite it with 'hot' and lose the handoff state).
   const _curSt1    = store.getLead(from)?.status;
-  const _protect1  = ['human_owns', 'opted_out', 'converted_member'].includes(_curSt1);
+  const _protect1  = ['human_owns', 'opted_out', 'converted_member',
+                       'callback_requested', 'call_scheduled'].includes(_curSt1);
   const status     = _protect1 ? _curSt1 : _rawStat;
   store.upsertLead(from, _protect1 ? { score } : { score, status });
   store.logEvent('score_update', from, { score, status });
@@ -1452,38 +1493,6 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
     // since it runs after the outbound send and does not delay the lead's experience.
     const handoffLead = store.getLead(from);
     await reliableHandoffAlert(from, handoffLead?.name ?? from, history, latestQualData);
-
-    // Create an aptStore entry so the reminder/no-show worker can fire.
-    // The WhatsApp brief was already sent by reliableHandoffAlert above — no second alert.
-    // Parse the Hebrew time asynchronously; the entry is immediately visible in the panel
-    // with rawTime even if scheduledAt is null (reminder worker skips unresolved times).
-    try {
-      const staffCfg = JSON.parse(require('fs').readFileSync(
-        require('path').join(__dirname, '../data/staff_config.json'), 'utf8'));
-      const assignedId = staffCfg.default_assignee_id ?? 'eden';
-      const apt = aptStore.create({
-        leadPhone:       from,
-        leadName:        handoffLead?.name ?? null,
-        rawTime:         latestQualData.callTimeGiven,
-        scheduledAt:     null,
-        durationMin:     staffCfg.appointment_duration_min ?? 30,
-        assignedStaffId: assignedId,
-      });
-      store.logEvent('apt_created_ai_path', from, { aptId: apt.id, rawTime: apt.rawTime });
-      logger.info('[lead_agent] aptStore entry created for AI-path callback', { from, aptId: apt.id });
-
-      // Parse the Hebrew time text and update scheduledAt so the reminder window works.
-      calendarSvc.parseHebrewTime(apt.rawTime)
-        .then(scheduledAt => {
-          if (scheduledAt) {
-            aptStore.update(apt.id, { scheduledAt });
-            logger.info('[lead_agent] aptStore scheduledAt resolved', { aptId: apt.id, scheduledAt });
-          }
-        })
-        .catch(err => logger.warn('[lead_agent] aptStore time parse failed', { aptId: apt.id, error: err.message }));
-    } catch (aptErr) {
-      logger.warn('[lead_agent] aptStore create failed — reminder will not fire', { from, error: aptErr.message });
-    }
 
     // Save a persistent session summary to the memory store (fire-and-forget is acceptable
     // here — it enriches future conversations but is not required for the team handoff)
@@ -1620,5 +1629,5 @@ function recordSchedulingExchange(phone, userText, agentReply) {
   }
 }
 
-module.exports = { handleInbound, clearSession, generateLeadBrief, sendIntroOffer, getLastDebugContext, recordSchedulingExchange, computeLeadProfile };
+module.exports = { handleInbound, clearSession, generateLeadBrief, sendIntroOffer, getLastDebugContext, recordSchedulingExchange, computeLeadProfile, TIME_PATTERN, TIME_REJECTION_RE, extractNameFromMessage };
 
