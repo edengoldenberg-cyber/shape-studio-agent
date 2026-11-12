@@ -33,4 +33,33 @@ function nextMorningRelease() {
   return release;
 }
 
-module.exports = { isQuietHours, nextMorningRelease, nowInIsrael };
+const HEBREW_DAYS = ['ראשון','שני','שלישי','רביעי','חמישי','שישי','שבת'];
+
+/**
+ * Format a scheduled appointment time as a Hebrew date/time string.
+ * Returns e.g. "יום שישי, 13.11.2026 בשעה 12:00"
+ *
+ * @param {Date|string|null} scheduledAt — parsed appointment date
+ * @param {string}           rawTime     — fallback Hebrew text
+ * @returns {string}
+ */
+function fmtScheduledAt(scheduledAt, rawTime) {
+  if (scheduledAt) {
+    try {
+      const d  = scheduledAt instanceof Date ? scheduledAt : new Date(scheduledAt);
+      if (!isNaN(d.getTime())) {
+        const il  = new Date(d.toLocaleString('en-US', { timeZone: TIMEZONE }));
+        const dow = HEBREW_DAYS[il.getDay()];
+        const dd  = String(il.getDate()).padStart(2, '0');
+        const mm  = String(il.getMonth() + 1).padStart(2, '0');
+        const yy  = il.getFullYear();
+        const hh  = String(il.getHours()).padStart(2, '0');
+        const min = String(il.getMinutes()).padStart(2, '0');
+        return `יום ${dow}, ${dd}.${mm}.${yy} בשעה ${hh}:${min}`;
+      }
+    } catch {}
+  }
+  return rawTime ?? '';
+}
+
+module.exports = { isQuietHours, nextMorningRelease, nowInIsrael, fmtScheduledAt };

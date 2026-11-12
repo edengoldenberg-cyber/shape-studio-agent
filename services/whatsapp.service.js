@@ -189,7 +189,7 @@ async function sendText(to, text, { bypassQuietHours = false } = {}) {
  * can record the provider-assigned idMessage or the specific failure reason.
  * Quiet hours do NOT apply to alerts.
  */
-async function alertOwner(subject, body) {
+async function alertOwner(subject, body, { skipPhones = new Set() } = {}) {
   const phones = getAdminPhones();
   if (!phones.length) {
     logger.error('alertOwner: no admin phones configured (staff_config.json or STUDIO_OWNER_PHONE)');
@@ -197,9 +197,15 @@ async function alertOwner(subject, body) {
   }
   const message  = `🚨 *Shape Studio Agent Alert*\n\n*${subject}*\n\n${body}`;
   const settled  = await Promise.allSettled(
-    phones.map(phone => _dispatch(phone, message))
+    phones.map(phone => {
+      if (skipPhones.has(phone)) return Promise.resolve({ skipped: true });
+      return _dispatch(phone, message);
+    })
   );
   const results = settled.map((r, i) => {
+    if (r.status === 'fulfilled' && r.value?.skipped) {
+      return { phone: phones[i], skipped: true, idMessage: null, error: null };
+    }
     const val = r.status === 'fulfilled' ? r.value : null;
     // A real provider-confirmed idMessage must NOT be a demo/blocked/test placeholder.
     // _dispatch returns { demo:true } or { blocked:true } for intercepted sends;
@@ -208,6 +214,7 @@ async function alertOwner(subject, body) {
     return {
       phone:     phones[i],
       idMessage: isReal ? val.idMessage : null,
+      skipped:   false,
       error:     r.status === 'rejected'  ? r.reason?.message :
                  val?.blocked             ? `blocked (TEST_MODE)` :
                  val?.demo               ? `intercepted (demo phone)` : null,
@@ -216,7 +223,7 @@ async function alertOwner(subject, body) {
   const sent = results.filter(r => r.idMessage).length;
   if (!sent) {
     // Log failures but do not throw — caller decides how to handle
-    results.filter(r => r.error).forEach(r =>
+    results.filter(r => r.error && !r.skipped).forEach(r =>
       logger.warn('alertOwner: dispatch failed', { phone: r.phone, error: r.error })
     );
   }

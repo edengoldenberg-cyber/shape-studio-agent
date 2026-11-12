@@ -12,7 +12,8 @@
 const cron         = require('node-cron');
 const logger       = require('../utils/logger');
 const aptStore     = require('../utils/appointment_store');
-const { sendStaffReminder, sendNoShowFollowUp } = require('../services/notification.service');
+const { sendStaffReminder, sendNoShowFollowUp, sendProspectReminder } = require('../services/notification.service');
+const { fmtScheduledAt } = require('../utils/time');
 
 // Loaded lazily to avoid circular dependency with server.js
 let _staffConfig = null;
@@ -173,17 +174,68 @@ async function runCallbackPendingReminderPass(store) {
   return { pendingReminders: attempted };
 }
 
+// ── Prospect reminder pass ─────────────────────────────────────────────────────
+//
+// Sends a WhatsApp reminder DIRECTLY to the lead (not staff) before their scheduled
+// callback. Only fires when CALLBACK_PENDING_REMINDER_ENABLED=true.
+//
+// Uses the same reminderMinutes window and per-phone allowlist as
+// runCallbackPendingReminderPass so the two passes stay in sync.
+
+async function runProspectReminderPass(store) {
+  if (process.env.CALLBACK_PENDING_REMINDER_ENABLED !== 'true') return { prospectReminders: 0 };
+
+  const reminderMinutes = Math.max(parseInt(process.env.CALLBACK_PENDING_REMINDER_MIN ?? '30', 10), 20);
+  const windowMs        = reminderMinutes * 60 * 1000;
+
+  const _allowlistRaw = (process.env.CALLBACK_PENDING_REMINDER_PHONES ?? '').trim();
+  const _allowlist    = _allowlistRaw ? new Set(_allowlistRaw.split(',').map(s => s.trim()).filter(Boolean)) : null;
+
+  let due = aptStore.getCallbacksDueForProspectReminder(windowMs);
+  if (_allowlist) due = due.filter(a => _allowlist.has(a.leadPhone));
+  if (!due.length) return { prospectReminders: 0 };
+
+  logger.info('[apt-worker] Prospect reminder pass', { due: due.length, windowMin: reminderMinutes, allowlist: _allowlist ? [..._allowlist] : 'all' });
+
+  let sent = 0;
+  for (const apt of due) {
+    const name          = (apt.leadName ?? '').split(' ')[0] || 'שלום';
+    const formattedTime = fmtScheduledAt(apt.scheduledAt, apt.rawTime);
+    const result        = await sendProspectReminder(apt, name, formattedTime);
+    if (result.ok) {
+      aptStore.update(apt.id, {
+        prospectReminderSent:   true,
+        prospectReminderSentTo: result.idMessage,
+      });
+      store?.logEvent('prospect_reminder_sent', apt.leadPhone, {
+        aptId:     apt.id,
+        idMessage: result.idMessage,
+        reminderMinutes,
+      });
+      sent++;
+    } else {
+      logger.warn('[apt-worker] Prospect reminder failed — will retry next cycle', {
+        aptId:     apt.id,
+        leadPhone: apt.leadPhone,
+        error:     result.error,
+      });
+    }
+  }
+  return { prospectReminders: sent };
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 function initAppointmentWorker(store) {
   // Every 15 minutes
   cron.schedule('*/15 * * * *', async () => {
     try {
-      const r = await runReminderPass(store);
-      const n = await runNoShowPass(store);
-      const p = await runCallbackPendingReminderPass(store);
-      if (r.reminders || n.noShows || p.pendingReminders) {
-        logger.info('[apt-worker] Cycle complete', { ...r, ...n, ...p });
+      const r  = await runReminderPass(store);
+      const n  = await runNoShowPass(store);
+      const p  = await runCallbackPendingReminderPass(store);
+      const pr = await runProspectReminderPass(store);
+      if (r.reminders || n.noShows || p.pendingReminders || pr.prospectReminders) {
+        logger.info('[apt-worker] Cycle complete', { ...r, ...n, ...p, ...pr });
       }
     } catch (err) {
       logger.error('[apt-worker] Error', { error: err.message });
@@ -198,4 +250,4 @@ function initAppointmentWorker(store) {
   });
 }
 
-module.exports = { initAppointmentWorker, runReminderPass, runNoShowPass, runCallbackPendingReminderPass };
+module.exports = { initAppointmentWorker, runReminderPass, runNoShowPass, runCallbackPendingReminderPass, runProspectReminderPass };

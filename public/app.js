@@ -1952,13 +1952,29 @@ function renderCallbackPanel(callbacks) {
     const waPhone   = fullPhone ? fullPhone.replace(/[^0-9]/g, '') : null;
     const waLink    = waPhone ? `https://wa.me/${waPhone}` : null;
 
-    const timeLabel = fmtCallbackTime(apt, qd);
+    const timeLabel = apt?.scheduledAt
+      ? (() => {
+          try {
+            const d    = new Date(apt.scheduledAt);
+            const days = ['ראשון','שני','שלישי','רביעי','חמישי','שישי','שבת'];
+            const il   = new Date(d.toLocaleString('en-US', { timeZone: 'Asia/Jerusalem' }));
+            return `יום ${days[il.getDay()]} ${String(il.getDate()).padStart(2,'0')}.${String(il.getMonth()+1).padStart(2,'0')}.${il.getFullYear()} בשעה ${String(il.getHours()).padStart(2,'0')}:${String(il.getMinutes()).padStart(2,'0')}`;
+          } catch { return qd?.callTimeGiven ?? apt?.rawTime ?? '—'; }
+        })()
+      : (qd?.callTimeGiven ?? apt?.rawTime ?? '—');
     const assignee  = apt?.assignedStaffId ?? '—';
 
     const convoSum   = l.meta?.qualProfile?.qualificationReason ?? l.meta?.leadBrief?.notes ?? '';
     const readySt    = l.meta?.qualProfile?.readiness;
     const readyEmoji = readySt === 'HIGH' ? '🔥' : readySt === 'MEDIUM' ? '🌡️' : readySt === 'LOW' ? '❄️' : '';
     const interests  = [qd.fitnessInterest, qd.goal, qd.location].filter(Boolean).join(' · ');
+
+    const availState = apt?.prospectAvailability;
+    const availLabel = availState === 'confirmed'   ? '✅ זמינות אושרה'
+      : availState === 'rescheduled'                ? '🔄 שינוי זמן'
+      : availState === 'cancelled'                  ? '❌ בוטל ע"י הליד'
+      : apt?.prospectReminderSent                   ? '❓ ממתין לאישור זמינות'
+      : null;
 
     const aptId  = apt?.id ?? '';
     const actions = aptId ? `
@@ -1981,6 +1997,7 @@ function renderCallbackPanel(callbacks) {
           <div style="font-size:12px;color:var(--text);font-weight:500">${esc(timeLabel)}</div>
           <div style="font-size:10px;color:var(--muted);margin-top:2px">נציג: ${esc(assignee)}</div>
           <div style="font-size:11px;font-weight:600;color:${stColor};margin-top:2px">${esc(st.label)}</div>
+          ${availLabel ? `<div style="font-size:10px;margin-top:3px;color:var(--muted)">${esc(availLabel)}</div>` : ''}
         </div>
         <div>
           <div style="font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(convoSum)}">${readyEmoji} ${esc(convoSum || interests || '—')}</div>

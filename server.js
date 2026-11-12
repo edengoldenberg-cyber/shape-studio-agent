@@ -48,6 +48,7 @@ const calendarSvc                      = require('./services/calendar.service');
 const notifySvc                        = require('./services/notification.service');
 const greenApiSvc                      = require('./services/greenapi.service');
 const persist                          = require('./utils/persist');
+const { fmtScheduledAt }               = require('./utils/time');
 const tomerStore                       = require('./utils/tomer_store');
 const retentionWorker                  = require('./workers/retention_worker');
 const studioAssets                     = require('./utils/studio_assets');
@@ -3636,8 +3637,37 @@ async function processInboundWAMessage(msg) {
           const _nm    = _postCallRec?.meta ?? {};
           const _prevQd = _nm.qualData ?? {};
 
-          // Build closing messages before the upsert so we can include the
-          // prospect reply in the inbox entry.
+          // Skip entirely if closing already completed on a previous message.
+          if (_prevQd.closingSummarySent) {
+            // Name arrived twice — just update aptStore name without re-sending.
+            aptStore.getByPhone(fromNorm)
+              .filter(a => a.status === 'callback_pending' || a.status === 'confirmed')
+              .forEach(a => { if (a.leadName !== capturedName) aptStore.update(a.id, { leadName: capturedName }); });
+            persist.saveLeads(store);
+            logger.info('[pipeline] Post-call name captured (closing already sent — skipping)',
+              { from: fromNorm, name: capturedName });
+            const _skEntry = inbox.push({
+              from: fromNorm, fromIsraeli, name: msg.name ?? null,
+              text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
+              receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
+              clientMatch, intent, route: 'post_call_name_captured', barakReply: null,
+            });
+            return { inboxEntry: _skEntry, clientMatch, intent, route: 'post_call_name_captured', barakReply: null };
+          }
+
+          // Concurrency guard: skip if either send is already in-flight.
+          if (_nm.closingSummaryProspectState === 'in_flight' || _nm.closingSummaryManagerState === 'in_flight') {
+            logger.info('[pipeline] Closing summary in-flight — skipping concurrent duplicate', { from: fromNorm });
+            persist.saveLeads(store);
+            const _ifEntry = inbox.push({
+              from: fromNorm, fromIsraeli, name: msg.name ?? null,
+              text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
+              receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
+              clientMatch, intent, route: 'post_call_name_captured', barakReply: null,
+            });
+            return { inboxEntry: _ifEntry, clientMatch, intent, route: 'post_call_name_captured', barakReply: null };
+          }
+
           const _callTime  = _prevQd.callTimeGiven ?? null;
           const _interest  = _prevQd.fitnessInterest ?? null;
           const _location  = _prevQd.location ?? null;
@@ -3648,17 +3678,19 @@ async function processInboundWAMessage(msg) {
             .filter(a => a.status === 'callback_pending' || a.status === 'confirmed')
             .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0] ?? null;
 
-          // Prospect closing summary: confirmed name, exact time, request (not confirmed) status.
-          // No trailing question — the conversation is complete at this point.
+          // Format the callback time as a full Hebrew date/time for user-facing messages.
+          // rawTime ("מחר ב12") is preserved for reference; formatted time is what users see.
+          const _fmtTime = fmtScheduledAt(_aptRecord?.scheduledAt, _callTime);
+
+          // Prospect closing: confirmed name, exact formatted time, request status (not confirmed).
           const _prospectMsg = _callTime ? [
             `${capturedName}, קיבלנו את בקשת השיחה שלך ✅`,
-            `📞 ${_callTime}`,
+            `📞 ${_fmtTime}`,
             `נציג מהצוות של Shape Studio יצור איתך קשר.`,
           ].join('\n') : null;
 
-          // Complete manager handoff: everything collected, missing info explicit.
-          const _missingParts = [];
-          if (!_goal) _missingParts.push('מטרה ספציפית');
+          // Manager handoff: complete information with formatted time, missing info explicit.
+          const _missingParts = [...(!_goal ? ['מטרה ספציפית'] : [])];
           const _managerHandoff = _callTime ? [
             `━━━━━━━━━━━━━━━━━━━━━`,
             `📋 ליד — Shape Studio`,
@@ -3666,7 +3698,8 @@ async function processInboundWAMessage(msg) {
             `👤 שם: ${capturedName}`,
             `📱 ${fromNorm}`,
             `💬 https://wa.me/${fromNorm}`,
-            `📞 שיחה מבוקשת: ${_callTime}`,
+            `📞 שיחה מבוקשת: ${_fmtTime}`,
+            _callTime !== _fmtTime ? `   (מקורי: ${_callTime})` : null,
             `⚠️ בקשה — לא אושרה עדיין על ידי הצוות`,
             `━━━━━━━━━━━━━━━━━━━━━`,
             _interest ? `💪 ענין: ${_interest}` : null,
@@ -3676,69 +3709,107 @@ async function processInboundWAMessage(msg) {
             _missingParts.length ? `━━━━━━━━━━━━━━━━━━━━━\n⚠️ חסר: ${_missingParts.join(', ')}` : null,
           ].filter(Boolean).join('\n') : null;
 
-          // Mark closingSummarySent immediately (synchronous) to block concurrent retries.
-          // Per-recipient IDs are filled in asynchronously when provider responds.
+          // Read already-covered manager recipients BEFORE sending (use as skipPhones).
+          // This prevents resending to phones that already accepted in a prior attempt.
+          const _alreadyMgrSentTo = new Set(_nm.closingSummaryManagerSentTo ?? []);
+          const _prospectAlreadyAccepted = _nm.closingSummaryProspectState === 'accepted';
+
+          // Set in-flight states synchronously to block concurrent duplicates.
+          // closingSummarySent stays false until both are accepted.
           store.upsertLead(fromNorm, {
             name: capturedName,
             meta: {
               ..._nm,
               qualData: {
                 ..._prevQd,
-                confirmedName:        capturedName,
-                nameConfirmed:        true,
-                nameConfirmedAlertSent: true,  // legacy flag preserved
-                closingSummarySent:   !!_callTime,
+                confirmedName:          capturedName,
+                nameConfirmed:          true,
+                nameConfirmedAlertSent: true,
+                closingSummarySent:     false,
               },
+              closingSummaryProspectState: _prospectAlreadyAccepted ? 'accepted' : (_callTime ? 'in_flight' : null),
+              closingSummaryManagerState:  _callTime ? 'in_flight' : null,
               closingSummaryProspectReply: _prospectMsg ?? null,
-              closingSummarySentAt:        _callTime ? new Date().toISOString() : null,
-              closingSummaryManagerSentTo: [],
+              closingSummarySentAt:        null,
+              closingSummaryManagerSentTo: [..._alreadyMgrSentTo],
             },
           });
 
-          // Propagate confirmed name to any open aptStore entries.
+          // Helper: mark closingSummarySent=true only when BOTH outcomes are accepted.
+          // Writes to both meta.closingSummarySent AND meta.qualData.closingSummarySent so
+          // the inbound guard (_prevQd.closingSummarySent) and admin endpoint both see it.
+          const _markClosingCompleteIfBoth = () => {
+            const cur = store.getLead(fromNorm)?.meta ?? {};
+            if (cur.closingSummaryProspectState === 'accepted' && cur.closingSummaryManagerState === 'accepted') {
+              store.upsertLead(fromNorm, {
+                meta: { ...cur,
+                  closingSummarySent:   true,
+                  closingSummarySentAt: new Date().toISOString(),
+                  qualData: { ...(cur.qualData ?? {}), closingSummarySent: true },
+                },
+              });
+              persist.saveLeads(store);
+            }
+          };
+
+          // Propagate confirmed name to open aptStore entries.
           aptStore.getByPhone(fromNorm)
             .filter(a => a.status === 'callback_pending' || a.status === 'confirmed')
             .forEach(a => { if (a.leadName !== capturedName) aptStore.update(a.id, { leadName: capturedName }); });
 
-          // Send prospect closing summary (WhatsApp to the prospect).
-          if (_prospectMsg && process.env.WHATSAPP_AUTO_REPLY === 'true') {
+          // Send prospect closing summary (skipped if already accepted).
+          if (_prospectMsg && !_prospectAlreadyAccepted && process.env.WHATSAPP_AUTO_REPLY === 'true') {
             _markBotSent(fromNorm);
             sendText(fromNorm, _prospectMsg)
               .then(res => {
-                const _cur = store.getLead(fromNorm)?.meta ?? {};
+                const idMsg = res?.idMessage ?? null;
+                const cur = store.getLead(fromNorm)?.meta ?? {};
                 store.upsertLead(fromNorm, {
-                  meta: { ..._cur, closingSummaryProspectIdMessage: res?.idMessage ?? null },
-                });
-              })
-              .catch(err => logger.warn('[pipeline] Prospect closing summary send failed',
-                { from: fromNorm, error: err.message }));
-          }
-
-          // Send complete manager handoff. Deduped by closingSummarySent (already set).
-          // Per-recipient: skip phones that already received it (supports partial retry).
-          if (_managerHandoff) {
-            const _alreadySent = new Set(_nm.closingSummaryManagerSentTo ?? []);
-            alertOwner(`📋 ליד מוכן — ${capturedName}`, _managerHandoff)
-              .then(ar => {
-                const _newSent = (ar?.results ?? [])
-                  .filter(r => r.idMessage && !_alreadySent.has(r.phone))
-                  .map(r => r.phone);
-                const _firstId = ar?.results?.find(r => r.idMessage)?.idMessage ?? null;
-                const _cur = store.getLead(fromNorm)?.meta ?? {};
-                store.upsertLead(fromNorm, {
-                  meta: {
-                    ..._cur,
-                    closingSummaryManagerSentTo:    [..._alreadySent, ..._newSent],
-                    closingSummaryManagerIdMessage: _firstId,
+                  meta: { ...cur,
+                    closingSummaryProspectState:    idMsg ? 'accepted' : 'failed',
+                    closingSummaryProspectIdMessage: idMsg,
                   },
                 });
                 persist.saveLeads(store);
-                logger.info('[pipeline] Manager closing handoff sent',
-                  { from: fromNorm, name: capturedName, idMsg: _firstId,
-                    sentTo: [..._alreadySent, ..._newSent] });
+                _markClosingCompleteIfBoth();
               })
-              .catch(err => logger.warn('[pipeline] Manager closing handoff failed',
-                { from: fromNorm, error: err.message }));
+              .catch(err => {
+                const cur = store.getLead(fromNorm)?.meta ?? {};
+                store.upsertLead(fromNorm, { meta: { ...cur, closingSummaryProspectState: 'failed' } });
+                persist.saveLeads(store);
+                logger.warn('[pipeline] Prospect closing summary send failed', { from: fromNorm, error: err.message });
+              });
+          }
+
+          // Send manager handoff — pass already-covered phones as skipPhones BEFORE calling.
+          if (_managerHandoff) {
+            alertOwner(`📋 ליד מוכן — ${capturedName}`, _managerHandoff, { skipPhones: _alreadyMgrSentTo })
+              .then(ar => {
+                const newSent   = (ar?.results ?? []).filter(r => r.idMessage && !r.skipped).map(r => r.phone);
+                const allSentTo = [..._alreadyMgrSentTo, ...newSent];
+                const firstId   = ar?.results?.find(r => r.idMessage)?.idMessage ?? null;
+                // Partial failure: any non-skipped recipient without idMessage = failed.
+                const anyFailed = (ar?.results ?? []).some(r => !r.skipped && !r.idMessage);
+                const accepted  = allSentTo.length > 0 && !anyFailed;
+                const cur = store.getLead(fromNorm)?.meta ?? {};
+                store.upsertLead(fromNorm, {
+                  meta: { ...cur,
+                    closingSummaryManagerState:    accepted ? 'accepted' : 'failed',
+                    closingSummaryManagerSentTo:   allSentTo,
+                    closingSummaryManagerIdMessage: firstId,
+                  },
+                });
+                persist.saveLeads(store);
+                _markClosingCompleteIfBoth();
+                logger.info('[pipeline] Manager closing handoff sent',
+                  { from: fromNorm, name: capturedName, accepted, idMsg: firstId, sentTo: allSentTo });
+              })
+              .catch(err => {
+                const cur = store.getLead(fromNorm)?.meta ?? {};
+                store.upsertLead(fromNorm, { meta: { ...cur, closingSummaryManagerState: 'failed' } });
+                persist.saveLeads(store);
+                logger.warn('[pipeline] Manager closing handoff failed', { from: fromNorm, error: err.message });
+              });
           }
 
           persist.saveLeads(store);
@@ -3754,7 +3825,57 @@ async function processInboundWAMessage(msg) {
           return { inboxEntry: nmEntry, clientMatch, intent, route: 'post_call_name_captured',
                    barakReply: _prospectMsg ?? null };
         }
-        // Fall through to staff-alert path for non-name messages
+        // Fall through for non-name messages.
+        // Before alerting staff, check if this is an availability-confirmation reply
+        // (lead responding to the prospect reminder sent by the worker).
+        {
+          const _availAptN = aptStore.getByPhone(fromNorm).find(
+            a => a.prospectReminderSent === true && a.prospectAvailability === null
+              && a.status === 'callback_pending'
+          );
+          if (_availAptN) {
+            const _lcN = msgText.trim().toLowerCase();
+            const _CONFIRM_REN = /^(כן|בסדר|אוקיי|יופי|מצוין|sure|yes|ok|טוב|בטח|ברור|נכון)(\s|$)/i;
+            const _CANCEL_REN  = /לא\s*(נוח|יכול|יכולה)|לא\s+ok|לא\s+בסדר|^לא(\s|$)|אי\s*אפשר|לשנות|לדחות|reschedule|cancel/i;
+            let _availStateN = null, _availReplyN = null;
+            const _aptNameN  = (_availAptN.leadName ?? '').split(' ')[0] || 'שלום';
+            const { fmtScheduledAt: _fmtN } = require('./utils/time');
+            const _aptTimeN  = _fmtN(_availAptN.scheduledAt, _availAptN.rawTime);
+            if (_CONFIRM_REN.test(_lcN)) {
+              _availStateN = 'confirmed';
+              _availReplyN = `מצוין ${_aptNameN}! 🎉 נציג יצור איתך קשר ${_aptTimeN}`;
+            } else if (_CANCEL_REN.test(_lcN)) {
+              _availStateN = 'cancelled';
+              _availReplyN = `הבנתי! שלח/י לי מועד שנוח לך ונסדר מחדש 🗓️`;
+            }
+            if (_availStateN) {
+              aptStore.update(_availAptN.id, { prospectAvailability: _availStateN });
+              if (_availReplyN && process.env.WHATSAPP_AUTO_REPLY === 'true') {
+                _markBotSent(fromNorm);
+                sendText(fromNorm, _availReplyN).catch(() => {});
+              }
+              if (_availStateN === 'cancelled') {
+                alertOwner(
+                  `📬 ליד ביטל זמינות — ${msg.name ?? fromNorm}`,
+                  `*${msg.name ?? fromNorm}* (${fromNorm})\nביטל/ה את הזמינות לשיחה ${_aptTimeN}.\nהודעה: "${msgText.slice(0, 200)}"\n\nאנא צור קשר לתיאום מחדש.`
+                ).catch(() => {});
+              }
+              store.logEvent('prospect_availability_replied', fromNorm, {
+                aptId: _availAptN.id, availState: _availStateN, preview: msgText.slice(0, 80),
+              });
+              logger.info('[pipeline] Prospect availability reply (name-branch fall-through)',
+                { from: fromNorm, state: _availStateN, aptId: _availAptN.id });
+              const _availEntryN = inbox.push({
+                from: fromNorm, fromIsraeli, name: msg.name ?? null,
+                text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
+                receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
+                clientMatch, intent, route: `post_call_avail_${_availStateN}`, barakReply: _availReplyN,
+              });
+              return { inboxEntry: _availEntryN, clientMatch, intent, route: `post_call_avail_${_availStateN}`, barakReply: _availReplyN };
+            }
+          }
+        }
+        // Not an availability reply — alert staff
         alertOwner(
           `📬 הודעה אחרי ${_postCallStatus === 'call_scheduled' ? 'תיאום' : 'בקשת חזרה'} — ${msg.name ?? fromNorm}`,
           `*${msg.name ?? fromNorm}* (${fromNorm})\n*סטטוס:* ${_postCallStatus}\n*הודעה:* "${msgText.slice(0, 200)}"\n\nהאדם כתב אחרי שהתיאום הושלם. אנא בדוק ידנית.`
@@ -3801,6 +3922,60 @@ async function processInboundWAMessage(msg) {
             clientMatch, intent, route: 'post_call_rep_acknowledged', barakReply: _repReply,
           });
           return { inboxEntry: _repEntry, clientMatch, intent, route: 'post_call_rep_acknowledged', barakReply: _repReply };
+        }
+
+        // ── Prospect availability-confirmation reply ───────────────────────
+        // After the worker sends a prospect reminder ("עדיין נוח לך לדבר?"), the
+        // lead may reply to confirm or cancel. Detect this BEFORE the dup-accept
+        // check so a simple "כן" doesn't fall through to staff-alert.
+        const _pendingAvailApt = aptStore.getByPhone(fromNorm).find(
+          a => a.prospectReminderSent === true && a.prospectAvailability === null
+            && a.status === 'callback_pending'
+        );
+        if (_pendingAvailApt) {
+          const _lc = msgText.trim().toLowerCase();
+          // Simple positive patterns. Use (\s|$) not \b since Hebrew chars are not \w.
+          const _CONFIRM_RE  = /^(כן|בסדר|אוקיי|יופי|מצוין|sure|yes|ok|טוב|בטח|ברור|נכון)(\s|$)/i;
+          // Negative / reschedule patterns
+          const _CANCEL_RE   = /לא\s*(נוח|יכול|יכולה)|לא\s+ok|לא\s+בסדר|^לא(\s|$)|אי\s*אפשר|לשנות|לדחות|reschedule|cancel/i;
+
+          let _availState = null, _availReply = null;
+          const _aptName  = (_pendingAvailApt.leadName ?? '').split(' ')[0] || 'שלום';
+          const { fmtScheduledAt: _fmtForAvail } = require('./utils/time');
+          const _aptTime  = _fmtForAvail(_pendingAvailApt.scheduledAt, _pendingAvailApt.rawTime);
+
+          if (_CONFIRM_RE.test(_lc)) {
+            _availState = 'confirmed';
+            _availReply = `מצוין ${_aptName}! 🎉 נציג יצור איתך קשר ${_aptTime}`;
+          } else if (_CANCEL_RE.test(_lc)) {
+            _availState = 'cancelled';
+            _availReply = `הבנתי! שלח/י לי מועד שנוח לך ונסדר מחדש 🗓️`;
+          }
+
+          if (_availState) {
+            aptStore.update(_pendingAvailApt.id, { prospectAvailability: _availState });
+            if (_availReply && process.env.WHATSAPP_AUTO_REPLY === 'true') {
+              _markBotSent(fromNorm);
+              sendText(fromNorm, _availReply).catch(() => {});
+            }
+            if (_availState === 'cancelled') {
+              alertOwner(
+                `📬 ליד ביטל זמינות — ${msg.name ?? fromNorm}`,
+                `*${msg.name ?? fromNorm}* (${fromNorm})\nביטל/ה את הזמינות לשיחה ${_aptTime}.\nהודעה: "${msgText.slice(0, 200)}"\n\nאנא צור קשר לתיאום מחדש.`
+              ).catch(() => {});
+            }
+            store.logEvent('prospect_availability_replied', fromNorm, {
+              aptId: _pendingAvailApt.id, availState: _availState, preview: msgText.slice(0, 80),
+            });
+            logger.info('[pipeline] Prospect availability reply', { from: fromNorm, state: _availState, aptId: _pendingAvailApt.id });
+            const _availEntry = inbox.push({
+              from: fromNorm, fromIsraeli, name: msg.name ?? null,
+              text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
+              receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
+              clientMatch, intent, route: `post_call_avail_${_availState}`, barakReply: _availReply,
+            });
+            return { inboxEntry: _availEntry, clientMatch, intent, route: `post_call_avail_${_availState}`, barakReply: _availReply };
+          }
         }
 
         // Remaining sub-cases:
@@ -4529,6 +4704,13 @@ app.post('/api/whatsapp/simulate', jsonBody, async (req, res) => {
       const { history, ...rest } = l;
       return { ...rest, historyLength: history?.length ?? 0 };
     })() : undefined;
+    const _simApts = process.env.TEST_MODE === 'true'
+      ? aptStore.getByPhone(normalizeToE164(from) ?? from).map(a => ({
+          id: a.id, status: a.status,
+          prospectReminderSent: a.prospectReminderSent,
+          prospectAvailability: a.prospectAvailability,
+        }))
+      : undefined;
     res.json({
       ok: true,
       inboxId:     result.inboxEntry.id,
@@ -4538,6 +4720,7 @@ app.post('/api/whatsapp/simulate', jsonBody, async (req, res) => {
       barakReply:  result.barakReply,
       processedAt: new Date(),
       _lead:       _simLead,
+      _apts:       _simApts,
     });
   } catch (err) {
     logger.error('WA simulate error', { error: err.message });
@@ -5939,6 +6122,130 @@ app.post('/api/admin/reset-lead-state/:phone', (req, res) => {
   res.json({ ok: true, status: 'new', phone });
 });
 
+// ── Shared closing-summary send/retry logic ───────────────────────────────
+// Called by the admin endpoint and the startup recovery pass.
+// Sends only the parts not yet accepted:
+//   - prospect: skipped if closingSummaryProspectState === 'accepted'
+//   - manager:  per-phone dedup via closingSummaryManagerSentTo + skipPhones
+// Uses fmtScheduledAt for the formatted time visible to humans.
+// Returns a result object for the caller to report or log.
+async function _retryClosingSummary(phone, { force = false } = {}) {
+  const lead = store.getLead(phone);
+  if (!lead) return { ok: false, error: 'lead_not_found' };
+  const meta     = lead.meta ?? {};
+  const qd       = meta.qualData ?? {};
+  const name     = qd.confirmedName ?? lead.name ?? null;
+  const callTime = qd.callTimeGiven ?? meta.callbackTime ?? null;
+  if (!name)     return { ok: false, error: 'no_name' };
+  if (!callTime) return { ok: false, error: 'no_call_time' };
+  if (qd.closingSummarySent && !force) {
+    return { ok: false, error: 'already_sent',
+      existing: { managerIdMessage: meta.closingSummaryManagerIdMessage, sentTo: meta.closingSummaryManagerSentTo } };
+  }
+
+  const interest   = qd.fitnessInterest ?? null;
+  const location   = qd.location ?? null;
+  const goal       = qd.goal ?? null;
+  const readiness  = meta.qualProfile?.readiness ?? null;
+  const readyEmoji = readiness === 'HIGH' ? '🔥' : readiness === 'MEDIUM' ? '🌡️' : '❄️';
+  const missingParts = [...(!goal ? ['מטרה ספציפית'] : [])];
+
+  const apt = aptStore.getByPhone(phone)
+    .filter(a => a.status === 'callback_pending' || a.status === 'confirmed')
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0] ?? null;
+  const fmtTime = fmtScheduledAt(apt?.scheduledAt, callTime);
+
+  const prospectMsg = [
+    `${name}, קיבלנו את בקשת השיחה שלך ✅`,
+    `📞 ${fmtTime}`,
+    `נציג מהצוות של Shape Studio יצור איתך קשר.`,
+  ].join('\n');
+
+  const managerLines = [
+    `━━━━━━━━━━━━━━━━━━━━━`,
+    `📋 ליד — Shape Studio`,
+    `━━━━━━━━━━━━━━━━━━━━━`,
+    `👤 שם: ${name}`,
+    `📱 ${phone}`,
+    `💬 https://wa.me/${phone}`,
+    `📞 שיחה מבוקשת: ${fmtTime}`,
+    callTime !== fmtTime ? `   (מקורי: ${callTime})` : null,
+    `⚠️ בקשה — לא אושרה עדיין על ידי הצוות`,
+    `━━━━━━━━━━━━━━━━━━━━━`,
+    interest  ? `💪 ענין: ${interest}` : null,
+    location  ? `📍 מיקום: ${location}` : null,
+    goal      ? `🎯 מטרה: ${goal}` : null,
+    readiness ? `📊 מוכנות: ${readyEmoji} ${readiness}` : null,
+    missingParts.length ? `━━━━━━━━━━━━━━━━━━━━━\n⚠️ חסר: ${missingParts.join(', ')}` : null,
+  ].filter(Boolean).join('\n');
+
+  const prospectAlreadyAccepted = meta.closingSummaryProspectState === 'accepted';
+  const alreadySentTo = new Set(meta.closingSummaryManagerSentTo ?? []);
+
+  let prospectIdMessage = null, prospectError = null;
+  if (!prospectAlreadyAccepted) {
+    try {
+      const pr = await sendText(phone, prospectMsg);
+      prospectIdMessage = pr?.idMessage ?? null;
+    } catch (err) {
+      prospectError = err.message;
+      logger.warn('[closing] Prospect send failed', { phone, error: err.message });
+    }
+  }
+
+  let managerResults = [], managerIdMessage = null;
+  try {
+    const ar = await alertOwner(`📋 ליד מוכן — ${name}`, managerLines, { skipPhones: alreadySentTo });
+    managerResults = ar?.results ?? [];
+    managerIdMessage = managerResults.find(r => r.idMessage)?.idMessage ?? null;
+  } catch (err) {
+    logger.warn('[closing] Manager send failed', { phone, error: err.message });
+  }
+
+  const newSentTo     = managerResults.filter(r => r.idMessage && !r.skipped && !alreadySentTo.has(r.phone)).map(r => r.phone);
+  const updatedSentTo = [...alreadySentTo, ...newSentTo];
+  const anyMgrFailed  = managerResults.some(r => !r.skipped && !r.idMessage);
+
+  const prospectAccepted = prospectAlreadyAccepted || !!prospectIdMessage;
+  const managerAccepted  = updatedSentTo.length > 0 && !anyMgrFailed;
+  const bothAccepted     = prospectAccepted && managerAccepted;
+
+  const curMeta = store.getLead(phone)?.meta ?? {};
+  store.upsertLead(phone, {
+    meta: {
+      ...curMeta,
+      qualData: { ...(curMeta.qualData ?? {}), closingSummarySent: bothAccepted },
+      closingSummarySent:              bothAccepted,
+      closingSummarySentAt:            bothAccepted ? new Date().toISOString() : (curMeta.closingSummarySentAt ?? null),
+      closingSummaryProspectState:     prospectAccepted ? 'accepted' : (prospectError ? 'failed' : (curMeta.closingSummaryProspectState ?? null)),
+      closingSummaryProspectReply:     prospectMsg,
+      closingSummaryProspectIdMessage: prospectIdMessage ?? curMeta.closingSummaryProspectIdMessage ?? null,
+      closingSummaryManagerState:      managerAccepted ? 'accepted' : (anyMgrFailed ? 'failed' : (curMeta.closingSummaryManagerState ?? null)),
+      closingSummaryManagerIdMessage:  managerIdMessage ?? curMeta.closingSummaryManagerIdMessage ?? null,
+      closingSummaryManagerSentTo:     updatedSentTo,
+    },
+  });
+  persist.saveLeads(store);
+  store.logEvent('closing_summary_sent', phone, {
+    name, callTimeFmt: fmtTime, bothAccepted, managerIdMessage, sentTo: updatedSentTo,
+  });
+
+  return {
+    ok:                      bothAccepted,
+    prospectMsg,
+    prospectRecipient:       phone,
+    prospectIdMessage,
+    prospectError,
+    prospectAlreadyAccepted,
+    managerMsg:              managerLines,
+    managerResults,
+    managerIdMessage,
+    sentTo:                  updatedSentTo,
+    skipped:                 [...alreadySentTo],
+    bothAccepted,
+  };
+}
+
 // POST /api/admin/send-closing-summary/:phone — manually trigger the closing summary
 // for a lead whose name and callTimeGiven are already known. Used for recovery when
 // the automatic flow did not fire (e.g. wrong recipient was configured).
@@ -5950,101 +6257,22 @@ app.post('/api/admin/send-closing-summary/:phone', jsonBody, async (req, res) =>
   const lead  = store.getLead(phone);
   if (!lead) return res.status(404).json({ ok: false, error: 'Lead not found' });
 
-  const meta   = lead.meta ?? {};
-  const qd     = meta.qualData ?? {};
-  const name   = qd.confirmedName ?? lead.name ?? null;
-  const callTime = qd.callTimeGiven ?? meta.callbackTime ?? null;
+  const result = await _retryClosingSummary(phone, { force });
 
-  if (!name)     return res.status(422).json({ ok: false, error: 'confirmedName not set' });
-  if (!callTime) return res.status(422).json({ ok: false, error: 'callTimeGiven not set' });
-  if (qd.closingSummarySent && !force) {
+  if (result.error === 'no_name')     return res.status(422).json({ ok: false, error: 'confirmedName not set' });
+  if (result.error === 'no_call_time') return res.status(422).json({ ok: false, error: 'callTimeGiven not set' });
+  if (result.error === 'already_sent') {
     return res.status(409).json({ ok: false, error: 'closingSummarySent already true — pass force:true to override',
-      existing: { managerIdMessage: meta.closingSummaryManagerIdMessage, sentTo: meta.closingSummaryManagerSentTo } });
+      existing: result.existing });
   }
 
-  const interest = qd.fitnessInterest ?? null;
-  const location = qd.location ?? null;
-  const goal     = qd.goal ?? null;
-  const readiness = meta.qualProfile?.readiness ?? null;
-  const readyEmoji = readiness === 'HIGH' ? '🔥' : readiness === 'MEDIUM' ? '🌡️' : '❄️';
-  const missingParts = [...(!goal ? ['מטרה ספציפית'] : [])];
-
-  const prospectMsg = [
-    `${name}, קיבלנו את בקשת השיחה שלך ✅`,
-    `📞 ${callTime}`,
-    `נציג מהצוות של Shape Studio יצור איתך קשר.`,
-  ].join('\n');
-
-  const managerLines = [
-    `━━━━━━━━━━━━━━━━━━━━━`,
-    `📋 ליד — Shape Studio`,
-    `━━━━━━━━━━━━━━━━━━━━━`,
-    `👤 שם: ${name}`,
-    `📱 ${phone}`,
-    `💬 https://wa.me/${phone}`,
-    `📞 שיחה מבוקשת: ${callTime}`,
-    `⚠️ בקשה — לא אושרה עדיין על ידי הצוות`,
-    `━━━━━━━━━━━━━━━━━━━━━`,
-    interest  ? `💪 ענין: ${interest}` : null,
-    location  ? `📍 מיקום: ${location}` : null,
-    goal      ? `🎯 מטרה: ${goal}` : null,
-    readiness ? `📊 מוכנות: ${readyEmoji} ${readiness}` : null,
-    missingParts.length ? `━━━━━━━━━━━━━━━━━━━━━\n⚠️ חסר: ${missingParts.join(', ')}` : null,
-  ].filter(Boolean).join('\n');
-
-  // Skip phones that already received the closing summary.
-  const alreadySentTo = new Set(meta.closingSummaryManagerSentTo ?? []);
-
-  // Send prospect summary
-  let prospectIdMessage = null, prospectError = null;
-  try {
-    const pr = await sendText(phone, prospectMsg);
-    prospectIdMessage = pr?.idMessage ?? null;
-  } catch (err) {
-    prospectError = err.message;
-    logger.warn('[admin] send-closing-summary: prospect send failed', { phone, error: err.message });
-  }
-
-  // Send manager handoff
-  let managerResults = [], managerIdMessage = null;
-  try {
-    const ar = await alertOwner(`📋 ליד מוכן — ${name}`, managerLines);
-    managerResults = ar?.results ?? [];
-    managerIdMessage = managerResults.find(r => r.idMessage)?.idMessage ?? null;
-  } catch (err) {
-    logger.warn('[admin] send-closing-summary: manager send failed', { phone, error: err.message });
-  }
-
-  const newSentTo = managerResults.filter(r => r.idMessage && !alreadySentTo.has(r.phone)).map(r => r.phone);
-  const updatedSentTo = [...alreadySentTo, ...newSentTo];
-
-  const curMeta = store.getLead(phone)?.meta ?? {};
-  store.upsertLead(phone, {
-    meta: {
-      ...curMeta,
-      qualData: { ...(curMeta.qualData ?? {}), closingSummarySent: true },
-      closingSummarySentAt:            new Date().toISOString(),
-      closingSummaryProspectReply:     prospectMsg,
-      closingSummaryProspectIdMessage: prospectIdMessage,
-      closingSummaryManagerIdMessage:  managerIdMessage,
-      closingSummaryManagerSentTo:     updatedSentTo,
-    },
+  store.logEvent('closing_summary_sent_manual', phone, {
+    name: lead.meta?.qualData?.confirmedName ?? lead.name,
+    bothAccepted: result.bothAccepted,
+    managerIdMessage: result.managerIdMessage,
+    sentTo: result.sentTo,
   });
-  persist.saveLeads(store);
-  store.logEvent('closing_summary_sent_manual', phone, { name, callTime, managerIdMessage, sentTo: updatedSentTo });
-
-  res.json({
-    ok: true,
-    prospectMsg,
-    prospectRecipient: phone,
-    prospectIdMessage,
-    prospectError,
-    managerMsg:        managerLines,
-    managerResults,
-    managerIdMessage,
-    sentTo:            updatedSentTo,
-    skipped:           [...alreadySentTo],
-  });
+  res.json(result);
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -6578,6 +6806,15 @@ try {
   _deployedRevision = _rev.sha?.slice(0, 8) ?? _deployedRevision;
 } catch { /* revision.json absent in development — not an error */ }
 
+// In test mode (TEST_MODE=true) the server is loaded via require() without binding
+// a port. Mark the store ready immediately so webhook processing doesn't block.
+if (process.env.TEST_MODE === 'true') {
+  persist.loadLeads(store);
+  persist.loadInbox(inbox);
+  _markStoreReady();
+  _startupComplete = true;
+} else {
+
 app.listen(PORT, async () => {
   logger.info(`Shape Studio Agent running — http://localhost:${PORT}`, {
     revision:   _deployedRevision ?? 'unknown',
@@ -6653,6 +6890,53 @@ app.listen(PORT, async () => {
   // Unblock any inbound webhook that arrived before loadLeads completed.
   _markStoreReady();
 
+  // ── Startup closing-summary recovery ──────────────────────────────────────
+  // Reset any in_flight states left by a crash to 'failed', then retry all
+  // leads whose closing summary is incomplete (failed prospect or manager send).
+  // Auto-retry only fires when WHATSAPP_AUTO_REPLY=true so staging/test restarts
+  // do not blast messages.
+  {
+    const _closingLeads = store.getAllLeads().filter(l => {
+      const m = l.meta ?? {};
+      return m.closingSummaryProspectState != null || m.closingSummaryManagerState != null;
+    });
+    let _inFlightReset = 0;
+    for (const l of _closingLeads) {
+      const m = l.meta ?? {};
+      if (m.closingSummaryProspectState === 'in_flight' || m.closingSummaryManagerState === 'in_flight') {
+        store.upsertLead(l.phone, {
+          meta: {
+            ...m,
+            closingSummaryProspectState: m.closingSummaryProspectState === 'in_flight' ? 'failed' : m.closingSummaryProspectState,
+            closingSummaryManagerState:  m.closingSummaryManagerState  === 'in_flight' ? 'failed' : m.closingSummaryManagerState,
+          },
+        });
+        _inFlightReset++;
+      }
+    }
+    if (_inFlightReset > 0) {
+      persist.saveLeads(store);
+      logger.info('[startup] Closing summary in-flight → failed (crash recovery)', { count: _inFlightReset });
+    }
+    // Retry failed states when auto-reply is enabled.
+    if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
+      const _toRetry = store.getAllLeads().filter(l => {
+        const m  = l.meta ?? {};
+        const qd = m.qualData ?? {};
+        return !qd.closingSummarySent &&
+               (m.closingSummaryProspectState === 'failed' || m.closingSummaryManagerState === 'failed');
+      });
+      if (_toRetry.length) {
+        logger.info('[startup] Retrying failed closing summaries', { count: _toRetry.length });
+        for (const l of _toRetry) {
+          _retryClosingSummary(l.phone).catch(err =>
+            logger.warn('[startup] Closing summary retry failed', { phone: l.phone, error: err.message })
+          );
+        }
+      }
+    }
+  }
+
   // ── Startup purge: remove stale lead records for phones now in the registry ──
   // phoneRegistry is already warm from the await above — zero extra Arbox calls.
   // This is the fix for the "Orly" class of bug: a person who was a prospect
@@ -6706,6 +6990,8 @@ app.listen(PORT, async () => {
     }, 2000); // 2s delay so the server is fully accepting connections first
   }
 });
+
+} // end else (TEST_MODE !== 'true')
 
 module.exports = app;
 

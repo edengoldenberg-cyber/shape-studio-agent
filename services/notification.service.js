@@ -354,6 +354,36 @@ async function sendDailySummaryToAdmins(summaryText) {
   return dsSent;
 }
 
+/**
+ * Send a WhatsApp reminder DIRECTLY to the lead (prospect) before a scheduled callback.
+ * This goes to the lead, not to staff.
+ *
+ * Skips silently if apt.prospectReminderSent === true.
+ *
+ * @param {object} apt             — appointment record
+ * @param {string} name            — display name (first name)
+ * @param {string} formattedTime   — human-readable time string (from fmtScheduledAt)
+ * @returns {{ ok: boolean, idMessage: string|null, error: string|null }}
+ */
+async function sendProspectReminder(apt, name, formattedTime) {
+  if (apt.prospectReminderSent === true) {
+    return { ok: false, idMessage: null, error: 'already_sent' };
+  }
+  if (!apt.leadPhone) {
+    return { ok: false, idMessage: null, error: 'no_lead_phone' };
+  }
+  const msg = `היי ${name}, תזכורת לבקשת השיחה שלך עם Shape Studio ${formattedTime} 📞\nעדיין נוח לך לדבר בשעה הזו?`;
+  try {
+    const res = await sendText(apt.leadPhone, msg);
+    const idMessage = res?.idMessage ?? null;
+    logger.info('[notify] Prospect reminder sent', { aptId: apt.id, leadPhone: apt.leadPhone, idMessage });
+    return { ok: true, idMessage, error: null };
+  } catch (err) {
+    logger.warn('[notify] Prospect reminder failed', { aptId: apt.id, leadPhone: apt.leadPhone, error: err.message });
+    return { ok: false, idMessage: null, error: err.message };
+  }
+}
+
 module.exports = {
   notifyStaffCallbackConfirmed,
   sendStaffReminder,
@@ -363,4 +393,5 @@ module.exports = {
   alertEden,
   notifyRepresentativeRequest,
   sendDailySummaryToAdmins,
+  sendProspectReminder,
 };

@@ -461,6 +461,10 @@ function buildStageContext(completedTurns, qualData, msgCount) {
 
   // 4. Location check needed (asked once, waiting for confirmation)
   if (qualData.locationCheckNeeded && qualData.locationViable !== true) {
+    const _locAssets = studioAssets.getAssets();
+    const _wazeInstruction = _locAssets.wazeUrl
+      ? `Include in your message: "דרך השדה 12, פרדס חנה-כרכור 📍\n${_locAssets.wazeUrl}"`
+      : `Mention: "דרך השדה 12, פרדס חנה-כרכור" (no Waze URL configured)`;
     return [
       qualData.locationNearby
         ? `STATE: LOCATION CONVENIENCE CHECK. Ask once, lightly.`
@@ -471,7 +475,8 @@ function buildStageContext(completedTurns, qualData, msgCount) {
       qualData.locationNearby
         ? `Their area: "${qualData.location}". Ask if דרך השדה 12 is convenient.`
         : `Their area: "${qualData.location}". Ask if traveling to Pardes Hanna is realistic.`,
-      `Max 2 sentences. If they give any positive or neutral reply, proceed.`,
+      _wazeInstruction,
+      `Include address+Waze first, then one question. No second question.`,
     ].join('\n');
   }
 

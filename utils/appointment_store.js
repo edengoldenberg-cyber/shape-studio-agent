@@ -95,6 +95,9 @@ class AppointmentStore {
       reminderSentTo:  [],   // phones that confirmed reminder receipt; used for per-recipient retry
       handoffSentTo:   [],   // phones that confirmed initial handoff notification; used for retry
       noShowAlerted:   false,
+      prospectReminderSent:    false,
+      prospectReminderSentTo:  null,  // idMessage once sent
+      prospectAvailability:    null,  // null | 'confirmed' | 'rescheduled' | 'cancelled'
       createdAt:       now,
       updatedAt:       now,
     };
@@ -178,6 +181,26 @@ class AppointmentStore {
       a.scheduledAt.getTime() > now &&
       a.scheduledAt.getTime() <= cutoff &&
       !a.reminderSent
+    );
+  }
+
+  /**
+   * callback_pending entries that are due for a prospect (lead) reminder.
+   * Conditions:
+   *   - status === 'callback_pending'
+   *   - scheduledAt is set and is in the future
+   *   - scheduledAt is within the next windowMs
+   *   - prospectReminderSent !== true
+   */
+  getCallbacksDueForProspectReminder(windowMs = 20 * 60 * 1000) {
+    const now    = Date.now();
+    const cutoff = now + windowMs;
+    return this.getAll().filter(a =>
+      a.status === 'callback_pending' &&
+      a.scheduledAt != null &&
+      a.scheduledAt.getTime() > now &&
+      a.scheduledAt.getTime() <= cutoff &&
+      a.prospectReminderSent !== true
     );
   }
 
