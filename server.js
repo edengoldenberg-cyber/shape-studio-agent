@@ -3883,12 +3883,15 @@ async function processInboundWAMessage(msg) {
       // the alert, this just mirrors that for the aptStore).
       {
         const _postHandoffLead = store.getLead(fromNorm);
-        if (_postHandoffLead?.status === 'callback_requested'
-            && _postHandoffLead.meta?.callTimeGiven) {
+        // callTimeGiven lives in meta.qualData (set by setQualData in lead_agent step 3a);
+        // callTimeGivenAt lives in meta directly (set by store.upsertLead in the same step).
+        const _phCallTime = _postHandoffLead?.meta?.qualData?.callTimeGiven
+                          ?? _postHandoffLead?.meta?.callbackTime ?? null;
+        if (_postHandoffLead?.status === 'callback_requested' && _phCallTime) {
           const _existing = aptStore.getByPhone(fromNorm).find(a => a.status === 'callback_pending');
           if (!_existing) {
             try {
-              const _rawTime    = _postHandoffLead.meta.callTimeGiven;
+              const _rawTime    = _phCallTime;
               const _sentAt     = _postHandoffLead.meta.callTimeGivenAt
                 ? new Date(_postHandoffLead.meta.callTimeGivenAt)
                 : new Date();
