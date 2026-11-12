@@ -1838,17 +1838,89 @@ document.getElementById('btn-pull-arbox-leads')?.addEventListener('click', async
 
 async function loadBarakPanel() {
   try {
-    const [leadsRes, statsRes] = await Promise.all([
+    const [leadsRes, statsRes, aptsRes] = await Promise.all([
       fetch('/api/leads'),
       fetch('/api/stats'),
+      fetch('/api/admin/appointments?limit=50').catch(() => ({ json: () => ({ appointments: [] }) })),
     ]);
     allLeads         = await leadsRes.json();
     const { daily }  = await statsRes.json();
+    const aptsData   = await aptsRes.json();
     renderBarakStats(daily);
     renderBarakTable(allLeads);
+    renderCallbackPanel(allLeads, aptsData.appointments ?? []);
     const upEl = document.getElementById('barak-updated');
     if (upEl) upEl.textContent = 'עודכן: ' + now();
   } catch (e) { console.error('loadBarakPanel', e); }
+}
+
+function renderCallbackPanel(leads, apts) {
+  const bodyEl  = document.getElementById('barak-callbacks-body');
+  const badgeEl = document.getElementById('barak-callbacks-badge');
+  if (!bodyEl) return;
+
+  // Gather callback leads: callback_requested status or confirmed appointments
+  const cbLeads = leads.filter(l =>
+    l.status === 'callback_requested' || l.status === 'call_scheduled'
+  );
+  // Index appointments by leadPhone for quick lookup
+  const aptByPhone = {};
+  for (const a of apts) {
+    if (!aptByPhone[a.leadPhone] || new Date(a.createdAt) > new Date(aptByPhone[a.leadPhone].createdAt)) {
+      aptByPhone[a.leadPhone] = a;
+    }
+  }
+
+  if (!cbLeads.length) {
+    badgeEl.textContent = '';
+    bodyEl.innerHTML = `<div class="empty-state" style="padding:12px">אין שיחות ממתינות</div>`;
+    return;
+  }
+
+  badgeEl.textContent = cbLeads.length;
+
+  const rows = cbLeads.map(l => {
+    const qd       = l.meta?.qualData ?? {};
+    const apt      = aptByPhone[l.phone];
+    const rawTime  = qd.callTimeGiven ?? apt?.rawTime ?? '—';
+    const alertSt  = l.meta?.handoffAlertStatus;
+    const alertIcon =
+      alertSt === 'sent'    ? '<span style="color:var(--green)" title="התראה נשלחה">✅</span>' :
+      alertSt === 'failed'  ? '<span style="color:var(--hot)"   title="שליחת התראה נכשלה">❌</span>' :
+      alertSt === 'pending' ? '<span style="color:var(--warm)"  title="ממתין לשליחה">⏳</span>' :
+                              '<span style="color:var(--muted)" title="לא נשלחה התראה">—</span>';
+    const aptIcon =
+      apt?.status === 'confirmed'  ? '<span style="color:var(--green)"  title="תור מאושר">📅</span>' :
+      apt?.status === 'completed'  ? '<span style="color:var(--muted)"  title="הושלם">✔</span>'  :
+      apt?.status === 'no_show'    ? '<span style="color:var(--hot)"    title="לא הגיע">❌</span>' :
+      apt?.status === 'cancelled'  ? '<span style="color:var(--muted)"  title="בוטל">🚫</span>' :
+                                     '<span style="color:var(--muted)"  title="אין תור במערכת">—</span>';
+    const scoreNum  = l.score ?? '—';
+    const scoreTip  = 'ציון כשירות ליד (1-10): מודד אותות רכישה, לא איכות שיחה';
+    const scoreColor = l.score >= 8 ? 'var(--hot)' : l.score >= 5 ? 'var(--warm)' : 'var(--muted)';
+    const readySt  = l.meta?.qualProfile?.readiness;
+    const readyEmoji = readySt === 'HIGH' ? '🔥' : readySt === 'MEDIUM' ? '🌡️' : readySt === 'LOW' ? '❄️' : '';
+    const convoSum = l.meta?.qualProfile?.qualificationReason ?? '';
+    const dispPhone = l.phone.startsWith('972') ? '0' + l.phone.slice(3) : l.phone;
+
+    return `<div class="callback-row" style="display:grid;grid-template-columns:140px 110px 1fr 60px 32px 32px;gap:8px;align-items:center;padding:10px 16px;border-bottom:1px solid var(--border)">
+      <div>
+        <div class="lead-name" style="font-weight:600">${esc(l.name ?? '—')}</div>
+        <div style="font-size:11px;color:var(--muted);direction:ltr">${esc(dispPhone)}</div>
+      </div>
+      <div style="font-size:12px;color:var(--text)">${esc(rawTime)}</div>
+      <div style="font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(convoSum)}">${readyEmoji} ${esc(convoSum || '—')}</div>
+      <div><span style="font-weight:700;color:${scoreColor}" title="${scoreTip}">${scoreNum}/10</span></div>
+      <div title="תור">${aptIcon}</div>
+      <div title="התראה">${alertIcon}</div>
+    </div>`;
+  }).join('');
+
+  bodyEl.innerHTML = `
+    <div style="display:grid;grid-template-columns:140px 110px 1fr 60px 32px 32px;gap:8px;padding:6px 16px;font-size:11px;font-weight:600;color:var(--muted);border-bottom:1px solid var(--border)">
+      <div>שם / טלפון</div><div>זמן מבוקש</div><div>סיכום שיחה</div><div>ציון</div><div>תור</div><div>התראה</div>
+    </div>
+    ${rows}`;
 }
 
 function renderBarakStats(d) {

@@ -13,6 +13,8 @@ const memoryService = require('../services/memory.service');
 const handoffService = require('../services/handoff.service');
 const memberCache   = require('../utils/member_cache');
 const { checkOperationalIntent } = require('../utils/operational_interceptor');
+const aptStore      = require('../utils/appointment_store');
+const calendarSvc   = require('../services/calendar.service');
 
 const SYSTEM_PROMPT = fs.readFileSync(
   path.join(__dirname, '../prompts/system_prompt.md'),
@@ -558,9 +560,11 @@ const CRISIS_PATTERNS = [
   /\b(עזרה|חירום)\b/i,
 ];
 
-// Regex to detect a callback time in the user's message
+// Regex to detect a callback time in the user's message.
+// Covers: day names, HH:MM, time-of-day words, AM/PM, "מחר"/"היום",
+// "בשעה N" (bare hour without colon — the most common Israeli WhatsApp form).
 const TIME_PATTERN =
-  /\b(ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת|sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b|\b\d{1,2}:\d{2}\b|\b(בוקר|ערב|צהריים|אחה"צ|אחרי עבודה)\b|\b\d{1,2}\s*(am|pm)\b/i;
+  /\b(ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת|sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b|\b\d{1,2}:\d{2}\b|\b(בוקר|ערב|צהריים|אחה"צ|אחרי עבודה)\b|\b\d{1,2}\s*(am|pm)\b|\bמחר\b|\bהיום\b|\bבשעה\s+\d{1,2}\b/i;
 
 // ── Qualification data helpers ────────────────────────────────────────────────
 
@@ -1448,6 +1452,38 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
     // since it runs after the outbound send and does not delay the lead's experience.
     const handoffLead = store.getLead(from);
     await reliableHandoffAlert(from, handoffLead?.name ?? from, history, latestQualData);
+
+    // Create an aptStore entry so the reminder/no-show worker can fire.
+    // The WhatsApp brief was already sent by reliableHandoffAlert above — no second alert.
+    // Parse the Hebrew time asynchronously; the entry is immediately visible in the panel
+    // with rawTime even if scheduledAt is null (reminder worker skips unresolved times).
+    try {
+      const staffCfg = JSON.parse(require('fs').readFileSync(
+        require('path').join(__dirname, '../data/staff_config.json'), 'utf8'));
+      const assignedId = staffCfg.default_assignee_id ?? 'eden';
+      const apt = aptStore.create({
+        leadPhone:       from,
+        leadName:        handoffLead?.name ?? null,
+        rawTime:         latestQualData.callTimeGiven,
+        scheduledAt:     null,
+        durationMin:     staffCfg.appointment_duration_min ?? 30,
+        assignedStaffId: assignedId,
+      });
+      store.logEvent('apt_created_ai_path', from, { aptId: apt.id, rawTime: apt.rawTime });
+      logger.info('[lead_agent] aptStore entry created for AI-path callback', { from, aptId: apt.id });
+
+      // Parse the Hebrew time text and update scheduledAt so the reminder window works.
+      calendarSvc.parseHebrewTime(apt.rawTime)
+        .then(scheduledAt => {
+          if (scheduledAt) {
+            aptStore.update(apt.id, { scheduledAt });
+            logger.info('[lead_agent] aptStore scheduledAt resolved', { aptId: apt.id, scheduledAt });
+          }
+        })
+        .catch(err => logger.warn('[lead_agent] aptStore time parse failed', { aptId: apt.id, error: err.message }));
+    } catch (aptErr) {
+      logger.warn('[lead_agent] aptStore create failed — reminder will not fire', { from, error: aptErr.message });
+    }
 
     // Save a persistent session summary to the memory store (fire-and-forget is acceptable
     // here — it enriches future conversations but is not required for the team handoff)

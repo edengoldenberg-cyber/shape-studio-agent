@@ -627,6 +627,17 @@
         <button class="barak-sv-btn" data-bview="sync">🔗 סנכרון</button>
       </nav>
 
+      <!-- VIEW: Pending Callbacks -->
+      <div id="barak-callbacks-panel" class="panel" style="margin-bottom:16px;border-right:4px solid var(--hot)">
+        <div class="panel-header">
+          <h2>📞 שיחות ממתינות <span id="barak-callbacks-badge" style="font-size:12px;background:var(--hot);color:#fff;border-radius:10px;padding:2px 8px;margin-right:8px;vertical-align:middle"></span></h2>
+          <div style="font-size:12px;color:var(--muted)" title="ציון כשירות ליד (1-10): מודד אותות מוכנות לרכישה. לא מדד איכות שיחה — דירוג שיחה אינו זמין כרגע.">❓ ציון = כשירות ליד, לא איכות שיחה</div>
+        </div>
+        <div id="barak-callbacks-body">
+          <div class="empty-state" style="padding:12px">אין שיחות ממתינות</div>
+        </div>
+      </div>
+
       <!-- VIEW: Local lead pipeline -->
       <div id="barak-view-pipeline">
         <div class="panel" style="margin-bottom:24px">
