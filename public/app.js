@@ -1838,17 +1838,17 @@ document.getElementById('btn-pull-arbox-leads')?.addEventListener('click', async
 
 async function loadBarakPanel() {
   try {
-    const [leadsRes, statsRes, aptsRes] = await Promise.all([
+    const [leadsRes, statsRes, cbRes] = await Promise.all([
       fetch('/api/leads'),
       fetch('/api/stats'),
-      fetch('/api/admin/appointments?limit=50').catch(() => ({ json: () => ({ appointments: [] }) })),
+      fetch('/api/barak/callbacks').catch(() => ({ json: () => ({ callbacks: [] }) })),
     ]);
-    allLeads         = await leadsRes.json();
-    const { daily }  = await statsRes.json();
-    const aptsData   = await aptsRes.json();
+    allLeads        = await leadsRes.json();
+    const { daily } = await statsRes.json();
+    const cbData    = await cbRes.json();
     renderBarakStats(daily);
     renderBarakTable(allLeads);
-    renderCallbackPanel(allLeads, aptsData.appointments ?? []);
+    renderCallbackPanel(cbData.callbacks ?? []);
     const upEl = document.getElementById('barak-updated');
     if (upEl) upEl.textContent = 'עודכן: ' + now();
   } catch (e) { console.error('loadBarakPanel', e); }
@@ -1877,7 +1877,8 @@ function fmtCallbackTime(apt, qualData) {
 function cbStatusLabel(leadStatus, aptStatus, qualData) {
   if (aptStatus === 'completed')       return { label: 'הושלם',             cls: 'muted' };
   if (aptStatus === 'cancelled')       return { label: 'בוטל',              cls: 'muted' };
-  if (aptStatus === 'no_show')         return { label: 'לא ענה',            cls: 'hot'   };
+  if (aptStatus === 'no_answer')       return { label: 'לא ענה (שיחה)',     cls: 'hot'   };
+  if (aptStatus === 'no_show')         return { label: 'לא הגיע (שיעור)',   cls: 'hot'   };
   if (aptStatus === 'confirmed')       return { label: 'מאושר',             cls: 'green' };
   if (qualData?.nameAsked && !qualData?.confirmedName)
                                        return { label: 'ממתין לשם',         cls: 'warm'  };
@@ -1886,40 +1887,27 @@ function cbStatusLabel(leadStatus, aptStatus, qualData) {
   return                                      { label: 'בקשת שיחה',         cls: 'warm'  };
 }
 
-function renderCallbackPanel(leads, apts) {
+// renderCallbackPanel now accepts combined records from /api/barak/callbacks.
+// Each record has fullPhone (E.164, server-authoritative), maskedPhone (display only),
+// and an embedded apt object — all joined server-side by full phone. No client-side
+// phone matching or masked-phone collision risk.
+function renderCallbackPanel(callbacks) {
   const bodyEl  = document.getElementById('barak-callbacks-body');
   const badgeEl = document.getElementById('barak-callbacks-badge');
   if (!bodyEl) return;
 
-  const cbLeads = leads.filter(l =>
-    l.status === 'callback_requested' || l.status === 'call_scheduled'
-  );
-
-  // ── Index appointments by MASKED phone ───────────────────────────────────────
-  // /api/leads masks phones; /api/admin/appointments stores full phones.
-  // Build the lookup with both masked and full phone as keys so either works.
-  const aptByPhone = {};
-  for (const a of apts) {
-    const full   = a.leadPhone;
-    const masked = maskPhone(full);
-    const existing = aptByPhone[full] ?? aptByPhone[masked];
-    if (!existing || new Date(a.createdAt) > new Date(existing.createdAt)) {
-      aptByPhone[full]   = a;
-      aptByPhone[masked] = a;
-    }
-  }
-
-  if (!cbLeads.length) {
+  if (!callbacks.length) {
     if (badgeEl) badgeEl.textContent = '';
     bodyEl.innerHTML = `<div class="empty-state" style="padding:12px">אין שיחות ממתינות</div>`;
     return;
   }
 
-  if (badgeEl) badgeEl.textContent = cbLeads.length;
+  if (badgeEl) badgeEl.textContent = callbacks.length;
 
-  const rows = cbLeads.map(l => {
-    const qd        = l.meta?.qualData ?? {};
-    const apt       = aptByPhone[l.phone];
+  const rows = callbacks.map(l => {
+    const qd  = l.meta?.qualData ?? {};
+    const apt = l.apt ?? null; // already joined server-side
+
     const alertSt   = l.meta?.handoffAlertStatus;
     const alertIdMsg = l.meta?.handoffAlertIdMessage ? ` · idMsg: ${l.meta.handoffAlertIdMessage}` : '';
     const alertTime  = l.meta?.handoffAlertSentAt
@@ -1934,9 +1922,9 @@ function renderCallbackPanel(leads, apts) {
       alertSt === 'pending' ? `<span style="color:var(--warm)"  title="${alertTip}">⏳</span>` :
                               `<span style="color:var(--muted)" title="${alertTip}">—</span>`;
 
-    const reminderSent = apt?.reminderSent;
+    const reminderSent   = apt?.reminderSent;
     const reminderSentTo = apt?.reminderSentTo ?? [];
-    const reminderTip = reminderSent
+    const reminderTip    = reminderSent
       ? `תזכורת נשלחה ל-${reminderSentTo.length} נמענ/ים`
       : (apt ? 'תזכורת טרם נשלחה' : 'אין רשומת תור');
     const reminderIcon = reminderSent
@@ -1947,38 +1935,32 @@ function renderCallbackPanel(leads, apts) {
     const scoreTip   = `ציון כשירות ליד (1-10): מודד אותות רכישה, לא איכות שיחה\n${l.meta?.qualProfile?.readinessEvidence ?? ''}`;
     const scoreColor = l.score >= 8 ? 'var(--hot)' : l.score >= 5 ? 'var(--warm)' : 'var(--muted)';
 
-    const st         = cbStatusLabel(l.status, apt?.status, qd);
-    const stColor    = st.cls === 'green' ? 'var(--green)' : st.cls === 'warm' ? 'var(--warm)' : st.cls === 'hot' ? 'var(--hot)' : 'var(--muted)';
+    const st     = cbStatusLabel(l.status, apt?.status, qd);
+    const stColor = st.cls === 'green' ? 'var(--green)' : st.cls === 'warm' ? 'var(--warm)' : st.cls === 'hot' ? 'var(--hot)' : 'var(--muted)';
 
     const dispName   = l.name && l.name.trim() ? l.name : null;
     const confirmedN = qd.confirmedName && qd.confirmedName.trim() ? qd.confirmedName : null;
     const nameDisplay = confirmedN ?? dispName ?? `<span style="color:var(--hot);font-size:11px">שם חסר</span>`;
     const nameLabel  = confirmedN ? `✓ ${esc(confirmedN)}` : (dispName ? esc(dispName) : nameDisplay);
 
-    // Use apt.leadPhone (full E.164 from aptStore) for WA links and thread lookup.
-    // l.phone from /api/leads is masked — stripping non-digits from it yields a
-    // corrupted number. The matched apt always holds the real phone.
-    const fullPhone  = apt?.leadPhone ?? null;
-    const dispPhone  = fullPhone
+    // fullPhone is the authorized E.164 from /api/barak/callbacks (server-side join).
+    // maskedPhone is display-only. Never use masked phone for action routing.
+    const fullPhone = l.fullPhone ?? null;
+    const dispPhone = fullPhone
       ? (fullPhone.startsWith('972') ? '0' + fullPhone.slice(3) : fullPhone)
-      : l.phone;
-    const waPhone    = fullPhone ? fullPhone.replace(/[^0-9]/g, '') : null;
-    const waLink     = waPhone ? `https://wa.me/${waPhone}` : null;
+      : (l.maskedPhone ?? '—');
+    const waPhone   = fullPhone ? fullPhone.replace(/[^0-9]/g, '') : null;
+    const waLink    = waPhone ? `https://wa.me/${waPhone}` : null;
 
-    const timeLabel  = fmtCallbackTime(apt, qd);
-
-    // Assigned representative (from aptStore — full phone is unmasked there)
-    const assignee   = apt?.assignedStaffId ?? '—';
+    const timeLabel = fmtCallbackTime(apt, qd);
+    const assignee  = apt?.assignedStaffId ?? '—';
 
     const convoSum   = l.meta?.qualProfile?.qualificationReason ?? l.meta?.leadBrief?.notes ?? '';
     const readySt    = l.meta?.qualProfile?.readiness;
     const readyEmoji = readySt === 'HIGH' ? '🔥' : readySt === 'MEDIUM' ? '🌡️' : readySt === 'LOW' ? '❄️' : '';
     const interests  = [qd.fitnessInterest, qd.goal, qd.location].filter(Boolean).join(' · ');
 
-    // Action buttons — POST to appointments API if apt exists.
-    // no_answer uses a dedicated endpoint (not no_show) so it never triggers
-    // the class-no-show automation that fires follow-up messages to the prospect.
-    const aptId   = apt?.id ?? '';
+    const aptId  = apt?.id ?? '';
     const actions = aptId ? `
       <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px">
         <button onclick="cbAction('${aptId}','complete')"   style="font-size:10px;padding:2px 6px;cursor:pointer;border-radius:3px;border:1px solid var(--border)">✔ הושלם</button>
@@ -2055,9 +2037,11 @@ async function cbAction(aptId, action) {
     const rawTime = window.prompt('זמן חדש לשיחה (עברית — למשל: מחר בשעה 15:00):');
     if (!rawTime?.trim()) return;
     try {
-      const res = await fetch(`/api/admin/appointments/${aptId}`, {
-        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rawTime: rawTime.trim(), status: 'callback_pending', reminderSent: false }),
+      // Use dedicated reschedule endpoint: recalculates scheduledAt, clears reminderSentTo,
+      // syncs lead meta, and notifies staff. PATCH rawTime alone is insufficient.
+      const res = await fetch(`/api/admin/appointments/${aptId}/reschedule`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rawTime: rawTime.trim() }),
       });
       if (!res.ok) throw new Error(await res.text());
       await loadBarakPanel();

@@ -1248,6 +1248,58 @@ app.post('/api/barak/sync-arbox', async (_req, res) => {
   }
 });
 
+// GET /api/barak/callbacks — server-side join of callback leads + appointments.
+// Returns combined records with FULL phones (never masked) and aptId for panel actions.
+// Matching is done by full E.164 phone, not by masked phone, so no collision risk.
+// The panel uses this single endpoint instead of client-side joining masked phones.
+app.get('/api/barak/callbacks', (_req, res) => {
+  const CB_STATUSES = new Set(['callback_requested', 'call_scheduled']);
+  const cbLeads = store.getAllLeads()
+    .filter(l => CB_STATUSES.has(l.status));
+
+  // Index latest active appointment by full phone
+  const aptByPhone = {};
+  for (const a of aptStore.getAll()) {
+    if (!a.leadPhone) continue;
+    const existing = aptByPhone[a.leadPhone];
+    // Prefer active statuses (callback_pending / confirmed) over terminal ones
+    const isActive   = a.status === 'callback_pending' || a.status === 'confirmed';
+    const wasActive  = existing?.status === 'callback_pending' || existing?.status === 'confirmed';
+    if (!existing
+        || (isActive && !wasActive)
+        || (isActive === wasActive && new Date(a.createdAt) > new Date(existing.createdAt))) {
+      aptByPhone[a.leadPhone] = a;
+    }
+  }
+
+  const callbacks = cbLeads.map(lead => {
+    const { history, ...safeLeadFields } = lead;
+    const apt = aptByPhone[lead.phone] ?? null;
+    return {
+      ...safeLeadFields,
+      // fullPhone: authorized — this endpoint is staff-only panel use.
+      // The panel must use fullPhone for WA links and conversation lookup.
+      // maskedPhone is provided for display-only; never use it for action routing.
+      fullPhone:   lead.phone,
+      maskedPhone: maskPhone(lead.phone),
+      apt: apt ? {
+        id:              apt.id,
+        status:          apt.status,
+        rawTime:         apt.rawTime,
+        scheduledAt:     apt.scheduledAt,
+        assignedStaffId: apt.assignedStaffId,
+        reminderSent:    apt.reminderSent,
+        reminderSentTo:  apt.reminderSentTo ?? [],
+        handoffSentTo:   apt.handoffSentTo  ?? [],
+        createdAt:       apt.createdAt,
+        updatedAt:       apt.updatedAt,
+      } : null,
+    };
+  });
+
+  res.json({ ok: true, callbacks });
+});
+
 // GET /api/barak/sync-status — Arbox sync summary for dashboard
 app.get('/api/barak/sync-status', (_req, res) => {
   const all     = store.getAllLeads();
@@ -5811,6 +5863,67 @@ app.post('/api/admin/appointments/:id/no-answer', jsonBody, (req, res) => {
   if (!apt) return res.status(404).json({ ok: false, error: 'Appointment not found' });
   store.logEvent('appointment_no_answer', apt.leadPhone, { aptId: apt.id, note: req.body?.note });
   res.json({ ok: true, appointment: apt });
+});
+
+// POST /api/admin/appointments/:id/reschedule — reparse time, reset reminder state, notify staff
+// PATCH rawTime alone is insufficient: scheduledAt must be recalculated, reminderSentTo cleared
+// (not just reminderSent), and lead meta synced so the lead store reflects the new time.
+app.post('/api/admin/appointments/:id/reschedule', jsonBody, async (req, res) => {
+  const { rawTime } = req.body ?? {};
+  if (!rawTime?.trim()) return res.status(400).json({ ok: false, error: 'rawTime required' });
+
+  const apt = aptStore.get(req.params.id);
+  if (!apt) return res.status(404).json({ ok: false, error: 'Appointment not found' });
+
+  const oldTimeLabel = apt.rawTime;
+
+  // 1. Re-parse the new time in Asia/Jerusalem
+  const newScheduledAt = await calendarSvc.parseHebrewTime(rawTime.trim()).catch(() => null);
+
+  // 2. Cancel old Google Calendar event
+  if (apt.calendarEventId) {
+    calendarSvc.cancelCalendarEvent(apt).catch(() => {});
+  }
+
+  // 3. Update appointment: new time, reset all reminder state, stay callback_pending
+  //    reminderSentTo must be cleared along with reminderSent so per-recipient state
+  //    matches the new schedule. The old recipients list is stale for the new time.
+  const updated = aptStore.update(apt.id, {
+    rawTime:       rawTime.trim(),
+    scheduledAt:   newScheduledAt ?? null,
+    status:        'callback_pending', // staff must re-confirm
+    reminderSent:  false,
+    reminderSentTo: [],
+  });
+
+  // 4. Sync lead meta so callTimeGiven reflects the new schedule
+  if (apt.leadPhone) {
+    const curMeta = store.getLead(apt.leadPhone)?.meta ?? {};
+    store.upsertLead(apt.leadPhone, {
+      meta: {
+        ...curMeta,
+        handoffCallTime: rawTime.trim(),
+        qualData: {
+          ...(curMeta.qualData ?? {}),
+          callTimeGiven: rawTime.trim(),
+        },
+      },
+    });
+    persist.saveLeads(store);
+  }
+
+  // 5. Notify staff of reschedule (fire-and-forget)
+  const staff = findStaff(updated.assignedStaffId);
+  notifySvc.notifyStaffRescheduled(
+    { ...updated, scheduledAt: newScheduledAt },
+    staff,
+    oldTimeLabel ?? '—'
+  ).catch(err => logger.warn('[api] reschedule notify failed', { error: err.message }));
+
+  store.logEvent('appointment_rescheduled_manual', apt.leadPhone, {
+    aptId: apt.id, oldTime: oldTimeLabel, newTime: rawTime, parsedAt: newScheduledAt,
+  });
+  res.json({ ok: true, appointment: updated, scheduledAt: newScheduledAt });
 });
 
 // POST /api/admin/appointments/:id/assign — reassign to a different staff member
