@@ -3177,20 +3177,40 @@ async function processInboundWAMessage(msg) {
       });
       logger.info('Appointment rescheduled', { phone: fromNorm, rawTime, aptId: prevAptId, oldTime: oldTimeLabel });
     } else {
-      // Fresh appointment
-      apt = aptStore.create({
+      // Fresh callback request — use callback_pending semantics: staff has not yet
+      // confirmed this call. The panel (and status) distinguish "requested" from
+      // "confirmed" so the team knows action is required.
+      apt = aptStore.createCallbackPending({
         leadPhone:       fromNorm,
         leadName:        callbackName,
         rawTime,
-        scheduledAt:     null,
+        scheduledAt:     null,         // filled async via parseHebrewTimeLocal below
         durationMin:     staffConfig.appointment_duration_min ?? 30,
         assignedStaffId: assignedStaff?.id ?? 'eden',
       });
-      // aptStore entry created = real appointment → upgrade to call_scheduled.
-      // callback_requested (from AI flow) ≠ call_scheduled (confirmed aptStore entry).
-      store.upsertLead(fromNorm, { status: 'call_scheduled' });
-      store.logEvent('appointment_created', fromNorm, { aptId: apt.id, rawTime, staff: apt.assignedStaffId });
-      logger.info('Appointment created — status → call_scheduled', { phone: fromNorm, rawTime, aptId: apt.id });
+      // Set callback_requested (not call_scheduled) — same semantics as the AI flow.
+      // Also persist callTimeGiven in qualData so the panel rawTime lookup works and
+      // the post-call gate (nameAsked check) can reference it.
+      const _awFreshMeta = store.getLead(fromNorm)?.meta ?? {};
+      const _awFreshAt   = msg.timestamp
+        ? new Date(msg.timestamp * 1000).toISOString()
+        : new Date().toISOString();
+      store.upsertLead(fromNorm, {
+        status: 'callback_requested',
+        meta: {
+          ..._awFreshMeta,
+          callTimeGivenAt: _awFreshAt,
+          handoffAlertStatus: 'pending',
+          handoffCallTime:    rawTime,
+          qualData: {
+            ...(_awFreshMeta.qualData ?? {}),
+            callTimeGiven:   rawTime,
+            callTimeGivenAt: _awFreshAt,
+          },
+        },
+      });
+      store.logEvent('callback_requested_explicit', fromNorm, { aptId: apt.id, rawTime, staff: apt.assignedStaffId });
+      logger.info('Callback requested (explicit representative) — status → callback_requested', { phone: fromNorm, rawTime, aptId: apt.id });
     }
 
     // ── Async: parse time + calendar + notify all staff ───────────────────────
@@ -3221,21 +3241,45 @@ async function processInboundWAMessage(msg) {
             oldTimeLabel ?? '—'
           );
         } else {
-          // Notify all active staff: "new appointment confirmed"
-          await notifySvc.notifyStaffCallbackConfirmed(
+          // Notify all active staff: "callback requested"
+          // notifyStaffCallbackConfirmed now returns {results, sent, firstIdMessage}
+          // so we can record the handoff outcome to the lead meta.
+          const notifResult = await notifySvc.notifyStaffCallbackConfirmed(
             { ...apt, scheduledAt },
             assignedStaff,
             icsUrl
           );
+          const _notified    = (notifResult?.sent ?? 0) > 0;
+          const _idMsg       = notifResult?.firstIdMessage ?? null;
+          const _curMeta     = store.getLead(fromNorm)?.meta ?? {};
+          store.upsertLead(fromNorm, {
+            meta: {
+              ..._curMeta,
+              handoffAlertStatus:    _notified ? 'sent'  : 'failed',
+              handoffAlertSentAt:    _notified ? new Date().toISOString() : null,
+              handoffAlertFailedAt:  _notified ? null : new Date().toISOString(),
+              handoffAlertIdMessage: _idMsg,
+            },
+          });
+          persist.saveLeads(store);
         }
 
         store.logEvent('appointment_staff_notified', fromNorm, {
           aptId:   apt.id,
           staffId: apt.assignedStaffId,
-          type:    isReschedule ? 'rescheduled' : 'confirmed',
+          type:    isReschedule ? 'rescheduled' : 'requested',
         });
       } catch (err) {
         logger.error('Appointment background tasks failed', { aptId: apt.id, error: err.message });
+        // Record failure to lead meta so the panel shows the correct state
+        try {
+          const _failMeta = store.getLead(fromNorm)?.meta ?? {};
+          if (_failMeta.handoffAlertStatus === 'pending') {
+            store.upsertLead(fromNorm, {
+              meta: { ..._failMeta, handoffAlertStatus: 'failed', handoffAlertFailedAt: new Date().toISOString() },
+            });
+          }
+        } catch {}
       }
     });
 
@@ -3254,12 +3298,12 @@ async function processInboundWAMessage(msg) {
     }
 
     // ── Confirm to lead ───────────────────────────────────────────────────────
-    // Fresh appointment: confirm the time, then ask for the name in the same
-    // message. The post-call gate (call_scheduled) captures the next reply as
-    // the name (nameAsked=true set above). No trailing generic question.
+    // Fresh request: confirm the time and ask for the name in the same message.
+    // "רשמנו" (we noted) rather than "נקבעה" (was booked) — the callback is
+    // requested, not confirmed by staff yet. Post-call gate captures the name.
     const confirmMsg = isReschedule
       ? `מעולה! קבענו מחדש ל-${rawTime} ✅\nנציג מהצוות ייצור איתך קשר בזמן החדש. 😊`
-      : `מעולה! השיחה נקבעה ל-${rawTime} ✅\nנציג מהצוות ייצור איתך קשר. ואיך קוראים לך? 😊`;
+      : `מעולה! רשמנו את בקשת השיחה ל-${rawTime} ✅\nנציג מהצוות ייצור איתך קשר. ואיך קוראים לך? 😊`;
 
     if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
       _markBotSent(fromNorm);

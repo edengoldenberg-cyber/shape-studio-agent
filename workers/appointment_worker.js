@@ -36,17 +36,39 @@ function findStaff(staffId) {
 // ── Reminder pass ─────────────────────────────────────────────────────────────
 
 async function runReminderPass(store) {
-  const due = aptStore.getDueForReminder(20 * 60 * 1000); // 20-min window
+  // Apply the same per-phone allowlist as runCallbackPendingReminderPass.
+  // During controlled tests (CALLBACK_PENDING_REMINDER_PHONES set), only the
+  // listed phones receive reminders. This prevents the existing confirmed callback
+  // record from firing outside the controlled test window.
+  // When the env var is absent or empty, all due confirmed entries are reminded.
+  const _rawAllowlist = (process.env.CALLBACK_PENDING_REMINDER_PHONES ?? '').trim();
+  const _allowlist    = _rawAllowlist ? new Set(_rawAllowlist.split(',').map(s => s.trim()).filter(Boolean)) : null;
+
+  let due = aptStore.getDueForReminder(20 * 60 * 1000); // 20-min window
+  if (_allowlist) due = due.filter(a => _allowlist.has(a.leadPhone));
   if (!due.length) return { reminders: 0 };
 
-  logger.info('[apt-worker] Reminder pass', { due: due.length });
+  logger.info('[apt-worker] Reminder pass', { due: due.length, allowlist: _allowlist ? [..._allowlist] : 'all' });
   let sent = 0;
   for (const apt of due) {
     const staff = findStaff(apt.assignedStaffId);
-    await sendStaffReminder(apt, staff);
-    aptStore.markReminderSent(apt.id);
-    store?.logEvent('appointment_reminder_sent', apt.leadPhone, { aptId: apt.id });
-    sent++;
+    const results = await sendStaffReminder(apt, staff, {
+      skipPhones: new Set(apt.reminderSentTo ?? []),
+    });
+    const newSucceeded = results.filter(r => r.ok && !r.skipped).map(r => r.phone);
+    if (newSucceeded.length) {
+      aptStore.update(apt.id, { reminderSentTo: [...new Set([...(apt.reminderSentTo ?? []), ...newSucceeded])] });
+    }
+    if (results.length > 0 && results.every(r => r.ok)) {
+      aptStore.markReminderSent(apt.id);
+      store?.logEvent('appointment_reminder_sent', apt.leadPhone, { aptId: apt.id });
+      sent++;
+    } else if (results.length === 0) {
+      // Fallback path: no roster configured; mark sent conservatively
+      aptStore.markReminderSent(apt.id);
+      store?.logEvent('appointment_reminder_sent', apt.leadPhone, { aptId: apt.id });
+      sent++;
+    }
   }
   return { reminders: sent };
 }

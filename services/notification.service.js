@@ -139,6 +139,10 @@ async function broadcastToStaff(message, { skipPhones = new Set() } = {}) {
  * WhatsApp broadcast → all active staff with phones (Eden + Melanie + others).
  * Email → assigned staff member only (if email is configured).
  */
+/**
+ * @returns {{ results: Array, sent: number, firstIdMessage: string|null }}
+ *   Callers may record handoffAlertStatus/handoffAlertIdMessage from these results.
+ */
 async function notifyStaffCallbackConfirmed(apt, assignedStaff, icsDownloadUrl) {
   const timeLabel = formatTime(apt.scheduledAt, apt.rawTime);
   const lead      = apt.leadName ?? apt.leadPhone;
@@ -184,6 +188,8 @@ async function notifyStaffCallbackConfirmed(apt, assignedStaff, icsDownloadUrl) 
   logger.info('[notify] Staff callback notification sent', {
     staffId: apt.assignedStaffId, aptId: apt.id, waRecipients: sent,
   });
+  const firstIdMessage = waResults.find(r => r.ok && r.idMessage)?.idMessage ?? null;
+  return { results: waResults, sent, firstIdMessage };
 }
 
 /**

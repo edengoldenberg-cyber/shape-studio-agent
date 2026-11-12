@@ -1854,73 +1854,203 @@ async function loadBarakPanel() {
   } catch (e) { console.error('loadBarakPanel', e); }
 }
 
+// maskPhone mirrors server.js maskPhone: slice(0,5) + '••••' + slice(-3)
+function maskPhone(p) {
+  if (!p || p.length < 7) return p ?? '—';
+  return p.slice(0, 5) + '••••' + p.slice(-3);
+}
+
+function fmtCallbackTime(apt, qualData) {
+  // Prefer parsed scheduledAt (Asia/Jerusalem) over raw text; fall back to rawTime / callTimeGiven
+  if (apt?.scheduledAt) {
+    try {
+      const d = new Date(apt.scheduledAt);
+      return d.toLocaleString('he-IL', {
+        timeZone: 'Asia/Jerusalem', weekday: 'short', day: 'numeric', month: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+      });
+    } catch {}
+  }
+  return qualData?.callTimeGiven ?? apt?.rawTime ?? '—';
+}
+
+function cbStatusLabel(leadStatus, aptStatus, qualData) {
+  if (aptStatus === 'completed')       return { label: 'הושלם',             cls: 'muted' };
+  if (aptStatus === 'cancelled')       return { label: 'בוטל',              cls: 'muted' };
+  if (aptStatus === 'no_show')         return { label: 'לא ענה',            cls: 'hot'   };
+  if (aptStatus === 'confirmed')       return { label: 'מאושר',             cls: 'green' };
+  if (qualData?.nameAsked && !qualData?.confirmedName)
+                                       return { label: 'ממתין לשם',         cls: 'warm'  };
+  if (aptStatus === 'callback_pending') return { label: 'בקשת שיחה',        cls: 'warm'  };
+  if (leadStatus === 'call_scheduled') return { label: 'מתוזמן (ישן)',      cls: 'green' };
+  return                                      { label: 'בקשת שיחה',         cls: 'warm'  };
+}
+
 function renderCallbackPanel(leads, apts) {
   const bodyEl  = document.getElementById('barak-callbacks-body');
   const badgeEl = document.getElementById('barak-callbacks-badge');
   if (!bodyEl) return;
 
-  // Gather callback leads: callback_requested status or confirmed appointments
   const cbLeads = leads.filter(l =>
     l.status === 'callback_requested' || l.status === 'call_scheduled'
   );
-  // Index appointments by leadPhone for quick lookup
+
+  // ── Index appointments by MASKED phone ───────────────────────────────────────
+  // /api/leads masks phones; /api/admin/appointments stores full phones.
+  // Build the lookup with both masked and full phone as keys so either works.
   const aptByPhone = {};
   for (const a of apts) {
-    if (!aptByPhone[a.leadPhone] || new Date(a.createdAt) > new Date(aptByPhone[a.leadPhone].createdAt)) {
-      aptByPhone[a.leadPhone] = a;
+    const full   = a.leadPhone;
+    const masked = maskPhone(full);
+    const existing = aptByPhone[full] ?? aptByPhone[masked];
+    if (!existing || new Date(a.createdAt) > new Date(existing.createdAt)) {
+      aptByPhone[full]   = a;
+      aptByPhone[masked] = a;
     }
   }
 
   if (!cbLeads.length) {
-    badgeEl.textContent = '';
+    if (badgeEl) badgeEl.textContent = '';
     bodyEl.innerHTML = `<div class="empty-state" style="padding:12px">אין שיחות ממתינות</div>`;
     return;
   }
 
-  badgeEl.textContent = cbLeads.length;
+  if (badgeEl) badgeEl.textContent = cbLeads.length;
 
   const rows = cbLeads.map(l => {
-    const qd       = l.meta?.qualData ?? {};
-    const apt      = aptByPhone[l.phone];
-    const rawTime  = qd.callTimeGiven ?? apt?.rawTime ?? '—';
-    const alertSt  = l.meta?.handoffAlertStatus;
+    const qd        = l.meta?.qualData ?? {};
+    const apt       = aptByPhone[l.phone];
+    const alertSt   = l.meta?.handoffAlertStatus;
+    const alertIdMsg = l.meta?.handoffAlertIdMessage ? ` · idMsg: ${l.meta.handoffAlertIdMessage}` : '';
+    const alertTime  = l.meta?.handoffAlertSentAt
+      ? ` · שנשלח: ${new Date(l.meta.handoffAlertSentAt).toLocaleTimeString('he-IL',{timeZone:'Asia/Jerusalem',hour:'2-digit',minute:'2-digit'})}`
+      : (l.meta?.handoffAlertFailedAt ? ' · נכשל' : '');
+    const alertTip  = alertSt === 'sent'
+      ? `ספק אישר קבלה${alertIdMsg}${alertTime}`
+      : alertSt === 'failed' ? `שליחה נכשלה${alertTime}` : 'לא נשלחה';
     const alertIcon =
-      alertSt === 'sent'    ? '<span style="color:var(--green)" title="התראה נשלחה">✅</span>' :
-      alertSt === 'failed'  ? '<span style="color:var(--hot)"   title="שליחת התראה נכשלה">❌</span>' :
-      alertSt === 'pending' ? '<span style="color:var(--warm)"  title="ממתין לשליחה">⏳</span>' :
-                              '<span style="color:var(--muted)" title="לא נשלחה התראה">—</span>';
-    const aptIcon =
-      apt?.status === 'confirmed'  ? '<span style="color:var(--green)"  title="תור מאושר">📅</span>' :
-      apt?.status === 'completed'  ? '<span style="color:var(--muted)"  title="הושלם">✔</span>'  :
-      apt?.status === 'no_show'    ? '<span style="color:var(--hot)"    title="לא הגיע">❌</span>' :
-      apt?.status === 'cancelled'  ? '<span style="color:var(--muted)"  title="בוטל">🚫</span>' :
-                                     '<span style="color:var(--muted)"  title="אין תור במערכת">—</span>';
-    const scoreNum  = l.score ?? '—';
-    const scoreTip  = 'ציון כשירות ליד (1-10): מודד אותות רכישה, לא איכות שיחה';
-    const scoreColor = l.score >= 8 ? 'var(--hot)' : l.score >= 5 ? 'var(--warm)' : 'var(--muted)';
-    const readySt  = l.meta?.qualProfile?.readiness;
-    const readyEmoji = readySt === 'HIGH' ? '🔥' : readySt === 'MEDIUM' ? '🌡️' : readySt === 'LOW' ? '❄️' : '';
-    const convoSum = l.meta?.qualProfile?.qualificationReason ?? '';
-    const dispPhone = l.phone.startsWith('972') ? '0' + l.phone.slice(3) : l.phone;
+      alertSt === 'sent'    ? `<span style="color:var(--green)" title="${alertTip}">✅</span>` :
+      alertSt === 'failed'  ? `<span style="color:var(--hot)"   title="${alertTip}">❌</span>` :
+      alertSt === 'pending' ? `<span style="color:var(--warm)"  title="${alertTip}">⏳</span>` :
+                              `<span style="color:var(--muted)" title="${alertTip}">—</span>`;
 
-    return `<div class="callback-row" style="display:grid;grid-template-columns:140px 110px 1fr 60px 32px 32px;gap:8px;align-items:center;padding:10px 16px;border-bottom:1px solid var(--border)">
-      <div>
-        <div class="lead-name" style="font-weight:600">${esc(l.name ?? '—')}</div>
-        <div style="font-size:11px;color:var(--muted);direction:ltr">${esc(dispPhone)}</div>
+    const reminderSent = apt?.reminderSent;
+    const reminderSentTo = apt?.reminderSentTo ?? [];
+    const reminderTip = reminderSent
+      ? `תזכורת נשלחה ל-${reminderSentTo.length} נמענ/ים`
+      : (apt ? 'תזכורת טרם נשלחה' : 'אין רשומת תור');
+    const reminderIcon = reminderSent
+      ? `<span style="color:var(--green)" title="${reminderTip}">🔔</span>`
+      : `<span style="color:var(--muted)" title="${reminderTip}">🔕</span>`;
+
+    const scoreNum   = l.score ?? '—';
+    const scoreTip   = `ציון כשירות ליד (1-10): מודד אותות רכישה, לא איכות שיחה\n${l.meta?.qualProfile?.readinessEvidence ?? ''}`;
+    const scoreColor = l.score >= 8 ? 'var(--hot)' : l.score >= 5 ? 'var(--warm)' : 'var(--muted)';
+
+    const st         = cbStatusLabel(l.status, apt?.status, qd);
+    const stColor    = st.cls === 'green' ? 'var(--green)' : st.cls === 'warm' ? 'var(--warm)' : st.cls === 'hot' ? 'var(--hot)' : 'var(--muted)';
+
+    const dispName   = l.name && l.name.trim() ? l.name : null;
+    const confirmedN = qd.confirmedName && qd.confirmedName.trim() ? qd.confirmedName : null;
+    const nameDisplay = confirmedN ?? dispName ?? `<span style="color:var(--hot);font-size:11px">שם חסר</span>`;
+    const nameLabel  = confirmedN ? `✓ ${esc(confirmedN)}` : (dispName ? esc(dispName) : nameDisplay);
+
+    const dispPhone  = l.phone.startsWith('972') ? '0' + l.phone.slice(3) : l.phone;
+    // WhatsApp link uses the masked phone format for display, full E.164 for WA link
+    const waPhone    = l.phone.replace(/[^0-9]/g, '');
+    const waLink     = `https://wa.me/${waPhone}`;
+
+    const timeLabel  = fmtCallbackTime(apt, qd);
+
+    // Assigned representative (from aptStore — full phone is unmasked there)
+    const assignee   = apt?.assignedStaffId ?? '—';
+
+    const convoSum   = l.meta?.qualProfile?.qualificationReason ?? l.meta?.leadBrief?.notes ?? '';
+    const readySt    = l.meta?.qualProfile?.readiness;
+    const readyEmoji = readySt === 'HIGH' ? '🔥' : readySt === 'MEDIUM' ? '🌡️' : readySt === 'LOW' ? '❄️' : '';
+    const interests  = [qd.fitnessInterest, qd.goal, qd.location].filter(Boolean).join(' · ');
+
+    // Action buttons — POST to appointments API if apt exists
+    const aptId   = apt?.id ?? '';
+    const actions = aptId ? `
+      <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px">
+        <button onclick="cbAction('${aptId}','complete')"   style="font-size:10px;padding:2px 6px;cursor:pointer;border-radius:3px;border:1px solid var(--border)">✔ הושלם</button>
+        <button onclick="cbAction('${aptId}','no_answer')"  style="font-size:10px;padding:2px 6px;cursor:pointer;border-radius:3px;border:1px solid var(--border)">📵 לא ענה</button>
+        <button onclick="cbAction('${aptId}','cancel')"     style="font-size:10px;padding:2px 6px;cursor:pointer;border-radius:3px;border:1px solid var(--border)">🚫 בטל</button>
+      </div>` : '';
+
+    return `<div class="callback-row" style="padding:10px 16px;border-bottom:1px solid var(--border)">
+      <div style="display:grid;grid-template-columns:160px 130px 1fr 56px 28px 28px 28px;gap:8px;align-items:start">
+        <div>
+          <div style="font-weight:600;font-size:13px">${nameLabel}</div>
+          <div style="font-size:11px;color:var(--muted);direction:ltr">${esc(dispPhone)}</div>
+          <a href="${waLink}" target="_blank" style="font-size:10px;color:var(--accent);text-decoration:none">💬 WhatsApp</a>
+        </div>
+        <div>
+          <div style="font-size:12px;color:var(--text);font-weight:500">${esc(timeLabel)}</div>
+          <div style="font-size:10px;color:var(--muted);margin-top:2px">נציג: ${esc(assignee)}</div>
+          <div style="font-size:11px;font-weight:600;color:${stColor};margin-top:2px">${esc(st.label)}</div>
+        </div>
+        <div>
+          <div style="font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(convoSum)}">${readyEmoji} ${esc(convoSum || interests || '—')}</div>
+          ${actions}
+        </div>
+        <div><span style="font-weight:700;color:${scoreColor}" title="${scoreTip}">${scoreNum}/10</span></div>
+        <div title="${alertTip}">${alertIcon}</div>
+        <div title="${reminderTip}">${reminderIcon}</div>
+        <div title="היסטוריית שיחה"><button onclick="openThread('${waPhone}')" style="font-size:10px;padding:2px 4px;cursor:pointer;border-radius:3px;border:1px solid var(--border)">💬</button></div>
       </div>
-      <div style="font-size:12px;color:var(--text)">${esc(rawTime)}</div>
-      <div style="font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(convoSum)}">${readyEmoji} ${esc(convoSum || '—')}</div>
-      <div><span style="font-weight:700;color:${scoreColor}" title="${scoreTip}">${scoreNum}/10</span></div>
-      <div title="תור">${aptIcon}</div>
-      <div title="התראה">${alertIcon}</div>
     </div>`;
   }).join('');
 
   bodyEl.innerHTML = `
-    <div style="display:grid;grid-template-columns:140px 110px 1fr 60px 32px 32px;gap:8px;padding:6px 16px;font-size:11px;font-weight:600;color:var(--muted);border-bottom:1px solid var(--border)">
-      <div>שם / טלפון</div><div>זמן מבוקש</div><div>סיכום שיחה</div><div>ציון</div><div>תור</div><div>התראה</div>
+    <div style="display:grid;grid-template-columns:160px 130px 1fr 56px 28px 28px 28px;gap:8px;padding:6px 16px;font-size:11px;font-weight:600;color:var(--muted);border-bottom:1px solid var(--border)">
+      <div>שם / טלפון</div><div>זמן / נציג / סטטוס</div><div>סיכום שיחה</div><div>ציון ליד</div><div>🔔</div><div>✅</div><div>💬</div>
     </div>
     ${rows}`;
+}
+
+// ── Callback action handlers ──────────────────────────────────────────────────
+
+async function cbAction(aptId, action) {
+  if (!aptId) return;
+  let url, body;
+  if (action === 'complete') {
+    url = `/api/admin/appointments/${aptId}/complete`;
+    body = {};
+  } else if (action === 'cancel') {
+    url = `/api/admin/appointments/${aptId}/cancel`;
+    body = {};
+  } else if (action === 'no_answer') {
+    // Reschedule as no_show without auto-messaging; staff manually follows up
+    url = `/api/admin/appointments/${aptId}`;
+    body = { status: 'no_show' };
+  } else {
+    return;
+  }
+  try {
+    const method = (action === 'no_answer') ? 'PATCH' : 'POST';
+    const res = await fetch(url, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    await loadBarakPanel(); // refresh
+  } catch (e) {
+    alert('שגיאה: ' + e.message);
+  }
+}
+
+function openThread(phone) {
+  // Open the conversations tab filtered to this phone
+  const tab = document.querySelector('[data-tab="conversations"]') ?? document.querySelector('[data-panel="conversations"]');
+  if (tab) tab.click();
+  // Brief delay to let the tab render, then filter
+  setTimeout(() => {
+    const filter = document.getElementById('conv-filter') ?? document.querySelector('input[placeholder*="חיפוש"]');
+    if (filter) { filter.value = phone.slice(-4); filter.dispatchEvent(new Event('input')); }
+  }, 200);
 }
 
 function renderBarakStats(d) {

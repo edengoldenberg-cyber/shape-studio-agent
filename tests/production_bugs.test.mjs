@@ -268,12 +268,17 @@ try {
   const leadAfterTime = await getLead();
   const qd = leadAfterTime?.meta?.qualData ?? {};
 
-  test('status = call_scheduled after awaitingCallbackTime flow', leadAfterTime?.status, 'call_scheduled');
+  // Unified semantics: awaitingCallbackTime now uses callback_requested (not call_scheduled)
+  // so both paths share the same status, panel rendering, and name-capture gate.
+  test('status = callback_requested after awaitingCallbackTime flow (unified)', leadAfterTime?.status, 'callback_requested');
+
+  // callTimeGiven must be in qualData so the panel rawTime lookup works
+  truthy('callTimeGiven in qualData', typeof qd.callTimeGiven === 'string' && qd.callTimeGiven.length > 0);
 
   // Core fix: nameAsked must be true so the NEXT reply is captured as the name
   test('nameAsked=true set by awaitingCallbackTime path', qd.nameAsked, true);
 
-  // The confirmation reply must ask for a name, not end with a generic question
+  // The confirmation reply must ask for a name, not claim "booked", not add a generic question
   const confirmReply = simResult?.barakReply ?? '';
   truthy('confirmation reply asks for name',
     /איך קוראים|מה שמ|קוראים לך|שמך/i.test(confirmReply));
@@ -281,11 +286,13 @@ try {
     !/יש עוד משהו שאוכל לעזור/i.test(confirmReply));
   truthy('confirmation reply preserves the callback time',
     /מחר.*12|12.*מחר/i.test(confirmReply));
+  truthy('confirmation reply uses "request" wording (not "booked")',
+    /רשמנו.*בקשת|בקשת.*שיחה/i.test(confirmReply) || !/השיחה נקבעה/i.test(confirmReply));
 
-  // aptStore entry created
+  // aptStore entry must be callback_pending (requested, not yet confirmed by staff)
   const apts = await getApts();
-  const confirmed = apts.filter(a => a.leadPhone === LEAD && a.status === 'confirmed');
-  test('exactly 1 confirmed aptStore entry', confirmed.length, 1);
+  const pendingEntry = apts.filter(a => a.leadPhone === LEAD && a.status === 'callback_pending');
+  test('exactly 1 callback_pending aptStore entry (not confirmed)', pendingEntry.length, 1);
 
   // ── Send the name ─────────────────────────────────────────────────────────
   await clearCD();
@@ -296,9 +303,9 @@ try {
   const qdN = leadAfterName?.meta?.qualData ?? {};
   test('confirmedName captured from post-call gate', qdN.confirmedName, 'שרה');
 
-  // aptStore entry must have the confirmed name now
+  // aptStore callback_pending entry must have the confirmed name now
   const aptsAfterName = await getApts();
-  const updatedApt = aptsAfterName.find(a => a.leadPhone === LEAD && a.status === 'confirmed');
+  const updatedApt = aptsAfterName.find(a => a.leadPhone === LEAD && a.status === 'callback_pending');
   test('aptStore leadName updated to confirmed name', updatedApt?.leadName, 'שרה');
 
 } catch (err) {
