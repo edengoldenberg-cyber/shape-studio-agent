@@ -5939,6 +5939,114 @@ app.post('/api/admin/reset-lead-state/:phone', (req, res) => {
   res.json({ ok: true, status: 'new', phone });
 });
 
+// POST /api/admin/send-closing-summary/:phone — manually trigger the closing summary
+// for a lead whose name and callTimeGiven are already known. Used for recovery when
+// the automatic flow did not fire (e.g. wrong recipient was configured).
+// Guards: does not resend if closingSummarySent is already true; checks per-recipient
+// to skip phones already covered. Set force=true in body to override the sent flag.
+app.post('/api/admin/send-closing-summary/:phone', jsonBody, async (req, res) => {
+  const phone = decodeURIComponent(req.params.phone);
+  const force = req.body?.force === true;
+  const lead  = store.getLead(phone);
+  if (!lead) return res.status(404).json({ ok: false, error: 'Lead not found' });
+
+  const meta   = lead.meta ?? {};
+  const qd     = meta.qualData ?? {};
+  const name   = qd.confirmedName ?? lead.name ?? null;
+  const callTime = qd.callTimeGiven ?? meta.callbackTime ?? null;
+
+  if (!name)     return res.status(422).json({ ok: false, error: 'confirmedName not set' });
+  if (!callTime) return res.status(422).json({ ok: false, error: 'callTimeGiven not set' });
+  if (qd.closingSummarySent && !force) {
+    return res.status(409).json({ ok: false, error: 'closingSummarySent already true — pass force:true to override',
+      existing: { managerIdMessage: meta.closingSummaryManagerIdMessage, sentTo: meta.closingSummaryManagerSentTo } });
+  }
+
+  const interest = qd.fitnessInterest ?? null;
+  const location = qd.location ?? null;
+  const goal     = qd.goal ?? null;
+  const readiness = meta.qualProfile?.readiness ?? null;
+  const readyEmoji = readiness === 'HIGH' ? '🔥' : readiness === 'MEDIUM' ? '🌡️' : '❄️';
+  const missingParts = [...(!goal ? ['מטרה ספציפית'] : [])];
+
+  const prospectMsg = [
+    `${name}, קיבלנו את בקשת השיחה שלך ✅`,
+    `📞 ${callTime}`,
+    `נציג מהצוות של Shape Studio יצור איתך קשר.`,
+  ].join('\n');
+
+  const managerLines = [
+    `━━━━━━━━━━━━━━━━━━━━━`,
+    `📋 ליד — Shape Studio`,
+    `━━━━━━━━━━━━━━━━━━━━━`,
+    `👤 שם: ${name}`,
+    `📱 ${phone}`,
+    `💬 https://wa.me/${phone}`,
+    `📞 שיחה מבוקשת: ${callTime}`,
+    `⚠️ בקשה — לא אושרה עדיין על ידי הצוות`,
+    `━━━━━━━━━━━━━━━━━━━━━`,
+    interest  ? `💪 ענין: ${interest}` : null,
+    location  ? `📍 מיקום: ${location}` : null,
+    goal      ? `🎯 מטרה: ${goal}` : null,
+    readiness ? `📊 מוכנות: ${readyEmoji} ${readiness}` : null,
+    missingParts.length ? `━━━━━━━━━━━━━━━━━━━━━\n⚠️ חסר: ${missingParts.join(', ')}` : null,
+  ].filter(Boolean).join('\n');
+
+  // Skip phones that already received the closing summary.
+  const alreadySentTo = new Set(meta.closingSummaryManagerSentTo ?? []);
+
+  // Send prospect summary
+  let prospectIdMessage = null, prospectError = null;
+  try {
+    const pr = await sendText(phone, prospectMsg);
+    prospectIdMessage = pr?.idMessage ?? null;
+  } catch (err) {
+    prospectError = err.message;
+    logger.warn('[admin] send-closing-summary: prospect send failed', { phone, error: err.message });
+  }
+
+  // Send manager handoff
+  let managerResults = [], managerIdMessage = null;
+  try {
+    const ar = await alertOwner(`📋 ליד מוכן — ${name}`, managerLines);
+    managerResults = ar?.results ?? [];
+    managerIdMessage = managerResults.find(r => r.idMessage)?.idMessage ?? null;
+  } catch (err) {
+    logger.warn('[admin] send-closing-summary: manager send failed', { phone, error: err.message });
+  }
+
+  const newSentTo = managerResults.filter(r => r.idMessage && !alreadySentTo.has(r.phone)).map(r => r.phone);
+  const updatedSentTo = [...alreadySentTo, ...newSentTo];
+
+  const curMeta = store.getLead(phone)?.meta ?? {};
+  store.upsertLead(phone, {
+    meta: {
+      ...curMeta,
+      qualData: { ...(curMeta.qualData ?? {}), closingSummarySent: true },
+      closingSummarySentAt:            new Date().toISOString(),
+      closingSummaryProspectReply:     prospectMsg,
+      closingSummaryProspectIdMessage: prospectIdMessage,
+      closingSummaryManagerIdMessage:  managerIdMessage,
+      closingSummaryManagerSentTo:     updatedSentTo,
+    },
+  });
+  persist.saveLeads(store);
+  store.logEvent('closing_summary_sent_manual', phone, { name, callTime, managerIdMessage, sentTo: updatedSentTo });
+
+  res.json({
+    ok: true,
+    prospectMsg,
+    prospectRecipient: phone,
+    prospectIdMessage,
+    prospectError,
+    managerMsg:        managerLines,
+    managerResults,
+    managerIdMessage,
+    sentTo:            updatedSentTo,
+    skipped:           [...alreadySentTo],
+  });
+});
+
 // ══════════════════════════════════════════════════════════════════════════════
 // APPOINTMENTS API
 // ══════════════════════════════════════════════════════════════════════════════
