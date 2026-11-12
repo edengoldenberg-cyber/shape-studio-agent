@@ -3633,56 +3633,126 @@ async function processInboundWAMessage(msg) {
         const { extractNameFromMessage } = require('./agents/lead_agent');
         const capturedName = extractNameFromMessage(msgText);
         if (capturedName) {
-          const _nm = _postCallRec?.meta ?? {};
+          const _nm    = _postCallRec?.meta ?? {};
           const _prevQd = _nm.qualData ?? {};
+
+          // Build closing messages before the upsert so we can include the
+          // prospect reply in the inbox entry.
+          const _callTime  = _prevQd.callTimeGiven ?? null;
+          const _interest  = _prevQd.fitnessInterest ?? null;
+          const _location  = _prevQd.location ?? null;
+          const _goal      = _prevQd.goal ?? null;
+          const _readiness = _nm.qualProfile?.readiness ?? null;
+          const _readyEmoji = _readiness === 'HIGH' ? '🔥' : _readiness === 'MEDIUM' ? '🌡️' : _readiness === 'LOW' ? '❄️' : '';
+          const _aptRecord = aptStore.getByPhone(fromNorm)
+            .filter(a => a.status === 'callback_pending' || a.status === 'confirmed')
+            .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0] ?? null;
+
+          // Prospect closing summary: confirmed name, exact time, request (not confirmed) status.
+          // No trailing question — the conversation is complete at this point.
+          const _prospectMsg = _callTime ? [
+            `${capturedName}, קיבלנו את בקשת השיחה שלך ✅`,
+            `📞 ${_callTime}`,
+            `נציג מהצוות של Shape Studio יצור איתך קשר.`,
+          ].join('\n') : null;
+
+          // Complete manager handoff: everything collected, missing info explicit.
+          const _missingParts = [];
+          if (!_goal) _missingParts.push('מטרה ספציפית');
+          const _managerHandoff = _callTime ? [
+            `━━━━━━━━━━━━━━━━━━━━━`,
+            `📋 ליד — Shape Studio`,
+            `━━━━━━━━━━━━━━━━━━━━━`,
+            `👤 שם: ${capturedName}`,
+            `📱 ${fromNorm}`,
+            `💬 https://wa.me/${fromNorm}`,
+            `📞 שיחה מבוקשת: ${_callTime}`,
+            `⚠️ בקשה — לא אושרה עדיין על ידי הצוות`,
+            `━━━━━━━━━━━━━━━━━━━━━`,
+            _interest ? `💪 ענין: ${_interest}` : null,
+            _location ? `📍 מיקום: ${_location}` : null,
+            _goal     ? `🎯 מטרה: ${_goal}` : null,
+            _readiness ? `📊 מוכנות: ${_readyEmoji} ${_readiness}` : null,
+            _missingParts.length ? `━━━━━━━━━━━━━━━━━━━━━\n⚠️ חסר: ${_missingParts.join(', ')}` : null,
+          ].filter(Boolean).join('\n') : null;
+
+          // Mark closingSummarySent immediately (synchronous) to block concurrent retries.
+          // Per-recipient IDs are filled in asynchronously when provider responds.
           store.upsertLead(fromNorm, {
             name: capturedName,
             meta: {
               ..._nm,
-              qualData: { ..._prevQd, confirmedName: capturedName, nameConfirmed: true,
-                          nameConfirmedAlertSent: true },
+              qualData: {
+                ..._prevQd,
+                confirmedName:        capturedName,
+                nameConfirmed:        true,
+                nameConfirmedAlertSent: true,  // legacy flag preserved
+                closingSummarySent:   !!_callTime,
+              },
+              closingSummaryProspectReply: _prospectMsg ?? null,
+              closingSummarySentAt:        _callTime ? new Date().toISOString() : null,
+              closingSummaryManagerSentTo: [],
             },
           });
 
-          // Notification ordering: the initial handoff brief fires when callTimeGiven
-          // is first captured (before the name is known). Once the name arrives here,
-          // send ONE update to the team so the brief is complete. Deduped by
-          // nameConfirmedAlertSent in qualData — will not fire twice.
-          if (!_prevQd.nameConfirmedAlertSent && _prevQd.callTimeGiven) {
-            const _nameUpdateMsg = [
-              `✅ שם אושר: *${capturedName}*`,
-              `📱 ${fromNorm}`,
-              `📞 שיחה: ${_prevQd.callTimeGiven}`,
-            ].join('\n');
-            alertOwner(`📋 שם ליד אושר — ${capturedName}`, _nameUpdateMsg)
-              .then(ar => {
-                const idMsg = ar?.results?.find(r => r.idMessage)?.idMessage ?? null;
-                const _cur = store.getLead(fromNorm)?.meta ?? {};
-                store.upsertLead(fromNorm, {
-                  meta: { ..._cur, nameConfirmedAlertIdMessage: idMsg,
-                          nameConfirmedAlertSentAt: new Date().toISOString() },
-                });
-                logger.info('[pipeline] Name-confirmed alert sent', { from: fromNorm, name: capturedName, idMsg });
-              })
-              .catch(err => logger.warn('[pipeline] Name-confirmed alert failed', { from: fromNorm, error: err.message }));
-          }
-
-          // Propagate the confirmed name to any open aptStore entries so the
-          // appointments panel and reminder messages show the correct name.
+          // Propagate confirmed name to any open aptStore entries.
           aptStore.getByPhone(fromNorm)
             .filter(a => a.status === 'callback_pending' || a.status === 'confirmed')
             .forEach(a => { if (a.leadName !== capturedName) aptStore.update(a.id, { leadName: capturedName }); });
 
+          // Send prospect closing summary (WhatsApp to the prospect).
+          if (_prospectMsg && process.env.WHATSAPP_AUTO_REPLY === 'true') {
+            _markBotSent(fromNorm);
+            sendText(fromNorm, _prospectMsg)
+              .then(res => {
+                const _cur = store.getLead(fromNorm)?.meta ?? {};
+                store.upsertLead(fromNorm, {
+                  meta: { ..._cur, closingSummaryProspectIdMessage: res?.idMessage ?? null },
+                });
+              })
+              .catch(err => logger.warn('[pipeline] Prospect closing summary send failed',
+                { from: fromNorm, error: err.message }));
+          }
+
+          // Send complete manager handoff. Deduped by closingSummarySent (already set).
+          // Per-recipient: skip phones that already received it (supports partial retry).
+          if (_managerHandoff) {
+            const _alreadySent = new Set(_nm.closingSummaryManagerSentTo ?? []);
+            alertOwner(`📋 ליד מוכן — ${capturedName}`, _managerHandoff)
+              .then(ar => {
+                const _newSent = (ar?.results ?? [])
+                  .filter(r => r.idMessage && !_alreadySent.has(r.phone))
+                  .map(r => r.phone);
+                const _firstId = ar?.results?.find(r => r.idMessage)?.idMessage ?? null;
+                const _cur = store.getLead(fromNorm)?.meta ?? {};
+                store.upsertLead(fromNorm, {
+                  meta: {
+                    ..._cur,
+                    closingSummaryManagerSentTo:    [..._alreadySent, ..._newSent],
+                    closingSummaryManagerIdMessage: _firstId,
+                  },
+                });
+                persist.saveLeads(store);
+                logger.info('[pipeline] Manager closing handoff sent',
+                  { from: fromNorm, name: capturedName, idMsg: _firstId,
+                    sentTo: [..._alreadySent, ..._newSent] });
+              })
+              .catch(err => logger.warn('[pipeline] Manager closing handoff failed',
+                { from: fromNorm, error: err.message }));
+          }
+
           persist.saveLeads(store);
           store.logEvent('name_captured_post_call', fromNorm, { name: capturedName, status: _postCallStatus });
-          logger.info('[pipeline] Post-call name captured — silent', { from: fromNorm, name: capturedName });
+          logger.info('[pipeline] Post-call name captured — closing summaries queued',
+            { from: fromNorm, name: capturedName, hasCallTime: !!_callTime });
           const nmEntry = inbox.push({
             from: fromNorm, fromIsraeli, name: msg.name ?? null,
             text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
             receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
-            clientMatch, intent, route: 'post_call_name_captured', barakReply: null,
+            clientMatch, intent, route: 'post_call_name_captured', barakReply: _prospectMsg ?? null,
           });
-          return { inboxEntry: nmEntry, clientMatch, intent, route: 'post_call_name_captured', barakReply: null };
+          return { inboxEntry: nmEntry, clientMatch, intent, route: 'post_call_name_captured',
+                   barakReply: _prospectMsg ?? null };
         }
         // Fall through to staff-alert path for non-name messages
         alertOwner(

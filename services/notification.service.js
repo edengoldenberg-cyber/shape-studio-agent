@@ -205,8 +205,15 @@ async function sendStaffReminder(apt, assignedStaff, { skipPhones = new Set() } 
   const timeLabel = formatTime(apt.scheduledAt, apt.rawTime);
   const lead      = apt.leadName ?? apt.leadPhone;
 
+  // Calculate actual minutes remaining so the text matches the real timing.
+  // The reminder window can be 20–30 min, so "בעוד 15 דקות" is not always accurate.
+  const minRemaining = apt.scheduledAt
+    ? Math.max(1, Math.round((new Date(apt.scheduledAt).getTime() - Date.now()) / 60000))
+    : null;
+  const countdownLabel = minRemaining != null ? `בעוד ${minRemaining} דקות` : 'בקרוב';
+
   const msg = [
-    `⏰ *תזכורת: שיחה בעוד 15 דקות!*`,
+    `⏰ *תזכורת: שיחה ${countdownLabel}!*`,
     ``,
     `👤 ${lead}`,
     `📱 ${apt.leadPhone}`,

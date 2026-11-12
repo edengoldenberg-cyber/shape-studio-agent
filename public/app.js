@@ -1914,7 +1914,7 @@ function renderCallbackPanel(callbacks) {
       ? ` · שנשלח: ${new Date(l.meta.handoffAlertSentAt).toLocaleTimeString('he-IL',{timeZone:'Asia/Jerusalem',hour:'2-digit',minute:'2-digit'})}`
       : (l.meta?.handoffAlertFailedAt ? ' · נכשל' : '');
     const alertTip  = alertSt === 'sent'
-      ? `ספק אישר קבלה${alertIdMsg}${alertTime}`
+      ? `ספק קיבל הודעה (לא אישור מסירה)${alertIdMsg}${alertTime}`
       : alertSt === 'failed' ? `שליחה נכשלה${alertTime}` : 'לא נשלחה';
     const alertIcon =
       alertSt === 'sent'    ? `<span style="color:var(--green)" title="${alertTip}">✅</span>` :

@@ -346,10 +346,10 @@ try {
     catch { return b.includes('שרה'); }
   });
   s2truthy('Name-confirmed alert captured by mock with name', nameInAlert);
-  // nameConfirmedAlertSentAt is set by the fire-and-forget inside the gate; re-read lead
+  // closingSummarySentAt is set by the new complete closing flow; re-read lead
   const leadAfterNameFresh = await getLead2();
-  s2truthy('nameConfirmedAlertSentAt set in lead meta after alert completes',
-    typeof leadAfterNameFresh?.meta?.nameConfirmedAlertSentAt === 'string');
+  s2truthy('closingSummarySentAt set in lead meta after closing summary fires',
+    typeof leadAfterNameFresh?.meta?.closingSummarySentAt === 'string');
 
   // ── 2e. Dup acceptance: silent + zero staff alerts ───────────────────────
   // Sending the acceptance message again must:
