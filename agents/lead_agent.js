@@ -1396,11 +1396,14 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
     const locationResolved = !freshQualData.locationCheckNeeded && freshQualData.locationViable !== false;
 
     // nameAsked: set any time the AI's actual reply asks for the lead's name.
-    // No turn-count guard — the AI won't ask for the name on Turn 1 in practice
-    // (the Turn 1 minimal prompt doesn't include it), and removing the guard lets
-    // fast-track paths that ask on Turn 2 (completedTurns=1) be recorded correctly.
-    if (!freshQualData.nameAsked && !freshQualData.callProposed && locationResolved
-        && NAME_ASK_RE.test(reply)) {
+    // Covers two code paths:
+    //   • Early qualification (callProposed not yet set): locationResolved guard prevents
+    //     a premature name-ask before location is confirmed.
+    //   • CALL_TIME_CONFIRMED stage (callTimeGiven set, callProposed=true): the !callProposed
+    //     guard was blocking this path. Remove it — the AI is explicitly instructed to ask
+    //     for the name in the CALL_TIME_CONFIRMED stage context.
+    if (!freshQualData.nameAsked && NAME_ASK_RE.test(reply)
+        && (locationResolved || freshQualData.callTimeGiven)) {
       setQualData(from, { nameAsked: true });
     }
 
@@ -1427,8 +1430,11 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
     // Deterministic fallback: when call time is confirmed but name not yet given,
     // always ask for the name so the team brief can be completed. This guarantees
     // the name-ask step works even without an OpenAI key (e.g. in test environments).
+    // nameAsked must be set HERE too — the try-block setter runs AFTER the OpenAI
+    // call, so it is never reached when OpenAI throws (sk-test, network error, etc.).
     if (freshQualData.callTimeGiven && !freshQualData.confirmedName) {
       reply = `מצוין — ${freshQualData.callTimeGiven} 😊 ואיך קוראים לך?`;
+      setQualData(from, { nameAsked: true });
     } else {
       reply = `שלום! נתקלנו בתקלה טכנית קטנה. הצוות שלנו יחזור אליך בהקדם 🙏`;
     }

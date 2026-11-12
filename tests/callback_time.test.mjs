@@ -217,15 +217,21 @@ function startAppServer() {
     serverProc.on('error', reject);
 
     let resolved = false;
+    // Wait for startupComplete=true (persist.loadLeads + initWorkers done).
+    // Without this, store/reset could run before persist.loadLeads, then
+    // _storeReadyPromise holds the first webhook until loadLeads fires — which
+    // reloads old state into the already-reset store.
     const poll = setInterval(async () => {
       try {
-        await get('/health');
-        if (!resolved) { resolved = true; clearInterval(poll); resolve(); }
+        const h = await get('/health');
+        if (!resolved && h?.startupComplete === true) {
+          resolved = true; clearInterval(poll); resolve();
+        }
       } catch {}
     }, 300);
     setTimeout(() => {
       if (!resolved) { resolved = true; clearInterval(poll); resolve(); }
-    }, 15_000);
+    }, 20_000);
   });
 }
 

@@ -3559,15 +3559,38 @@ async function processInboundWAMessage(msg) {
         persist.saveInbox(inbox);
         return { inboxEntry: pcEntry, clientMatch, intent, route: 'post_call_staff_hold', barakReply: null };
       } else {
-        // Catch-all for all remaining post-call messages:
-        // dup acceptances, unsolicited new questions, etc. after name has been confirmed.
-        // Opt-out and reschedule are excluded above. Everything else → alert staff, bot silent.
+        // Catch-all for remaining post-call messages.
+        // Two sub-cases:
+        //   (a) Dup acceptance — callTimeGiven is already set AND the message contains
+        //       a callback time/acceptance pattern (TIME_PATTERN). This is a re-send of
+        //       the original acceptance. No staff alert — they were already notified when
+        //       the first acceptance arrived. Route silently.
+        //   (b) Genuine new question after callback (e.g. "מה הסטטוס?") — alert staff
+        //       so they can handle it. The bot stays silent in both cases.
+        const { TIME_PATTERN, TIME_REJECTION_RE } = require('./agents/lead_agent');
+        const _qd         = _postCallRec?.meta?.qualData ?? {};
+        const isDupAccept = _qd.callTimeGiven
+          && TIME_PATTERN.test(msgText) && !TIME_REJECTION_RE.test(msgText);
+
+        if (isDupAccept) {
+          store.logEvent('post_call_dup_acceptance', fromNorm, { status: _postCallStatus, preview: msgText.slice(0, 80) });
+          logger.info('[pipeline] Post-call dup acceptance — silent (staff already notified)', { from: fromNorm, status: _postCallStatus });
+          const dupEntry = inbox.push({
+            from: fromNorm, fromIsraeli, name: msg.name ?? null,
+            text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
+            receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
+            clientMatch, intent, route: 'post_call_silent', barakReply: null,
+          });
+          return { inboxEntry: dupEntry, clientMatch, intent, route: 'post_call_silent', barakReply: null };
+        }
+
+        // Genuine new question → alert staff, bot silent.
         alertOwner(
           `📬 הודעה אחרי ${_postCallStatus === 'call_scheduled' ? 'תיאום' : 'בקשת חזרה'} — ${msg.name ?? fromNorm}`,
           `*${msg.name ?? fromNorm}* (${fromNorm})\n*סטטוס:* ${_postCallStatus}\n*הודעה:* "${msgText.slice(0, 200)}"\n\nהאדם כתב אחרי שהתיאום הושלם. אנא בדוק ידנית.`
         ).catch(() => {});
         store.logEvent('post_call_staff_notified', fromNorm, { status: _postCallStatus, preview: msgText.slice(0, 80) });
-        logger.info('[pipeline] Post-call catch-all — staff alerted, bot silent', { from: fromNorm, status: _postCallStatus });
+        logger.info('[pipeline] Post-call genuine new message — staff alerted, bot silent', { from: fromNorm, status: _postCallStatus });
         const pcCatchEntry = inbox.push({
           from: fromNorm, fromIsraeli, name: msg.name ?? null,
           text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,

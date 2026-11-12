@@ -305,10 +305,17 @@ try {
   s2truthy('handoffAlertStatus is sent or failed',
     leadAfterAcc?.meta?.handoffAlertStatus === 'sent' || leadAfterAcc?.meta?.handoffAlertStatus === 'failed');
 
-  // ── 2d. Lead sends their name ─────────────────────────────────────────────
+  // ── 2d. nameAsked set automatically by agent (production path) ──────────────
+  // The agent should have set nameAsked=true when it replied with the name-ask phrase.
+  // Previously the test manually set nameAsked via setQ — that masked a bug where the
+  // !callProposed guard in lead_agent blocked the setter in the CALL_TIME_CONFIRMED stage.
+  // Now we verify the production path sets it without manual intervention.
+  s2truthy('nameAsked=true set by agent without manual setQ', qd.nameAsked === true);
+
+  // ── 2d2. Lead sends their name ───────────────────────────────────────────────
   capturedMockBodies = [];
   await clearCD();
-  await setQ(TEST2_LEAD, { nameAsked: true });
+  // No setQ(nameAsked: true) here — nameAsked must already be true from the acceptance reply.
   const simName = await sim('שרה');
   await sleep(600);  // name-confirmed alert is fire-and-forget; allow time to settle
 
@@ -344,24 +351,43 @@ try {
   s2truthy('nameConfirmedAlertSentAt set in lead meta after alert completes',
     typeof leadAfterNameFresh?.meta?.nameConfirmedAlertSentAt === 'string');
 
-  // ── 2e. No duplicate of the initial brief ────────────────────────────────
-  // Sending the acceptance message again must not fire a second handoff alert.
-  // The dup hits post_call_staff_notified (early return, no store change, no brief).
-  // Idempotency proof: handoffAlertSentAt value must be unchanged between
-  // the read taken BEFORE the dup and the read taken AFTER.
-  console.log(`  [dbg] leadAfterNameFresh.status=${leadAfterNameFresh?.status}  handoffAlertSentAt=${leadAfterNameFresh?.meta?.handoffAlertSentAt ?? 'none'}`);
+  // ── 2e. Dup acceptance: silent + zero staff alerts ───────────────────────
+  // Sending the acceptance message again must:
+  //   (1) Not fire a second handoff alert (capturedMockBodies stays empty)
+  //   (2) Not reset the lead status to 'new' (must stay callback_requested)
+  //   (3) Not change handoffAlertSentAt (idempotency proof)
+  // The dup is routed as post_call_silent (isDupAccept=true in catch-all).
   const alertSentAtBefore = leadAfterNameFresh?.meta?.handoffAlertSentAt;
   await clearCD();
   capturedMockBodies = [];
   const dupSimRes = await sim('כן אשמח למחר בשעה 12');
   await sleep(400);
   const leadAfterDup = await getLead2();
-  // Debug: show what the dup sim returned and what the lead looks like now
-  console.log(`  [dbg] dup route=${dupSimRes?.route}  leadAfterDup.status=${leadAfterDup?.status}  handoffAlertSentAt=${leadAfterDup?.meta?.handoffAlertSentAt ?? 'undefined'}`);
-  s2test('Duplicate acceptance: handoffAlertSentAt unchanged (idempotent)',
+  s2test('Dup acceptance: 0 staff alerts sent to mock',
+    capturedMockBodies.length, 0);
+  s2test('Dup acceptance: route is post_call_silent',
+    dupSimRes?.route, 'post_call_silent');
+  s2test('Dup acceptance: lead status unchanged (callback_requested)',
+    leadAfterDup?.status, 'callback_requested');
+  s2test('Dup acceptance: handoffAlertSentAt unchanged (idempotent)',
     leadAfterDup?.meta?.handoffAlertSentAt, alertSentAtBefore);
 
-  // ── 2f. callback panel shows the lead ─────────────────────────────────────
+  // ── 2f. Genuine new question → staff alert sent ───────────────────────────
+  // A new message that is NOT a callback acceptance pattern (no TIME_PATTERN match)
+  // must alert staff so they can handle it. The bot stays silent.
+  capturedMockBodies = [];
+  await clearCD();
+  const genuineSimRes = await sim('מה הסטטוס? האם אפשר לדעת מתי מתקשרים?');
+  await sleep(400);
+  const leadAfterGenuine = await getLead2();
+  s2truthy('Genuine new message: ≥1 staff alerts sent to mock',
+    capturedMockBodies.length >= 1);
+  s2test('Genuine new message: route is post_call_staff_hold',
+    genuineSimRes?.route, 'post_call_staff_hold');
+  s2test('Genuine new message: lead status unchanged (callback_requested)',
+    leadAfterGenuine?.status, 'callback_requested');
+
+  // ── 2g. callback panel shows the lead ─────────────────────────────────────
   const panelData = await httpGet(APP2_PORT, '/api/leads');
   // Panel masks phones: '972509970099' → '97250••••099'. Match by masked phone.
   const panelLead = Array.isArray(panelData)
