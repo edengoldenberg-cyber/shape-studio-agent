@@ -3242,8 +3242,8 @@ async function processInboundWAMessage(msg) {
           );
         } else {
           // Notify all active staff: "callback requested"
-          // notifyStaffCallbackConfirmed now returns {results, sent, firstIdMessage}
-          // so we can record the handoff outcome to the lead meta.
+          // notifyStaffCallbackConfirmed returns {results, sent, firstIdMessage}
+          // so we can record per-recipient outcomes in the aptStore and lead meta.
           const notifResult = await notifySvc.notifyStaffCallbackConfirmed(
             { ...apt, scheduledAt },
             assignedStaff,
@@ -3251,6 +3251,16 @@ async function processInboundWAMessage(msg) {
           );
           const _notified    = (notifResult?.sent ?? 0) > 0;
           const _idMsg       = notifResult?.firstIdMessage ?? null;
+          // Persist per-recipient success in aptStore (like reminderSentTo) so the
+          // retry-notify endpoint can skip already-covered phones.
+          const _succeededPhones = (notifResult?.results ?? [])
+            .filter(r => r.ok && !r.skipped).map(r => r.phone);
+          if (_succeededPhones.length) {
+            const _existingHST = aptStore.get(apt.id)?.handoffSentTo ?? [];
+            aptStore.update(apt.id, {
+              handoffSentTo: [...new Set([..._existingHST, ..._succeededPhones])],
+            });
+          }
           const _curMeta     = store.getLead(fromNorm)?.meta ?? {};
           store.upsertLead(fromNorm, {
             meta: {
@@ -3639,7 +3649,39 @@ async function processInboundWAMessage(msg) {
         return { inboxEntry: pcEntry, clientMatch, intent, route: 'post_call_staff_hold', barakReply: null };
       } else {
         // Catch-all for remaining post-call messages.
-        // Two sub-cases:
+        //
+        // Representative request: lead asks for a human representative but already has an
+        // existing callback. Acknowledge the existing appointment and offer to reschedule
+        // rather than creating a duplicate callback or silently alerting staff.
+        if (intent === 'representative') {
+          const _existApts = aptStore.getByPhone(fromNorm)
+            .filter(a => a.status === 'callback_pending' || a.status === 'confirmed')
+            .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+          const _existApt = _existApts[0] ?? null;
+          const _timeRef  = _existApt?.rawTime ?? _postCallRec?.meta?.qualData?.callTimeGiven;
+          const _repReply = _timeRef
+            ? `יש לנו שיחה מתוכננת ${_timeRef} 😊\nאם זה לא נוח — ספר/י לי מה עדיף ואסדר מחדש.`
+            : `יש לנו שיחה מתוכננת בינינו 😊\nאם תרצה/י לשנות מועד — פשוט תגיד/י לי את השעה שנוחה לך.`;
+          if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
+            _markBotSent(fromNorm);
+            sendText(fromNorm, _repReply).catch(() => {});
+          }
+          store.logEvent('post_call_representative_acknowledged', fromNorm, {
+            status: _postCallStatus, existingAptId: _existApt?.id, timeRef: _timeRef,
+          });
+          logger.info('[pipeline] Post-call representative request — acknowledged existing callback', {
+            from: fromNorm, existingAptId: _existApt?.id,
+          });
+          const _repEntry = inbox.push({
+            from: fromNorm, fromIsraeli, name: msg.name ?? null,
+            text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
+            receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
+            clientMatch, intent, route: 'post_call_rep_acknowledged', barakReply: _repReply,
+          });
+          return { inboxEntry: _repEntry, clientMatch, intent, route: 'post_call_rep_acknowledged', barakReply: _repReply };
+        }
+
+        // Remaining sub-cases:
         //   (a) Dup acceptance — callTimeGiven is already set AND the message contains
         //       a callback time/acceptance pattern (TIME_PATTERN). This is a re-send of
         //       the original acceptance. No staff alert — they were already notified when
@@ -5740,11 +5782,13 @@ app.patch('/api/admin/appointments/:id', jsonBody, (req, res) => {
   res.json({ ok: true, appointment: apt });
 });
 
-// POST /api/admin/appointments/:id/complete — mark completed
-app.post('/api/admin/appointments/:id/complete', (req, res) => {
-  const apt = aptStore.markCompleted(req.params.id);
+// POST /api/admin/appointments/:id/complete — mark completed with optional notes
+app.post('/api/admin/appointments/:id/complete', jsonBody, (req, res) => {
+  const fields = { status: 'completed' };
+  if (req.body?.notes) fields.completionNotes = req.body.notes;
+  const apt = aptStore.update(req.params.id, fields);
   if (!apt) return res.status(404).json({ ok: false, error: 'Appointment not found' });
-  store.logEvent('appointment_completed', apt.leadPhone, { aptId: apt.id });
+  store.logEvent('appointment_completed', apt.leadPhone, { aptId: apt.id, notes: req.body?.notes });
   res.json({ ok: true, appointment: apt });
 });
 
@@ -5755,6 +5799,61 @@ app.post('/api/admin/appointments/:id/cancel', async (req, res) => {
   calendarSvc.cancelCalendarEvent(apt).catch(() => {});
   store.logEvent('appointment_cancelled', apt.leadPhone, { aptId: apt.id });
   res.json({ ok: true, appointment: apt });
+});
+
+// POST /api/admin/appointments/:id/no-answer — record a no-answer outcome (not a class no-show)
+app.post('/api/admin/appointments/:id/no-answer', jsonBody, (req, res) => {
+  const apt = aptStore.update(req.params.id, {
+    status:       'no_answer',
+    noAnswerNote: req.body?.note ?? null,
+    noAnswerAt:   new Date().toISOString(),
+  });
+  if (!apt) return res.status(404).json({ ok: false, error: 'Appointment not found' });
+  store.logEvent('appointment_no_answer', apt.leadPhone, { aptId: apt.id, note: req.body?.note });
+  res.json({ ok: true, appointment: apt });
+});
+
+// POST /api/admin/appointments/:id/assign — reassign to a different staff member
+app.post('/api/admin/appointments/:id/assign', jsonBody, (req, res) => {
+  const { staffId } = req.body ?? {};
+  if (!staffId) return res.status(400).json({ ok: false, error: 'staffId required' });
+  const apt = aptStore.update(req.params.id, { assignedStaffId: staffId });
+  if (!apt) return res.status(404).json({ ok: false, error: 'Appointment not found' });
+  store.logEvent('appointment_staff_reassigned', apt.leadPhone, { aptId: apt.id, staffId });
+  res.json({ ok: true, appointment: apt });
+});
+
+// POST /api/admin/appointments/:id/retry-notify — resend handoff alert, skipping already-covered phones
+app.post('/api/admin/appointments/:id/retry-notify', async (req, res) => {
+  const apt = aptStore.get(req.params.id);
+  if (!apt) return res.status(404).json({ ok: false, error: 'Appointment not found' });
+  const skipPhones = new Set(apt.handoffSentTo ?? []);
+  const staff      = findStaff(apt.assignedStaffId);
+  try {
+    const notifResult = await notifySvc.notifyStaffCallbackConfirmed(apt, staff, null, { skipPhones });
+    const newSucceeded = (notifResult?.results ?? []).filter(r => r.ok && !r.skipped).map(r => r.phone);
+    if (newSucceeded.length) {
+      const updatedHST = [...new Set([...(apt.handoffSentTo ?? []), ...newSucceeded])];
+      aptStore.update(apt.id, { handoffSentTo: updatedHST });
+      const curMeta = store.getLead(apt.leadPhone)?.meta ?? {};
+      store.upsertLead(apt.leadPhone, {
+        meta: {
+          ...curMeta,
+          handoffAlertStatus:    'sent',
+          handoffAlertSentAt:    new Date().toISOString(),
+          handoffAlertIdMessage: notifResult.firstIdMessage ?? curMeta.handoffAlertIdMessage,
+        },
+      });
+      persist.saveLeads(store);
+    }
+    store.logEvent('appointment_handoff_retried', apt.leadPhone, {
+      aptId: apt.id, newSent: newSucceeded.length, skipped: skipPhones.size,
+    });
+    res.json({ ok: true, sent: notifResult.sent, skipped: skipPhones.size, results: notifResult.results });
+  } catch (err) {
+    logger.error('[api] retry-notify failed', { aptId: req.params.id, error: err.message });
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 // ══════════════════════════════════════════════════════════════════════════════

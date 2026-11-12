@@ -64,10 +64,11 @@ async function runReminderPass(store) {
       store?.logEvent('appointment_reminder_sent', apt.leadPhone, { aptId: apt.id });
       sent++;
     } else if (results.length === 0) {
-      // Fallback path: no roster configured; mark sent conservatively
-      aptStore.markReminderSent(apt.id);
-      store?.logEvent('appointment_reminder_sent', apt.leadPhone, { aptId: apt.id });
-      sent++;
+      // Zero recipients = configuration failure, not success. Leave reminderSent=false
+      // so the entry is retried next cycle once staff_config.json is populated.
+      logger.warn('[apt-worker] Reminder pass: no recipients configured — entry stays pending', {
+        aptId: apt.id, leadPhone: apt.leadPhone,
+      });
     }
   }
   return { reminders: sent };

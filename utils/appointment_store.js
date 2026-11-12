@@ -92,7 +92,8 @@ class AppointmentStore {
       calendarEventId: null,
       icsUrl:          `/api/calendar/appointment/${id}.ics`,
       reminderSent:    false,
-      reminderSentTo:  [],   // phones that have confirmed receipt; used for per-recipient retry
+      reminderSentTo:  [],   // phones that confirmed reminder receipt; used for per-recipient retry
+      handoffSentTo:   [],   // phones that confirmed initial handoff notification; used for retry
       noShowAlerted:   false,
       createdAt:       now,
       updatedAt:       now,

@@ -1955,10 +1955,15 @@ function renderCallbackPanel(leads, apts) {
     const nameDisplay = confirmedN ?? dispName ?? `<span style="color:var(--hot);font-size:11px">שם חסר</span>`;
     const nameLabel  = confirmedN ? `✓ ${esc(confirmedN)}` : (dispName ? esc(dispName) : nameDisplay);
 
-    const dispPhone  = l.phone.startsWith('972') ? '0' + l.phone.slice(3) : l.phone;
-    // WhatsApp link uses the masked phone format for display, full E.164 for WA link
-    const waPhone    = l.phone.replace(/[^0-9]/g, '');
-    const waLink     = `https://wa.me/${waPhone}`;
+    // Use apt.leadPhone (full E.164 from aptStore) for WA links and thread lookup.
+    // l.phone from /api/leads is masked — stripping non-digits from it yields a
+    // corrupted number. The matched apt always holds the real phone.
+    const fullPhone  = apt?.leadPhone ?? null;
+    const dispPhone  = fullPhone
+      ? (fullPhone.startsWith('972') ? '0' + fullPhone.slice(3) : fullPhone)
+      : l.phone;
+    const waPhone    = fullPhone ? fullPhone.replace(/[^0-9]/g, '') : null;
+    const waLink     = waPhone ? `https://wa.me/${waPhone}` : null;
 
     const timeLabel  = fmtCallbackTime(apt, qd);
 
@@ -1970,12 +1975,16 @@ function renderCallbackPanel(leads, apts) {
     const readyEmoji = readySt === 'HIGH' ? '🔥' : readySt === 'MEDIUM' ? '🌡️' : readySt === 'LOW' ? '❄️' : '';
     const interests  = [qd.fitnessInterest, qd.goal, qd.location].filter(Boolean).join(' · ');
 
-    // Action buttons — POST to appointments API if apt exists
+    // Action buttons — POST to appointments API if apt exists.
+    // no_answer uses a dedicated endpoint (not no_show) so it never triggers
+    // the class-no-show automation that fires follow-up messages to the prospect.
     const aptId   = apt?.id ?? '';
     const actions = aptId ? `
       <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px">
         <button onclick="cbAction('${aptId}','complete')"   style="font-size:10px;padding:2px 6px;cursor:pointer;border-radius:3px;border:1px solid var(--border)">✔ הושלם</button>
         <button onclick="cbAction('${aptId}','no_answer')"  style="font-size:10px;padding:2px 6px;cursor:pointer;border-radius:3px;border:1px solid var(--border)">📵 לא ענה</button>
+        <button onclick="cbAction('${aptId}','reschedule')" style="font-size:10px;padding:2px 6px;cursor:pointer;border-radius:3px;border:1px solid var(--border)">🔄 שנה מועד</button>
+        <button onclick="cbAction('${aptId}','assign')"     style="font-size:10px;padding:2px 6px;cursor:pointer;border-radius:3px;border:1px solid var(--border)">👤 נציג</button>
         <button onclick="cbAction('${aptId}','cancel')"     style="font-size:10px;padding:2px 6px;cursor:pointer;border-radius:3px;border:1px solid var(--border)">🚫 בטל</button>
       </div>` : '';
 
@@ -1984,7 +1993,7 @@ function renderCallbackPanel(leads, apts) {
         <div>
           <div style="font-weight:600;font-size:13px">${nameLabel}</div>
           <div style="font-size:11px;color:var(--muted);direction:ltr">${esc(dispPhone)}</div>
-          <a href="${waLink}" target="_blank" style="font-size:10px;color:var(--accent);text-decoration:none">💬 WhatsApp</a>
+          ${waLink ? `<a href="${waLink}" target="_blank" style="font-size:10px;color:var(--accent);text-decoration:none">💬 WhatsApp</a>` : '<span style="font-size:10px;color:var(--muted)">📵 לא זמין</span>'}
         </div>
         <div>
           <div style="font-size:12px;color:var(--text);font-weight:500">${esc(timeLabel)}</div>
@@ -1998,7 +2007,7 @@ function renderCallbackPanel(leads, apts) {
         <div><span style="font-weight:700;color:${scoreColor}" title="${scoreTip}">${scoreNum}/10</span></div>
         <div title="${alertTip}">${alertIcon}</div>
         <div title="${reminderTip}">${reminderIcon}</div>
-        <div title="היסטוריית שיחה"><button onclick="openThread('${waPhone}')" style="font-size:10px;padding:2px 4px;cursor:pointer;border-radius:3px;border:1px solid var(--border)">💬</button></div>
+        <div title="היסטוריית שיחה">${waPhone ? `<button onclick="openThread('${waPhone}')" style="font-size:10px;padding:2px 4px;cursor:pointer;border-radius:3px;border:1px solid var(--border)">💬</button>` : '<span style="color:var(--muted)">—</span>'}</div>
       </div>
     </div>`;
   }).join('');
@@ -2014,32 +2023,76 @@ function renderCallbackPanel(leads, apts) {
 
 async function cbAction(aptId, action) {
   if (!aptId) return;
-  let url, body;
+
+  // Actions that need a prompt before POSTing
   if (action === 'complete') {
-    url = `/api/admin/appointments/${aptId}/complete`;
-    body = {};
-  } else if (action === 'cancel') {
-    url = `/api/admin/appointments/${aptId}/cancel`;
-    body = {};
-  } else if (action === 'no_answer') {
-    // Reschedule as no_show without auto-messaging; staff manually follows up
-    url = `/api/admin/appointments/${aptId}`;
-    body = { status: 'no_show' };
-  } else {
+    const notes = window.prompt('הערת סגירה (אופציונלי):') ?? '';
+    try {
+      const res = await fetch(`/api/admin/appointments/${aptId}/complete`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ notes }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      await loadBarakPanel();
+    } catch (e) { alert('שגיאה: ' + e.message); }
     return;
   }
+
+  if (action === 'no_answer') {
+    const note = window.prompt('הערה (אופציונלי — למשל: לא ענה, ננסה מחר):') ?? '';
+    try {
+      const res = await fetch(`/api/admin/appointments/${aptId}/no-answer`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ note }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      await loadBarakPanel();
+    } catch (e) { alert('שגיאה: ' + e.message); }
+    return;
+  }
+
+  if (action === 'reschedule') {
+    const rawTime = window.prompt('זמן חדש לשיחה (עברית — למשל: מחר בשעה 15:00):');
+    if (!rawTime?.trim()) return;
+    try {
+      const res = await fetch(`/api/admin/appointments/${aptId}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rawTime: rawTime.trim(), status: 'callback_pending', reminderSent: false }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      await loadBarakPanel();
+    } catch (e) { alert('שגיאה: ' + e.message); }
+    return;
+  }
+
+  if (action === 'assign') {
+    const staffId = window.prompt('מזהה נציג (eden / melanie / miri):');
+    if (!staffId?.trim()) return;
+    try {
+      const res = await fetch(`/api/admin/appointments/${aptId}/assign`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ staffId: staffId.trim() }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      await loadBarakPanel();
+    } catch (e) { alert('שגיאה: ' + e.message); }
+    return;
+  }
+
+  // Simple one-shot actions (cancel)
+  const urlMap = {
+    cancel: `/api/admin/appointments/${aptId}/cancel`,
+  };
+  const url = urlMap[action];
+  if (!url) return;
   try {
-    const method = (action === 'no_answer') ? 'PATCH' : 'POST';
     const res = await fetch(url, {
-      method,
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
     });
     if (!res.ok) throw new Error(await res.text());
-    await loadBarakPanel(); // refresh
-  } catch (e) {
-    alert('שגיאה: ' + e.message);
-  }
+    await loadBarakPanel();
+  } catch (e) { alert('שגיאה: ' + e.message); }
 }
 
 function openThread(phone) {

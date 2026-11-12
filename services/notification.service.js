@@ -143,7 +143,7 @@ async function broadcastToStaff(message, { skipPhones = new Set() } = {}) {
  * @returns {{ results: Array, sent: number, firstIdMessage: string|null }}
  *   Callers may record handoffAlertStatus/handoffAlertIdMessage from these results.
  */
-async function notifyStaffCallbackConfirmed(apt, assignedStaff, icsDownloadUrl) {
+async function notifyStaffCallbackConfirmed(apt, assignedStaff, icsDownloadUrl, { skipPhones = new Set() } = {}) {
   const timeLabel = formatTime(apt.scheduledAt, apt.rawTime);
   const lead      = apt.leadName ?? apt.leadPhone;
 
@@ -159,8 +159,9 @@ async function notifyStaffCallbackConfirmed(apt, assignedStaff, icsDownloadUrl) 
     `נקבע אוטומטית על ידי הסוכן 🤖`,
   ].filter(l => l !== null).join('\n');
 
-  // WhatsApp: all active staff (Eden + Melanie + any configured)
-  const waResults = await broadcastToStaff(waMsg);
+  // WhatsApp: all active staff (Eden + Melanie + any configured). skipPhones avoids
+  // re-sending to recipients who already confirmed receipt (used by retry-notify).
+  const waResults = await broadcastToStaff(waMsg, { skipPhones });
   const sent = waResults.filter(r => r.ok && !r.skipped).length;
   if (!waResults.length && assignedStaff?.phone) {
     // No roster configured — fall back to assigned staff only
