@@ -279,12 +279,24 @@ app.use((req, _res, next) => {
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ── Health check ──────────────────────────────────────────────────────────────
-// _startupComplete is set to true at the END of the app.listen async callback
-// (after phoneRegistry.init + persist.loadLeads + initWorkers).
-// Tests and local scripts that call store APIs MUST wait for startupComplete=true
-// to avoid racing with persist.loadLeads overwriting in-memory state.
+// _startupComplete: set after phoneRegistry.init + persist.loadLeads + initWorkers.
+// _storeReady / _storeReadyPromise: set immediately after persist.loadLeads so that
+// inbound webhooks arriving during the phoneRegistry.init window (up to 10 s) are
+// HELD in processInboundWAMessage rather than processing against an empty store.
+// Without this gate a webhook could run, capture state, and then have that state
+// silently overwritten when persist.loadLeads fires moments later.
 let _startupComplete = false;
-app.get('/health', (_req, res) => res.json({ status: 'ok', ts: new Date().toISOString(), startupComplete: _startupComplete }));
+let _storeReady = false;
+// Promise resolves once persist.loadLeads has completed. processInboundWAMessage
+// awaits it so webhooks arriving before loadLeads are deferred, not dropped.
+let _storeReadyResolve;
+const _storeReadyPromise = new Promise(r => { _storeReadyResolve = r; });
+function _markStoreReady() {
+  if (_storeReady) return;
+  _storeReady = true;
+  _storeReadyResolve();
+}
+app.get('/health', (_req, res) => res.json({ status: 'ok', ts: new Date().toISOString(), startupComplete: _startupComplete, storeReady: _storeReady }));
 
 // ── Test instrumentation endpoints ───────────────────────────────────────────
 // All routes below are gated behind TEST_MODE=true and return 404 in production.
@@ -2461,6 +2473,23 @@ function isBriefAck(text) {
   return BRIEF_ACK_RE.some(p => p.test(t));
 }
 
+// Opt-out signals that MUST reach lead_agent even when status=callback_requested/call_scheduled.
+// lead_agent sets opted_out status and sends the removal acknowledgement.
+// Keep in sync with lead_agent._optOutPatterns.
+const _POST_CALL_OPT_OUT_PATS = [
+  /^\s*STOP\s*$/i,
+  /^\s*unsubscribe\s*$/i,
+  /^\s*HDR\s*$/i,
+  /(?:^|[ ,.!?])(?:הסר|תסיר)[ו]?\s+אות[יה](?:$|[ ,.!?])/,
+  /(?:^|[ ,.!?])אל\s+תשלח[ו]?(?:\s+לי)?(?:\s+יותר)?(?:\s+הודעות)?(?:$|[ ,.!?])/,
+  /לא\s+רוצה\s+(?:לקבל\s+)?הודעות/,
+  /(?:^|[ ,.!?])הסר\s+מרשימה(?:$|[ ,.!?])/,
+];
+function isPostCallOptOut(text) {
+  if (!text) return false;
+  return _POST_CALL_OPT_OUT_PATS.some(p => p.test(text));
+}
+
 // ── Payment screenshot / confirmation detector ────────────────────────────────
 // Catches Bit/Paybox/bank-transfer screenshots and text confirmations.
 // These must NEVER trigger sales scripts — always ack + alert staff.
@@ -2851,6 +2880,11 @@ function _flushPending(fromNorm) {
 // ── Internal processor (shared by webhook + simulate) ─────────────────────────
 
 async function processInboundWAMessage(msg) {
+  // Hold processing until persist.loadLeads has completed. Without this gate a
+  // webhook arriving during phoneRegistry.init (~10 s) would process against an
+  // empty store; persist.loadLeads would then overwrite any state it wrote.
+  if (!_storeReady) await _storeReadyPromise;
+
   const fromNorm    = normalizeToE164(msg.from);
   const fromIsraeli = e164ToIsraeli(fromNorm);
 
@@ -3409,11 +3443,12 @@ async function processInboundWAMessage(msg) {
     if (_postCallStatus === 'call_scheduled' || _postCallStatus === 'callback_requested') {
       const msgText = (msg.text ?? '').trim();
 
-      // Always let opt-out fall through to lead_agent (which will set opted_out status)
-      // — do not early-return here; the opt-out handler in lead_agent.js needs to run.
-
+      // Opt-out: always let this fall through to lead_agent (which sets opted_out + acks).
+      if (isPostCallOptOut(msgText)) {
+        // fall through — lead_agent handles it
+      }
       // Reschedule intent → let the reschedule interception block handle it
-      if (intent === 'reschedule') {
+      else if (intent === 'reschedule') {
         // fall through to the standard reschedule path below
       } else if (isBriefAck(msgText) || msg.type !== 'text') {
         // Brief ack / emoji / non-text → silent. The sales phase is over.
@@ -3464,10 +3499,39 @@ async function processInboundWAMessage(msg) {
         const capturedName = extractNameFromMessage(msgText);
         if (capturedName) {
           const _nm = _postCallRec?.meta ?? {};
+          const _prevQd = _nm.qualData ?? {};
           store.upsertLead(fromNorm, {
             name: capturedName,
-            meta: { ..._nm, qualData: { ...(_nm.qualData ?? {}), confirmedName: capturedName, nameConfirmed: true } },
+            meta: {
+              ..._nm,
+              qualData: { ..._prevQd, confirmedName: capturedName, nameConfirmed: true,
+                          nameConfirmedAlertSent: true },
+            },
           });
+
+          // Notification ordering: the initial handoff brief fires when callTimeGiven
+          // is first captured (before the name is known). Once the name arrives here,
+          // send ONE update to the team so the brief is complete. Deduped by
+          // nameConfirmedAlertSent in qualData — will not fire twice.
+          if (!_prevQd.nameConfirmedAlertSent && _prevQd.callTimeGiven) {
+            const _nameUpdateMsg = [
+              `✅ שם אושר: *${capturedName}*`,
+              `📱 ${fromNorm}`,
+              `📞 שיחה: ${_prevQd.callTimeGiven}`,
+            ].join('\n');
+            alertOwner(`📋 שם ליד אושר — ${capturedName}`, _nameUpdateMsg)
+              .then(ar => {
+                const idMsg = ar?.results?.find(r => r.idMessage)?.idMessage ?? null;
+                const _cur = store.getLead(fromNorm)?.meta ?? {};
+                store.upsertLead(fromNorm, {
+                  meta: { ..._cur, nameConfirmedAlertIdMessage: idMsg,
+                          nameConfirmedAlertSentAt: new Date().toISOString() },
+                });
+                logger.info('[pipeline] Name-confirmed alert sent', { from: fromNorm, name: capturedName, idMsg });
+              })
+              .catch(err => logger.warn('[pipeline] Name-confirmed alert failed', { from: fromNorm, error: err.message }));
+          }
+
           persist.saveLeads(store);
           store.logEvent('name_captured_post_call', fromNorm, { name: capturedName, status: _postCallStatus });
           logger.info('[pipeline] Post-call name captured — silent', { from: fromNorm, name: capturedName });
@@ -3494,6 +3558,24 @@ async function processInboundWAMessage(msg) {
         });
         persist.saveInbox(inbox);
         return { inboxEntry: pcEntry, clientMatch, intent, route: 'post_call_staff_hold', barakReply: null };
+      } else {
+        // Catch-all for all remaining post-call messages:
+        // dup acceptances, unsolicited new questions, etc. after name has been confirmed.
+        // Opt-out and reschedule are excluded above. Everything else → alert staff, bot silent.
+        alertOwner(
+          `📬 הודעה אחרי ${_postCallStatus === 'call_scheduled' ? 'תיאום' : 'בקשת חזרה'} — ${msg.name ?? fromNorm}`,
+          `*${msg.name ?? fromNorm}* (${fromNorm})\n*סטטוס:* ${_postCallStatus}\n*הודעה:* "${msgText.slice(0, 200)}"\n\nהאדם כתב אחרי שהתיאום הושלם. אנא בדוק ידנית.`
+        ).catch(() => {});
+        store.logEvent('post_call_staff_notified', fromNorm, { status: _postCallStatus, preview: msgText.slice(0, 80) });
+        logger.info('[pipeline] Post-call catch-all — staff alerted, bot silent', { from: fromNorm, status: _postCallStatus });
+        const pcCatchEntry = inbox.push({
+          from: fromNorm, fromIsraeli, name: msg.name ?? null,
+          text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
+          receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
+          clientMatch, intent, route: 'post_call_staff_hold', barakReply: null,
+        });
+        persist.saveInbox(inbox);
+        return { inboxEntry: pcCatchEntry, clientMatch, intent, route: 'post_call_staff_hold', barakReply: null };
       }
     }
   }
@@ -5971,8 +6053,18 @@ app.listen(PORT, async () => {
   // active as independent safety layers throughout the warm-up window.
   await phoneRegistry.init({ timeoutMs: 10_000 });
 
+  // TEST_STARTUP_DELAY_MS: artificial pause injected between loadLeads and
+  // _markStoreReady for integration tests that need to send a webhook during
+  // the startup window and verify it is held, not processed against an empty store.
+  if (process.env.TEST_STARTUP_DELAY_MS) {
+    await new Promise(r => setTimeout(r, Number(process.env.TEST_STARTUP_DELAY_MS)));
+  }
+
   persist.loadLeads(store);
   persist.loadInbox(inbox);
+
+  // Unblock any inbound webhook that arrived before loadLeads completed.
+  _markStoreReady();
 
   // ── Startup purge: remove stale lead records for phones now in the registry ──
   // phoneRegistry is already warm from the await above — zero extra Arbox calls.

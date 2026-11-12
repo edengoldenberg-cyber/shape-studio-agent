@@ -18,12 +18,14 @@ const logger     = require('../utils/logger');
 const { sendText } = require('./whatsapp.service');
 
 // ── Staff roster loader ───────────────────────────────────────────────────────
+// Reads from DATA_DIR (Railway Volume) so the same file edited through the
+// production admin panel is used here. Falls back to the app-root data/
+// directory when DATA_DIR is not set (local development).
 
 function loadStaffRoster() {
+  const dataDir = (process.env.DATA_DIR ?? path.join(__dirname, '../data')).replace(/\/$/, '');
   try {
-    return JSON.parse(
-      fs.readFileSync(path.join(__dirname, '../data/staff_config.json'), 'utf8')
-    );
+    return JSON.parse(fs.readFileSync(path.join(dataDir, 'staff_config.json'), 'utf8'));
   } catch { return { staff: [] }; }
 }
 

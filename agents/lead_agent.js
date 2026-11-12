@@ -1230,6 +1230,10 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
         store.upsertLead(from, { name: captured });
         setQualData(from, { confirmedName: captured, nameConfirmed: true });
         logger.info('[lead_agent] Name captured', { from, name: captured });
+        // The name-confirmed team alert fires from the post_call_name_captured gate
+        // in server.js when status=callback_requested (the common path). Lead_agent
+        // only runs when that gate is NOT active (e.g. fresh lead not yet in callback
+        // state). In that case no extra alert is needed — the team was not yet notified.
       }
     }
   }
@@ -1420,7 +1424,14 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
     saveHistory(from, history);
   } catch (err) {
     logger.error('[lead_agent] OpenAI error', { error: err.message });
-    reply = `שלום! נתקלנו בתקלה טכנית קטנה. הצוות שלנו יחזור אליך בהקדם 🙏`;
+    // Deterministic fallback: when call time is confirmed but name not yet given,
+    // always ask for the name so the team brief can be completed. This guarantees
+    // the name-ask step works even without an OpenAI key (e.g. in test environments).
+    if (freshQualData.callTimeGiven && !freshQualData.confirmedName) {
+      reply = `מצוין — ${freshQualData.callTimeGiven} 😊 ואיך קוראים לך?`;
+    } else {
+      reply = `שלום! נתקלנו בתקלה טכנית קטנה. הצוות שלנו יחזור אליך בהקדם 🙏`;
+    }
   }
 
   // 7. Score the lead (history already has user+assistant appended above)

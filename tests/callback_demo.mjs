@@ -19,6 +19,8 @@ import { createServer }     from 'http';
 import { spawn }            from 'child_process';
 import { createRequire }    from 'module';
 import { fileURLToPath }    from 'url';
+import { mkdtempSync, copyFileSync, writeFileSync, rmSync, existsSync } from 'fs';
+import { tmpdir }           from 'os';
 import path                 from 'path';
 
 // createRequire lets us load CommonJS modules from this ESM file.
@@ -40,6 +42,24 @@ async function freePort(base) {
 
 const MOCK_PORT = await freePort(20499);
 const APP_PORT  = await freePort(20498);
+
+// ── Isolated temp DATA_DIR ─────────────────────────────────────────────────
+// Use a fresh temp directory so the demo never reads from or writes to the
+// project's real data/ directory. This keeps the demo idempotent and prevents
+// stale leads_persist.json from causing the persist.loadLeads race.
+const DEMO_DATA_DIR = mkdtempSync(path.join(tmpdir(), 'shape-demo-'));
+// Copy the studio's staff_config.json (read-only during demo) so modules that
+// read it (notification.service, appointment_worker, whatsapp.service) work.
+const srcStaff = path.join(__dirname, '../data/staff_config.json');
+if (existsSync(srcStaff)) {
+  copyFileSync(srcStaff, path.join(DEMO_DATA_DIR, 'staff_config.json'));
+} else {
+  writeFileSync(path.join(DEMO_DATA_DIR, 'staff_config.json'),
+    JSON.stringify({ staff: [], default_assignee_id: null }));
+}
+// Copy subscription packages so pricing context loads correctly.
+const srcPkg = path.join(__dirname, '../data/subscription_packages.json');
+if (existsSync(srcPkg)) copyFileSync(srcPkg, path.join(DEMO_DATA_DIR, 'subscription_packages.json'));
 
 // ── Mock Green API server — captures ALL outbound messages ───────────────────
 let _capturedSends = [];
@@ -77,7 +97,7 @@ const serverProc = spawn(process.execPath, ['server.js'], {
     NOTIFY_PHONES:            '972509000001',
     TEST_ALLOWLIST_PHONES:    '972509000001',
     OPENAI_API_KEY:           'sk-test',  // Force fake key — demo uses mocked pipeline only
-    DATA_DIR:                 path.join(__dirname, '../data'),
+    DATA_DIR:                 DEMO_DATA_DIR,
     NODE_ENV:                 'test',
   },
   stdio: ['ignore', 'pipe', 'pipe'],
@@ -87,6 +107,7 @@ const serverProc = spawn(process.execPath, ['server.js'], {
 function cleanup() {
   try { serverProc.kill(); } catch {}
   try { mockSrv.close(); } catch {}
+  try { rmSync(DEMO_DATA_DIR, { recursive: true, force: true }); } catch {}
 }
 process.on('exit', cleanup);
 process.on('SIGINT', () => { cleanup(); process.exit(0); });
@@ -191,6 +212,9 @@ console.log(`  Inbound: "שרה"`);
 console.log(`  → confirmedName: "${qd5.confirmedName ?? '—'}"`);
 
 // Step 6 — Create callback_pending aptStore entry (shows what the reminder worker will use)
+// Point the demo process's appointment_store at the same temp dir so Step 6's
+// createCallbackPending writes to DEMO_DATA_DIR, not the project's real data/.
+process.env.DATA_DIR = DEMO_DATA_DIR;
 const aptStore = require('../utils/appointment_store');
 const { parseHebrewTimeLocal } = require('../services/calendar.service');
 const msgTs = qd5.callTimeGivenAt ? new Date(qd5.callTimeGivenAt) : new Date();
@@ -228,8 +252,8 @@ console.log(`  score:              ${pl?.score ?? '—'}/10`);
 // Captured outbound sends
 console.log('\nAll mocked WhatsApp sends this demo:');
 _capturedSends.forEach((s, i) => {
-  const isAlert = s.chatId?.includes('000000099');
-  console.log(`  ${i+1}. to=${s.chatId} [${isAlert ? 'team alert (demo intercept)' : 'lead'}] "${s.preview}"`);
+  const isAlert = s.chatId?.includes('972509000001');
+  console.log(`  ${i+1}. to=${s.chatId} [${isAlert ? 'team alert' : 'lead'}] "${s.preview}"`);
 });
 
 // ── Cleanup ───────────────────────────────────────────────────────────────────
