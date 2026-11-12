@@ -5820,6 +5820,55 @@ app.post('/api/admin/staff', jsonBody, (req, res) => {
   }
 });
 
+// POST /api/admin/reset-lead-state/:phone — controlled reset for live E2E testing.
+// Clears callback, qualification and AI history for one specific phone.
+// Preserves firstSeen, messageCount, source and all appointment records.
+// Appointment cancellation must be done separately via PATCH/cancel endpoints.
+app.post('/api/admin/reset-lead-state/:phone', (req, res) => {
+  const phone = decodeURIComponent(req.params.phone);
+  const lead  = store.getLead(phone);
+  if (!lead) return res.status(404).json({ ok: false, error: 'Lead not found' });
+
+  // Preserve identity; clear all qualification, callback and dedup state.
+  store.upsertLead(phone, {
+    status: 'new',
+    name:   null,
+    score:  4,
+    meta: {
+      source:              lead.meta?.source              ?? null,
+      lastIntent:          null,
+      qualData:            {},
+      qualProfile:         null,
+      leadBrief:           null,
+      briefGeneratedAt:    null,
+      awaitingCallbackTime:  false,
+      callbackTime:          null,
+      callbackRequestedAt:   null,
+      noShowAptId:           null,
+      reschedulingAptId:     null,
+      reschedulingOldTime:   null,
+      handoffAlertStatus:    null,
+      handoffAlertSentAt:    null,
+      handoffAlertFailedAt:  null,
+      handoffAlertIdMessage: null,
+      handoffAlertError:     null,
+      handoffSentPhones:     [],
+      handoffCallTime:       null,
+      nameConfirmedAlertSent:    null,
+      nameConfirmedAlertIdMessage: null,
+    },
+  });
+
+  // Clear Barak's in-memory conversation history for this phone.
+  // Without this the AI would continue from the previous session context.
+  try { leadAgent.clearSession(phone); } catch {}
+
+  persist.saveLeads(store);
+  store.logEvent('lead_state_reset', phone, { by: 'admin_panel', preserved: 'firstSeen,messageCount' });
+  logger.info('[admin] Lead state reset for E2E test', { phone });
+  res.json({ ok: true, status: 'new', phone });
+});
+
 // ══════════════════════════════════════════════════════════════════════════════
 // APPOINTMENTS API
 // ══════════════════════════════════════════════════════════════════════════════
