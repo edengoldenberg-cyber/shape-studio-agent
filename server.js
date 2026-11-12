@@ -3874,6 +3874,41 @@ async function processInboundWAMessage(msg) {
       } catch (err) {
         logger.error('Barak (lead_agent) error in WA pipeline', { error: err.message, from: fromNorm });
       }
+
+      // Auto-create callback_pending aptStore entry when Barak's AI flow captures
+      // callTimeGiven for the first time. This makes the entry visible in the
+      // appointments panel and eligible for the scheduled reminder worker.
+      // Only fires when no existing callback_pending entry exists for this phone
+      // (idempotent — the handoff idempotency gate in lead_agent already deduplicates
+      // the alert, this just mirrors that for the aptStore).
+      {
+        const _postHandoffLead = store.getLead(fromNorm);
+        if (_postHandoffLead?.status === 'callback_requested'
+            && _postHandoffLead.meta?.callTimeGiven) {
+          const _existing = aptStore.getByPhone(fromNorm).find(a => a.status === 'callback_pending');
+          if (!_existing) {
+            try {
+              const _rawTime    = _postHandoffLead.meta.callTimeGiven;
+              const _sentAt     = _postHandoffLead.meta.callTimeGivenAt
+                ? new Date(_postHandoffLead.meta.callTimeGivenAt)
+                : new Date();
+              const _parsedAt   = calendarSvc.parseHebrewTimeLocal(_rawTime, _sentAt);
+              aptStore.createCallbackPending({
+                leadPhone:       fromNorm,
+                leadName:        _postHandoffLead.name ?? null,
+                rawTime:         _rawTime,
+                scheduledAt:     _parsedAt ?? null,
+                assignedStaffId: staffConfig?.staff?.find(s => s.id === 'eden')?.id ?? 'eden',
+              });
+              logger.info('[pipeline] callback_pending aptStore entry created from AI flow',
+                { from: fromNorm, rawTime: _rawTime, scheduledAt: _parsedAt?.toISOString() ?? null });
+            } catch (aptErr) {
+              logger.warn('[pipeline] Failed to create callback_pending aptStore entry',
+                { from: fromNorm, error: aptErr.message });
+            }
+          }
+        }
+      }
     }
   }
 

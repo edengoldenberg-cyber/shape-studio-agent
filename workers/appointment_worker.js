@@ -98,10 +98,17 @@ async function runCallbackPendingReminderPass(store) {
   const reminderMinutes = parseInt(process.env.CALLBACK_PENDING_REMINDER_MIN ?? '30', 10);
   const windowMs        = Math.max(reminderMinutes, 20) * 60 * 1000; // floor at 20 min
 
-  const due = aptStore.getPendingCallbacksDueForReminder(windowMs);
+  // Per-phone allowlist: when CALLBACK_PENDING_REMINDER_PHONES is set (comma-separated)
+  // only remind entries whose leadPhone is in the list. Used for controlled tests.
+  // When the var is absent or empty, all due entries are reminded.
+  const _allowlistRaw = (process.env.CALLBACK_PENDING_REMINDER_PHONES ?? '').trim();
+  const _allowlist    = _allowlistRaw ? new Set(_allowlistRaw.split(',').map(s => s.trim()).filter(Boolean)) : null;
+
+  let due = aptStore.getPendingCallbacksDueForReminder(windowMs);
+  if (_allowlist) due = due.filter(a => _allowlist.has(a.leadPhone));
   if (!due.length) return { pendingReminders: 0 };
 
-  logger.info('[apt-worker] Callback-pending reminder pass', { due: due.length, windowMin: reminderMinutes });
+  logger.info('[apt-worker] Callback-pending reminder pass', { due: due.length, windowMin: reminderMinutes, allowlist: _allowlist ? [..._allowlist] : 'all' });
 
   const { sendStaffReminder } = require('../services/notification.service');
   let attempted = 0;
