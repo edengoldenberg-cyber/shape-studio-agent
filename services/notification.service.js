@@ -29,9 +29,19 @@ function loadStaffRoster() {
   } catch { return { staff: [] }; }
 }
 
-/** All active staff members who have a phone number configured. */
+/**
+ * All active staff members who have a phone number configured.
+ * Falls back to NOTIFY_PHONES / STUDIO_OWNER_PHONE when staff_config.json
+ * has no active entries — keeps broadcastToStaff aligned with alertOwner.
+ */
 function activeStaffWithPhones() {
-  return (loadStaffRoster().staff ?? []).filter(s => s.active && s.phone);
+  const configured = (loadStaffRoster().staff ?? []).filter(s => s.active && s.phone);
+  if (configured.length) return configured;
+  // No staff in roster — fall back to env-var phones so reminders reach someone.
+  const envRaw = (process.env.NOTIFY_PHONES ?? process.env.STUDIO_OWNER_PHONE ?? '');
+  return envRaw.split(',')
+    .map((p, i) => ({ id: `env_${i}`, name: 'Staff', phone: p.trim().replace(/^\+/, ''), active: true }))
+    .filter(s => s.phone && /^\d{7,15}$/.test(s.phone));
 }
 
 // ── Email transporter (lazy — built only when first needed) ───────────────────

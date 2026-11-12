@@ -3532,6 +3532,12 @@ async function processInboundWAMessage(msg) {
               .catch(err => logger.warn('[pipeline] Name-confirmed alert failed', { from: fromNorm, error: err.message }));
           }
 
+          // Propagate the confirmed name to any open aptStore entries so the
+          // appointments panel and reminder messages show the correct name.
+          aptStore.getByPhone(fromNorm)
+            .filter(a => a.status === 'callback_pending' || a.status === 'confirmed')
+            .forEach(a => { if (a.leadName !== capturedName) aptStore.update(a.id, { leadName: capturedName }); });
+
           persist.saveLeads(store);
           store.logEvent('name_captured_post_call', fromNorm, { name: capturedName, status: _postCallStatus });
           logger.info('[pipeline] Post-call name captured — silent', { from: fromNorm, name: capturedName });
