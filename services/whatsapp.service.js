@@ -183,20 +183,44 @@ async function sendText(to, text, { bypassQuietHours = false } = {}) {
  * plus any STUDIO_OWNER_PHONE / NOTIFY_PHONES env overrides.
  * Quiet hours do NOT apply to alerts.
  */
+/**
+ * Alert all admin/staff phones about a system event.
+ * Returns { sent: number, results: [{ phone, idMessage, error }] } so callers
+ * can record the provider-assigned idMessage or the specific failure reason.
+ * Quiet hours do NOT apply to alerts.
+ */
 async function alertOwner(subject, body) {
   const phones = getAdminPhones();
   if (!phones.length) {
     logger.error('alertOwner: no admin phones configured (staff_config.json or STUDIO_OWNER_PHONE)');
-    return;
+    return { sent: 0, results: [] };
   }
-  const message = `🚨 *Shape Studio Agent Alert*\n\n*${subject}*\n\n${body}`;
-  await Promise.allSettled(
-    phones.map(phone =>
-      _dispatch(phone, message).catch(err =>
-        logger.warn('alertOwner: dispatch failed', { phone, error: err.message })
-      )
-    )
+  const message  = `🚨 *Shape Studio Agent Alert*\n\n*${subject}*\n\n${body}`;
+  const settled  = await Promise.allSettled(
+    phones.map(phone => _dispatch(phone, message))
   );
+  const results = settled.map((r, i) => {
+    const val = r.status === 'fulfilled' ? r.value : null;
+    // A real provider-confirmed idMessage must NOT be a demo/blocked/test placeholder.
+    // _dispatch returns { demo:true } or { blocked:true } for intercepted sends;
+    // only plain { idMessage:'BAE5...' } (no such flags) is a real provider receipt.
+    const isReal = val && val.idMessage && !val.demo && !val.blocked && !val.testMode;
+    return {
+      phone:     phones[i],
+      idMessage: isReal ? val.idMessage : null,
+      error:     r.status === 'rejected'  ? r.reason?.message :
+                 val?.blocked             ? `blocked (TEST_MODE)` :
+                 val?.demo               ? `intercepted (demo phone)` : null,
+    };
+  });
+  const sent = results.filter(r => r.idMessage).length;
+  if (!sent) {
+    // Log failures but do not throw — caller decides how to handle
+    results.filter(r => r.error).forEach(r =>
+      logger.warn('alertOwner: dispatch failed', { phone: r.phone, error: r.error })
+    );
+  }
+  return { sent, results, message };
 }
 
 /**

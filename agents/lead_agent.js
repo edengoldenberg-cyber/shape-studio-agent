@@ -709,8 +709,13 @@ async function reliableHandoffAlert(phone, name, history, latestQualData) {
     meta: { ...existingMeta, handoffAlertStatus: 'pending', handoffCallTime: qd.callTimeGiven, handoffReadiness: readiness.level },
   });
 
-  let notificationSent = false;
-  let briefErr = null;
+  let notificationSent  = false;
+  let briefErr          = null;
+  // Declared outside the try block so they are accessible in the persist step below.
+  // alertOwner returns { sent, results: [{phone, idMessage, error}] }; the first
+  // real provider idMessage is stored so the panel can verify receipt beyond "sent".
+  let handoffIdMessage  = null;
+  let handoffAlertError = null;
 
   try {
     // 3. Race the LLM brief against a 10-second timeout.
@@ -735,14 +740,20 @@ async function reliableHandoffAlert(phone, name, history, latestQualData) {
       logger.warn('[lead_agent] Handoff brief failed — sending direct fallback', { phone, error: raceErr.message });
     }
 
-    // Single sending gate — both success and fallback paths check notificationSent.
     if (briefResult && !notificationSent) {
       try {
-        await alertOwner(`📋 ליד מוכן לשיחה — ${name ?? phone}`, briefResult.briefLines);
-        notificationSent = true;
-        logger.info('[lead_agent] Handoff brief sent to team', { phone, readiness: readiness.level });
+        const ar = await alertOwner(`📋 ליד מוכן לשיחה — ${name ?? phone}`, briefResult.briefLines);
+        const firstOk = ar?.results?.find(r => r.idMessage);
+        if (firstOk) {
+          notificationSent = true;
+          handoffIdMessage  = firstOk.idMessage;
+          logger.info('[lead_agent] Handoff brief sent to team', { phone, readiness: readiness.level, idMessage: handoffIdMessage });
+        } else {
+          briefErr = new Error(ar?.results?.map(r => r.error).filter(Boolean).join('; ') || 'no idMessage returned');
+          logger.warn('[lead_agent] Brief alertOwner returned no idMessage — will try fallback', { phone });
+        }
       } catch (sendErr) {
-        logger.warn('[lead_agent] Brief alertOwner failed — will try fallback', { phone, error: sendErr.message });
+        logger.warn('[lead_agent] Brief alertOwner threw — will try fallback', { phone, error: sendErr.message });
         briefErr = sendErr;
       }
     }
@@ -759,11 +770,19 @@ async function reliableHandoffAlert(phone, name, history, latestQualData) {
         `\n⚠️ Brief מפורט לא הצליח (${briefErr?.message ?? 'unknown'}). בדוק/י ב-dashboard.`,
       ].filter(Boolean).join('\n');
       try {
-        await alertOwner(`📋 ליד (fallback) — ${name ?? phone}`, fallbackLines);
-        notificationSent = true;
-        logger.info('[lead_agent] Fallback handoff alert sent', { phone });
+        const ar2 = await alertOwner(`📋 ליד (fallback) — ${name ?? phone}`, fallbackLines);
+        const firstOk2 = ar2?.results?.find(r => r.idMessage);
+        if (firstOk2) {
+          notificationSent = true;
+          handoffIdMessage  = firstOk2.idMessage;
+          logger.info('[lead_agent] Fallback handoff alert sent', { phone, idMessage: handoffIdMessage });
+        } else {
+          handoffAlertError = ar2?.results?.map(r => r.error).filter(Boolean).join('; ') || 'no idMessage returned';
+          logger.error('[lead_agent] Even fallback handoff alert failed', { phone, error: handoffAlertError });
+        }
       } catch (alertErr) {
-        logger.error('[lead_agent] Even fallback handoff alert failed', { phone, error: alertErr.message });
+        handoffAlertError = alertErr.message;
+        logger.error('[lead_agent] Even fallback handoff alert threw', { phone, error: alertErr.message });
       }
     }
   } finally {
@@ -775,9 +794,11 @@ async function reliableHandoffAlert(phone, name, history, latestQualData) {
   store.upsertLead(phone, {
     meta: {
       ...updatedMeta,
-      handoffAlertStatus:   notificationSent ? 'sent' : 'failed',
-      handoffAlertSentAt:   notificationSent ? new Date().toISOString() : null,
-      handoffAlertFailedAt: notificationSent ? null : new Date().toISOString(),
+      handoffAlertStatus:    notificationSent ? 'sent' : 'failed',
+      handoffAlertSentAt:    notificationSent ? new Date().toISOString() : null,
+      handoffAlertFailedAt:  notificationSent ? null : new Date().toISOString(),
+      handoffAlertIdMessage: handoffIdMessage ?? null,
+      handoffAlertError:     handoffAlertError ?? null,
     },
   });
 }
@@ -944,7 +965,7 @@ function _isKnownMemberPhone(phone) {
  * Handle an inbound WhatsApp message for lead qualification.
  * Returns { reply, score, status }.
  */
-async function handleInbound({ from, name, text, _pendingMessages: pendingMap = null }) {
+async function handleInbound({ from, name, text, _pendingMessages: pendingMap = null, msgTimestamp = null }) {
   // ── GATE 1: Member Firewall ───────────────────────────────────────────────────
   // Checks memberCache (in-process, seeded every 15 min from Arbox) first,
   // then known_members.json. Both must miss before we continue.
@@ -1123,11 +1144,14 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
   // as a time even though TIME_PATTERN matches the keyword.
   if (qualData.callProposed && !qualData.callTimeGiven
       && TIME_PATTERN.test(text) && !TIME_REJECTION_RE.test(text)) {
-    const callTime    = text.trim().slice(0, 80);
-    const capturedAt  = new Date().toISOString();
-    // callTimeGivenAt preserves the message timestamp so parseHebrewTime can
-    // resolve relative references ("מחר") against the original send time, not
-    // a later processing time.
+    const callTime = text.trim().slice(0, 80);
+    // callTimeGivenAt = the ORIGINAL inbound message timestamp, not the processing
+    // time. This anchors relative date resolution ("מחר" → tomorrow relative to when
+    // the lead SENT the message). For delayed processing or retries, using new Date()
+    // here would resolve "מחר" against the WRONG calendar day.
+    const capturedAt = msgTimestamp
+      ? new Date(msgTimestamp).toISOString()
+      : new Date().toISOString();
     setQualData(from, { callTimeGiven: callTime, callTimeGivenAt: capturedAt });
     // Mark callback_requested (NOT call_scheduled):
     //   • Tomer/Barak workers skip this lead (getSendableLeads excludes callback_requested)

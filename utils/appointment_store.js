@@ -12,7 +12,11 @@
  *   scheduledAt:     Date | null,         // parsed datetime; null = unparsed
  *   durationMin:     number,              // default 30
  *   assignedStaffId: string,             // staff.id from staff_config.json
- *   status:          'confirmed' | 'completed' | 'no_show' | 'rescheduled' | 'cancelled',
+ *   status:          'confirmed' | 'callback_pending' | 'completed' | 'no_show' | 'rescheduled' | 'cancelled',
+ *                      callback_pending = AI-detected callback request, not yet staff-confirmed.
+ *                      IMPORTANT: callback_pending is EXCLUDED from no-show detection so the
+ *                      system never auto-sends a prospect "we missed our call" message without
+ *                      a recorded call outcome. Staff must manually upgrade to 'confirmed'.
  *   calendarEventId: string | null,
  *   icsUrl:          string | null,       // /api/calendar/appointment/:id.ics
  *   reminderSent:    boolean,
@@ -31,7 +35,7 @@ const { randomUUID } = require('crypto');
 const path           = require('path');
 const fs             = require('fs');
 
-const DATA_DIR  = path.join(__dirname, '../data');
+const DATA_DIR  = (process.env.DATA_DIR ?? path.join(__dirname, '../data')).replace(/\/$/, '');
 const APTS_FILE = path.join(DATA_DIR, 'appointments.json');
 
 // Fields stored as ISO strings on disk that must be rehydrated as Date objects
@@ -73,7 +77,7 @@ class AppointmentStore {
 
   // ── Create ─────────────────────────────────────────────────────────────────
 
-  create({ leadPhone, leadName, rawTime, scheduledAt, durationMin = 30, assignedStaffId }) {
+  create({ leadPhone, leadName, rawTime, scheduledAt, durationMin = 30, assignedStaffId, status = 'confirmed' }) {
     const id  = `apt_${Date.now()}_${randomUUID().slice(0, 8)}`;
     const now = new Date();
     const apt = {
@@ -84,7 +88,7 @@ class AppointmentStore {
       scheduledAt:     scheduledAt ?? null,
       durationMin,
       assignedStaffId: assignedStaffId ?? 'eden',
-      status:          'confirmed',
+      status,
       calendarEventId: null,
       icsUrl:          `/api/calendar/appointment/${id}.ics`,
       reminderSent:    false,
@@ -95,6 +99,21 @@ class AppointmentStore {
     this._apts.set(id, apt);
     this._save();
     return apt;
+  }
+
+  /**
+   * Create a callback_pending entry for an AI-detected callback request.
+   * callback_pending entries are NEVER processed by the no-show pass — the system
+   * will not auto-message the prospect about a missed call before anyone has called.
+   * Staff must confirm the appointment (upgrade to 'confirmed') in the panel.
+   */
+  createCallbackPending({ leadPhone, leadName, rawTime, scheduledAt = null, durationMin = 30, assignedStaffId }) {
+    return this.create({ leadPhone, leadName, rawTime, scheduledAt, durationMin, assignedStaffId, status: 'callback_pending' });
+  }
+
+  /** Upgrade a callback_pending record to confirmed once a staff member verifies the booking. */
+  confirmPending(id) {
+    return this.update(id, { status: 'confirmed', noShowAlerted: false, reminderSent: false });
   }
 
   // ── Read ──────────────────────────────────────────────────────────────────
@@ -115,7 +134,11 @@ class AppointmentStore {
 
   getAll() { return Array.from(this._apts.values()); }
 
-  /** Confirmed appointments whose scheduledAt is 15+ min in the past and not yet flagged. */
+  /**
+   * Confirmed appointments whose scheduledAt is 15+ min in the past and not yet flagged.
+   * callback_pending is EXCLUDED — no automatic prospect no-show messaging for unconfirmed
+   * callbacks. Only 'confirmed' entries receive no-show detection.
+   */
   getOverdue(bufferMs = 15 * 60 * 1000) {
     const cutoff = new Date(Date.now() - bufferMs);
     return this.getAll().filter(a =>
@@ -137,6 +160,28 @@ class AppointmentStore {
       a.scheduledAt.getTime() <= cutoff &&
       !a.reminderSent
     );
+  }
+
+  /**
+   * callback_pending entries whose scheduledAt is within the next windowMs and
+   * staff reminder not yet sent.  These are for STAFF ONLY — never prospect-facing.
+   * windowMs defaults to the same 20-min window; callers may override.
+   */
+  getPendingCallbacksDueForReminder(windowMs = 20 * 60 * 1000) {
+    const now    = Date.now();
+    const cutoff = now + windowMs;
+    return this.getAll().filter(a =>
+      a.status === 'callback_pending' &&
+      a.scheduledAt != null &&
+      a.scheduledAt.getTime() > now &&
+      a.scheduledAt.getTime() <= cutoff &&
+      !a.reminderSent
+    );
+  }
+
+  /** All callback_pending entries (for panel display). */
+  getCallbackPending() {
+    return this.getAll().filter(a => a.status === 'callback_pending');
   }
 
   // ── Update ────────────────────────────────────────────────────────────────

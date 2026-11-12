@@ -196,21 +196,122 @@ async function updateGoogleCalendarEvent(eventId, patch) {
 
 // ── Hebrew time parser ────────────────────────────────────────────────────────
 
+// ── Hebrew day names (Sunday=0 .. Saturday=6, Israeli week) ──────────────────
+const HE_WEEKDAY = {
+  ראשון: 0, יום_ראשון: 0,
+  שני:   1, יום_שני:   1,
+  שלישי: 2, יום_שלישי: 2,
+  רביעי: 3, יום_רביעי: 3,
+  חמישי: 4, יום_חמישי: 4,
+  שישי:  5, יום_שישי:  5,
+  שבת:   6,
+};
+
 /**
- * Parse a Hebrew free-text time reference into a JS Date using OpenAI.
- * Returns null when parsing fails or OPENAI_API_KEY is not set.
- * Examples: "מחר בשעה 15:00", "ביום שלישי בשעה 10 בבוקר", "בעוד שעתיים"
+ * Deterministic local resolver for common Israeli Hebrew time references.
+ * Resolves relative to `ref` in Asia/Jerusalem (defaults to now).
+ * Covers: "מחר", "היום", bare "שעה N", "מחר בשעה N", day names.
+ * Returns a Date on success, or null when the pattern is unrecognised.
+ * Always called FIRST by parseHebrewTime before the OpenAI fallback.
+ */
+function parseHebrewTimeLocal(rawText, ref = new Date()) {
+  if (!rawText) return null;
+  const t = rawText.toLowerCase().trim();
+
+  // Reference time components in Asia/Jerusalem
+  const refStr  = ref.toLocaleString('en-US', { timeZone: 'Asia/Jerusalem',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false });
+  // "11/12/2026, 06:41" → extract fields
+  const dateMatch = refStr.match(/(\d{2})\/(\d{2})\/(\d{4}),\s*(\d{2}):(\d{2})/);
+  if (!dateMatch) return null;
+  const [, mm, dd, yyyy, hh, mi] = dateMatch;
+  const refYear  = parseInt(yyyy), refMonth = parseInt(mm) - 1, refDay = parseInt(dd);
+  const refHour  = parseInt(hh);
+
+  // Helper: build a Date at a specific calendar day + hour in IL tz
+  function ilDate(year, month, day, hour = 12, minute = 0) {
+    // 'month' is 0-based
+    const s = `${year}-${String(month + 1).padStart(2,'0')}-${String(day).padStart(2,'0')}T${String(hour).padStart(2,'0')}:${String(minute).padStart(2,'0')}:00`;
+    // Convert IL local time to UTC via known offset (+2 or +3 depending on DST)
+    // Use a date-string that includes timezone offset: Intl.DateTimeFormat cannot
+    // go backwards, so we approximate using a probe.
+    const probe = new Date(s + '+00:00');
+    const ilOffset = (() => {
+      const ilStr = probe.toLocaleString('en-US', { timeZone: 'Asia/Jerusalem', hour12: false,
+        year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+      const m = ilStr.match(/(\d{2})\/(\d{2})\/(\d{4}),\s*(\d{2}):(\d{2})/);
+      if (!m) return 0;
+      const utcH = probe.getUTCHours(), ilH = parseInt(m[4]);
+      let diff = ilH - utcH; if (diff < -12) diff += 24; if (diff > 12) diff -= 24;
+      return diff;
+    })();
+    return new Date(s + (ilOffset >= 0 ? `+0${ilOffset}:00` : `-0${Math.abs(ilOffset)}:00`));
+  }
+
+  // Extract hour from text, e.g. "בשעה 12", "שעה 15:30", "ב-9", "ב9"
+  function extractHour(text) {
+    const m = text.match(/(?:ב[-–]?|שעה\s+|בשעה\s*)(\d{1,2})(?::(\d{2}))?/);
+    if (!m) return null;
+    return { h: parseInt(m[1]), min: m[2] ? parseInt(m[2]) : 0 };
+  }
+
+  // "מחר" or "למחר" (tomorrow)
+  if (/מחר/.test(t) && !/מחרתיים/.test(t)) {
+    const hour = extractHour(t);
+    const h = hour?.h ?? 12, min = hour?.min ?? 0;
+    return ilDate(refYear, refMonth, refDay + 1, h, min);
+  }
+  // "היום" or "להיום" (today)
+  if (/היום/.test(t)) {
+    const hour = extractHour(t);
+    const h = hour?.h ?? refHour + 1, min = hour?.min ?? 0;
+    return ilDate(refYear, refMonth, refDay, h, min);
+  }
+  // Bare "בשעה N" / "שעה N" with no day reference → assume today (or tomorrow if past)
+  if (/(?:בשעה|שעה)\s+\d/.test(t) && !/ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת|מחר|היום/.test(t)) {
+    const hour = extractHour(t);
+    if (hour) {
+      let d = ilDate(refYear, refMonth, refDay, hour.h, hour.min);
+      if (d <= ref) d = ilDate(refYear, refMonth, refDay + 1, hour.h, hour.min); // next day if past
+      return d;
+    }
+  }
+  // Hebrew day name
+  for (const [name, weekday] of Object.entries(HE_WEEKDAY)) {
+    if (t.includes(name)) {
+      const refWeekday = new Date(ilDate(refYear, refMonth, refDay, 12)).getDay();
+      let daysAhead = (weekday - refWeekday + 7) % 7 || 7; // always future
+      const hour = extractHour(t);
+      const h = hour?.h ?? 12, min = hour?.min ?? 0;
+      return ilDate(refYear, refMonth, refDay + daysAhead, h, min);
+    }
+  }
+  return null;
+}
+
+/**
+ * Parse a Hebrew free-text time reference into a JS Date.
+ * Primary: local deterministic resolver (no network required, synchronous-like).
+ * Fallback: OpenAI gpt-4o-mini (requires OPENAI_API_KEY; async).
  *
- * @param {string}    rawText       - Hebrew time text
- * @param {Date|null} referenceTime - anchor for relative dates ("מחר"); defaults to
- *   now. Pass the original message timestamp (meta.callTimeGivenAt) so "מחר" is
- *   resolved against the moment the lead sent the message, not a later parse time.
+ * @param {string}    rawText       - Hebrew time text, e.g. "מחר בשעה 12"
+ * @param {Date|null} referenceTime - anchor for relative dates. MUST be the original
+ *   inbound message timestamp (stored in meta.callTimeGivenAt), not processing time.
+ *   "מחר" on a message sent Nov-12 at 06:41 IL → Nov-13 at 12:00 IL.
  */
 async function parseHebrewTime(rawText, referenceTime = null) {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey || !rawText) return null;
+  if (!rawText) return null;
+  const ref = (referenceTime instanceof Date && !isNaN(referenceTime)) ? referenceTime : new Date();
 
-  const ref   = (referenceTime instanceof Date && !isNaN(referenceTime)) ? referenceTime : new Date();
+  // Try local resolver first — no network, deterministic, testable
+  const local = parseHebrewTimeLocal(rawText, ref);
+  if (local) return local;
+
+  // Fall back to OpenAI for complex expressions ("בעוד שעתיים", "בין 10 ל-11")
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return null;
+
   const nowIL = ref.toLocaleString('en-US', { timeZone: 'Asia/Jerusalem' });
 
   try {
@@ -374,6 +475,7 @@ async function notifyEden(apt, icsUrl, event = 'confirmed', oldTimeLabel = null)
 
 module.exports = {
   buildICS,
+  parseHebrewTimeLocal,
   parseHebrewTime,
   createCalendarEntry,
   cancelCalendarEvent,

@@ -19,9 +19,11 @@ let _staffConfig = null;
 function getStaffConfig() {
   if (_staffConfig) return _staffConfig;
   try {
-    const path = require('path');
-    _staffConfig = JSON.parse(
-      require('fs').readFileSync(path.join(__dirname, '../data/staff_config.json'), 'utf8')
+    const nodePath = require('path');
+    // Respects DATA_DIR so production (Railway Volume) and local share the same path.
+    const dataDir  = (process.env.DATA_DIR ?? nodePath.join(__dirname, '../data')).replace(/\/$/, '');
+    _staffConfig   = JSON.parse(
+      require('fs').readFileSync(nodePath.join(dataDir, 'staff_config.json'), 'utf8')
     );
   } catch { _staffConfig = { staff: [] }; }
   return _staffConfig;
@@ -76,6 +78,48 @@ async function runNoShowPass(store) {
   return { noShows: flagged };
 }
 
+// ── Callback-pending reminder pass ────────────────────────────────────────────
+//
+// Staff-only reminder for AI-detected callbacks (callback_pending status).
+// Unlike the confirmed reminder, this never contacts the prospect.
+//
+// ACTIVATION:
+//   Set CALLBACK_PENDING_REMINDER_ENABLED=true in Railway Variables to activate.
+//   Default: disabled. The timing window is CALLBACK_PENDING_REMINDER_MIN (default 30).
+//   Remind staff N minutes before the requested callback time so they're not caught
+//   off-guard. Must be > 15 min to avoid missing the reminder due to the 15-min poll.
+//
+// Deduplication: reminderSent flag on the aptStore entry (same as confirmed reminder).
+// A restart will not re-send if reminderSent is already true.
+
+async function runCallbackPendingReminderPass(store) {
+  if (process.env.CALLBACK_PENDING_REMINDER_ENABLED !== 'true') return { pendingReminders: 0 };
+
+  const reminderMinutes = parseInt(process.env.CALLBACK_PENDING_REMINDER_MIN ?? '30', 10);
+  const windowMs        = Math.max(reminderMinutes, 20) * 60 * 1000; // floor at 20 min
+
+  const due = aptStore.getPendingCallbacksDueForReminder(windowMs);
+  if (!due.length) return { pendingReminders: 0 };
+
+  logger.info('[apt-worker] Callback-pending reminder pass', { due: due.length, windowMin: reminderMinutes });
+
+  const { sendStaffReminder } = require('../services/notification.service');
+  let sent = 0;
+  for (const apt of due) {
+    const staff = findStaff(apt.assignedStaffId);
+    // sendStaffReminder sends to all active staff with phones (staff-only, not prospect)
+    await sendStaffReminder(apt, staff);
+    aptStore.markReminderSent(apt.id);
+    store?.logEvent('callback_pending_reminder_sent', apt.leadPhone, {
+      aptId:          apt.id,
+      rawTime:        apt.rawTime,
+      reminderMinutes,
+    });
+    sent++;
+  }
+  return { pendingReminders: sent };
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 function initAppointmentWorker(store) {
@@ -84,14 +128,21 @@ function initAppointmentWorker(store) {
     try {
       const r = await runReminderPass(store);
       const n = await runNoShowPass(store);
-      if (r.reminders || n.noShows) {
-        logger.info('[apt-worker] Cycle complete', r, n);
+      const p = await runCallbackPendingReminderPass(store);
+      if (r.reminders || n.noShows || p.pendingReminders) {
+        logger.info('[apt-worker] Cycle complete', { ...r, ...n, ...p });
       }
     } catch (err) {
       logger.error('[apt-worker] Error', { error: err.message });
     }
   }, { timezone: 'Asia/Jerusalem' });
-  logger.info('Worker[Appointments]: reminder + no-show worker scheduled — every 15 min');
+
+  const reminderStatus = process.env.CALLBACK_PENDING_REMINDER_ENABLED === 'true'
+    ? `enabled — ${process.env.CALLBACK_PENDING_REMINDER_MIN ?? '30'} min window`
+    : 'disabled (set CALLBACK_PENDING_REMINDER_ENABLED=true to activate)';
+  logger.info('Worker[Appointments]: reminder + no-show worker scheduled — every 15 min', {
+    callbackPendingReminder: reminderStatus,
+  });
 }
 
-module.exports = { initAppointmentWorker, runReminderPass, runNoShowPass };
+module.exports = { initAppointmentWorker, runReminderPass, runNoShowPass, runCallbackPendingReminderPass };

@@ -55,8 +55,17 @@ const memberCache                      = require('./utils/member_cache');
 const { detectAndMarkConversions, isMemberPhoneSync } = require('./utils/conversion_detector');
 
 // ── Staff configuration (hot-reloadable) ─────────────────────────────────────
+//
+// DATA_DIR_VAL resolves from the DATA_DIR env var (set to /data on Railway with a
+// mounted Volume) or falls back to the bundled ./data directory in the container.
+// All runtime config files (staff_config, leads_persist, inbox_persist) must come
+// from the same directory so a volume mount is the authoritative source.
+//
+// On Railway: set DATA_DIR=/data in Railway Variables + mount a Volume at /data.
+// Without DATA_DIR: falls back to <app-root>/data/ (container-local, wiped on deploy).
 
-const STAFF_CONFIG_PATH  = path.join(__dirname, 'data/staff_config.json');
+const DATA_DIR_VAL = (process.env.DATA_DIR ?? path.join(__dirname, 'data')).replace(/\/$/, '');
+const STAFF_CONFIG_PATH  = path.join(DATA_DIR_VAL, 'staff_config.json');
 const SCHEDULE_PNG_PATH  = path.join(__dirname, 'public', 'schedule.png');
 
 /**
@@ -270,7 +279,12 @@ app.use((req, _res, next) => {
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ── Health check ──────────────────────────────────────────────────────────────
-app.get('/health', (_req, res) => res.json({ status: 'ok', ts: new Date().toISOString() }));
+// _startupComplete is set to true at the END of the app.listen async callback
+// (after phoneRegistry.init + persist.loadLeads + initWorkers).
+// Tests and local scripts that call store APIs MUST wait for startupComplete=true
+// to avoid racing with persist.loadLeads overwriting in-memory state.
+let _startupComplete = false;
+app.get('/health', (_req, res) => res.json({ status: 'ok', ts: new Date().toISOString(), startupComplete: _startupComplete }));
 
 // ── Test instrumentation endpoints ───────────────────────────────────────────
 // All routes below are gated behind TEST_MODE=true and return 404 in production.
@@ -3680,6 +3694,7 @@ async function processInboundWAMessage(msg) {
           try {
             const leadResult = await leadAgent.handleInbound({
               from: fromNorm, name: msg.name, text: msg.text ?? '', _pendingMessages,
+              msgTimestamp: msg.timestamp ?? null,
             });
             _markReplied(fromNorm);
             if (leadResult?.reply) {
@@ -3705,6 +3720,7 @@ async function processInboundWAMessage(msg) {
           name:             msg.name,
           text:             msg.text ?? '',
           _pendingMessages, // stale-send gate: handleInbound checks before sendText
+          msgTimestamp:     msg.timestamp ?? null, // anchor relative date resolution to send time
         });
         _markReplied(fromNorm);
         if (leadResult?.reply) {
@@ -5976,6 +5992,12 @@ app.listen(PORT, async () => {
   setInterval(() => persist.saveAll(store, inbox), 60_000).unref();
 
   initWorkers(store);
+
+  // Mark startup complete AFTER persist.loadLeads + initWorkers so demos and
+  // integration tests that poll /health can safely start sending store-modifying
+  // requests without racing against persist.loadLeads overwriting in-memory state.
+  _startupComplete = true;
+  logger.info('[startup] Startup sequence complete — store ready');
 
   // Also seed the legacy member_cache for backward compatibility with any code
   // that still calls memberCache.isConfirmed() directly.
