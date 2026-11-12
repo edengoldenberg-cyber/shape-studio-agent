@@ -73,9 +73,10 @@ const wa = req('../services/whatsapp.service');
 const originalSendText = wa.sendText;
 
 let sendCalls = [];
-let sendShouldThrow = false;
+let sendShouldThrow = false;    // throw for every phone
+let sendFailPhones  = new Set(); // throw only for specific phones
 wa.sendText = async (phone, message, _opts) => {
-  if (sendShouldThrow) throw new Error('mock send failure');
+  if (sendShouldThrow || sendFailPhones.has(phone)) throw new Error('mock send failure');
   sendCalls.push({ phone, message });
   return { idMessage: `MOCK-${Date.now()}` };
 };
@@ -346,41 +347,99 @@ console.log('\n── Section I — Rescheduling ──');
   note('I: After reschedule: status=confirmed → runReminderPass (not callback_pending pass) handles it.');
 }
 
-// ── Section J — Retry behavior when sends fail ───────────────────────────────
+// ── Section J — Retry behavior ────────────────────────────────────────────────
+// J1: All sends fail → entry NOT marked sent → retried on next cycle.
+// J2: Retry succeeds → entry marked sent → no further sends.
+// J3: Partial failure → only failed recipient retried, succeeded recipient skipped.
 
-console.log('\n── Section J — Retry behavior: all sends fail ──');
+console.log('\n── Section J — Retry behavior ──');
+
+// J1 + J2: full failure → not marked → retry → marked → dedup
 {
   clearAptsFile();
   process.env.CALLBACK_PENDING_REMINDER_ENABLED = 'true';
   const { aptStore, runCallbackPendingReminderPass } = reloadModules();
-  sendCalls = [];
 
   const apt = aptStore.createCallbackPending({
-    leadPhone: '972501000010', leadName: 'Test J',
+    leadPhone: '972501000010', leadName: 'Test J1',
     rawTime: 'בעוד 10 דקות', scheduledAt: new Date(Date.now() + 10 * 60_000),
     assignedStaffId: 'eden',
   });
 
-  // Make all sends throw
+  // ── J1: all fail ──────────────────────────────────────────────────────────
+  sendCalls = [];
   sendShouldThrow = true;
-  let result;
-  try {
-    result = await runCallbackPendingReminderPass(null);
-  } finally {
-    sendShouldThrow = false;
-  }
+  let r1;
+  try { r1 = await runCallbackPendingReminderPass(null); }
+  finally { sendShouldThrow = false; }
 
-  const afterFailure = aptStore.get(apt.id);
-  test('J: worker completes even when all sends throw', result?.pendingReminders, 1);
-  // CURRENT BEHAVIOR: broadcastToStaff catches send errors internally, returns 0.
-  // sendStaffReminder does NOT throw, so markReminderSent IS called even on full failure.
-  // This means failed sends are NOT retried on the next cycle.
-  test('J: reminderSent=true after failed sends (current behavior — no retry)',
-    afterFailure?.reminderSent, true);
-  note('J: LIMITATION — broadcastToStaff swallows send errors, so markReminderSent is');
-  note('J: called even when all WhatsApp sends failed. Failed reminders are not retried.');
-  note('J: To enable retry, sendStaffReminder must signal failure to the worker so');
-  note('J: markReminderSent is only called on confirmed delivery.');
+  const afterFail = aptStore.get(apt.id);
+  test('J1: worker returns pendingReminders=1 (attempted)', r1.pendingReminders, 1);
+  test('J1: reminderSent=false after full failure (not marked)',
+    afterFail?.reminderSent, false);
+  test('J1: reminderSentTo is empty after full failure',
+    (afterFail?.reminderSentTo ?? []).length, 0);
+  test('J1: 0 successful sends recorded', sendCalls.length, 0);
+
+  // ── J2: retry — all succeed ───────────────────────────────────────────────
+  sendCalls = [];
+  const r2 = await runCallbackPendingReminderPass(null);
+
+  const afterRetry = aptStore.get(apt.id);
+  test('J2: retry returns pendingReminders=1', r2.pendingReminders, 1);
+  test('J2: reminderSent=true after successful retry', afterRetry?.reminderSent, true);
+  test('J2: 2 sends on retry (all active staff)', sendCalls.length, 2);
+  truthy('J2: eden sent on retry', sendCalls.some(s => s.phone === '972509000001'));
+  truthy('J2: melanie sent on retry', sendCalls.some(s => s.phone === '972509000002'));
+
+  // ── J3: dedup — no further sends after full success ───────────────────────
+  sendCalls = [];
+  const r3 = await runCallbackPendingReminderPass(null);
+  test('J3: dedup — 0 reminders after full success', r3.pendingReminders, 0);
+  test('J3: dedup — 0 sends', sendCalls.length, 0);
+}
+
+// J4 + J5: partial failure — one recipient fails, is retried; already-succeeded is skipped
+console.log('\n── Section J (partial failure) ──');
+{
+  clearAptsFile();
+  process.env.CALLBACK_PENDING_REMINDER_ENABLED = 'true';
+  const { aptStore, runCallbackPendingReminderPass } = reloadModules();
+
+  const apt = aptStore.createCallbackPending({
+    leadPhone: '972501000011', leadName: 'Test J4',
+    rawTime: 'בעוד 10 דקות', scheduledAt: new Date(Date.now() + 10 * 60_000),
+    assignedStaffId: 'eden',
+  });
+
+  // ── J4: eden succeeds, melanie fails ──────────────────────────────────────
+  sendCalls = [];
+  sendFailPhones = new Set(['972509000002']); // melanie fails
+  let r4;
+  try { r4 = await runCallbackPendingReminderPass(null); }
+  finally { sendFailPhones = new Set(); }
+
+  const afterPartial = aptStore.get(apt.id);
+  test('J4: pendingReminders=1 (attempted)', r4.pendingReminders, 1);
+  test('J4: reminderSent=false after partial failure', afterPartial?.reminderSent, false);
+  truthy('J4: eden in reminderSentTo after partial success',
+    (afterPartial?.reminderSentTo ?? []).includes('972509000001'));
+  test('J4: melanie NOT in reminderSentTo (failed)',
+    (afterPartial?.reminderSentTo ?? []).includes('972509000002'), false);
+  test('J4: eden received 1 send', sendCalls.filter(s => s.phone === '972509000001').length, 1);
+  test('J4: melanie received 0 sends (failed)', sendCalls.filter(s => s.phone === '972509000002').length, 0);
+
+  // ── J5: retry — only melanie is retried, eden is skipped ──────────────────
+  sendCalls = [];
+  const r5 = await runCallbackPendingReminderPass(null);
+
+  const afterRecovery = aptStore.get(apt.id);
+  test('J5: pendingReminders=1 (retried)', r5.pendingReminders, 1);
+  test('J5: reminderSent=true after recovery', afterRecovery?.reminderSent, true);
+  test('J5: eden NOT resent (already accepted)',
+    sendCalls.filter(s => s.phone === '972509000001').length, 0);
+  test('J5: melanie sent on retry',
+    sendCalls.filter(s => s.phone === '972509000002').length, 1);
 }
 
 // ── Timing / status report ────────────────────────────────────────────────────
@@ -390,8 +449,8 @@ note('ENABLED: requires CALLBACK_PENDING_REMINDER_ENABLED=true in env/Railway Va
 note('TIMING: cron runs every 15 min (timezone: Asia/Jerusalem). Default window: 30 min.');
 note('WINDOW: controlled by CALLBACK_PENDING_REMINDER_MIN (default "30"). Floor: 20 min.');
 note('RECIPIENTS: ALL active staff in staff_config.json with a phone. Not just the owner.');
-note('DEDUP: reminderSent flag on the aptStore entry. Persists across restarts.');
-note('LIMITATION: failed sends mark the entry as sent anyway (no automatic retry).');
+note('DEDUP: per-recipient (reminderSentTo[]) + global (reminderSent). Persists across restarts.');
+note('RETRY: failed recipients are retried each cycle; accepted recipients are never resent.');
 
 // ── Cleanup ───────────────────────────────────────────────────────────────────
 

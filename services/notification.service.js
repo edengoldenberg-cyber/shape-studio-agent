@@ -94,20 +94,32 @@ function formatTime(scheduledAt, rawTime) {
  * Send a WhatsApp message to every active staff member who has a phone.
  * Always bypasses quiet hours — outbound alerts to staff must never be queued
  * or trigger the "Got your message" ack that is meant for inbound client messages.
- * Returns the count of successful sends.
+ *
+ * Returns an array of per-recipient results:
+ *   { staffId, phone, ok: true,  idMessage }   — provider accepted
+ *   { staffId, phone, ok: true,  skipped: true } — already accepted (in skipPhones)
+ *   { staffId, phone, ok: false, error }         — send failed
+ *
+ * @param {string} message
+ * @param {{ skipPhones?: Set<string> }} [opts]
  */
-async function broadcastToStaff(message) {
+async function broadcastToStaff(message, { skipPhones = new Set() } = {}) {
   const recipients = activeStaffWithPhones();
-  let sent = 0;
+  const results = [];
   for (const member of recipients) {
+    if (skipPhones.has(member.phone)) {
+      results.push({ staffId: member.id, phone: member.phone, ok: true, skipped: true });
+      continue;
+    }
     try {
-      await sendText(member.phone, message, { bypassQuietHours: true });
-      sent++;
+      const res = await sendText(member.phone, message, { bypassQuietHours: true });
+      results.push({ staffId: member.id, phone: member.phone, ok: true, idMessage: res?.idMessage ?? null });
     } catch (err) {
       logger.warn('[notify] broadcastToStaff failed', { staffId: member.id, error: err.message });
+      results.push({ staffId: member.id, phone: member.phone, ok: false, error: err.message });
     }
   }
-  return sent;
+  return results;
 }
 
 // ── Public functions ──────────────────────────────────────────────────────────
@@ -134,8 +146,9 @@ async function notifyStaffCallbackConfirmed(apt, assignedStaff, icsDownloadUrl) 
   ].filter(l => l !== null).join('\n');
 
   // WhatsApp: all active staff (Eden + Melanie + any configured)
-  const sent = await broadcastToStaff(waMsg);
-  if (!sent && assignedStaff?.phone) {
+  const waResults = await broadcastToStaff(waMsg);
+  const sent = waResults.filter(r => r.ok && !r.skipped).length;
+  if (!waResults.length && assignedStaff?.phone) {
     // No roster configured — fall back to assigned staff only
     await sendText(assignedStaff.phone, waMsg).catch(err =>
       logger.warn('[notify] Fallback staff WhatsApp failed', { error: err.message })
@@ -165,8 +178,13 @@ async function notifyStaffCallbackConfirmed(apt, assignedStaff, icsDownloadUrl) 
 
 /**
  * Send a WhatsApp reminder to ALL active staff 15–20 minutes before the call.
+ *
+ * @param {object} apt
+ * @param {object|null} assignedStaff
+ * @param {{ skipPhones?: Set<string> }} [opts]  skipPhones = phones already accepted
+ * @returns {Array}  per-recipient result array from broadcastToStaff
  */
-async function sendStaffReminder(apt, assignedStaff) {
+async function sendStaffReminder(apt, assignedStaff, { skipPhones = new Set() } = {}) {
   const timeLabel = formatTime(apt.scheduledAt, apt.rawTime);
   const lead      = apt.leadName ?? apt.leadPhone;
 
@@ -179,13 +197,17 @@ async function sendStaffReminder(apt, assignedStaff) {
     `🕐 ${timeLabel}`,
   ].join('\n');
 
-  const sent = await broadcastToStaff(msg);
-  if (!sent && assignedStaff?.phone) {
+  const results = await broadcastToStaff(msg, { skipPhones });
+  const sent    = results.filter(r => r.ok && !r.skipped).length;
+  const failed  = results.filter(r => !r.ok).length;
+  if (!results.length && assignedStaff?.phone) {
+    // No roster configured — fall back to assigned staff only (not tracked per-recipient)
     await sendText(assignedStaff.phone, msg).catch(err =>
       logger.warn('[notify] Reminder fallback failed', { error: err.message })
     );
   }
-  logger.info('[notify] Staff reminder sent', { aptId: apt.id, waRecipients: sent });
+  logger.info('[notify] Staff reminder attempted', { aptId: apt.id, sent, failed, skipped: results.filter(r => r.skipped).length });
+  return results;
 }
 
 /**
@@ -235,8 +257,9 @@ async function notifyStaffRescheduled(apt, assignedStaff, oldTimeLabel) {
     `🕐 חדש: *${newTime}*`,
   ].join('\n');
 
-  const sent = await broadcastToStaff(msg);
-  if (!sent && assignedStaff?.phone) {
+  const rsResults = await broadcastToStaff(msg);
+  const sent = rsResults.filter(r => r.ok && !r.skipped).length;
+  if (!rsResults.length && assignedStaff?.phone) {
     await sendText(assignedStaff.phone, msg).catch(() => {});
   }
 
@@ -291,8 +314,9 @@ async function notifyRepresentativeRequest(leadPhone, leadName) {
     `בקרוב תקבלו הודעה עם השעה המועדפת.`,
   ].join('\n');
 
-  const sent = await broadcastToStaff(msg);
-  logger.info('[notify] Representative request alert sent', { leadPhone, waRecipients: sent });
+  const rrResults = await broadcastToStaff(msg);
+  const rrSent = rrResults.filter(r => r.ok && !r.skipped).length;
+  logger.info('[notify] Representative request alert sent', { leadPhone, waRecipients: rrSent });
 }
 
 /**
@@ -300,9 +324,10 @@ async function notifyRepresentativeRequest(leadPhone, leadName) {
  * Called by the 20:00 cron worker in scheduler.js.
  */
 async function sendDailySummaryToAdmins(summaryText) {
-  const sent = await broadcastToStaff(summaryText);
-  logger.info('[notify] Daily summary sent', { waRecipients: sent });
-  return sent;
+  const dsResults = await broadcastToStaff(summaryText);
+  const dsSent = dsResults.filter(r => r.ok && !r.skipped).length;
+  logger.info('[notify] Daily summary sent', { waRecipients: dsSent });
+  return dsSent;
 }
 
 module.exports = {

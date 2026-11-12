@@ -104,20 +104,43 @@ async function runCallbackPendingReminderPass(store) {
   logger.info('[apt-worker] Callback-pending reminder pass', { due: due.length, windowMin: reminderMinutes });
 
   const { sendStaffReminder } = require('../services/notification.service');
-  let sent = 0;
+  let attempted = 0;
   for (const apt of due) {
     const staff = findStaff(apt.assignedStaffId);
-    // sendStaffReminder sends to all active staff with phones (staff-only, not prospect)
-    await sendStaffReminder(apt, staff);
-    aptStore.markReminderSent(apt.id);
-    store?.logEvent('callback_pending_reminder_sent', apt.leadPhone, {
-      aptId:          apt.id,
-      rawTime:        apt.rawTime,
-      reminderMinutes,
-    });
-    sent++;
+
+    // Build the set of phones that have already confirmed receipt so we never resend.
+    const alreadyAccepted = new Set(apt.reminderSentTo ?? []);
+
+    // Send to remaining recipients (broadcastToStaff skips phones in alreadyAccepted).
+    const results = await sendStaffReminder(apt, staff, { skipPhones: alreadyAccepted });
+
+    // Record newly-succeeded phones.
+    const newSucceeded = results.filter(r => r.ok && !r.skipped).map(r => r.phone);
+    if (newSucceeded.length) {
+      const updatedSentTo = [...alreadyAccepted, ...newSucceeded];
+      aptStore.update(apt.id, { reminderSentTo: updatedSentTo });
+    }
+
+    // Mark complete only when every current active recipient is covered (sent or skipped-ok).
+    // If any recipient failed, the entry stays in the next cycle's due list for retry.
+    const allCovered = results.length > 0 && results.every(r => r.ok);
+    if (allCovered) {
+      aptStore.markReminderSent(apt.id);
+      store?.logEvent('callback_pending_reminder_sent', apt.leadPhone, {
+        aptId:          apt.id,
+        rawTime:        apt.rawTime,
+        reminderMinutes,
+      });
+    } else {
+      const failedCount = results.filter(r => !r.ok).length;
+      logger.warn('[apt-worker] Callback-pending reminder: partial/full failure — will retry next cycle', {
+        aptId: apt.id, failedCount, results: results.map(r => ({ phone: r.phone, ok: r.ok })),
+      });
+    }
+
+    attempted++;
   }
-  return { pendingReminders: sent };
+  return { pendingReminders: attempted };
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
