@@ -4069,15 +4069,23 @@ async function processInboundWAMessage(msg) {
                 ? new Date(_postHandoffLead.meta.callTimeGivenAt)
                 : new Date();
               const _parsedAt   = calendarSvc.parseHebrewTimeLocal(_rawTime, _sentAt);
-              aptStore.createCallbackPending({
+              const _newApt = aptStore.createCallbackPending({
                 leadPhone:       fromNorm,
                 leadName:        _postHandoffLead.name ?? null,
                 rawTime:         _rawTime,
                 scheduledAt:     _parsedAt ?? null,
                 assignedStaffId: staffConfig?.staff?.find(s => s.id === 'eden')?.id ?? 'eden',
               });
+              // Backfill handoffSentTo from the phones reliableHandoffAlert already
+              // reached. Without this the retry-notify endpoint would resend to staff
+              // who already received the initial alert via the AI-path flow.
+              const _aiHandoffPhones = _postHandoffLead.meta?.handoffSentPhones ?? [];
+              if (_aiHandoffPhones.length) {
+                aptStore.update(_newApt.id, { handoffSentTo: _aiHandoffPhones });
+              }
               logger.info('[pipeline] callback_pending aptStore entry created from AI flow',
-                { from: fromNorm, rawTime: _rawTime, scheduledAt: _parsedAt?.toISOString() ?? null });
+                { from: fromNorm, rawTime: _rawTime, scheduledAt: _parsedAt?.toISOString() ?? null,
+                  handoffSentTo: _aiHandoffPhones.length });
             } catch (aptErr) {
               logger.warn('[pipeline] Failed to create callback_pending aptStore entry',
                 { from: fromNorm, error: aptErr.message });

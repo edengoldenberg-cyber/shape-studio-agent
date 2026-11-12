@@ -244,6 +244,18 @@ try {
     const apts3    = await getApts();
     const pending3 = apts3.filter(a => a.leadPhone === LEAD && a.status === 'callback_pending');
     test('still exactly 1 callback_pending after dup', pending3.length, 1);
+
+    // ── 4. handoffSentTo backfill — AI-path initial alert phones recorded ──
+    // reliableHandoffAlert fires before the aptStore entry exists. When the entry
+    // is created, it must backfill handoffSentTo from lead.meta.handoffSentPhones
+    // so retry-notify does not resend to already-covered staff.
+    console.log('\n── 4. handoffSentTo backfilled from AI-path alert ──');
+
+    const aptAfter3 = apts3.find(a => a.id === apt.id);
+    // The mock returns a real idMessage so NOTIFY_PHONES phone is in handoffSentPhones.
+    truthy('handoffSentTo is not empty after AI-path creation', (aptAfter3?.handoffSentTo ?? []).length > 0);
+    truthy('handoffSentTo includes NOTIFY_PHONES phone',
+      (aptAfter3?.handoffSentTo ?? []).includes('972509000001'));
   }
 
 } catch (err) {

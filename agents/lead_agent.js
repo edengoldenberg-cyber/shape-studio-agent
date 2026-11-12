@@ -716,6 +716,9 @@ async function reliableHandoffAlert(phone, name, history, latestQualData) {
   // real provider idMessage is stored so the panel can verify receipt beyond "sent".
   let handoffIdMessage  = null;
   let handoffAlertError = null;
+  // Per-recipient phones that confirmed receipt — copied to apt.handoffSentTo so
+  // retry-notify can skip them and avoid resending to already-covered staff.
+  let handoffSentPhones = [];
 
   try {
     // 3. Race the LLM brief against a 10-second timeout.
@@ -745,8 +748,9 @@ async function reliableHandoffAlert(phone, name, history, latestQualData) {
         const ar = await alertOwner(`📋 ליד מוכן לשיחה — ${name ?? phone}`, briefResult.briefLines);
         const firstOk = ar?.results?.find(r => r.idMessage);
         if (firstOk) {
-          notificationSent = true;
+          notificationSent  = true;
           handoffIdMessage  = firstOk.idMessage;
+          handoffSentPhones = (ar.results ?? []).filter(r => r.idMessage).map(r => r.phone);
           logger.info('[lead_agent] Handoff brief sent to team', { phone, readiness: readiness.level, idMessage: handoffIdMessage });
         } else {
           briefErr = new Error(ar?.results?.map(r => r.error).filter(Boolean).join('; ') || 'no idMessage returned');
@@ -773,8 +777,9 @@ async function reliableHandoffAlert(phone, name, history, latestQualData) {
         const ar2 = await alertOwner(`📋 ליד (fallback) — ${name ?? phone}`, fallbackLines);
         const firstOk2 = ar2?.results?.find(r => r.idMessage);
         if (firstOk2) {
-          notificationSent = true;
+          notificationSent  = true;
           handoffIdMessage  = firstOk2.idMessage;
+          handoffSentPhones = (ar2.results ?? []).filter(r => r.idMessage).map(r => r.phone);
           logger.info('[lead_agent] Fallback handoff alert sent', { phone, idMessage: handoffIdMessage });
         } else {
           handoffAlertError = ar2?.results?.map(r => r.error).filter(Boolean).join('; ') || 'no idMessage returned';
@@ -790,6 +795,8 @@ async function reliableHandoffAlert(phone, name, history, latestQualData) {
   }
 
   // 4. Persist the durable outcome so the team panel reflects delivery status.
+  //    handoffSentPhones is read by server.js when creating the AI-path aptStore entry
+  //    so apt.handoffSentTo reflects who actually received the initial alert.
   const updatedMeta = store.getLead(phone)?.meta ?? {};
   store.upsertLead(phone, {
     meta: {
@@ -799,6 +806,7 @@ async function reliableHandoffAlert(phone, name, history, latestQualData) {
       handoffAlertFailedAt:  notificationSent ? null : new Date().toISOString(),
       handoffAlertIdMessage: handoffIdMessage ?? null,
       handoffAlertError:     handoffAlertError ?? null,
+      handoffSentPhones:     handoffSentPhones,
     },
   });
 }
