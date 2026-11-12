@@ -2341,7 +2341,7 @@ async function buildSchedulingReply(intent, msg, clientMatch, { noMatchPassthrou
     // the conversation naturally with an empathetic, non-dead-end response.
     // For existing clients: give a direct honest answer.
     if (noMatchPassthrough) return null;
-    return `נכון לעכשיו אין לנו מידע מלא על מדריכים בהתמחות זו. אפשר לפנות לסטודיו ישירות כדי לקבל תשובה מדויקת.`;
+    return `נכון לעכשיו אין לי מידע מלא על מדריכים בהתמחות הזו. אשמח לחבר אותך עם נציג מהצוות שיוכל לענות — באיזו שעה נוח לך? 📞`;
   }
 
   // ── Subscription / membership query (Bug 3 & 4) ───────────────────────────
@@ -2370,7 +2370,7 @@ async function buildSchedulingReply(intent, msg, clientMatch, { noMatchPassthrou
       `המשתמש שאל: "${msgText}"\n\n` +
       `ענה בעברית על מבנה המנויים של Shape Studio לפי הנתונים הבאים:\n\n${subCtx}\n\n` +
       `כלל חשוב: כל מנוי כולל גישה לכל סוגי האימונים. ציין זאת בתשובה. ` +
-      `אם המחיר לא מצוין (null) — ציין "פנה/י לסטודיו לפרטי מחיר". עד 4 שורות.`
+      `אם המחיר לא מצוין (null) — ציין "אשמח לחבר אותך עם נציג שייתן לך את הפרטים". עד 4 שורות.`
     );
   }
 
@@ -2390,10 +2390,12 @@ async function buildSchedulingReply(intent, msg, clientMatch, { noMatchPassthrou
     );
   }
 
-  // For booking / schedule_query — pull live Arbox schedule for the right day
+  // For booking / schedule_query — pull live Arbox schedule for the right day.
+  // Pass msg.timestamp (Unix seconds) so "חמישי" resolves relative to the send
+  // time rather than the server's processing clock.
   let scheduleData = { classes: [], total: 0, date: null };
   try {
-    scheduleData = await barakAgent.checkSchedule(msgText);
+    scheduleData = await barakAgent.checkSchedule(msgText, msg?.timestamp ?? null);
   } catch { /* non-fatal */ }
 
   if (intent === 'booking' || intent === 'schedule_query') {
@@ -2406,10 +2408,20 @@ async function buildSchedulingReply(intent, msg, clientMatch, { noMatchPassthrou
     const instructorOnly = isInstructorQuery(msgText);
     const classFilter    = extractClassFilter(msgText);
 
+    // Time-of-day filter: morning query → before 12:00; evening → 17:00+.
+    // Applied before the class-name filter so "פילאטיס בבוקר" works correctly.
+    const isMorningQuery = /בבוקר|שעות\s*בוקר|אימון\s*בוקר/.test(msgText);
+    const isEveningQuery = /בערב|שעות\s*ערב|אחה"צ|אחרי\s*הצהריים/.test(msgText);
+    const timeFiltered = isMorningQuery
+      ? scheduleData.classes.filter(c => parseInt((c.start ?? '12').split(':')[0], 10) < 12)
+      : isEveningQuery
+        ? scheduleData.classes.filter(c => parseInt((c.start ?? '12').split(':')[0], 10) >= 17)
+        : scheduleData.classes;
+
     // Surgical filter: when the user named a specific class, show only that class
     const relevantClasses = classFilter
-      ? scheduleData.classes.filter(c => classFilter.test(c.name))
-      : scheduleData.classes;
+      ? timeFiltered.filter(c => classFilter.test(c.name))
+      : timeFiltered;
 
     // If a class was named but none found that day, say so precisely
     if (classFilter && !relevantClasses.length) {
@@ -3227,10 +3239,27 @@ async function processInboundWAMessage(msg) {
       }
     });
 
+    // ── Ask for name when not yet known ──────────────────────────────────────
+    // After the callback time is recorded, ask for the prospect's first name so
+    // the staff brief can include it. Only ask on a fresh appointment, not on
+    // reschedule (name was captured during the original booking).
+    if (!isReschedule) {
+      const _awMeta = store.getLead(fromNorm)?.meta ?? {};
+      store.upsertLead(fromNorm, {
+        meta: {
+          ..._awMeta,
+          qualData: { ...(_awMeta.qualData ?? {}), nameAsked: true },
+        },
+      });
+    }
+
     // ── Confirm to lead ───────────────────────────────────────────────────────
+    // Fresh appointment: confirm the time, then ask for the name in the same
+    // message. The post-call gate (call_scheduled) captures the next reply as
+    // the name (nameAsked=true set above). No trailing generic question.
     const confirmMsg = isReschedule
       ? `מעולה! קבענו מחדש ל-${rawTime} ✅\nנציג מהצוות ייצור איתך קשר בזמן החדש. 😊`
-      : `מעולה! השיחה נקבעה ל-${rawTime} ✅\nנציג מהצוות ייצור איתך קשר. יש עוד משהו שאוכל לעזור? 😊`;
+      : `מעולה! השיחה נקבעה ל-${rawTime} ✅\nנציג מהצוות ייצור איתך קשר. ואיך קוראים לך? 😊`;
 
     if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
       _markBotSent(fromNorm);

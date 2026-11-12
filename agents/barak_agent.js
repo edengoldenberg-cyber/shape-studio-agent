@@ -253,8 +253,15 @@ const HE_DAY_MAP = {
   'שבת':    6, 'saturday':  6,
 };
 
-function resolveTargetDate(query) {
-  if (!query) return new Date().toISOString().split('T')[0];
+/**
+ * @param {string|null} query
+ * @param {Date|null} anchorDate - anchor for relative day resolution; defaults to now.
+ *   Pass the original inbound message timestamp so "חמישי" resolves relative to when
+ *   the user sent the message, not when the server processes it.
+ */
+function resolveTargetDate(query, anchorDate = null) {
+  const today = anchorDate instanceof Date ? anchorDate : new Date();
+  if (!query) return today.toISOString().split('T')[0];
 
   // If it's already a YYYY-MM-DD date string, return it directly
   if (/^\d{4}-\d{2}-\d{2}$/.test(query)) return query;
@@ -262,8 +269,10 @@ function resolveTargetDate(query) {
   const lc = query.toLowerCase();
   for (const [token, weekday] of Object.entries(HE_DAY_MAP)) {
     if (lc.includes(token)) {
-      const today  = new Date();
-      const diff   = (weekday - today.getDay() + 7) % 7 || 7; // always future
+      // diff=0 means TODAY is the requested day — return today.
+      // The old `|| 7` rule (force next week when diff=0) was wrong: asking
+      // "מי מדריך ביום חמישי?" ON a Thursday means THIS Thursday, not next.
+      const diff   = (weekday - today.getDay() + 7) % 7;
       const target = new Date(today);
       target.setDate(today.getDate() + diff);
       return target.toISOString().split('T')[0];
@@ -272,19 +281,21 @@ function resolveTargetDate(query) {
 
   // "היום" / "today" — stay on today
   if (lc.includes('היום') || lc.includes('today')) {
-    return new Date().toISOString().split('T')[0];
+    return today.toISOString().split('T')[0];
   }
 
-  return new Date().toISOString().split('T')[0];
+  return today.toISOString().split('T')[0];
 }
 
 /**
  * Pull a day's class schedule from Arbox.
  * @param {string} [dateOrQuery] - ISO date, Hebrew day name, or free text containing a day name.
- *   Omit for today.
+ * @param {number|null} [msgTimestamp] - Unix seconds of the original inbound message.
+ *   Anchors relative day resolution ("חמישי") to the send time, not processing time.
  */
-async function checkSchedule(dateOrQuery) {
-  const targetDate = resolveTargetDate(dateOrQuery ?? null);
+async function checkSchedule(dateOrQuery, msgTimestamp = null) {
+  const anchor = msgTimestamp ? new Date(msgTimestamp * 1000) : null;
+  const targetDate = resolveTargetDate(dateOrQuery ?? null, anchor);
 
   try {
     // Fetch 14 days so any day-of-week query within 2 weeks is covered
