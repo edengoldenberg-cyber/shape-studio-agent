@@ -4,6 +4,7 @@ const path    = require('path');
 const OpenAI  = require('openai');
 const logger  = require('../utils/logger');
 const store   = require('../utils/lead_store');
+const _persist = require('../utils/persist');
 const { sendText, alertOwner } = require('../services/whatsapp.service');
 const { tryDeterministicWazeReply, tryDeterministicScheduleReply } = require('./deterministic_reply');
 
@@ -1184,6 +1185,10 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
     });
     store.logEvent('call_time_captured', from, { callTime, statusSet: 'callback_requested' });
     logger.info('[lead_agent] Call time captured — status → callback_requested', { from, callTime });
+    // Persist immediately so callTimeGiven survives a server restart before the
+    // closing summary fires. Without this, a crash between capture and summary
+    // would lose the callback commitment.
+    _persist.saveLeads(store);
   }
 
   // 3b. Location detection — runs on every message so early mentions are caught.
@@ -1426,6 +1431,11 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
     if (completedTurns >= 2 && !freshQualData.callProposed && !freshQualData.callTimeGiven
         && CALL_PROPOSAL_RE.test(reply)) {
       setQualData(from, { callProposed: true });
+      // Persist immediately so the proposal survives a restart before the lead
+      // replies with their callback time. Without this, the stage-gate condition
+      // (qualData.callProposed && !qualData.callTimeGiven) would fail on reload
+      // and the user's time response would not be captured.
+      _persist.saveLeads(store);
     }
 
     // pricingObjectionHandled: set once the call proposal has been delivered after

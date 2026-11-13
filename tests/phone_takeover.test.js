@@ -465,6 +465,126 @@ describe('T_R2 — Repeated phone messages while human_owns preserve previousSta
   });
 });
 
+// ── T_R4: idempotent release ──────────────────────────────────────────────────
+
+describe('T_R4 — release is idempotent when lead is not in human_owns', () => {
+  beforeEach(() => {
+    resetAll();
+    store.upsertLead(LEAD_PHONE, { status: 'callback_requested', meta: { callbackTime: 'מחר ב12' } });
+  });
+
+  test('release on callback_requested returns unchanged:true without changing status', async () => {
+    expect(store.getLead(LEAD_PHONE)?.status).toBe('callback_requested');
+    const r = await request(app)
+      .post(`/api/leads/${LEAD_PHONE}/release`).send({});
+    expect(r.status).toBe(200);
+    expect(r.body.unchanged).toBe(true);
+    // Status must NOT have changed to cold
+    expect(store.getLead(LEAD_PHONE)?.status).toBe('callback_requested');
+  });
+
+  test('release on cold returns unchanged:true without changing status', async () => {
+    store.upsertLead(LEAD_PHONE, { status: 'cold', meta: {} });
+    const r = await request(app)
+      .post(`/api/leads/${LEAD_PHONE}/release`).send({});
+    expect(r.status).toBe(200);
+    expect(r.body.unchanged).toBe(true);
+    expect(store.getLead(LEAD_PHONE)?.status).toBe('cold');
+  });
+
+  test('release on human_owns still works normally', async () => {
+    store.upsertLead(LEAD_PHONE, {
+      status: 'human_owns',
+      meta: { humanOwnsReason: 'staff_manual_reply', previousStatus: 'callback_requested' },
+    });
+    const r = await request(app)
+      .post(`/api/leads/${LEAD_PHONE}/release`).send({});
+    expect(r.status).toBe(200);
+    expect(r.body.unchanged).toBeUndefined();
+    expect(r.body.status).toBe('callback_requested');
+  });
+});
+
+// ── T_R5: callProposed survives restart (persist on proposal) ─────────────────
+
+describe('T_R5 — callProposed persists to disk so restart between proposal and time-capture is safe', () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'callproposed-'));
+  });
+
+  afterEach(() => {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    jest.resetModules();
+  });
+
+  test('callProposed=true written to disk and readable in fresh store after reload', () => {
+    const originalDataDir = process.env.DATA_DIR;
+    process.env.DATA_DIR = tmpDir;
+
+    const realPersist   = jest.requireActual('../utils/persist');
+    const { LeadStore } = jest.requireActual('../utils/lead_store');
+
+    // Simulate the state after Barak proposes a callback: callProposed=true in qualData
+    const writeStore = new LeadStore();
+    writeStore.upsertLead(LEAD_PHONE, {
+      status: 'warm',
+      meta: {
+        qualData: {
+          callProposed:    true,
+          fitnessInterest: 'פילאטיס',
+          location:        'חדרה',
+          locationViable:  true,
+        },
+      },
+    });
+
+    realPersist.saveLeads(writeStore);
+    expect(fs.existsSync(path.join(tmpDir, 'leads_persist.json'))).toBe(true);
+
+    // Reload — simulates server restart
+    const readStore = new LeadStore();
+    realPersist.loadLeads(readStore);
+
+    const after = readStore.getLead(LEAD_PHONE);
+    expect(after?.meta?.qualData?.callProposed).toBe(true);
+    // Other qualData fields also survive
+    expect(after?.meta?.qualData?.fitnessInterest).toBe('פילאטיס');
+
+    process.env.DATA_DIR = originalDataDir;
+  });
+
+  test('callTimeGiven written to disk and readable in fresh store after reload', () => {
+    const originalDataDir = process.env.DATA_DIR;
+    process.env.DATA_DIR = tmpDir;
+
+    const realPersist   = jest.requireActual('../utils/persist');
+    const { LeadStore } = jest.requireActual('../utils/lead_store');
+
+    const writeStore = new LeadStore();
+    writeStore.upsertLead(LEAD_PHONE, {
+      status: 'callback_requested',
+      meta: {
+        callbackTime: 'מחר ב19',
+        callTimeGivenAt: new Date().toISOString(),
+        qualData: { callProposed: true, callTimeGiven: 'מחר ב19' },
+      },
+    });
+
+    realPersist.saveLeads(writeStore);
+    const readStore = new LeadStore();
+    realPersist.loadLeads(readStore);
+
+    const after = readStore.getLead(LEAD_PHONE);
+    expect(after?.status).toBe('callback_requested');
+    expect(after?.meta?.qualData?.callTimeGiven).toBe('מחר ב19');
+    expect(after?.meta?.qualData?.callProposed).toBe(true);
+
+    process.env.DATA_DIR = originalDataDir;
+  });
+});
+
 // ── T_R3: previousStatus survives real file persistence and reload ────────────
 //
 // Writes to a temp directory using a fresh module instance (jest.isolateModules),

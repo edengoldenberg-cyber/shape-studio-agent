@@ -44,6 +44,13 @@ function releaseOwnership(store, phone, { isMember } = {}) {
   const existing = store.getLead(phone);
   if (!existing) return null;
 
+  // Idempotent: only act when ownership is actually held.
+  // Calling release on an already-released lead must NOT change the current
+  // status or metadata — the lead's real state takes priority over fallback logic.
+  if (existing.status !== 'human_owns') {
+    return { status: existing.status, automationResumed: false, unchanged: true };
+  }
+
   const meta   = existing.meta ?? {};
   const status = computeReleaseStatus(meta, isMember, phone);
   const clear  = {

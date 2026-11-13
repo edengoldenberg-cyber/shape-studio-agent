@@ -1987,6 +1987,12 @@ app.post('/api/leads/:phone/release', jsonBody, (req, res) => {
   const result = ownership.releaseOwnership(store, norm, { isMember: phoneRegistry.isMember.bind(phoneRegistry) });
   if (!result) return res.status(404).json({ error: 'lead not found' });
 
+  // Idempotent: lead was not in human_owns — preserve current state, no-op.
+  if (result.unchanged) {
+    logger.info('[lead-ownership] Release no-op — not in human_owns', { phone: norm, status: result.status });
+    return res.json({ ok: true, phone: norm, status: result.status, automationResumed: false, unchanged: true });
+  }
+
   store.logEvent('human_release', norm, { restoredTo: result.status, automationResumed: result.automationResumed });
   persist.saveLeads(store);
   logger.info('[lead-ownership] Released — bot resumed', { phone: norm, restoredTo: result.status });
@@ -3560,6 +3566,25 @@ async function processInboundWAMessage(msg) {
       else if (intent === 'reschedule') {
         // fall through to the standard reschedule path below
       } else if (isBriefAck(msgText) || msg.type !== 'text') {
+        // Before going silent: if availability was already confirmed and this is a
+        // duplicate affirmation, route it distinctly instead of silently dropping it.
+        // This prevents a second "כן" being indistinguishable from the first in logs.
+        const _dupAvailAlready = aptStore.getByPhone(fromNorm).some(
+          a => a.prospectReminderSent === true
+            && a.prospectAvailability !== null
+            && a.status === 'callback_pending'
+        );
+        if (_dupAvailAlready) {
+          store.logEvent('post_call_avail_dup_affirm', fromNorm, { preview: msgText.slice(0, 60) });
+          logger.info('[pipeline] Duplicate availability affirmation — no new alert', { from: fromNorm });
+          const dupAvEntry = inbox.push({
+            from: fromNorm, fromIsraeli, name: msg.name ?? null,
+            text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
+            receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
+            clientMatch, intent, route: 'post_call_avail_already_confirmed', barakReply: null,
+          });
+          return { inboxEntry: dupAvEntry, clientMatch, intent, route: 'post_call_avail_already_confirmed', barakReply: null };
+        }
         // Brief ack / emoji / non-text → silent. The sales phase is over.
         store.logEvent('post_call_ack_silent', fromNorm, { status: _postCallStatus, preview: msgText.slice(0, 60) });
         logger.info('[pipeline] Post-call ack silent', { from: fromNorm, status: _postCallStatus });
@@ -3987,6 +4012,7 @@ async function processInboundWAMessage(msg) {
         //       so they can handle it. The bot stays silent in both cases.
         const { TIME_PATTERN, TIME_REJECTION_RE } = require('./agents/lead_agent');
         const _qd         = _postCallRec?.meta?.qualData ?? {};
+
         const isDupAccept = _qd.callTimeGiven
           && TIME_PATTERN.test(msgText) && !TIME_REJECTION_RE.test(msgText);
 
