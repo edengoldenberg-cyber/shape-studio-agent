@@ -3837,30 +3837,41 @@ async function processInboundWAMessage(msg) {
           );
           if (_availAptN) {
             const _lcN = msgText.trim().toLowerCase();
-            const _CONFIRM_REN = /^(כן|בסדר|אוקיי|יופי|מצוין|sure|yes|ok|טוב|בטח|ברור|נכון)(\s|$)/i;
-            const _CANCEL_REN  = /לא\s*(נוח|יכול|יכולה)|לא\s+ok|לא\s+בסדר|^לא(\s|$)|אי\s*אפשר|לשנות|לדחות|reschedule|cancel/i;
-            let _availStateN = null, _availReplyN = null;
-            const _aptNameN  = (_availAptN.leadName ?? '').split(' ')[0] || 'שלום';
+            const _aptNameN = (_availAptN.leadName ?? '').split(' ')[0] || 'שלום';
             const { fmtScheduledAt: _fmtN } = require('./utils/time');
-            const _aptTimeN  = _fmtN(_availAptN.scheduledAt, _availAptN.rawTime);
+            const _aptTimeN = _fmtN(_availAptN.scheduledAt, _availAptN.rawTime);
+            const _CONFIRM_REN    = /^(כן|בסדר|אוקיי|יופי|מצוין|sure|yes|ok|טוב|בטח|ברור|נכון)(\s|$)/i;
+            const _RESCHEDULE_REN = /לא\s*(נוח|מתאים|יכול|יכולה|אפשרי)|לא\s+ok|לא\s+בסדר|אי\s*אפשר|לשנות|לדחות|reschedule/i;
+            const _CANCEL_REN     = /לבטל|אבטל|לא\s*רוצ[הי]|לא\s*מעוניי?נ|not interested|cancel/i;
+            let _availStateN = null, _availReplyN = null, _aptUpdatesN = {};
             if (_CONFIRM_REN.test(_lcN)) {
               _availStateN = 'confirmed';
               _availReplyN = `מצוין ${_aptNameN}! 🎉 נציג יצור איתך קשר ${_aptTimeN}`;
+              _aptUpdatesN = { prospectAvailability: 'confirmed' };
+            } else if (_RESCHEDULE_REN.test(_lcN)) {
+              _availStateN = 'rescheduled';
+              _availReplyN = `מה הזמן שיהיה לך נוח? נסדר זמן חדש 🗓️`;
+              _aptUpdatesN = { prospectAvailability: 'rescheduled', prospectReminderSent: false };
             } else if (_CANCEL_REN.test(_lcN)) {
               _availStateN = 'cancelled';
-              _availReplyN = `הבנתי! שלח/י לי מועד שנוח לך ונסדר מחדש 🗓️`;
+              _availReplyN = `הבנתי! אם תרצה/י לתאם שיחה בעתיד — אנחנו כאן 😊`;
+              _aptUpdatesN = { prospectAvailability: 'cancelled' };
             }
             if (_availStateN) {
-              aptStore.update(_availAptN.id, { prospectAvailability: _availStateN });
+              aptStore.update(_availAptN.id, _aptUpdatesN);
               if (_availReplyN && process.env.WHATSAPP_AUTO_REPLY === 'true') {
                 _markBotSent(fromNorm);
                 sendText(fromNorm, _availReplyN).catch(() => {});
               }
-              if (_availStateN === 'cancelled') {
-                alertOwner(
-                  `📬 ליד ביטל זמינות — ${msg.name ?? fromNorm}`,
-                  `*${msg.name ?? fromNorm}* (${fromNorm})\nביטל/ה את הזמינות לשיחה ${_aptTimeN}.\nהודעה: "${msgText.slice(0, 200)}"\n\nאנא צור קשר לתיאום מחדש.`
-                ).catch(() => {});
+              if (_availStateN === 'rescheduled' || _availStateN === 'cancelled') {
+                const _subjN = _availStateN === 'cancelled'
+                  ? `📬 ליד ביטל בקשת שיחה — ${msg.name ?? fromNorm}`
+                  : `📬 ליד ביקש לשנות מועד — ${msg.name ?? fromNorm}`;
+                const _bodyN = `*${msg.name ?? fromNorm}* (${fromNorm})\n`
+                  + (_availStateN === 'cancelled'
+                      ? `ביטל/ה את בקשת השיחה (${_aptTimeN}).\nהודעה: "${msgText.slice(0, 200)}"\n\nניתן לסגור את הפנייה.`
+                      : `הזמן ${_aptTimeN} לא נוח לו/לה.\nהודעה: "${msgText.slice(0, 200)}"\n\nאנא תאמו מועד חדש.`);
+                alertOwner(_subjN, _bodyN).catch(() => {});
               }
               store.logEvent('prospect_availability_replied', fromNorm, {
                 aptId: _availAptN.id, availState: _availStateN, preview: msgText.slice(0, 80),
@@ -3936,35 +3947,49 @@ async function processInboundWAMessage(msg) {
         );
         if (_pendingAvailApt) {
           const _lc = msgText.trim().toLowerCase();
-          // Simple positive patterns. Use (\s|$) not \b since Hebrew chars are not \w.
-          const _CONFIRM_RE  = /^(כן|בסדר|אוקיי|יופי|מצוין|sure|yes|ok|טוב|בטח|ברור|נכון)(\s|$)/i;
-          // Negative / reschedule patterns
-          const _CANCEL_RE   = /לא\s*(נוח|יכול|יכולה)|לא\s+ok|לא\s+בסדר|^לא(\s|$)|אי\s*אפשר|לשנות|לדחות|reschedule|cancel/i;
-
-          let _availState = null, _availReply = null;
-          const _aptName  = (_pendingAvailApt.leadName ?? '').split(' ')[0] || 'שלום';
+          const _aptName = (_pendingAvailApt.leadName ?? '').split(' ')[0] || 'שלום';
           const { fmtScheduledAt: _fmtForAvail } = require('./utils/time');
-          const _aptTime  = _fmtForAvail(_pendingAvailApt.scheduledAt, _pendingAvailApt.rawTime);
+          const _aptTime = _fmtForAvail(_pendingAvailApt.scheduledAt, _pendingAvailApt.rawTime);
 
+          // Affirmative — time works
+          const _CONFIRM_RE    = /^(כן|בסדר|אוקיי|יופי|מצוין|sure|yes|ok|טוב|בטח|ברור|נכון)(\s|$)/i;
+          // Time is unsuitable — keep request, ask for another slot
+          const _RESCHEDULE_RE = /לא\s*(נוח|מתאים|יכול|יכולה|אפשרי)|לא\s+ok|לא\s+בסדר|אי\s*אפשר|לשנות|לדחות|reschedule/i;
+          // Explicit withdrawal of the callback request entirely
+          const _CANCEL_RE     = /לבטל|אבטל|לא\s*רוצ[הי]|לא\s*מעוניי?נ|not interested|cancel/i;
+
+          let _availState = null, _availReply = null, _aptUpdates = {};
           if (_CONFIRM_RE.test(_lc)) {
             _availState = 'confirmed';
             _availReply = `מצוין ${_aptName}! 🎉 נציג יצור איתך קשר ${_aptTime}`;
+            _aptUpdates = { prospectAvailability: 'confirmed' };
+          } else if (_RESCHEDULE_RE.test(_lc)) {
+            // Time unsuitable — preserve the request, reset reminder so it can re-fire after
+            // a new time is set, ask for preferred slot.
+            _availState = 'rescheduled';
+            _availReply = `מה הזמן שיהיה לך נוח? נסדר זמן חדש 🗓️`;
+            _aptUpdates = { prospectAvailability: 'rescheduled', prospectReminderSent: false };
           } else if (_CANCEL_RE.test(_lc)) {
             _availState = 'cancelled';
-            _availReply = `הבנתי! שלח/י לי מועד שנוח לך ונסדר מחדש 🗓️`;
+            _availReply = `הבנתי! אם תרצה/י לתאם שיחה בעתיד — אנחנו כאן 😊`;
+            _aptUpdates = { prospectAvailability: 'cancelled' };
           }
 
           if (_availState) {
-            aptStore.update(_pendingAvailApt.id, { prospectAvailability: _availState });
+            aptStore.update(_pendingAvailApt.id, _aptUpdates);
             if (_availReply && process.env.WHATSAPP_AUTO_REPLY === 'true') {
               _markBotSent(fromNorm);
               sendText(fromNorm, _availReply).catch(() => {});
             }
-            if (_availState === 'cancelled') {
-              alertOwner(
-                `📬 ליד ביטל זמינות — ${msg.name ?? fromNorm}`,
-                `*${msg.name ?? fromNorm}* (${fromNorm})\nביטל/ה את הזמינות לשיחה ${_aptTime}.\nהודעה: "${msgText.slice(0, 200)}"\n\nאנא צור קשר לתיאום מחדש.`
-              ).catch(() => {});
+            if (_availState === 'rescheduled' || _availState === 'cancelled') {
+              const _subj = _availState === 'cancelled'
+                ? `📬 ליד ביטל בקשת שיחה — ${msg.name ?? fromNorm}`
+                : `📬 ליד ביקש לשנות מועד — ${msg.name ?? fromNorm}`;
+              const _body = `*${msg.name ?? fromNorm}* (${fromNorm})\n`
+                + (_availState === 'cancelled'
+                    ? `ביטל/ה את בקשת השיחה (${_aptTime}).\nהודעה: "${msgText.slice(0, 200)}"\n\nניתן לסגור את הפנייה.`
+                    : `הזמן ${_aptTime} לא נוח לו/לה.\nהודעה: "${msgText.slice(0, 200)}"\n\nאנא תאמו מועד חדש.`);
+              alertOwner(_subj, _body).catch(() => {});
             }
             store.logEvent('prospect_availability_replied', fromNorm, {
               aptId: _pendingAvailApt.id, availState: _availState, preview: msgText.slice(0, 80),
