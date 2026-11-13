@@ -20,12 +20,16 @@ const fs     = require('fs');
 const path   = require('path');
 const logger = require('./logger');
 
-const DATA_DIR   = (process.env.DATA_DIR ?? path.join(__dirname, '../data')).replace(/\/$/, '');
-const LEADS_FILE = path.join(DATA_DIR, 'leads_persist.json');
-const INBOX_FILE = path.join(DATA_DIR, 'inbox_persist.json');
+// DATA_DIR is resolved at call-time so tests can override process.env.DATA_DIR
+// per-test without fighting module-load caching. Production behaviour is unchanged.
+function getDataDir()  { return (process.env.DATA_DIR ?? path.join(__dirname, '../data')).replace(/[/\\]$/, ''); }
+function getLeadsFile(){ return path.join(getDataDir(), 'leads_persist.json'); }
+function getInboxFile(){ return path.join(getDataDir(), 'inbox_persist.json'); }
+
 
 function ensureDir() {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  const d = getDataDir();
+  if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 }
 
 /** Atomic write: write to .tmp then rename so a crash never leaves a corrupt file. */
@@ -40,7 +44,7 @@ function atomicWrite(filePath, data) {
 function saveLeads(store) {
   try {
     ensureDir();
-    atomicWrite(LEADS_FILE, {
+    atomicWrite(getLeadsFile(), {
       leads:   Array.from(store._leads.entries()),
       members: Array.from(store._members.entries()),
       events:  store._events.slice(-500),
@@ -55,11 +59,12 @@ function saveLeads(store) {
 
 function loadLeads(store) {
   try {
-    if (!fs.existsSync(LEADS_FILE)) {
+    const f = getLeadsFile();
+    if (!fs.existsSync(f)) {
       logger.info('[persist] No leads snapshot — starting fresh');
       return false;
     }
-    const raw = JSON.parse(fs.readFileSync(LEADS_FILE, 'utf8'));
+    const raw = JSON.parse(fs.readFileSync(f, 'utf8'));
     for (const [k, v] of raw.leads   ?? []) store._leads.set(k, v);
     for (const [k, v] of raw.members ?? []) store._members.set(k, v);
     if (raw.events?.length) store._events.push(...raw.events);
@@ -81,7 +86,7 @@ function loadLeads(store) {
 function saveInbox(inbox) {
   try {
     ensureDir();
-    atomicWrite(INBOX_FILE, {
+    atomicWrite(getInboxFile(), {
       threads: Array.from(inbox._threads.entries()).map(([phone, t]) => ({
         phone,
         thread: { ...t, messages: t.messages.slice(-100) },
@@ -98,11 +103,12 @@ function saveInbox(inbox) {
 
 function loadInbox(inbox) {
   try {
-    if (!fs.existsSync(INBOX_FILE)) {
+    const f = getInboxFile();
+    if (!fs.existsSync(f)) {
       logger.info('[persist] No inbox snapshot — starting fresh');
       return false;
     }
-    const raw = JSON.parse(fs.readFileSync(INBOX_FILE, 'utf8'));
+    const raw = JSON.parse(fs.readFileSync(f, 'utf8'));
     for (const { phone, thread } of raw.threads ?? []) {
       thread.lastAt   = new Date(thread.lastAt);
       thread.messages = (thread.messages ?? []).map(m => ({
@@ -128,4 +134,7 @@ function saveAll(store, inbox) {
   saveInbox(inbox);
 }
 
-module.exports = { saveLeads, loadLeads, saveInbox, loadInbox, saveAll, DATA_DIR };
+module.exports = {
+  saveLeads, loadLeads, saveInbox, loadInbox, saveAll,
+  get DATA_DIR() { return getDataDir(); },
+};

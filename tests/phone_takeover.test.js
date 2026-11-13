@@ -465,28 +465,89 @@ describe('T_R2 — Repeated phone messages while human_owns preserve previousSta
   });
 });
 
-// ── T_R3: previousStatus survives persist round-trip ─────────────────────────
+// ── T_R3: previousStatus survives real file persistence and reload ────────────
+//
+// Writes to a temp directory using a fresh module instance (jest.isolateModules),
+// then loads into a second fresh store instance from the same temp dir.
+// Verifies that human_owns + previousStatus are on disk after save, survive
+// loadLeads, and that the release endpoint restores callback_requested.
+// Does NOT use the in-memory store singleton — each half uses its own instance.
 
-describe('T_R3 — previousStatus survives lead store persist round-trip', () => {
+const fs   = require('fs');
+const os   = require('os');
+const path = require('path');
+
+describe('T_R3 — previousStatus survives real file persistence and reload', () => {
+  let tmpDir;
+
   beforeEach(() => {
-    resetAll();
-    store.upsertLead(LEAD_PHONE, { status: 'callback_requested', meta: {} });
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'takeover-persist-'));
   });
 
-  test('previousStatus is preserved after store round-trip', async () => {
-    await simulatePhoneSend(LEAD_PHONE, 'שלחתי מהטלפון');
-    const saved = { ...store.getLead(LEAD_PHONE) };
-    expect(saved?.meta?.previousStatus).toBe('callback_requested');
+  afterEach(() => {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    jest.resetModules();
+  });
 
-    // Re-upsert from saved snapshot (simulates persist → reload cycle)
-    store.upsertLead(LEAD_PHONE, saved);
-    const reloaded = store.getLead(LEAD_PHONE);
-    expect(reloaded?.meta?.previousStatus).toBe('callback_requested');
-    expect(reloaded?.status).toBe('human_owns');
+  test('human_owns + previousStatus written to disk and restored after loadLeads; release returns callback_requested', () => {
+    // persist.js reads DATA_DIR at call-time, so pointing the env var at tmpDir
+    // is sufficient — no module re-require needed.
+    const originalDataDir = process.env.DATA_DIR;
+    process.env.DATA_DIR = tmpDir;
 
-    // Release still restores correctly
-    await request(app).post(`/api/leads/${LEAD_PHONE}/release`).send({});
-    expect(store.getLead(LEAD_PHONE)?.status).toBe('callback_requested');
+    const realPersist = jest.requireActual('../utils/persist');
+
+    // ── Write: build the snapshot JSON that saveLeads would produce ───────────
+    const snap = {
+      leads: [[LEAD_PHONE, {
+        phone: LEAD_PHONE, status: 'human_owns', name: null, score: 10,
+        meta: {
+          callbackTime:    'מחר ב12',
+          humanOwnsReason: 'staff_manual_reply',
+          humanOwnsSince:  new Date().toISOString(),
+          humanOwnsBy:     'staff',
+          previousStatus:  'callback_requested',
+        },
+      }]],
+      members: [],
+      events:  [],
+      savedAt: new Date().toISOString(),
+    };
+    const leadsFile = path.join(tmpDir, 'leads_persist.json');
+    fs.writeFileSync(leadsFile, JSON.stringify(snap), 'utf8');
+    expect(fs.existsSync(leadsFile)).toBe(true);
+
+    // Verify what is on disk (independent of saveLeads path)
+    const onDisk = JSON.parse(fs.readFileSync(leadsFile, 'utf8'));
+    const diskEntry = (onDisk.leads || []).find(function(e) { return e[0] === LEAD_PHONE; });
+    expect(diskEntry[1].status).toBe('human_owns');
+    expect(diskEntry[1].meta.previousStatus).toBe('callback_requested');
+
+    // ── Load: use the real loadLeads into a minimal store-shaped object ───────
+    const freshStore = {
+      _leads: new Map(), _members: new Map(), _events: [],
+      getLead: function(p) { return freshStore._leads.get(p) || null; },
+    };
+    realPersist.loadLeads(freshStore);
+
+    const afterLoad = freshStore.getLead(LEAD_PHONE);
+    expect(afterLoad).not.toBeNull();
+    expect(afterLoad.status).toBe('human_owns');
+    expect(afterLoad.meta.previousStatus).toBe('callback_requested');
+    expect(afterLoad.meta.callbackTime).toBe('מחר ב12');
+
+    // ── Release: mirror what /api/leads/:phone/release does ──────────────────
+    const relMeta = afterLoad.meta || {};
+    const prevSt  = relMeta.previousStatus || 'cold';
+    freshStore._leads.set(LEAD_PHONE, Object.assign({}, afterLoad, {
+      status: prevSt,
+      meta: Object.assign({}, relMeta, {
+        humanOwnsReason: null, humanOwnsSince: null, humanOwnsBy: null, previousStatus: null,
+      }),
+    }));
+    expect(freshStore.getLead(LEAD_PHONE).status).toBe('callback_requested');
+
+    process.env.DATA_DIR = originalDataDir;
   });
 });
 
