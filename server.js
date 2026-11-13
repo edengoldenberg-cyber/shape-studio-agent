@@ -3678,9 +3678,43 @@ async function processInboundWAMessage(msg) {
             .filter(a => a.status === 'callback_pending' || a.status === 'confirmed')
             .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0] ?? null;
 
+          // Ensure a persisted aptStore entry exists before sending ANY booking confirmation.
+          // The name-capture path is an early-return (never reaches the aptStore creation
+          // block at line ~4344). Without this, the confirmation reaches the prospect but
+          // no appointment exists — a false booking promise.
+          //
+          // If callTimeGiven is set but no entry exists, create one now.
+          // If the time cannot be parsed → _aptForSend = null → prospect confirmation blocked.
+          // The manager summary is still sent so staff can follow up manually.
+          let _aptForSend = _aptRecord;
+          if (!_aptForSend && _callTime) {
+            try {
+              const _sentAt  = msg.timestamp ? new Date(msg.timestamp) : new Date();
+              const _parsed  = calendarSvc.parseHebrewTimeLocal(_callTime, _sentAt);
+              if (_parsed) {
+                _aptForSend = aptStore.createCallbackPending({
+                  leadPhone:       fromNorm,
+                  leadName:        capturedName,
+                  rawTime:         _callTime,
+                  scheduledAt:     _parsed,
+                  assignedStaffId: staffConfig?.staff?.find(s => s.id === 'eden')?.id ?? 'eden',
+                });
+                logger.info('[pipeline] aptStore entry created before closing summary',
+                  { from: fromNorm, rawTime: _callTime, scheduledAt: _parsed.toISOString() });
+              } else {
+                logger.warn('[pipeline] callTimeGiven cannot be parsed — prospect confirmation blocked',
+                  { from: fromNorm, callTime: _callTime });
+              }
+            } catch (aptErr) {
+              logger.warn('[pipeline] aptStore creation failed — prospect confirmation blocked',
+                { from: fromNorm, error: aptErr.message });
+            }
+          }
+
           // Format the callback time as a full Hebrew date/time for user-facing messages.
           // rawTime ("מחר ב12") is preserved for reference; formatted time is what users see.
-          const _fmtTime = fmtScheduledAt(_aptRecord?.scheduledAt, _callTime);
+          // Use _aptForSend (which has a parsed scheduledAt) for the full date+time display.
+          const _fmtTime = fmtScheduledAt(_aptForSend?.scheduledAt, _callTime);
 
           // Prospect closing: confirmed name, exact formatted time, request status (not confirmed).
           const _prospectMsg = _callTime ? [
@@ -3757,8 +3791,10 @@ async function processInboundWAMessage(msg) {
             .filter(a => a.status === 'callback_pending' || a.status === 'confirmed')
             .forEach(a => { if (a.leadName !== capturedName) aptStore.update(a.id, { leadName: capturedName }); });
 
-          // Send prospect closing summary (skipped if already accepted).
-          if (_prospectMsg && !_prospectAlreadyAccepted && process.env.WHATSAPP_AUTO_REPLY === 'true') {
+          // Send prospect closing summary (skipped if already accepted or if no
+          // persisted appointment could be created — _aptForSend null means the
+          // time could not be resolved; never confirm a booking that doesn't exist).
+          if (_prospectMsg && !_prospectAlreadyAccepted && _aptForSend && process.env.WHATSAPP_AUTO_REPLY === 'true') {
             _markBotSent(fromNorm);
             sendText(fromNorm, _prospectMsg)
               .then(res => {

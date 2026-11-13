@@ -136,8 +136,20 @@ jest.mock('../utils/phone_registry', () => ({
   size:        0,
 }));
 
+// parseHebrewTimeLocal is called by the booking-conditional path in server.js
+// (aptStore entry creation before closing summary). Return a valid future Date
+// for well-formed time strings (anything containing digits or day names),
+// null for strings that look like affirmations rather than times.
+const _MOCK_PARSED_DATE = new Date('2026-11-14T10:00:00.000Z'); // Sat 14 Nov 12:00 IL
+const mockParseHebrewTimeLocal = jest.fn((rawText) => {
+  if (!rawText) return null;
+  if (/\d|מחר|היום|ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת/.test(rawText)) return _MOCK_PARSED_DATE;
+  return null; // e.g. bare 'כן' or other non-time strings
+});
+
 jest.mock('../services/calendar.service', () => ({
-  parseCallbackTime: jest.fn(() => null),
+  parseCallbackTime:      jest.fn(() => null),
+  parseHebrewTimeLocal:   mockParseHebrewTimeLocal,
 }));
 
 jest.mock('openai', () =>
@@ -612,5 +624,85 @@ describe('Prospect availability confirmation', () => {
     const r = await simulateMessage('כן ומתי בדיוק יתקשרו?');
     expect(r.route).toBe('post_call_staff_hold');
     expect(mockSentAlerts.length).toBeGreaterThan(alertsAfterConfirm);
+  });
+});
+
+// ── Booking confirmation conditional on appointment persistence ───────────────
+//
+// A closing summary must only be sent to the prospect if an aptStore entry
+// was successfully created and persisted. If the time cannot be resolved
+// (parseHebrewTimeLocal returns null) the prospect must not receive a
+// confirmation. The manager summary is still sent so staff can follow up.
+
+describe('Booking confirmation — conditional on appointment persistence', () => {
+  const aptStore = require('../utils/appointment_store');
+
+  beforeEach(() => {
+    resetState();
+    mockParseHebrewTimeLocal.mockClear();
+    // Seed lead at callback_requested: callProposed=true + callTimeGiven set
+    // This simulates the state after a restart between callProposed and name capture.
+    store.upsertLead(CLOSE_PHONE, {
+      status:   'callback_requested',
+      name:     null,
+      meta: {
+        arboxColdLeadConfirmedAt: Date.now(),
+        qualData: {
+          callTimeGiven:   'מחר ב12',
+          callProposed:    true,
+          nameAsked:       true,
+          confirmedName:   null,
+          fitnessInterest: 'פילאטיס',
+          location:        'כרכור',
+          locationViable:  true,
+        },
+      },
+    });
+    // Clear any aptStore entries from previous test so creation path is exercised
+    aptStore.getByPhone(CLOSE_PHONE).forEach(a => aptStore.update(a.id, { status: 'cancelled' }));
+  });
+
+  test('aptStore entry created before confirmation; prospect receives summary with resolved date', async () => {
+    // Name capture triggers the name-capture path; no existing callback_pending entry
+    const r = await simulateMessage('עמית');
+    expect(r.route).toBe('post_call_name_captured');
+
+    // aptStore entry must have been created (not null)
+    const apt = aptStore.getByPhone(CLOSE_PHONE)
+      .find(a => a.status === 'callback_pending' && a.scheduledAt != null);
+    expect(apt).toBeDefined();
+    expect(apt.scheduledAt).toBeTruthy(); // parsed scheduledAt present
+
+    // Prospect received the closing summary
+    expect(mockSentTexts.some(s => s.to === CLOSE_PHONE && s.text.includes('קיבלנו'))).toBe(true);
+
+    // calendarSvc.parseHebrewTimeLocal was called with the raw callTime
+    expect(mockParseHebrewTimeLocal).toHaveBeenCalledWith('מחר ב12', expect.any(Date));
+  });
+
+  test('no prospect confirmation when time cannot be resolved — manager still notified', async () => {
+    // Replace callTimeGiven with a string parseHebrewTimeLocal cannot resolve
+    store.upsertLead(CLOSE_PHONE, {
+      meta: Object.assign({}, store.getLead(CLOSE_PHONE)?.meta ?? {}, {
+        qualData: Object.assign({}, store.getLead(CLOSE_PHONE)?.meta?.qualData ?? {}, {
+          callTimeGiven: 'כן',  // not a parseable time → parseHebrewTimeLocal returns null
+        }),
+      }),
+    });
+
+    const alertsBefore = mockSentAlerts.length;
+    const r = await simulateMessage('עמית');
+    expect(r.route).toBe('post_call_name_captured');
+
+    // No aptStore entry should have been created for the unresolvable time
+    const apt = aptStore.getByPhone(CLOSE_PHONE)
+      .find(a => a.status === 'callback_pending');
+    expect(apt).toBeUndefined();
+
+    // No prospect confirmation sent
+    expect(mockSentTexts.some(s => s.to === CLOSE_PHONE && s.text.includes('קיבלנו'))).toBe(false);
+
+    // Manager summary IS sent — staff must follow up manually
+    expect(mockSentAlerts.length).toBeGreaterThan(alertsBefore);
   });
 });
