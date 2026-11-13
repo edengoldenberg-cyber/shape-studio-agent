@@ -31,10 +31,17 @@ const tomerStore = require('../utils/tomer_store');
 const { isQuietHours } = require('../utils/time');
 
 // ── Lazy service loads ────────────────────────────────────────────────────────
-let _arbox    = null;
-let _sendText = null;
-function arbox()    { if (!_arbox)    _arbox    = require('../services/arbox.service'); return _arbox; }
-function sendText() { if (!_sendText) _sendText = require('../services/whatsapp.service').sendText; return _sendText; }
+let _arbox     = null;
+let _sendText  = null;
+let _leadStore = null;
+function arbox()     { if (!_arbox)     _arbox     = require('../services/arbox.service'); return _arbox; }
+function sendText()  { if (!_sendText)  _sendText  = require('../services/whatsapp.service').sendText; return _sendText; }
+function leadStore() { if (!_leadStore) _leadStore = require('../utils/lead_store'); return _leadStore; }
+
+/** Returns true if staff has taken over the conversation for this phone. */
+function _isHumanOwned(phone) {
+  return leadStore()?.getLead(phone)?.status === 'human_owns';
+}
 
 // ── Storage ───────────────────────────────────────────────────────────────────
 const DATA_DIR        = () => (process.env.DATA_DIR ?? path.join(__dirname, '../data')).replace(/[/\\]$/, '');
@@ -161,6 +168,10 @@ async function _runBirthday(members, log, result) {
       ? `${name}, יום הולדת שמח! 🎂 שמחים שאתה איתנו ב-Shape Studio — יהיה שנה מלאת בריאות, שמחה ואנרגיה 💪`
       : `${name}, יום הולדת שמח! 🎂 שמחות שאת איתנו ב-Shape Studio — תהיי שנה מלאת בריאות, שמחה ואנרגיה 💪`;
 
+    if (_isHumanOwned(m.phone)) {
+      logger.info('[retention] Birthday skipped — human_owns', { phone: m.phone });
+      result.skipped++; continue;
+    }
     const qEntry = tomerStore.queueMessage({
       workflowId:   'birthday',
       phone:        m.phone,
@@ -220,6 +231,10 @@ async function _runOnboarding(members, log, result, dayAfter, workflowId) {
         : `${name}, שבועיים עברו 🙂 מקווים שאת כבר מרגישה כמו בבית. יש לנו עניין לשמוע איך היה עד כה — נשמח לפידבק קצר.`;
     }
 
+    if (_isHumanOwned(m.phone)) {
+      logger.info('[retention] Onboarding skipped — human_owns', { phone: m.phone, workflow: workflowId });
+      result.skipped++; continue;
+    }
     const qEntry = tomerStore.queueMessage({
       workflowId:   workflowId,
       phone:        m.phone,
@@ -285,6 +300,10 @@ async function _runAttendanceDrop(members, log, result) {
       ? `${name}, שלום! לא ראינו אותך בזמן האחרון — הכל בסדר? 🙂 אם יש משהו שנוכל לעזור, אנחנו כאן.`
       : `${name}, שלום! לא ראינו אותך בזמן האחרון — הכל בסדר? 🙂 אם יש משהו שנוכל לעזור, אנחנו כאן.`;
 
+    if (_isHumanOwned(m.phone)) {
+      logger.info('[retention] Attendance skipped — human_owns', { phone: m.phone });
+      result.skipped++; continue;
+    }
     const qEntry = tomerStore.queueMessage({
       workflowId:   'attendance',
       phone:        m.phone,
@@ -337,6 +356,10 @@ async function _runFeedback(members, log, result) {
       ? `${name}, כחבר ותיק ב-Shape Studio, הדעה שלך חשובה לנו 💙 מה הדבר שהכי אהבת עד כה, ומה היית משנה? תשובה קצרה עוזרת לנו לשפר.`
       : `${name}, כחברה וותיקה ב-Shape Studio, הדעה שלך חשובה לנו 💙 מה הדבר שהכי אהבת עד כה, ומה היית משנה? תשובה קצרה עוזרת לנו לשפר.`;
 
+    if (_isHumanOwned(m.phone)) {
+      logger.info('[retention] Feedback skipped — human_owns', { phone: m.phone });
+      result.skipped++; continue;
+    }
     const qEntry = tomerStore.queueMessage({
       workflowId:   'feedback',
       phone:        m.phone,

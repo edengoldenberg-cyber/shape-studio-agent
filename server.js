@@ -6236,12 +6236,21 @@ async function _retryClosingSummary(phone, { force = false } = {}) {
 
   let prospectIdMessage = null, prospectError = null;
   if (!prospectAlreadyAccepted) {
-    try {
-      const pr = await sendText(phone, prospectMsg);
-      prospectIdMessage = pr?.idMessage ?? null;
-    } catch (err) {
-      prospectError = err.message;
-      logger.warn('[closing] Prospect send failed', { phone, error: err.message });
+    // Final ownership check: if staff has taken over, skip the automated prospect
+    // message. The manager summary is still sent — they need to know the lead qualified.
+    const _prospectOwn = store.getLead(phone)?.status;
+    if (_prospectOwn === 'human_owns') {
+      prospectError = 'skipped_human_owns';
+      logger.info('[closing] Prospect closing summary skipped — human_owns', { phone });
+      store.logEvent('closing_prospect_suppressed_human_owns', phone, {});
+    } else {
+      try {
+        const pr = await sendText(phone, prospectMsg);
+        prospectIdMessage = pr?.idMessage ?? null;
+      } catch (err) {
+        prospectError = err.message;
+        logger.warn('[closing] Prospect send failed', { phone, error: err.message });
+      }
     }
   }
 
@@ -6658,24 +6667,36 @@ app.get('/api/debug/green-api', async (_req, res) => {
 });
 
 // GET /api/admin/green-api/settings — read the outgoingMessageWebhook flag only.
+// Strictly read-only: calls getSettings directly, never setSettings.
 // Returns only the specific setting needed for phone-side takeover; does not expose
 // full provider configuration (webhookUrl, instance state, etc.).
+// Note: no session-level authentication — all /api/admin/* endpoints rely on
+// network/obscurity (Railway HTTPS subdomain). Do not add secrets to the response.
 app.get('/api/admin/green-api/settings', async (_req, res) => {
+  const { host, instanceId, token } = getGreenCreds();
+  if (!host || !instanceId || !token) return res.status(503).json({ ok: false, error: 'Green API not configured' });
   try {
-    const r = await ensureOutgoingWebhooks();
-    if (!r.ok && r.reason === 'credentials missing') return res.status(503).json({ ok: false, error: 'Green API not configured' });
-    if (!r.ok) return res.status(502).json({ ok: false, error: r.reason });
-    res.json({ ok: true, outgoingMessageWebhook: r.settings?.outgoingMessageWebhook ?? 'unknown' });
+    const axios = require('axios');
+    const { data } = await axios.get(`https://${host}/waInstance${instanceId}/getSettings/${token}`, { timeout: 8000 });
+    res.json({ ok: true, outgoingMessageWebhook: data.outgoingMessageWebhook ?? 'unknown' });
   } catch (err) {
     res.status(502).json({ ok: false, error: err.message });
   }
 });
 
 // POST /api/admin/green-api/settings — enable or disable outgoingMessageWebhook only.
-// Allowlisted to this single field — arbitrary setSettings params are rejected.
+// Allowlisted to exactly one field: { outgoingMessageWebhook: 'yes'|'no' }.
+// Extra body keys are explicitly rejected so callers cannot accidentally forward
+// arbitrary setSettings params to the provider.
 // Body: { outgoingMessageWebhook: 'yes' | 'no' }
 app.post('/api/admin/green-api/settings', jsonBody, async (req, res) => {
-  const value = req.body?.outgoingMessageWebhook;
+  const body  = req.body ?? {};
+  const keys  = Object.keys(body);
+  const extra = keys.filter(k => k !== 'outgoingMessageWebhook');
+  if (extra.length > 0) {
+    return res.status(400).json({ ok: false, error: `Only outgoingMessageWebhook is accepted; unexpected keys: ${extra.join(', ')}` });
+  }
+  const value = body.outgoingMessageWebhook;
   if (value !== 'yes' && value !== 'no') {
     return res.status(400).json({ ok: false, error: 'Body must be { outgoingMessageWebhook: "yes"|"no" }' });
   }
