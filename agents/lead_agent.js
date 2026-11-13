@@ -247,6 +247,21 @@ function postProcessReply(reply, qualData, assets) {
     }
   }
 
+  // Gate 3b — Premature booking commitment guard.
+  // When the call time is known but the name has not yet been captured, the closing
+  // summary (the actual persisted confirmation) has not been sent. Any AI phrase that
+  // tells the prospect "the team will contact you at [time]" is a false promise —
+  // the aptStore entry may not yet exist. Strip those phrases so only the closing
+  // summary (which IS conditional on aptStore persistence) carries the commitment.
+  if (qualData.callTimeGiven && !qualData.confirmedName) {
+    const prematureBookingRE = /[^.!?\n]*(?:הצוות\s+יצור\s+קשר|נציג\s+יצור\s+קשר|נציג\s+מהסטודיו\s+יצור\s+קשר|ייצור\s+קשר\s+ב|יצרו\s+קשר)[^.!?\n]*[.!?\n]?/gi;
+    const stripped = out.replace(prematureBookingRE, '').trim();
+    if (stripped.length >= 10 && stripped !== out) {
+      out = stripped;
+      ppChanges.push('gate3b_premature_booking_stripped');
+    }
+  }
+
   // 3. CLOSE state — strip trailing question when conversation is fully finished.
   //    Not closed if callTimeGiven but confirmedName is still missing: the AI is
   //    expected to ask one more question (the name), so the question must not be stripped.
@@ -430,19 +445,20 @@ function buildStageContext(completedTurns, qualData, msgCount) {
     if (!qualData.confirmedName) {
       return [
         `STATE: CALL TIME CONFIRMED — awaiting first name before handoff.`,
-        `Warm reply: confirm the time in one short sentence, then ask their first name.`,
+        `Warm reply: confirm the time was received in one short sentence, then ask their first name.`,
         `Ask naturally — not formally. ONE question only.`,
         `Confirmed time: "${qualData.callTimeGiven}"`,
-        `Example: "מצוין — מחר בשעה 12 😊 ואיך קוראים לך?"`,
-        `Example: "מעולה! הצוות יצור קשר ${qualData.callTimeGiven} 🙏 ואיך קוראים לך?"`,
+        `Example: "מצוין — קיבלתי את הזמן 😊 ואיך קוראים לך?"`,
+        `Example: "מעולה! רשמתי ${qualData.callTimeGiven} 🙏 ואיך קוראים לך?"`,
+        `FORBIDDEN: "הצוות יצור קשר ב[time]" — the booking is NOT yet confirmed; the confirmation goes out separately after the name is captured.`,
         `FORBIDDEN: asking for more than the first name. FORBIDDEN: re-asking about time or location.`,
       ].join('\n');
     }
     return [
       `STATE: CALL TIME CONFIRMED. Conversation is complete.`,
-      `Write 1 warm sentence confirming the call. No question mark. No new topics.`,
+      `Write 1 warm sentence acknowledging the request. No question mark. No new topics.`,
       `Confirmed time: "${qualData.callTimeGiven}" | Name: "${qualData.confirmedName}"`,
-      `Example: "מצוין ${qualData.confirmedName} — הצוות יצור קשר ב${qualData.callTimeGiven} 😊"`,
+      `Example: "מצוין ${qualData.confirmedName} — קיבלנו את הפרטים שלך ✅ נציג מהצוות יצור קשר בהקדם 😊"`,
     ].join('\n');
   }
 

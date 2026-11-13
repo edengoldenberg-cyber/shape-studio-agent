@@ -3689,7 +3689,12 @@ async function processInboundWAMessage(msg) {
           let _aptForSend = _aptRecord;
           if (!_aptForSend && _callTime) {
             try {
-              const _sentAt  = msg.timestamp ? new Date(msg.timestamp) : new Date();
+              // Anchor "מחר"/"שישי" etc. to the message that GAVE the callback time,
+              // not the name message (which may arrive hours later or after midnight).
+              const _rawCallTimeGivenAt = _prevQd.callTimeGivenAt ?? _nm.callTimeGivenAt ?? null;
+              const _sentAt = _rawCallTimeGivenAt
+                ? new Date(_rawCallTimeGivenAt)
+                : (msg.timestamp ? new Date(msg.timestamp) : new Date());
               const _parsed  = calendarSvc.parseHebrewTimeLocal(_callTime, _sentAt);
               if (_parsed) {
                 _aptForSend = aptStore.createCallbackPending({

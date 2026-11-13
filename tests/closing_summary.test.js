@@ -705,4 +705,62 @@ describe('Booking confirmation — conditional on appointment persistence', () =
     // Manager summary IS sent — staff must follow up manually
     expect(mockSentAlerts.length).toBeGreaterThan(alertsBefore);
   });
+
+  test('aptStore.createCallbackPending throws → no prospect confirmation, manager still notified', async () => {
+    // This tests a storage failure (disk full, corrupt file, etc.) — distinct from an
+    // unparseable time. The time IS parseable, but createCallbackPending itself throws.
+    // A returned in-memory object alone must not authorize a booking confirmation.
+    const spy = jest.spyOn(aptStore, 'createCallbackPending').mockImplementationOnce(() => {
+      throw new Error('simulated_disk_full');
+    });
+
+    const alertsBefore = mockSentAlerts.length;
+    const r = await simulateMessage('עמית');
+    spy.mockRestore();
+    await new Promise(res => setTimeout(res, 200));
+
+    expect(r.route).toBe('post_call_name_captured');
+
+    // aptStore.createCallbackPending threw → no entry in store
+    const apt = aptStore.getByPhone(CLOSE_PHONE)
+      .find(a => a.status === 'callback_pending');
+    expect(apt).toBeUndefined();
+
+    // No prospect confirmation — _aptForSend stayed null
+    expect(mockSentTexts.some(s => s.to === CLOSE_PHONE && s.text.includes('קיבלנו'))).toBe(false);
+
+    // Manager summary IS sent — staff can follow up manually even when storage failed
+    expect(mockSentAlerts.length).toBeGreaterThan(alertsBefore);
+  });
+
+  test('callTimeGivenAt timestamp used for time resolution, not name-message timestamp', async () => {
+    // Store callTimeGivenAt in the lead meta so the name-capture path resolves
+    // "מחר ב12" relative to the TIME message, not the NAME message.
+    // Set a callTimeGivenAt that is 11:50pm on Nov 13 — the name message arrives
+    // after midnight (simulated by the test running past midnight doesn't matter;
+    // what matters is the anchor passed to parseHebrewTimeLocal).
+    const callTimeGivenAt = new Date('2026-11-13T21:50:00.000Z').toISOString(); // 23:50 IL
+    store.upsertLead(CLOSE_PHONE, {
+      meta: Object.assign({}, store.getLead(CLOSE_PHONE)?.meta ?? {}, {
+        callTimeGivenAt,
+        qualData: Object.assign({}, store.getLead(CLOSE_PHONE)?.meta?.qualData ?? {}, {
+          callTimeGivenAt,
+          callTimeGiven: 'מחר ב12',
+        }),
+      }),
+    });
+
+    await simulateMessage('עמית');
+    await new Promise(res => setTimeout(res, 200));
+
+    // parseHebrewTimeLocal must have been called with the callTimeGivenAt date,
+    // not the name-message timestamp. Verify the Date argument matches callTimeGivenAt.
+    const calls = mockParseHebrewTimeLocal.mock.calls.filter(c => c[0] === 'מחר ב12');
+    expect(calls.length).toBeGreaterThan(0);
+    const passedDate = calls[0][1];
+    expect(passedDate instanceof Date).toBe(true);
+    // The passed date should be close to callTimeGivenAt (within 1 second), not now
+    const diff = Math.abs(passedDate.getTime() - new Date(callTimeGivenAt).getTime());
+    expect(diff).toBeLessThan(1000);
+  });
 });
