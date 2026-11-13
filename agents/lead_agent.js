@@ -248,13 +248,19 @@ function postProcessReply(reply, qualData, assets) {
   }
 
   // Gate 3b — Premature booking commitment guard.
-  // When the call time is known but the name has not yet been captured, the closing
-  // summary (the actual persisted confirmation) has not been sent. Any AI phrase that
-  // tells the prospect "the team will contact you at [time]" is a false promise —
-  // the aptStore entry may not yet exist. Strip those phrases so only the closing
-  // summary (which IS conditional on aptStore persistence) carries the commitment.
-  if (qualData.callTimeGiven && !qualData.confirmedName) {
-    const prematureBookingRE = /[^.!?\n]*(?:הצוות\s+יצור\s+קשר|נציג\s+יצור\s+קשר|נציג\s+מהסטודיו\s+יצור\s+קשר|ייצור\s+קשר\s+ב|יצרו\s+קשר)[^.!?\n]*[.!?\n]?/gi;
+  // A scheduling commitment is only authorised when BOTH callTimeGiven AND confirmedName
+  // are present (the CLOSE state) — meaning the aptStore entry was created by the pipeline
+  // and the closing summary has already been sent.
+  //
+  // Any earlier AI output that commits to a specific call time is a false promise:
+  //   • callTimeGiven absent: the AI read a time from conversation history and fabricated
+  //     a commitment (e.g. "הצוות יצור קשר ב19:00") without any pipeline validation.
+  //   • callTimeGiven set but confirmedName absent: the aptStore entry may not yet exist;
+  //     the closing summary (the persisted confirmation) has not been sent.
+  //
+  // Guard fires unless BOTH are present. Only the closing summary is authorised to commit.
+  if (!qualData.callTimeGiven || !qualData.confirmedName) {
+    const prematureBookingRE = /[^.!?\n]*(?:הצוות\s+יצור\s+קשר|נציג\s+יצור\s+קשר|נציג\s+מהסטודיו\s+יצור\s+קשר|ייצור\s+קשר\s+ב|יצרו\s+קשר|אתקשר\s+אליך\s+ב|נתקשר\s+ב)[^.!?\n]*[.!?\n]?/gi;
     const stripped = out.replace(prematureBookingRE, '').trim();
     if (stripped.length >= 10 && stripped !== out) {
       out = stripped;
@@ -1709,5 +1715,5 @@ function recordSchedulingExchange(phone, userText, agentReply) {
   }
 }
 
-module.exports = { handleInbound, clearSession, generateLeadBrief, sendIntroOffer, getLastDebugContext, recordSchedulingExchange, computeLeadProfile, TIME_PATTERN, TIME_REJECTION_RE, extractNameFromMessage };
+module.exports = { handleInbound, clearSession, generateLeadBrief, sendIntroOffer, getLastDebugContext, recordSchedulingExchange, computeLeadProfile, TIME_PATTERN, TIME_REJECTION_RE, extractNameFromMessage, postProcessReply };
 

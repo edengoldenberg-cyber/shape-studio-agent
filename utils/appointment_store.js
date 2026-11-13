@@ -65,14 +65,14 @@ class AppointmentStore {
     }
   }
 
+  // Returns true on success; throws on failure so create() can propagate
+  // disk-write failures to callers. update() still swallows (non-fatal for
+  // read-heavy consumers), but create() must succeed atomically.
   _save() {
-    try {
-      if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-      const records = Array.from(this._apts.values());
-      fs.writeFileSync(APTS_FILE, JSON.stringify(records, null, 2), 'utf8');
-    } catch (err) {
-      console.warn('[apt-store] Could not save appointments.json:', err.message);
-    }
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    const records = Array.from(this._apts.values());
+    fs.writeFileSync(APTS_FILE, JSON.stringify(records, null, 2), 'utf8');
+    return true;
   }
 
   // ── Create ─────────────────────────────────────────────────────────────────
@@ -102,7 +102,14 @@ class AppointmentStore {
       updatedAt:       now,
     };
     this._apts.set(id, apt);
-    this._save();
+    // _save() now throws on disk failure — remove from memory too so the in-memory
+    // object never outlives the failed write, preventing a false "appointment exists".
+    try {
+      this._save();
+    } catch (saveErr) {
+      this._apts.delete(id); // undo in-memory insert
+      throw saveErr;         // propagate to caller
+    }
     return apt;
   }
 
@@ -216,7 +223,9 @@ class AppointmentStore {
     if (!existing) return null;
     const updated = { ...existing, ...fields, updatedAt: new Date() };
     this._apts.set(id, updated);
-    this._save();
+    try { this._save(); } catch (err) {
+      console.warn('[apt-store] update: save failed (non-fatal):', err.message);
+    }
     return updated;
   }
 
