@@ -615,12 +615,21 @@ app.get('/api/leads', (_req, res) => {
 // GET /api/version — running code identity, for deployment verification
 // Returns the git commit SHA baked in at build time via RAILWAY_GIT_COMMIT_SHA,
 // plus the active webhook URL so callers can confirm which provider is configured.
+// CODE_FEATURES is a static list of feature flags baked into this binary at
+// edit time — provides source-revision verification independent of git or env vars.
+const CODE_FEATURES = [
+  'gate3b_v2',           // Gate 3b covers !callTimeGiven (hallucinated time commitment)
+  'aptstore_save_throws', // appointment_store.create() throws on disk-write failure
+  'callTimeGivenAt_anchor', // name-capture path uses callTimeGivenAt for time resolution
+  'booking_guard_tests',  // booking_guard.test.js with disk-write spy test
+];
 app.get('/api/version', (_req, res) => {
   res.json({
-    commit:          process.env.RAILWAY_GIT_COMMIT_SHA ?? 'unknown (env not set)',
+    commit:          _deployedRevision ?? process.env.RAILWAY_GIT_COMMIT_SHA ?? 'unknown (env not set)',
     deploymentId:    process.env.RAILWAY_DEPLOYMENT_ID ?? 'unknown',
     serviceId:       process.env.RAILWAY_SERVICE_ID    ?? 'unknown',
     startedAt:       process.env._SERVER_START_TS      ?? 'unknown',
+    codeFeatures:    CODE_FEATURES,
     activeWebhooks: {
       greenApi: !!process.env.GREEN_API_ID_INSTANCE || !!process.env.GREEN_API_INSTANCE_ID,
       metaCloud: !!process.env.WHATSAPP_ACCESS_TOKEN,
