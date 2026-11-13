@@ -582,4 +582,24 @@ describe('Prospect availability confirmation', () => {
     const apt = aptStore.getByPhone(CLOSE_PHONE)[0];
     expect(apt?.prospectAvailability).toBeNull();
   });
+
+  test('duplicate "כן" after already confirmed → state stays confirmed, falls to post_call_staff_hold', async () => {
+    // First "כן" sets prospectAvailability=confirmed via the availability gate.
+    primeForNameCapture({ prospectReminderSent: true });
+    const r1 = await simulateMessage('כן בסדר');
+    expect(r1.route).toBe('post_call_avail_confirmed');
+    const afterFirst = aptStore.getByPhone(CLOSE_PHONE)
+      .find(a => a.prospectReminderSent === true && a.status === 'callback_pending');
+    expect(afterFirst?.prospectAvailability).toBe('confirmed');
+
+    // Second "כן": prospectAvailability is already 'confirmed' so _pendingAvailApt
+    // is null (requires prospectAvailability === null). The availability gate is
+    // bypassed and the message reaches the post-call catch-all, which alerts staff.
+    // prospectAvailability must NOT be changed from 'confirmed'.
+    const r2 = await simulateMessage('כן אחי');
+    expect(r2.route).toBe('post_call_staff_hold');
+    const afterSecond = aptStore.getByPhone(CLOSE_PHONE)
+      .find(a => a.prospectReminderSent === true && a.status === 'callback_pending');
+    expect(afterSecond?.prospectAvailability).toBe('confirmed'); // unchanged
+  });
 });
