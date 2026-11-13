@@ -214,13 +214,21 @@ class WhatsAppInbox {
 
     const thread = this._getOrCreateThread(phone, senderName, null);
 
+    // agentId must be supplied explicitly by the caller (e.g. 'barak', 'staff').
+    // History messages without an explicit agentId default to 'green-api' (sent via
+    // the linked phone's connection, attribution unknown).  We deliberately do NOT
+    // apply ID-prefix heuristics (e.g. 2A…/2B… → 'staff') because that mapping is
+    // undocumented by Green API and can produce false human-attribution for bot sends
+    // whose IDs happen to start with those bytes.
+    const resolvedAgentId = agentId ?? (direction === 'out' ? 'green-api' : null);
+
     const msgObj = {
       id:          idMessage ?? `hist-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       direction:   direction ?? 'in',
       text:        String(text),
       timestamp:   timestamp instanceof Date ? timestamp : new Date(timestamp ?? Date.now()),
       mediaType:   mediaType   ?? null,
-      agentId:     direction === 'out' ? (agentId ?? 'green-api') : null,
+      agentId:     resolvedAgentId,
       intent:      null,
       route:       null,
       clientMatch: null,

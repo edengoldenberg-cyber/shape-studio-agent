@@ -751,4 +751,56 @@ function parseGreenApiWebhook(body) {
   }
 }
 
-module.exports = { sendText, sendFileByUrl, alertOwner, notifyLeadTeam, releaseQueuedMessages, verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, probeGreenApiConnection, getGreenCreds, _tokenSourceVar, getTestSendLog, clearTestSendLog };
+/**
+ * Check and enable outgoing webhook settings on the Green API instance.
+ *
+ * Phone-side manual messages (typed in WhatsApp on the linked device) only fire
+ * `outgoingMessageReceived` webhooks when outgoingMessageWebhook=yes.
+ * Without this, the bot cannot detect phone-side staff intervention and
+ * cannot set human_owns for those contacts.
+ *
+ * We enable ONLY outgoingMessageWebhook (phone-typed messages) and leave
+ * outgoingAPIMessageWebhook=no so the bot's own API sends don't generate echoes
+ * that need extra filtering.
+ *
+ * Returns: { ok, changed, settings, reason? }
+ */
+async function ensureOutgoingWebhooks() {
+  const { host, instanceId, token } = getGreenCreds();
+  if (!host || !instanceId || !token) {
+    return { ok: false, reason: 'credentials missing' };
+  }
+  const base = `https://${host}/waInstance${instanceId}`;
+  try {
+    const { data: current } = await axios.get(`${base}/getSettings/${token}`, { timeout: 8000 });
+    const needsUpdate = current.outgoingMessageWebhook !== 'yes';
+    if (!needsUpdate) {
+      logger.info('[Green API] outgoingMessageWebhook already enabled — phone takeover active');
+      return { ok: true, changed: false, settings: current };
+    }
+    // Enable outgoingMessageWebhook (phone-typed messages only)
+    await axios.post(
+      `${base}/setSettings/${token}`,
+      { outgoingMessageWebhook: 'yes' },
+      { timeout: 8000 }
+    );
+    // Verify the change took effect with a fresh read — a successful HTTP response
+    // from setSettings does not guarantee the setting was persisted.
+    const { data: verified } = await axios.get(`${base}/getSettings/${token}`, { timeout: 8000 });
+    const confirmed = verified.outgoingMessageWebhook === 'yes';
+    logger.info('[Green API] outgoingMessageWebhook set + verified', {
+      prevSetting: current.outgoingMessageWebhook,
+      verifiedSetting: verified.outgoingMessageWebhook,
+      confirmed,
+    });
+    if (!confirmed) {
+      return { ok: false, reason: `setSettings accepted but getSettings still shows outgoingMessageWebhook=${verified.outgoingMessageWebhook}` };
+    }
+    return { ok: true, changed: true, settings: verified };
+  } catch (err) {
+    logger.error('[Green API] ensureOutgoingWebhooks failed', { error: err.message, response: err.response?.data });
+    return { ok: false, reason: err.message };
+  }
+}
+
+module.exports = { sendText, sendFileByUrl, alertOwner, notifyLeadTeam, releaseQueuedMessages, verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, probeGreenApiConnection, ensureOutgoingWebhooks, getGreenCreds, _tokenSourceVar, getTestSendLog, clearTestSendLog };

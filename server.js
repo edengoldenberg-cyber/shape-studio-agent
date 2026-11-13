@@ -21,7 +21,7 @@ process.on('uncaughtException', (err) => {
   logger.error('Uncaught exception — server will continue', { error: err.message, stack: err.stack });
 });
 
-const { verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, releaseQueuedMessages, sendText, sendFileByUrl, alertOwner, notifyLeadTeam, probeGreenApiConnection, getGreenCreds, _tokenSourceVar, getTestSendLog, clearTestSendLog } = require('./services/whatsapp.service');
+const { verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, releaseQueuedMessages, sendText, sendFileByUrl, alertOwner, notifyLeadTeam, probeGreenApiConnection, ensureOutgoingWebhooks, getGreenCreds, _tokenSourceVar, getTestSendLog, clearTestSendLog } = require('./services/whatsapp.service');
 const { SCHEDULE_TIMETABLE_RE: _SCHEDULE_RE } = require('./agents/deterministic_reply');
 const phoneRegistry = require('./utils/phone_registry');
 // conversation_fsm is imported for future wiring into processInboundWAMessage.
@@ -2647,6 +2647,10 @@ function _recordBotSend(idMessage, phone) {
   if (!idMessage || typeof idMessage !== 'string') return;
   if (idMessage.startsWith('demo-') || idMessage.startsWith('blocked-')) return;
   _botSentIds.set(idMessage, { phone, sentAt: Date.now() });
+  // Log the mapping from Green API provider ID to this bot-send.
+  // This proves "one send, two records" when history sync later imports the same
+  // provider ID: the provider ID here (3EB0...) matches the idMessage in the thread.
+  store.logEvent('bot_send_recorded', phone, { idMessage });
   if (_botSentIds.size > 400) {
     const oldestKey = _botSentIds.keys().next().value;
     _botSentIds.delete(oldestKey);
@@ -4643,6 +4647,16 @@ app.post('/api/green-api/webhook', (req, res) => {
 
             // idMessage not in _botSentIds AND no in-flight send → staff manually typed this.
             _applyStaffTakeover(norm, idMessage, msgText);
+            // Record the outbound in the inbox thread so the dashboard shows the
+            // staff reply and the conversation is fully visible.
+            const _senderName = body?.senderData?.senderName ?? null;
+            if (msgText) {
+              inbox.pushOutbound({ phone: norm, name: _senderName, text: msgText, agentId: 'staff' });
+              persist.saveInbox(inbox);
+              broadcastSse('message', { phone: norm, name: _senderName, direction: 'out' });
+            }
+            logger.info('[outgoing-webhook] Phone-side manual reply — human_owns set + inbox recorded',
+              { phone: norm, idMessage, preview: (msgText ?? '').slice(0, 60) });
           }
         }
         return;
@@ -6643,6 +6657,50 @@ app.get('/api/debug/green-api', async (_req, res) => {
   });
 });
 
+// GET /api/admin/green-api/settings — read the outgoingMessageWebhook flag only.
+// Returns only the specific setting needed for phone-side takeover; does not expose
+// full provider configuration (webhookUrl, instance state, etc.).
+app.get('/api/admin/green-api/settings', async (_req, res) => {
+  try {
+    const r = await ensureOutgoingWebhooks();
+    if (!r.ok && r.reason === 'credentials missing') return res.status(503).json({ ok: false, error: 'Green API not configured' });
+    if (!r.ok) return res.status(502).json({ ok: false, error: r.reason });
+    res.json({ ok: true, outgoingMessageWebhook: r.settings?.outgoingMessageWebhook ?? 'unknown' });
+  } catch (err) {
+    res.status(502).json({ ok: false, error: err.message });
+  }
+});
+
+// POST /api/admin/green-api/settings — enable or disable outgoingMessageWebhook only.
+// Allowlisted to this single field — arbitrary setSettings params are rejected.
+// Body: { outgoingMessageWebhook: 'yes' | 'no' }
+app.post('/api/admin/green-api/settings', jsonBody, async (req, res) => {
+  const value = req.body?.outgoingMessageWebhook;
+  if (value !== 'yes' && value !== 'no') {
+    return res.status(400).json({ ok: false, error: 'Body must be { outgoingMessageWebhook: "yes"|"no" }' });
+  }
+  const { host, instanceId, token } = getGreenCreds();
+  if (!host || !instanceId || !token) return res.status(503).json({ ok: false, error: 'Green API not configured' });
+  try {
+    const axios = require('axios');
+    await axios.post(
+      `https://${host}/waInstance${instanceId}/setSettings/${token}`,
+      { outgoingMessageWebhook: value },
+      { timeout: 8000 }
+    );
+    // Verify the change with a fresh read.
+    const { data: verified } = await axios.get(`https://${host}/waInstance${instanceId}/getSettings/${token}`, { timeout: 8000 });
+    const confirmed = verified.outgoingMessageWebhook === value;
+    logger.info('[admin] Green API outgoingMessageWebhook updated', { value, verified: verified.outgoingMessageWebhook, confirmed });
+    if (!confirmed) {
+      return res.status(502).json({ ok: false, error: `setSettings accepted but getSettings shows ${verified.outgoingMessageWebhook}` });
+    }
+    res.json({ ok: true, outgoingMessageWebhook: verified.outgoingMessageWebhook });
+  } catch (err) {
+    res.status(502).json({ ok: false, error: err.message });
+  }
+});
+
 // ══════════════════════════════════════════════════════════════════════════════
 // GREEN API HISTORY SYNC
 // ══════════════════════════════════════════════════════════════════════════════
@@ -7017,6 +7075,15 @@ app.listen(PORT, async () => {
   // Probe Green API credentials immediately at startup so Railway logs show
   // whether WhatsApp sending will work before the first real message arrives.
   probeGreenApiConnection().catch(() => {}); // errors already logged inside
+
+  // Ensure outgoing webhook is enabled so phone-side manual messages trigger
+  // human_owns takeover. Without outgoingMessageWebhook=yes, messages typed on
+  // the studio WhatsApp phone never reach the bot and cannot suppress automation.
+  ensureOutgoingWebhooks().then(r => {
+    if (r.ok && r.changed)   logger.info('[startup] Green API outgoingMessageWebhook ENABLED — phone takeover now active');
+    if (r.ok && !r.changed)  logger.info('[startup] Green API outgoingMessageWebhook already enabled');
+    if (!r.ok)               logger.warn('[startup] Green API outgoingMessageWebhook COULD NOT be enabled — phone takeover may not work', { reason: r.reason });
+  }).catch(() => {});
 
   // Auto-populate inbox from Green API history on every cold start.
   // After sync, persist immediately so threads survive a restart before the

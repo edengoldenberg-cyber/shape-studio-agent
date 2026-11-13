@@ -84,6 +84,13 @@ async function runNoShowPass(store) {
   logger.info('[apt-worker] No-show pass', { overdue: overdue.length });
   let flagged = 0;
   for (const apt of overdue) {
+    // Final ownership check: if staff took over this conversation, skip automated
+    // no-show follow-up — the staff member is handling it directly.
+    if (store?.getLead(apt.leadPhone)?.status === 'human_owns') {
+      logger.info('[apt-worker] No-show follow-up skipped — human_owns', { aptId: apt.id, leadPhone: apt.leadPhone });
+      store?.logEvent('no_show_followup_suppressed_human_owns', apt.leadPhone, { aptId: apt.id });
+      continue;
+    }
     // Mark as no_show and alert the lead
     aptStore.update(apt.id, { status: 'no_show', noShowAlerted: true });
     await sendNoShowFollowUp(apt);
@@ -199,6 +206,13 @@ async function runProspectReminderPass(store) {
 
   let sent = 0;
   for (const apt of due) {
+    // Final ownership check: if staff took over this conversation, do not send
+    // automated prospect messages regardless of the appointment state.
+    if (store?.getLead(apt.leadPhone)?.status === 'human_owns') {
+      logger.info('[apt-worker] Prospect reminder skipped — human_owns', { aptId: apt.id, leadPhone: apt.leadPhone });
+      store?.logEvent('prospect_reminder_suppressed_human_owns', apt.leadPhone, { aptId: apt.id });
+      continue;
+    }
     const name          = (apt.leadName ?? '').split(' ')[0] || 'שלום';
     const formattedTime = fmtScheduledAt(apt.scheduledAt, apt.rawTime);
     const result        = await sendProspectReminder(apt, name, formattedTime);
