@@ -3655,9 +3655,11 @@ async function processInboundWAMessage(msg) {
             return { inboxEntry: _skEntry, clientMatch, intent, route: 'post_call_name_captured', barakReply: null };
           }
 
-          // Concurrency guard: skip if either send is already in-flight.
-          if (_nm.closingSummaryProspectState === 'in_flight' || _nm.closingSummaryManagerState === 'in_flight') {
-            logger.info('[pipeline] Closing summary in-flight — skipping concurrent duplicate', { from: fromNorm });
+          // Concurrency guard: skip if either send is in-flight or uncertain (outcome unknown).
+          // 'uncertain' means in-flight when the process last crashed — do not auto-send on name repeat.
+          const _BLOCKING_STATES = new Set(['in_flight', 'uncertain']);
+          if (_BLOCKING_STATES.has(_nm.closingSummaryProspectState) || _BLOCKING_STATES.has(_nm.closingSummaryManagerState)) {
+            logger.info('[pipeline] Closing summary in-flight/uncertain — skipping concurrent duplicate', { from: fromNorm });
             persist.saveLeads(store);
             const _ifEntry = inbox.push({
               from: fromNorm, fromIsraeli, name: msg.name ?? null,
@@ -6891,34 +6893,39 @@ app.listen(PORT, async () => {
   _markStoreReady();
 
   // ── Startup closing-summary recovery ──────────────────────────────────────
-  // Reset any in_flight states left by a crash to 'failed', then retry all
-  // leads whose closing summary is incomplete (failed prospect or manager send).
-  // Auto-retry only fires when WHATSAPP_AUTO_REPLY=true so staging/test restarts
-  // do not blast messages.
+  // in_flight after a crash = UNKNOWN outcome. The provider may have accepted the
+  // send before the process died; treating it as 'failed' and auto-resending could
+  // duplicate a message already delivered. Mark uncertain, expose for review only.
+  //
+  // 'failed' states (confirmed failure before crash) ARE safe to auto-retry because
+  // the previous attempt never reached the provider.
   {
     const _closingLeads = store.getAllLeads().filter(l => {
       const m = l.meta ?? {};
       return m.closingSummaryProspectState != null || m.closingSummaryManagerState != null;
     });
-    let _inFlightReset = 0;
+    let _uncertainCount = 0;
     for (const l of _closingLeads) {
       const m = l.meta ?? {};
       if (m.closingSummaryProspectState === 'in_flight' || m.closingSummaryManagerState === 'in_flight') {
         store.upsertLead(l.phone, {
           meta: {
             ...m,
-            closingSummaryProspectState: m.closingSummaryProspectState === 'in_flight' ? 'failed' : m.closingSummaryProspectState,
-            closingSummaryManagerState:  m.closingSummaryManagerState  === 'in_flight' ? 'failed' : m.closingSummaryManagerState,
+            // 'uncertain': send was in-flight when process died; outcome unknown.
+            // Admin must review (GET /api/admin/send-closing-summary/:phone with force).
+            closingSummaryProspectState: m.closingSummaryProspectState === 'in_flight' ? 'uncertain' : m.closingSummaryProspectState,
+            closingSummaryManagerState:  m.closingSummaryManagerState  === 'in_flight' ? 'uncertain' : m.closingSummaryManagerState,
           },
         });
-        _inFlightReset++;
+        _uncertainCount++;
       }
     }
-    if (_inFlightReset > 0) {
+    if (_uncertainCount > 0) {
       persist.saveLeads(store);
-      logger.info('[startup] Closing summary in-flight → failed (crash recovery)', { count: _inFlightReset });
+      logger.warn('[startup] Closing summary uncertain states found (crash recovery) — review via admin endpoint',
+        { count: _uncertainCount });
     }
-    // Retry failed states when auto-reply is enabled.
+    // Auto-retry only definitively-failed states (never uncertain).
     if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
       const _toRetry = store.getAllLeads().filter(l => {
         const m  = l.meta ?? {};
@@ -6927,7 +6934,7 @@ app.listen(PORT, async () => {
                (m.closingSummaryProspectState === 'failed' || m.closingSummaryManagerState === 'failed');
       });
       if (_toRetry.length) {
-        logger.info('[startup] Retrying failed closing summaries', { count: _toRetry.length });
+        logger.info('[startup] Retrying definitively-failed closing summaries', { count: _toRetry.length });
         for (const l of _toRetry) {
           _retryClosingSummary(l.phone).catch(err =>
             logger.warn('[startup] Closing summary retry failed', { phone: l.phone, error: err.message })

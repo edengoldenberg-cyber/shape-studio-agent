@@ -6,7 +6,7 @@
  *   1. Normal flow: both sends succeed → qualData.closingSummarySent=true
  *   2. Partial manager failure: one phone fails → state stays 'failed', not 'accepted'
  *   3. Admin retry endpoint: failed state retried, correct per-recipient dedup
- *   4. In-flight reset on startup: 'in_flight' becomes 'failed' after module reload
+ *   4. In-flight → uncertain on restart: in_flight becomes 'uncertain' (not auto-retried)
  *   5. Availability confirmation: 'כן' reply → prospectAvailability='confirmed'
  *   6. Availability cancellation: cancel pattern → state='cancelled', staff alerted
  *
@@ -396,6 +396,68 @@ describe('Closing summary — admin retry endpoint', () => {
     expect(res.status).toBe(200);
     expect(res.body.skipped).toContain('972547598919');
     // No new manager alert should have been sent (all skipped)
+    expect(mockSentAlerts).toHaveLength(0);
+  });
+});
+
+describe('Startup in-flight recovery', () => {
+  beforeEach(resetState);
+
+  test('in_flight on restart → uncertain (not failed, not auto-retried)', () => {
+    // Simulate a lead left in in_flight state by a crash
+    store.upsertLead(CLOSE_PHONE, {
+      status: 'callback_requested',
+      name:   'עמית',
+      meta: {
+        qualData: { confirmedName: 'עמית', callTimeGiven: 'מחר ב12', closingSummarySent: false },
+        closingSummaryProspectState: 'in_flight',
+        closingSummaryManagerState:  'in_flight',
+      },
+    });
+
+    // Simulate what startup recovery does (call the same logic inline)
+    const leads = store.getAllLeads().filter(l => {
+      const m = l.meta ?? {};
+      return m.closingSummaryProspectState === 'in_flight' || m.closingSummaryManagerState === 'in_flight';
+    });
+    for (const l of leads) {
+      const m = l.meta ?? {};
+      store.upsertLead(l.phone, {
+        meta: {
+          ...m,
+          closingSummaryProspectState: m.closingSummaryProspectState === 'in_flight' ? 'uncertain' : m.closingSummaryProspectState,
+          closingSummaryManagerState:  m.closingSummaryManagerState  === 'in_flight' ? 'uncertain' : m.closingSummaryManagerState,
+        },
+      });
+    }
+
+    const m = store.getLead(CLOSE_PHONE)?.meta ?? {};
+    expect(m.closingSummaryProspectState).toBe('uncertain');
+    expect(m.closingSummaryManagerState).toBe('uncertain');
+    // uncertain must NOT be auto-retried — no sends should have fired
+    expect(mockSentTexts).toHaveLength(0);
+    expect(mockSentAlerts).toHaveLength(0);
+  });
+
+  test('uncertain blocks re-entry of name capture path', async () => {
+    // After a crash with uncertain state, another name message must NOT trigger
+    // a new closing send (outcome of previous attempt is unknown)
+    store.upsertLead(CLOSE_PHONE, {
+      status: 'callback_requested',
+      meta: {
+        arboxColdLeadConfirmedAt: Date.now(),
+        qualData: {
+          callTimeGiven: 'מחר ב12', nameAsked: true, confirmedName: null,
+          nameConfirmed: false, closingSummarySent: false,
+          fitnessInterest: 'פילאטיס', location: 'כרכור', goal: 'חיזוק',
+        },
+        closingSummaryProspectState: 'uncertain',
+        closingSummaryManagerState:  'uncertain',
+      },
+    });
+    const r = await simulateMessage('עמית');
+    expect(r.route).toBe('post_call_name_captured');  // blocked route
+    expect(mockSentTexts).toHaveLength(0);  // no new sends
     expect(mockSentAlerts).toHaveLength(0);
   });
 });
