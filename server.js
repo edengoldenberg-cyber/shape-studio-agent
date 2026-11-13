@@ -6126,6 +6126,32 @@ app.post('/api/admin/staff', jsonBody, (req, res) => {
   }
 });
 
+// POST /api/admin/leads/:phone/restore-status — set lead status to an allowlisted value
+// without touching any meta fields. Used for administrative corrections when automated
+// code drops the wrong status (e.g. phone-side takeover release before previousStatus fix).
+// All qualification, appointment, summary and notification records are preserved.
+const RESTORE_STATUS_ALLOWED = new Set([
+  'new', 'cold', 'warm', 'hot',
+  'callback_requested', 'call_scheduled', 'callback_pending',
+  'converted_member', 'opted_out',
+]);
+app.post('/api/admin/leads/:phone/restore-status', jsonBody, (req, res) => {
+  const norm = normalizeToE164(decodeURIComponent(req.params.phone));
+  if (!norm) return res.status(400).json({ error: 'invalid phone' });
+  const { status, reason = 'admin_correction' } = req.body ?? {};
+  if (!RESTORE_STATUS_ALLOWED.has(status)) {
+    return res.status(400).json({ error: `status must be one of: ${[...RESTORE_STATUS_ALLOWED].join(', ')}` });
+  }
+  const existing = store.getLead(norm);
+  if (!existing) return res.status(404).json({ error: 'lead not found' });
+  const prevStatus = existing.status;
+  store.upsertLead(norm, { status });
+  persist.saveLeads(store);
+  store.logEvent('lead_status_restored', norm, { from: prevStatus, to: status, reason });
+  logger.info('[admin] Lead status restored', { phone: norm, from: prevStatus, to: status, reason });
+  res.json({ ok: true, phone: norm, from: prevStatus, to: status });
+});
+
 // POST /api/admin/reset-lead-state/:phone — controlled reset for live E2E testing.
 // Clears callback, qualification and AI history for one specific phone.
 // Preserves firstSeen, messageCount, source and all appointment records.

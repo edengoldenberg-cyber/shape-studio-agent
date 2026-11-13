@@ -390,6 +390,106 @@ describe('T8 — History sync attribution (no ID-prefix heuristic)', () => {
   });
 });
 
+// ── T_R1: Phone takeover → release restores the original status ───────────────
+//
+// Before the previousStatus fix, _applyStaffTakeover did not save the pre-takeover
+// status. Release fell to 'cold' instead of restoring the original status.
+// This suite exercises the fix end-to-end via the webhook and release API paths.
+
+describe('T_R1 — Release restores original lead status after phone takeover', () => {
+  beforeEach(() => {
+    resetAll();
+    // Seed a lead at callback_requested — the status a lead has after Barak
+    // has captured callTimeGiven but before the callback was completed.
+    store.upsertLead(LEAD_PHONE, { status: 'callback_requested', meta: { callbackTime: 'מחר ב12' } });
+  });
+
+  test('release after phone-side takeover restores callback_requested', async () => {
+    await simulatePhoneSend(LEAD_PHONE, 'אני מטפל עכשיו');
+    expect(store.getLead(LEAD_PHONE)?.status).toBe('human_owns');
+    expect(store.getLead(LEAD_PHONE)?.meta?.previousStatus).toBe('callback_requested');
+
+    // Simulate release
+    const r = await request(app)
+      .post(`/api/leads/${LEAD_PHONE}/release`)
+      .send({})
+      .set('Content-Type', 'application/json');
+    expect(r.status).toBe(200);
+    expect(r.body.status).toBe('callback_requested');
+    expect(store.getLead(LEAD_PHONE)?.status).toBe('callback_requested');
+  });
+
+  test('release after phone-side takeover on a cold lead restores cold', async () => {
+    store.upsertLead(LEAD_PHONE, { status: 'cold', meta: {} });
+    await simulatePhoneSend(LEAD_PHONE, 'אני מטפל');
+    expect(store.getLead(LEAD_PHONE)?.meta?.previousStatus).toBe('cold');
+
+    await request(app).post(`/api/leads/${LEAD_PHONE}/release`).send({});
+    expect(store.getLead(LEAD_PHONE)?.status).toBe('cold');
+  });
+});
+
+// ── T_R2: Repeated phone-side messages do not overwrite previousStatus ─────────
+//
+// _applyStaffTakeover returns early when status is already human_owns, so the
+// second message cannot clobber previousStatus with 'human_owns'.
+
+describe('T_R2 — Repeated phone messages while human_owns preserve previousStatus', () => {
+  beforeEach(() => {
+    resetAll();
+    store.upsertLead(LEAD_PHONE, { status: 'callback_requested', meta: {} });
+  });
+
+  test('second phone-side message does not overwrite previousStatus', async () => {
+    // First message: sets human_owns, saves previousStatus=callback_requested
+    await simulatePhoneSend(LEAD_PHONE, 'הודעה ראשונה', '2A_FIRST');
+    const afterFirst = store.getLead(LEAD_PHONE);
+    expect(afterFirst?.status).toBe('human_owns');
+    expect(afterFirst?.meta?.previousStatus).toBe('callback_requested');
+
+    // Second message: _applyStaffTakeover should return early (already human_owns)
+    await simulatePhoneSend(LEAD_PHONE, 'הודעה שנייה', '2A_SECOND');
+    const afterSecond = store.getLead(LEAD_PHONE);
+    expect(afterSecond?.status).toBe('human_owns');
+    // previousStatus must still be callback_requested, not overwritten with human_owns
+    expect(afterSecond?.meta?.previousStatus).toBe('callback_requested');
+  });
+
+  test('release after repeated messages still restores callback_requested', async () => {
+    await simulatePhoneSend(LEAD_PHONE, 'ראשון', '2A_MSG1');
+    await simulatePhoneSend(LEAD_PHONE, 'שני',   '2A_MSG2');
+    await simulatePhoneSend(LEAD_PHONE, 'שלישי', '2A_MSG3');
+
+    await request(app).post(`/api/leads/${LEAD_PHONE}/release`).send({});
+    expect(store.getLead(LEAD_PHONE)?.status).toBe('callback_requested');
+  });
+});
+
+// ── T_R3: previousStatus survives persist round-trip ─────────────────────────
+
+describe('T_R3 — previousStatus survives lead store persist round-trip', () => {
+  beforeEach(() => {
+    resetAll();
+    store.upsertLead(LEAD_PHONE, { status: 'callback_requested', meta: {} });
+  });
+
+  test('previousStatus is preserved after store round-trip', async () => {
+    await simulatePhoneSend(LEAD_PHONE, 'שלחתי מהטלפון');
+    const saved = { ...store.getLead(LEAD_PHONE) };
+    expect(saved?.meta?.previousStatus).toBe('callback_requested');
+
+    // Re-upsert from saved snapshot (simulates persist → reload cycle)
+    store.upsertLead(LEAD_PHONE, saved);
+    const reloaded = store.getLead(LEAD_PHONE);
+    expect(reloaded?.meta?.previousStatus).toBe('callback_requested');
+    expect(reloaded?.status).toBe('human_owns');
+
+    // Release still restores correctly
+    await request(app).post(`/api/leads/${LEAD_PHONE}/release`).send({});
+    expect(store.getLead(LEAD_PHONE)?.status).toBe('callback_requested');
+  });
+});
+
 // ── T9/T10: ensureOutgoingWebhooks ────────────────────────────────────────────
 
 describe('T9/T10 — ensureOutgoingWebhooks', () => {
