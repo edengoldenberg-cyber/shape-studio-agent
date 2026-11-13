@@ -2793,6 +2793,7 @@ function _applyStaffTakeover(norm, idMessage, msgText) {
       humanOwnsReason: 'staff_manual_reply',
       humanOwnsSince:  new Date().toISOString(),
       humanOwnsBy:     'staff',
+      previousStatus:  curStatus ?? 'cold',
     },
   });
   persist.saveLeads(store);
