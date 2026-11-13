@@ -166,15 +166,14 @@ const quietQueue = [];
  * Send a plain text WhatsApp message.
  * Automatically queues if quiet hours are active.
  */
-async function sendText(to, text, { bypassQuietHours = false } = {}) {
+async function sendText(to, text, { bypassQuietHours = false, linkPreview = true } = {}) {
   if (!bypassQuietHours && isQuietHours()) {
     logger.info('Quiet hours active — queuing message', { to });
     quietQueue.push({ to, text, queuedAt: new Date() });
-    // Send an immediate acknowledgement
     await _dispatch(to, `קיבלנו את הודעתך 🙂 נחזור אליך מחר בבוקר. ערב טוב!`);
     return { queued: true, releaseAt: nextMorningRelease() };
   }
-  return _dispatch(to, text);
+  return _dispatch(to, text, { linkPreview });
 }
 
 /**
@@ -189,7 +188,7 @@ async function sendText(to, text, { bypassQuietHours = false } = {}) {
  * can record the provider-assigned idMessage or the specific failure reason.
  * Quiet hours do NOT apply to alerts.
  */
-async function alertOwner(subject, body, { skipPhones = new Set() } = {}) {
+async function alertOwner(subject, body, { skipPhones = new Set(), linkPreview = true } = {}) {
   const phones = getAdminPhones();
   if (!phones.length) {
     logger.error('alertOwner: no admin phones configured (staff_config.json or STUDIO_OWNER_PHONE)');
@@ -199,7 +198,7 @@ async function alertOwner(subject, body, { skipPhones = new Set() } = {}) {
   const settled  = await Promise.allSettled(
     phones.map(phone => {
       if (skipPhones.has(phone)) return Promise.resolve({ skipped: true });
-      return _dispatch(phone, message);
+      return _dispatch(phone, message, { linkPreview });
     })
   );
   const results = settled.map((r, i) => {
@@ -294,7 +293,7 @@ function _recordTestSend(to, type = 'sendText') {
 function getTestSendLog() { return [..._testSendLog]; }
 function clearTestSendLog() { _testSendLog.length = 0; }
 
-async function _dispatch(to, text) {
+async function _dispatch(to, text, { linkPreview = true } = {}) {
   const chatId = toChatId(to);
 
   if (isDemoPhone(to) || demoCapture.isActive()) {
@@ -338,6 +337,7 @@ async function _dispatch(to, text) {
 
   try {
     const payload = { chatId, message: text };
+    if (!linkPreview) payload.linkPreview = false;
     const { data } = await axios.post(url, payload, { headers: HEADERS, timeout: 15000 });
 
     // Success path — log at INFO so it appears in Railway default log view.

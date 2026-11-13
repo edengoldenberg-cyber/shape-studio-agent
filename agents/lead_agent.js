@@ -1573,12 +1573,21 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
   }
 
   if (callTimeCapturedNow) {
-    // reliableHandoffAlert is awaited so the persistent handoff record reflects the outcome
-    // before handleInbound returns. The lead already has their reply (sent in step 8).
-    // This may add up to ~10s to the handleInbound Promise resolution, which is acceptable
-    // since it runs after the outbound send and does not delay the lead's experience.
+    // Only send the handoff alert immediately when the name is ALREADY known (CLOSE state:
+    // name and time captured in the same turn). When the name is still unknown, the
+    // name-capture path in server.js fires the consolidated manager summary once
+    // the prospect provides their name — sending it here would create a premature,
+    // incomplete duplicate.
     const handoffLead = store.getLead(from);
-    await reliableHandoffAlert(from, handoffLead?.name ?? from, history, latestQualData);
+    if (latestQualData.confirmedName) {
+      await reliableHandoffAlert(from, handoffLead?.name ?? from, history, latestQualData);
+    } else {
+      const _deferMeta = handoffLead?.meta ?? {};
+      store.upsertLead(from, {
+        meta: { ..._deferMeta, handoffAlertStatus: 'deferred_pending_name' },
+      });
+      logger.info('[lead_agent] Handoff deferred — consolidated summary fires after name capture', { from });
+    }
 
     // Save a persistent session summary to the memory store (fire-and-forget is acceptable
     // here — it enriches future conversations but is not required for the team handoff)

@@ -113,7 +113,7 @@ function formatTime(scheduledAt, rawTime) {
  * @param {string} message
  * @param {{ skipPhones?: Set<string> }} [opts]
  */
-async function broadcastToStaff(message, { skipPhones = new Set() } = {}) {
+async function broadcastToStaff(message, { skipPhones = new Set(), linkPreview = true } = {}) {
   const recipients = activeStaffWithPhones();
   const results = [];
   for (const member of recipients) {
@@ -122,7 +122,7 @@ async function broadcastToStaff(message, { skipPhones = new Set() } = {}) {
       continue;
     }
     try {
-      const res = await sendText(member.phone, message, { bypassQuietHours: true });
+      const res = await sendText(member.phone, message, { bypassQuietHours: true, linkPreview });
       results.push({ staffId: member.id, phone: member.phone, ok: true, idMessage: res?.idMessage ?? null });
     } catch (err) {
       logger.warn('[notify] broadcastToStaff failed', { staffId: member.id, error: err.message });
@@ -147,16 +147,20 @@ async function notifyStaffCallbackConfirmed(apt, assignedStaff, icsDownloadUrl, 
   const timeLabel = formatTime(apt.scheduledAt, apt.rawTime);
   const lead      = apt.leadName ?? apt.leadPhone;
 
+  // "callback_pending" = staff approval still required; "confirmed" = staff confirmed.
+  const statusLine = apt.status === 'callback_pending'
+    ? `⏳ בקשת שיחה — ממתינה לאישור הצוות`
+    : `✅ שיחה אושרה`;
+
   const waMsg = [
-    `📞 *שיחת ייעוץ נקבעה!*`,
+    apt.status === 'callback_pending' ? `📞 *בקשת שיחה חדשה!*` : `📞 *שיחת ייעוץ נקבעה!*`,
     ``,
-    `👤 לקוח/ה: *${lead}*`,
-    `📱 טלפון: ${apt.leadPhone}`,
+    `👤 ${lead}`,
+    `📱 ${apt.leadPhone}`,
     `💬 WhatsApp: ${waLink(apt.leadPhone)}`,
-    `🕐 זמן: *${timeLabel}*`,
+    `🕐 זמן: ${timeLabel}`,
+    statusLine,
     icsDownloadUrl ? `📅 הוסף ליומן: ${icsDownloadUrl}` : null,
-    ``,
-    `נקבע אוטומטית על ידי הסוכן 🤖`,
   ].filter(l => l !== null).join('\n');
 
   // WhatsApp: all active staff (Eden + Melanie + any configured). skipPhones avoids

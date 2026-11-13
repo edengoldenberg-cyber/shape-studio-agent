@@ -3229,9 +3229,11 @@ async function processInboundWAMessage(msg) {
       // Also persist callTimeGiven in qualData so the panel rawTime lookup works and
       // the post-call gate (nameAsked check) can reference it.
       const _awFreshMeta = store.getLead(fromNorm)?.meta ?? {};
-      const _awFreshAt   = msg.timestamp
-        ? new Date(msg.timestamp * 1000).toISOString()
-        : new Date().toISOString();
+      // msg.timestamp is a Date object (parseGreenApiWebhook already converts Unix
+      // seconds to Date via * 1000). Do NOT multiply again — it would produce year 58838+.
+      const _awFreshAt = msg.timestamp instanceof Date
+        ? msg.timestamp.toISOString()
+        : (msg.timestamp ? new Date(msg.timestamp).toISOString() : new Date().toISOString());
       store.upsertLead(fromNorm, {
         status: 'callback_requested',
         meta: {
@@ -3278,37 +3280,28 @@ async function processInboundWAMessage(msg) {
             oldTimeLabel ?? '—'
           );
         } else {
-          // Notify all active staff: "callback requested"
-          // notifyStaffCallbackConfirmed returns {results, sent, firstIdMessage}
-          // so we can record per-recipient outcomes in the aptStore and lead meta.
-          const notifResult = await notifySvc.notifyStaffCallbackConfirmed(
-            { ...apt, scheduledAt },
-            assignedStaff,
-            icsUrl
-          );
-          const _notified    = (notifResult?.sent ?? 0) > 0;
-          const _idMsg       = notifResult?.firstIdMessage ?? null;
-          // Persist per-recipient success in aptStore (like reminderSentTo) so the
-          // retry-notify endpoint can skip already-covered phones.
-          const _succeededPhones = (notifResult?.results ?? [])
-            .filter(r => r.ok && !r.skipped).map(r => r.phone);
-          if (_succeededPhones.length) {
-            const _existingHST = aptStore.get(apt.id)?.handoffSentTo ?? [];
-            aptStore.update(apt.id, {
-              handoffSentTo: [...new Set([..._existingHST, ..._succeededPhones])],
-            });
-          }
-          const _curMeta     = store.getLead(fromNorm)?.meta ?? {};
+          // For fresh callbacks: suppress the preliminary staff notification.
+          // The name is unknown at this point (leadName = WhatsApp display name, often null
+          // or unconfirmed). Sending now produces an incomplete message with blank/wrong name
+          // and the misleading "שיחת ייעוץ נקבעה" subject when nothing has been confirmed.
+          //
+          // The CONSOLIDATED manager summary fires after the prospect provides their name
+          // via the name-capture path (server.js post_call_name_captured). That message has
+          // the full name, accurate status wording, and formatted scheduledAt date.
+          //
+          // Panel shows the callback_pending appointment immediately so staff is not blind.
+          // If the prospect never provides a name, the appointment remains visible in the panel.
+          const _curMeta = store.getLead(fromNorm)?.meta ?? {};
           store.upsertLead(fromNorm, {
             meta: {
               ..._curMeta,
-              handoffAlertStatus:    _notified ? 'sent'  : 'failed',
-              handoffAlertSentAt:    _notified ? new Date().toISOString() : null,
-              handoffAlertFailedAt:  _notified ? null : new Date().toISOString(),
-              handoffAlertIdMessage: _idMsg,
+              handoffAlertStatus:  'deferred_pending_name',
+              handoffCallTime:     rawTime,
             },
           });
           persist.saveLeads(store);
+          logger.info('[pipeline] New callback — manager summary deferred until name captured',
+            { from: fromNorm, rawTime });
         }
 
         store.logEvent('appointment_staff_notified', fromNorm, {
@@ -3737,24 +3730,31 @@ async function processInboundWAMessage(msg) {
             `נציג מהצוות של Shape Studio יצור איתך קשר.`,
           ].join('\n') : null;
 
-          // Manager handoff: complete information with formatted time, missing info explicit.
-          const _missingParts = [...(!_goal ? ['מטרה ספציפית'] : [])];
+          // ── Consolidated manager summary ──────────────────────────────────────────
+          // ONE message per callback, sent after both name and time are confirmed and the
+          // appointment is successfully persisted. Sent with linkPreview:false to prevent
+          // the wa.me link from rendering the contact's business profile as a preview card.
+          //
+          // Local phone format (05X-XXXXXXX) for readability; E164 preserved in wa.me link.
+          const _localPhone = fromNorm.startsWith('972')
+            ? '0' + fromNorm.slice(3)
+            : fromNorm;
+
+          const _backendBase = getBackendBase();
+          const _panelLink   = _backendBase
+            ? `${_backendBase}/api/barak/callbacks`
+            : null;
+
           const _managerHandoff = _callTime ? [
-            `━━━━━━━━━━━━━━━━━━━━━`,
-            `📋 ליד — Shape Studio`,
-            `━━━━━━━━━━━━━━━━━━━━━`,
-            `👤 שם: ${capturedName}`,
-            `📱 ${fromNorm}`,
-            `💬 https://wa.me/${fromNorm}`,
-            `📞 שיחה מבוקשת: ${_fmtTime}`,
-            _callTime !== _fmtTime ? `   (מקורי: ${_callTime})` : null,
-            `⚠️ בקשה — לא אושרה עדיין על ידי הצוות`,
-            `━━━━━━━━━━━━━━━━━━━━━`,
-            _interest ? `💪 ענין: ${_interest}` : null,
+            `📞 בקשת שיחה חדשה — ${capturedName}`,
+            `📅 ${_fmtTime}`,
+            `📱 ${_localPhone}`,
+            _interest ? `💪 עניין: ${_interest}` : null,
             _location ? `📍 מיקום: ${_location}` : null,
             _goal     ? `🎯 מטרה: ${_goal}` : null,
-            _readiness ? `📊 מוכנות: ${_readyEmoji} ${_readiness}` : null,
-            _missingParts.length ? `━━━━━━━━━━━━━━━━━━━━━\n⚠️ חסר: ${_missingParts.join(', ')}` : null,
+            `⏳ בקשת שיחה — ממתינה לאישור הצוות`,
+            `💬 https://wa.me/${fromNorm}`,
+            _panelLink ? `📋 ${_panelLink}` : null,
           ].filter(Boolean).join('\n') : null;
 
           // Read already-covered manager recipients BEFORE sending (use as skipPhones).
@@ -3832,8 +3832,10 @@ async function processInboundWAMessage(msg) {
           }
 
           // Send manager handoff — pass already-covered phones as skipPhones BEFORE calling.
+          // linkPreview:false prevents the wa.me link from rendering the contact's business
+          // profile card (e.g. "Fit Coach App" preview from the prospect's WhatsApp account).
           if (_managerHandoff) {
-            alertOwner(`📋 ליד מוכן — ${capturedName}`, _managerHandoff, { skipPhones: _alreadyMgrSentTo })
+            alertOwner(`📞 בקשת שיחה — ${capturedName}`, _managerHandoff, { skipPhones: _alreadyMgrSentTo, linkPreview: false })
               .then(ar => {
                 const newSent   = (ar?.results ?? []).filter(r => r.idMessage && !r.skipped).map(r => r.phone);
                 const allSentTo = [..._alreadyMgrSentTo, ...newSent];
@@ -4220,10 +4222,13 @@ async function processInboundWAMessage(msg) {
         try { barakReply = await buildSchedulingReply(intent, msg, clientMatch); } catch { /* non-fatal */ }
       }
       if (intent === 'representative') {
-        const clientName = msg.name ?? clientMatch.arboxName ?? fromIsraeli ?? fromNorm;
-        notifySvc.notifyRepresentativeRequest(fromNorm, clientName).catch(err =>
-          logger.warn('Representative request staff alert failed', { error: err.message })
-        );
+        const _awaitingNow = store.getLead(fromNorm)?.meta?.awaitingCallbackTime === true;
+        if (!_awaitingNow) {
+          const clientName = msg.name ?? clientMatch.arboxName ?? fromIsraeli ?? fromNorm;
+          notifySvc.notifyRepresentativeRequest(fromNorm, clientName).catch(err =>
+            logger.warn('Representative request staff alert failed', { error: err.message })
+          );
+        }
       }
     } else if (msg.type === 'text' && msg.text?.trim()) {
       // Existing member general message → Tomer silence classifier (strict rules)
@@ -4306,10 +4311,17 @@ async function processInboundWAMessage(msg) {
         }
       }
       if (intent === 'representative') {
-        const clientName = msg.name ?? fromIsraeli ?? fromNorm;
-        notifySvc.notifyRepresentativeRequest(fromNorm, clientName).catch(err =>
-          logger.warn('Representative request staff alert failed', { error: err.message })
-        );
+        // Suppress if awaitingCallbackTime was set by buildSchedulingReply — normal flow.
+        // Consolidated summary fires after name capture. Keep for urgent/non-callback cases.
+        const _awaitingNow = store.getLead(fromNorm)?.meta?.awaitingCallbackTime === true;
+        if (!_awaitingNow) {
+          const clientName = msg.name ?? fromIsraeli ?? fromNorm;
+          notifySvc.notifyRepresentativeRequest(fromNorm, clientName).catch(err =>
+            logger.warn('Representative request staff alert failed', { error: err.message })
+          );
+        } else {
+          logger.info('[pipeline] Representative alert suppressed — consolidated summary pending name', { from: fromNorm });
+        }
       }
     } else {
       // General / sales qualification → lead_agent (Barak's AI persona)

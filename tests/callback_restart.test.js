@@ -278,11 +278,11 @@ test('restart-flow: proposal → persist → reload → time → persist → rel
   // Prospect received "קיבלנו את בקשת השיחה ✅"
   expect(mockSentTexts.some(s => s.to === RESTART_PHONE && s.text.includes('קיבלנו'))).toBe(true);
 
-  // Manager received handoff with the lead's name
+  // Manager received consolidated summary with the lead's name
   expect(
     mockSentAlerts.some(a =>
       (a.subject?.includes('עמית') || a.body?.includes('עמית')) &&
-      (a.subject?.includes('ליד') || a.body?.includes('ליד') || a.subject?.includes('Shape'))
+      (a.subject?.includes('שיחה') || a.body?.includes('שיחה') || a.body?.includes('wa.me'))
     )
   ).toBe(true);
 }, 30000);
