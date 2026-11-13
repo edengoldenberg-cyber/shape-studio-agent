@@ -489,63 +489,57 @@ describe('T_R3 — previousStatus survives real file persistence and reload', ()
     jest.resetModules();
   });
 
-  test('human_owns + previousStatus written to disk and restored after loadLeads; release returns callback_requested', () => {
-    // persist.js reads DATA_DIR at call-time, so pointing the env var at tmpDir
-    // is sufficient — no module re-require needed.
+  test('human_owns + previousStatus written to disk by saveLeads, survive loadLeads, releaseOwnership restores callback_requested', () => {
     const originalDataDir = process.env.DATA_DIR;
     process.env.DATA_DIR = tmpDir;
 
-    const realPersist = jest.requireActual('../utils/persist');
+    // Real modules — not the mocked versions used by the rest of the suite.
+    const realPersist   = jest.requireActual('../utils/persist');
+    const { LeadStore } = jest.requireActual('../utils/lead_store');
+    const { releaseOwnership } = jest.requireActual('../utils/ownership');
 
-    // ── Write: build the snapshot JSON that saveLeads would produce ───────────
-    const snap = {
-      leads: [[LEAD_PHONE, {
-        phone: LEAD_PHONE, status: 'human_owns', name: null, score: 10,
-        meta: {
-          callbackTime:    'מחר ב12',
-          humanOwnsReason: 'staff_manual_reply',
-          humanOwnsSince:  new Date().toISOString(),
-          humanOwnsBy:     'staff',
-          previousStatus:  'callback_requested',
-        },
-      }]],
-      members: [],
-      events:  [],
-      savedAt: new Date().toISOString(),
-    };
-    const leadsFile = path.join(tmpDir, 'leads_persist.json');
-    fs.writeFileSync(leadsFile, JSON.stringify(snap), 'utf8');
-    expect(fs.existsSync(leadsFile)).toBe(true);
+    // ── Write: isolated store instance → takeover → real saveLeads ───────────
+    const writeStore = new LeadStore();
+    writeStore.upsertLead(LEAD_PHONE, { status: 'callback_requested', meta: { callbackTime: 'מחר ב12' } });
 
-    // Verify what is on disk (independent of saveLeads path)
-    const onDisk = JSON.parse(fs.readFileSync(leadsFile, 'utf8'));
-    const diskEntry = (onDisk.leads || []).find(function(e) { return e[0] === LEAD_PHONE; });
-    expect(diskEntry[1].status).toBe('human_owns');
-    expect(diskEntry[1].meta.previousStatus).toBe('callback_requested');
+    // Simulate _applyStaffTakeover (the pure mutation it performs, without IO)
+    const bt = writeStore.getLead(LEAD_PHONE);
+    writeStore.upsertLead(LEAD_PHONE, {
+      status: 'human_owns',
+      meta: Object.assign({}, bt.meta, {
+        humanOwnsReason: 'staff_manual_reply',
+        humanOwnsSince:  new Date().toISOString(),
+        humanOwnsBy:     'staff',
+        previousStatus:  bt.status,
+      }),
+    });
 
-    // ── Load: use the real loadLeads into a minimal store-shaped object ───────
-    const freshStore = {
-      _leads: new Map(), _members: new Map(), _events: [],
-      getLead: function(p) { return freshStore._leads.get(p) || null; },
-    };
-    realPersist.loadLeads(freshStore);
+    expect(writeStore.getLead(LEAD_PHONE).status).toBe('human_owns');
+    expect(writeStore.getLead(LEAD_PHONE).meta.previousStatus).toBe('callback_requested');
 
-    const afterLoad = freshStore.getLead(LEAD_PHONE);
-    expect(afterLoad).not.toBeNull();
+    // Real saveLeads — writes to tmpDir via getLeadsFile() which reads DATA_DIR
+    const saved = realPersist.saveLeads(writeStore);
+    expect(saved).toBe(true);
+    expect(fs.existsSync(path.join(tmpDir, 'leads_persist.json'))).toBe(true);
+
+    // ── Read: fresh isolated store + real loadLeads ───────────────────────────
+    const readStore = new LeadStore();
+    const loaded = realPersist.loadLeads(readStore);
+    expect(loaded).toBe(true);
+
+    const afterLoad = readStore.getLead(LEAD_PHONE);
     expect(afterLoad.status).toBe('human_owns');
     expect(afterLoad.meta.previousStatus).toBe('callback_requested');
     expect(afterLoad.meta.callbackTime).toBe('מחר ב12');
 
-    // ── Release: mirror what /api/leads/:phone/release does ──────────────────
-    const relMeta = afterLoad.meta || {};
-    const prevSt  = relMeta.previousStatus || 'cold';
-    freshStore._leads.set(LEAD_PHONE, Object.assign({}, afterLoad, {
-      status: prevSt,
-      meta: Object.assign({}, relMeta, {
-        humanOwnsReason: null, humanOwnsSince: null, humanOwnsBy: null, previousStatus: null,
-      }),
-    }));
-    expect(freshStore.getLead(LEAD_PHONE).status).toBe('callback_requested');
+    // ── Release: real releaseOwnership — the same function the HTTP handler uses
+    const result = releaseOwnership(readStore, LEAD_PHONE);
+    expect(result.status).toBe('callback_requested');
+    expect(result.automationResumed).toBe(true);
+    expect(readStore.getLead(LEAD_PHONE).status).toBe('callback_requested');
+    // Ownership fields cleared
+    expect(readStore.getLead(LEAD_PHONE).meta.humanOwnsReason).toBeNull();
+    expect(readStore.getLead(LEAD_PHONE).meta.previousStatus).toBeNull();
 
     process.env.DATA_DIR = originalDataDir;
   });

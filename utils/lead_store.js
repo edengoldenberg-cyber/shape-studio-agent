@@ -360,4 +360,6 @@ class LeadStore {
   }
 }
 
-module.exports = new LeadStore();
+const singleton = new LeadStore();
+module.exports = singleton;
+module.exports.LeadStore = LeadStore; // allow tests to create isolated instances

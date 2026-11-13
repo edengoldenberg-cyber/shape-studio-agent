@@ -24,6 +24,7 @@ process.on('uncaughtException', (err) => {
 const { verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, releaseQueuedMessages, sendText, sendFileByUrl, alertOwner, notifyLeadTeam, probeGreenApiConnection, ensureOutgoingWebhooks, getGreenCreds, _tokenSourceVar, getTestSendLog, clearTestSendLog } = require('./services/whatsapp.service');
 const { SCHEDULE_TIMETABLE_RE: _SCHEDULE_RE } = require('./agents/deterministic_reply');
 const phoneRegistry = require('./utils/phone_registry');
+const ownership     = require('./utils/ownership');
 // conversation_fsm is imported for future wiring into processInboundWAMessage.
 // Currently the pipeline uses the existing isExistingClient / 4-tier routing path.
 // getFsmState() is not yet called in the message pipeline — it is a structural module
@@ -1981,60 +1982,16 @@ app.post('/api/leads/:phone/takeover', jsonBody, (req, res) => {
 app.post('/api/leads/:phone/release', jsonBody, (req, res) => {
   const norm = normalizeToE164(decodeURIComponent(req.params.phone));
   if (!norm) return res.status(400).json({ error: 'invalid phone' });
+  if (!store.getLead(norm)) return res.status(404).json({ error: 'lead not found' });
 
-  const existing = store.getLead(norm);
-  if (!existing) return res.status(404).json({ error: 'lead not found' });
+  const result = ownership.releaseOwnership(store, norm, { isMember: phoneRegistry.isMember.bind(phoneRegistry) });
+  if (!result) return res.status(404).json({ error: 'lead not found' });
 
-  // Release only clears the human-ownership fields.
-  // Communication restrictions and identity are authoritative and are NOT overridden
-  // by releasing human ownership — they were set by the person or by identity resolution.
-  //
-  // Priority (highest to lowest):
-  //   1. optedOutAt in meta         → restore to opted_out (permanent comms preference)
-  //   2. isConfirmedMember in meta  → restore to converted_member (identity fact)
-  //   3. previousStatus if valid    → restore to that automation state
-  //   4. fallback                   → cold
-  const meta = existing.meta ?? {};
-  const ownershipClear = {
-    humanOwnsReason:  null,
-    humanOwnsSince:   null,
-    humanOwnsBy:      null,
-    humanReleasedAt:  new Date().toISOString(),
-    previousStatus:   null,
-  };
-
-  // opted_out: authoritative sources in priority order:
-  //   1. meta.optedOutAt — set by both in-flow and API opt-out paths
-  //   2. meta.previousStatus — covers legacy records where optedOutAt was not yet written
-  //      (e.g. opt-out set before this field was introduced, or via older code paths)
-  if (meta.optedOutAt || meta.previousStatus === 'opted_out') {
-    store.upsertLead(norm, { status: 'opted_out', meta: { ...meta, ...ownershipClear } });
-    store.logEvent('human_release', norm, { restoredTo: 'opted_out', reason: 'opted_out_preserved' });
-    persist.saveLeads(store);
-    logger.info('[lead-ownership] Released — opted_out preserved', { phone: norm });
-    return res.json({ ok: true, phone: norm, status: 'opted_out', automationResumed: false, reason: 'opted_out_preserved' });
-  }
-
-  // converted_member: authoritative sources in priority order:
-  //   1. meta.isConfirmedMember — stamped by reclassifyAsConvertedMember
-  //   2. phoneRegistry.isMember — synchronous O(1) check (most authoritative)
-  //   3. meta.previousStatus — covers legacy records where isConfirmedMember was not yet written
-  if (meta.isConfirmedMember || phoneRegistry.isMember(norm) || meta.previousStatus === 'converted_member') {
-    store.upsertLead(norm, { status: 'converted_member', meta: { ...meta, ...ownershipClear } });
-    store.logEvent('human_release', norm, { restoredTo: 'converted_member', reason: 'member_identity_preserved' });
-    persist.saveLeads(store);
-    logger.info('[lead-ownership] Released — converted_member preserved', { phone: norm });
-    return res.json({ ok: true, phone: norm, status: 'converted_member', automationResumed: false, reason: 'member_identity_preserved' });
-  }
-
-  const AUTOMATION_STATES = new Set(['new', 'cold', 'warm', 'hot', 'call_scheduled', 'callback_requested']);
-  const prev = meta.previousStatus;
-  const restoreStatus = AUTOMATION_STATES.has(prev) ? prev : 'cold';
-  store.upsertLead(norm, { status: restoreStatus, meta: { ...meta, ...ownershipClear } });
-  store.logEvent('human_release', norm, { restoredTo: restoreStatus, wasStatus: prev });
+  store.logEvent('human_release', norm, { restoredTo: result.status, automationResumed: result.automationResumed });
   persist.saveLeads(store);
-  logger.info('[lead-ownership] Released — bot resumed', { phone: norm, restoredTo: restoreStatus });
-  return res.json({ ok: true, phone: norm, status: restoreStatus, automationResumed: true });
+  logger.info('[lead-ownership] Released — bot resumed', { phone: norm, restoredTo: result.status });
+  broadcastSse('lead_updated', { phone: norm, status: result.status });
+  return res.json({ ok: true, phone: norm, status: result.status, automationResumed: result.automationResumed });
 });
 
 app.post('/api/leads/:phone/opt-out', jsonBody, (req, res) => {
