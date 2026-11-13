@@ -786,7 +786,13 @@ async function ensureOutgoingWebhooks() {
     );
     // Verify the change took effect with a fresh read — a successful HTTP response
     // from setSettings does not guarantee the setting was persisted.
-    const { data: verified } = await axios.get(`${base}/getSettings/${token}`, { timeout: 8000 });
+    // Green API sometimes has a propagation delay; retry once after 2s before failing.
+    let verified;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt > 0) await new Promise(r => setTimeout(r, 2000));
+      ({ data: verified } = await axios.get(`${base}/getSettings/${token}`, { timeout: 8000 }));
+      if (verified.outgoingMessageWebhook === 'yes') break;
+    }
     const confirmed = verified.outgoingMessageWebhook === 'yes';
     logger.info('[Green API] outgoingMessageWebhook set + verified', {
       prevSetting: current.outgoingMessageWebhook,
