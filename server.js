@@ -2247,7 +2247,10 @@ const INTENT_PATTERNS = {
   cancellation:     /ביטול|תבטל[יה]?|לבטל|לא אגיע|לא מגיע[ה]?|לא יכול[ה]?|אבטל|ביטלתי|להסיר|תסיר אותי/,
   booking:          /תשבץ[יה]?|שיבוץ|לשבץ|רוצה מקום|תרשמ[יה]|להירשם|להצטרף|רשמ[יה] אותי|קבע[יה] לי|אני רוצ[האה] להירשם/,
   representative:   /נציג|לדבר עם מישהו|לדבר עם אדם|לדבר עם בן אדם|העבר[יה]? אות[יה] לאדם|שמישהו יחזור|שיתקשרו|שיצרו קשר|אדם אמיתי/,
-  reschedule:       /לדחות|לשנות שעה|שעה אחרת|יום אחר|לא יכול[ה]? עכשיו|לא יכול[ה]? אז|פספסנו|לא הצלחתי|תקבע מחדש|זמן אחר|מועד אחר|לתזמן מחדש/,
+  // "לא הצלחתי" and "פספסנו" removed: they signal a missed class (attendance failure),
+  // not an intent to reschedule a future appointment. Both also appear in cancellation
+  // context. Reschedule intent now requires an explicit future-booking signal.
+  reschedule:       /לדחות|לשנות שעה|שעה אחרת|יום אחר|לא יכול[ה]? עכשיו|לא יכול[ה]? אז|תקבע מחדש|זמן אחר|מועד אחר|לתזמן מחדש/,
   // specialist_query: rehab, pre/post-natal, specific instructor background
   specialist_query: /שיקומ|rehab|rehabilit|מדריכ.{0,5}שיקומ|אחרי לידה|לאחר לידה|בהריון|pre.?natal|post.?natal|מדריכ.{0,10}מוסמכ|קורס.{0,10}מדריכ|מתמחה ב|מתמחה עם/,
   // subscription_query: questions about membership packages and what's included
@@ -2558,7 +2561,11 @@ function isPostCallOptOut(text) {
 // ── Payment screenshot / confirmation detector ────────────────────────────────
 // Catches Bit/Paybox/bank-transfer screenshots and text confirmations.
 // These must NEVER trigger sales scripts — always ack + alert staff.
-const PAYMENT_RE = /\bbit\b|ביט|paybox|פייבוקס|העברה בנקאית|העברה.*בנק|בנק.*העברה|אישור תשלום|אישור.*תשלום|קבלה.*תשלום|שלחתי תשלום|שלחתי העברה|העברתי|ביצעתי העברה|שלמתי|תשלום עבר|הועבר|payment.*confirm|transfer.*confirm|שלחתי.*₪|₪.*שלחתי|\b\d{2,4}\s*₪|\b\d{2,4}\s*ש["״"]ח|שלחתי.*\d{2,4}\s*(שקל|ש["״"]ח)|הוראת קבע|חיוב.*כרטיס/i;
+//
+// ביט (Bit app): requires a non-Hebrew char before and after to avoid matching
+// "ביטלתי" (I cancelled), "ביטול" (cancellation), "ביטוח" (insurance), etc.
+// א-ת covers the Hebrew Unicode block (alef–tav).
+const PAYMENT_RE = /\bbit\b|(?<![א-ת])ביט(?![א-ת])|paybox|פייבוקס|העברה בנקאית|העברה.*בנק|בנק.*העברה|אישור תשלום|אישור.*תשלום|קבלה.*תשלום|שלחתי תשלום|שלחתי העברה|העברתי|ביצעתי העברה|שלמתי|תשלום עבר|הועבר|payment.*confirm|transfer.*confirm|שלחתי.*₪|₪.*שלחתי|\b\d{2,4}\s*₪|\b\d{2,4}\s*ש["״"]ח|שלחתי.*\d{2,4}\s*(שקל|ש["״"]ח)|הוראת קבע|חיוב.*כרטיס/i;
 
 function isPaymentMessage(msg) {
   const text = (msg.mediaCaption ?? msg.text ?? '').trim();
@@ -3411,9 +3418,12 @@ async function processInboundWAMessage(msg) {
   }
 
   // ── Payment screenshot / confirmation — ack and alert staff ──────────────────
-  // Must fire before any agent routing so an existing member sending a Bit screenshot
-  // never ends up with Barak's "מאיזה אזור את?" as a reply.
-  if (isPaymentMessage(msg)) {
+  // Must fire before Barak/Tomer routing so a member's Bit screenshot never ends
+  // up with Barak's sales funnel as a reply.
+  // EXCEPTION: human_owns / opted_out take precedence — staff own the conversation.
+  {
+    const _pmtOwn = store.getLead(fromNorm)?.status ?? null;
+    if (_pmtOwn !== 'human_owns' && _pmtOwn !== 'opted_out' && isPaymentMessage(msg)) {
     const senderName = msg.name ?? clientMatch.arboxName ?? fromIsraeli ?? fromNorm;
     const paymentAck = `תודה רבה! קיבלנו את אישור התשלום ✅ הצוות שלנו יעדכן את המערכת בקרוב. לכל שאלה — אנחנו כאן 😊`;
 
@@ -3444,7 +3454,8 @@ async function processInboundWAMessage(msg) {
     });
     persist.saveLeads(store);
     return { inboxEntry: pmtEntry, clientMatch, intent: 'payment', route: 'payment_ack', barakReply: paymentAck };
-  }
+    }
+  } // end payment block
 
   // 2b. Universal ownership and status gate — runs before Tier-4 and before the
   //     Barak/Tomer routing split.
@@ -6559,9 +6570,12 @@ app.post('/api/whatsapp/threads/:phone/send', jsonBody, async (req, res) => {
   try {
     await sendText(phone, text.trim());
     inbox.pushOutbound({ phone, name: name ?? null, text: text.trim(), agentId: 'manual' });
+    // Dashboard manual send = staff is handling this contact. Set human_owns so
+    // automated agents (Barak, Tomer, payment ack) stay silent until released.
+    _applyStaffTakeover(normalizeToE164(phone) ?? phone, null, text.trim());
     store.logEvent('message_out', phone, { preview: text.slice(0, 80), agent: 'manual', source: 'dashboard' });
     broadcastSse('message', { phone, name: name ?? null, direction: 'out' });
-    logger.info('Dashboard manual reply sent', { phone });
+    logger.info('Dashboard manual reply sent — human_owns set', { phone });
     res.json({ ok: true, sentAt: new Date() });
   } catch (err) {
     logger.error('Thread send error', { phone, error: err.message });
