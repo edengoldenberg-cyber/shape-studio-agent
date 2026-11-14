@@ -52,6 +52,14 @@ failure.
 | `routing_webhook`, `startup_conversion`, `media_stale`, `tomer_service` | in-process server | HTTP mock on fixed local ports |
 | `reminder_worker` | module-level | worker + store against a temp dir |
 
+## Tomer (existing-member service) and dashboard auth
+
+| File | What it proves |
+|---|---|
+| `tomer_member_flow.test.js` (Jest) | real inbound member flows through `server.js`: verified Arbox reads, staff-handled membership requests, one manager alert per case, notification failure / uncertainty / retry, restart (no replay), duplicate message ids across a restart, staff workflow on a case, takeover / release for members |
+| `dashboard_auth.test.js` (Jest) | fail-closed, sessions (expiry, tampering, logout revocation across a restart), CSRF, login attempt limiting, public list |
+| `tomer_panel_browser_check.mjs` | real headless Chrome: login, deep link to a case, assign, staff reply, takeover / release, resolve, counters, retry, error / empty states, server restart, logout. Run directly: `node tests/tomer_panel_browser_check.mjs` |
+
 ## Not part of the isolated run
 
 | File | Why | How to run |
@@ -63,6 +71,6 @@ failure.
 
 ## Known non-test warning
 
-`tomer_service.test.mjs` prints `PASSED: 53 FAILED: 0` and then Node on Windows aborts
+`tomer_service.test.mjs` prints `PASSED: 55 FAILED: 0` and then Node on Windows aborts
 inside `process.exit()` (`UV_HANDLE_CLOSING` assertion in libuv). The runner reports this
 as a warning after a clean summary, not as a failure and not silently.

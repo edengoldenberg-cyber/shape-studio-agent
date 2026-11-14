@@ -174,23 +174,45 @@ async function loadToday() {
       api('/api/tomer/overview').catch(() => ({ ok: false })),
     ]);
 
-    // ── KPIs ──────────────────────────────────────────────────────────────────
-    const c = todayData.counts ?? {};
-    setTxt('twk-high',   c.highPriority  ?? 0);
-    setTxt('twk-await',  c.awaitingReply ?? 0);
-    setTxt('twk-open',   c.openTasks     ?? 0);
-    setTxt('twk-failed', c.failedSends   ?? 0);
-    setTxt('twk-arbox',  overviewData.arboxHealth ? '✅ OK' : '⚠️ Error');
+    // ── KPIs — service cases. A number that could not be read is shown as "—", never 0.
+    if (!todayData || todayData.ok !== true || !todayData.cases) {
+      ['twk-high', 'twk-await', 'twk-open', 'twk-member', 'twk-failed'].forEach(id => setTxt(id, '—'));
+      setTxt('twk-arbox', '—');
+      if (listEl) listEl.innerHTML = '<div class="tw-state-error" data-state="error" role="alert">לא ניתן לטעון את נתוני היום' + (todayData?.error ? ' (' + esc(todayData.error) + ')' : '') + '. לחצו 🔄 לניסיון נוסף.</div>';
+      return;
+    }
+    const c  = todayData.counts ?? {};
+    const cc = todayData.cases;
+    setTxt('twk-high',   cc.high);
+    setTxt('twk-await',  cc.awaiting_staff);
+    setTxt('twk-open',   cc.in_progress);
+    setTxt('twk-member', cc.awaiting_member);
+    setTxt('twk-failed', cc.notifFailed + cc.notifUncertain + cc.notifPending);
+    setTxt('twk-arbox',  overviewData && overviewData.ok === true ? (overviewData.arboxHealth ? '✅ זמין' : '⚠️ לא זמין') : '—');
 
-    // Badge on Today tab + Tasks tab
+    // Badges: Today = cases that need staff now; Cases = all open; Tasks = legacy task queue
     const badgeToday = $id('tw-badge-today');
-    const total = (c.highPriority ?? 0) + (c.awaitingReply ?? 0);
+    const total = cc.awaiting_staff + cc.unread;
     if (badgeToday) badgeToday.textContent = total > 0 ? String(total) : '';
+    const badgeCases = $id('tw-badge-cases');
+    if (badgeCases) badgeCases.textContent = cc.open > 0 ? String(cc.open) : '';
     const badgeTasks = $id('tw-badge-tasks');
     if (badgeTasks) badgeTasks.textContent = c.openTasks > 0 ? String(c.openTasks) : '';
 
     // ── Unified action list ────────────────────────────────────────────────────
     const items = [];
+
+    // 0. Service cases that need attention: urgent, new member message, alert not confirmed
+    (todayData.urgentCases ?? []).forEach(k => items.push({
+      urgency: k.priority === 'high' ? 12 : 9,
+      icon: k.priority === 'high' ? '🔴' : (k.unreadMember ? '💬' : '⚠️'),
+      title: 'פנייה' + (k.unreadMember ? ' — הודעה חדשה מהחבר/ה' : '') + (['failed', 'uncertain', 'pending'].includes(k.notification?.state) ? ' — ההתראה למנהל לא אושרה' : ''),
+      who: k.memberName ?? 'חבר/ה',
+      detail: (k.summary ?? '').slice(0, 80),
+      time: k.updatedAt,
+      type: 'service_case',
+      actions: `<button class="btn-xs" onclick="openTomerCase('${esc(k.id)}')">פתח פנייה</button>`,
+    }));
 
     // 1. High-priority Eden tasks
     (todayData.openTasks ?? [])
@@ -446,6 +468,7 @@ async function loadConversations() {
         : c.owner === 'attribution_review'              ? '<span class="badge-warm">⚠️ ייחוס</span>'
         : c.owner === 'opted_out'                       ? '<span class="badge-status-cancelled">🔇</span>'
         : '';
+      const caseBtn = c.caseId ? `<button class="btn-xs" onclick="openTomerCase('${esc(c.caseId)}')">פתח פנייה</button>` : '';
       const threadHtml = (c.messages ?? []).map(m =>
         `<div class="conv-msg ${m.direction === 'out' ? 'conv-bot' : 'conv-user'}" dir="rtl">
            <div class="conv-text">${esc(m.text)}</div>
@@ -458,7 +481,7 @@ async function loadConversations() {
       return `<div class="tw-conv-card">
         <div class="tw-conv-header">
           <span class="tw-conv-name">${esc(c.name ?? c.phone)}</span>
-          ${escalateTag} ${ownerTag}
+          ${escalateTag} ${ownerTag} ${caseBtn}
           <span class="tw-ts" style="margin-right:auto">${esc(c.ageMin)} דקות</span>
         </div>
         <div class="tw-conv-last">${esc((c.lastText ?? '').slice(0, 100))}</div>
@@ -1115,99 +1138,350 @@ if (document.querySelector('.tab-btn[data-tab="tomer"].active')) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  SERVICE CASES (פניות) — one card per member issue, with its Arbox action
+//  SERVICE CASES (פניות) — list with counters + one complete case view
+//
+//  Three things are always shown apart:
+//    • what the MEMBER asked / did          (conversation, request)
+//    • what STAFF reported                  (resolution: outcome + note)
+//    • what ARBOX shows, read by the system (Arbox data + read-only check)
+//  The panel has no button that changes anything in Arbox.
 // ════════════════════════════════════════════════════════════════════════════
-const CASE_STATUS_HE = { awaiting_member: 'ממתין לחבר/ה', awaiting_staff: 'ממתין לצוות', in_progress: 'בטיפול', resolved: 'נסגר', rejected: 'נדחה', cancelled: 'בוטל' };
-const ACTION_STATE_HE = {
-  awaiting_approval: 'ממתין לאישור', approved: 'אושר — ממתין להפעלה', awaiting_manual: 'אושר — לביצוע ידני ב-Arbox',
-  executing: 'מתבצע מול Arbox', verified: 'בוצע ואומת ב-Arbox ✓', failed: 'נכשל — Arbox דחה', uncertain: 'תוצאה לא ודאית — לבדוק ב-Arbox',
-  not_verified: 'דווח כבוצע — Arbox לא מציג', rejected: 'נדחה על ידי הצוות',
+const CASE_STATUS_HE = { awaiting_staff: 'פתוח — ממתין לצוות', in_progress: 'בטיפול', awaiting_member: 'ממתין לחבר/ה', resolved: 'נסגר', rejected: 'נסגר (נדחה)', cancelled: 'נסגר (בוטל)' };
+const CASE_OPEN = ['awaiting_staff', 'in_progress', 'awaiting_member'];
+const NOTIF_HE = {
+  pending:   'התראה למנהל: טרם נשלחה',
+  accepted:  'התראה למנהל: התקבלה אצל ספק הוואטסאפ',
+  failed:    'התראה למנהל: נכשלה — לא נשלחה',
+  uncertain: 'התראה למנהל: לא ודאי אם נשלחה',
+  not_required: 'התראה למנהל: לא נדרשת',
 };
-const ACTION_OP_HE = { membership_hold: 'הקפאת מנוי', membership_cancel: 'ביטול מנוי' };
-const NOTIF_HE = { accepted: 'התראה למנהל: נשלחה', failed: 'התראה למנהל: נכשלה', pending: 'התראה למנהל: ממתינה', not_required: '' };
-let _casesOpen = '1';
+const WHO_HE = { member: 'חבר/ה', tomer: 'תומר (אוטומטי)', staff: 'צוות', bot: 'בוט', system: 'מערכת', unknown: 'נשלח מהמספר של הסטודיו (מקור לא מזוהה)' };
+const OWNER_CONV_HE = { human: '👤 הצוות עונה — תומר מושתק', tomer: '🤖 תומר עונה אוטומטית', opted_out: '🔇 ביקש/ה לא לקבל הודעות', attribution_review: '⚠️ ייחוס הודעה בבדיקה — תומר מושתק' };
+const EVENT_HE = {
+  opened: 'הפנייה נפתחה', member_followup: 'הודעה נוספת מהחבר/ה', request_details_added: 'נוספו פרטים לבקשה',
+  staff_notified: 'התראה למנהל התקבלה אצל הספק', staff_notification_failed: 'התראה למנהל נכשלה', staff_notification_uncertain: 'התראה למנהל — תוצאה לא ודאית',
+  assigned: 'שויכה', status_changed: 'סטטוס שונה', staff_reply: 'הצוות השיב לחבר/ה', staff_reply_failed: 'תשובת צוות לא נשלחה', staff_reply_uncertain: 'תשובת צוות — לא ודאי אם נשלחה',
+  human_takeover: 'הצוות לקח את השיחה', human_release: 'השיחה שוחררה לתומר', arbox_checked: 'נקרא מ-Arbox', resolved: 'נסגרה', reopened: 'נפתחה מחדש',
+};
+const CASE_ERR_HE = {
+  not_found: 'הפנייה לא נמצאה', case_closed: 'הפנייה סגורה — יש לפתוח אותה מחדש', owner_required: 'יש לכתוב שם', bad_status: 'סטטוס לא חוקי',
+  text_required: 'יש לכתוב הודעה', member_opted_out: 'החבר/ה ביקש/ה לא לקבל הודעות — לא נשלח', send_failed: 'ההודעה לא נשלחה',
+  send_uncertain: 'לא ברור אם ההודעה נשלחה — בדקו בוואטסאפ לפני שליחה חוזרת', note_required: 'יש לכתוב הערת סיכום', outcome_required: 'יש לבחור מה נעשה',
+  not_required: 'לפנייה הזו לא נדרשת התראה', uncertain_needs_confirm: 'ייתכן שההתראה כבר הגיעה — נדרש אישור לשליחה חוזרת', notification_in_flight: 'התראה נשלחת כרגע',
+  notify_failed: 'ההתראה למנהל נכשלה שוב', notify_uncertain: 'לא ודאי אם ההתראה נשלחה', operation_failed: 'הפעולה נכשלה בשרת', csrf_token_invalid: 'פג תוקף החיבור — רעננו את הדף',
+  unauthorized: 'נדרשת כניסה מחדש', network: 'אין חיבור לשרת',
+};
+const MEMBERSHIP_CATS = ['membership_cancel', 'membership_freeze'];
 
-async function casePost(id, op, body = {}) {
-  const r = await fetch('/api/tomer/cases/' + encodeURIComponent(id) + '/' + op, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  const j = await r.json().catch(() => ({}));
-  return { status: r.status, ...j };
+let _caseFilter = 'open';           // open | awaiting_staff | in_progress | awaiting_member | resolved
+let _caseLabels = {}, _caseOutcomes = {};
+let _openCaseId = null;
+const staffName = () => { try { return (localStorage.getItem('tw_staff_name') || '').trim(); } catch { return ''; } };
+const dmyHe = iso => String(iso || '').split('-').reverse().join('.');
+
+/** fetch → { status, ok, ...json }. Network failures and non-JSON answers become errors, never empty data. */
+async function caseApi(url, { method = 'GET', body } = {}) {
+  let r;
+  try { r = await fetch(url, { method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined }); }
+  catch { return { status: 0, ok: false, error: 'network' }; }
+  let j = null;
+  try { j = await r.json(); } catch { /* not json */ }
+  if (!j) return { status: r.status, ok: false, error: r.status === 401 ? 'unauthorized' : 'operation_failed' };
+  return { ...j, status: r.status, ok: r.ok && j.ok !== false };
+}
+const caseErr = r => CASE_ERR_HE[r.error] || 'הפעולה נכשלה';
+
+function notifChip(n) {
+  if (!n || n.state === 'not_required' || n.state === 'accepted') return '';
+  const cls = n.state === 'failed' ? 'tw-chip-bad' : 'tw-chip-warn';
+  return '<span class="tw-chip ' + cls + '" data-notif="' + esc(n.state) + '">' + esc({ failed: 'התראה נכשלה', uncertain: 'התראה לא ודאית', pending: 'התראה טרם נשלחה' }[n.state] || n.state) + '</span>';
 }
 
-function renderCase(c, labels) {
-  const a = c.action;
-  const open = ['awaiting_member', 'awaiting_staff', 'in_progress'].includes(c.status);
+function renderCaseCard(c) {
+  const open = CASE_OPEN.includes(c.status);
   const last = [...(c.context || [])].reverse().find(x => x.from === 'member');
-  const btn = (op, label, cls = 'btn-secondary') => '<button class="btn ' + cls + ' tw-case-btn" data-op="' + op + '" data-id="' + esc(c.id) + '">' + label + '</button>';
-  const buttons = [];
-  if (a && open) {
-    if (a.state === 'awaiting_approval') { buttons.push(btn('approve', 'אשר', 'btn-primary')); buttons.push(btn('reject', 'דחה', 'btn-danger')); }
-    if (a.state === 'approved') buttons.push(btn('execute-now', 'בצע עכשיו ב-Arbox', 'btn-primary'));
-    if (['awaiting_manual', 'not_verified', 'failed', 'uncertain'].includes(a.state)) buttons.push(btn('mark-executed', 'בוצע ב-Arbox — אמת', 'btn-primary'));
-    if (['uncertain', 'not_verified', 'executing'].includes(a.state)) buttons.push(btn('recheck', 'בדוק שוב ב-Arbox'));
-  }
-  if (open) { buttons.push(btn('assign', 'שייך אליי')); buttons.push(btn('reply', 'השב לחבר/ה')); buttons.push(btn('resolve', 'סגור פנייה')); }
-  if (c.notification && c.notification.state === 'failed') buttons.push(btn('retry-notification', 'שלח שוב התראה למנהל'));
-  const actionLine = a
-    ? '<div class="tw-case-action" data-state="' + esc(a.state) + '">⚙️ ' + esc(ACTION_OP_HE[a.op] || a.op)
-      + (a.args && a.args.from ? ' · ' + esc(a.args.from) + ' – ' + esc(a.args.to) : '')
-      + ' · <strong>' + esc(ACTION_STATE_HE[a.state] || a.state) + '</strong>'
-      + (a.heldForTakeover ? ' · השיחה בטיפול אנושי' : '') + '</div>'
-    : '';
-  const notice = c.memberNotice ? '<div class="tw-case-meta">עדכון לחבר/ה: ' + esc(c.memberNotice.state === 'withheld' ? 'לא נשלח (' + (c.memberNotice.reason === 'human_owns' ? 'שיחה בטיפול אנושי' : 'ביקש/ה לא לקבל הודעות') + ')' : 'נשלח') + '</div>' : '';
-  return '<div class="tw-case-card" data-case="' + esc(c.id) + '" data-status="' + esc(c.status) + '">'
-    + '<div class="tw-case-head">' + (c.priority === 'high' ? '<span class="tw-case-prio">דחוף</span> ' : '')
-    + '<strong>' + esc(labels[c.category] || c.category) + '</strong> · ' + esc(c.memberName || 'חבר/ה') + ' · <span dir="ltr">' + esc(c.phone) + '</span>'
-    + '<span class="tw-case-status">' + esc(CASE_STATUS_HE[c.status] || c.status) + '</span></div>'
-    + (last ? '<div class="tw-case-text">"' + esc(last.text) + '"</div>' : '')
-    + (c.facts && c.facts.summary ? '<div class="tw-case-meta">📊 Arbox: ' + esc(c.facts.summary) + '</div>' : '')
-    + actionLine
-    + (c.nextAction && open ? '<div class="tw-case-meta">➡️ ' + esc(c.nextAction) + '</div>' : '')
-    + (c.resolution ? '<div class="tw-case-meta">נסגר: ' + esc(c.resolution.note || 'ללא הערה') + ' (' + esc(c.resolution.by) + ')</div>' : '')
-    + notice
-    + '<div class="tw-case-meta">' + esc(c.id) + ' · אחראי/ת: ' + esc(c.owner) + ' · ' + esc(fmtDate(c.updatedAt)) + (c.notification ? ' · ' + esc(NOTIF_HE[c.notification.state] || '') : '') + '</div>'
-    + (buttons.length ? '<div class="tw-case-btns">' + buttons.join('') + '</div>' : '')
-    + '</div>';
+  const owner = !c.owner || c.owner === 'tomer' ? 'לא שויכה' : c.owner;
+  return '<button type="button" class="tw-case-card" data-case="' + esc(c.id) + '" data-status="' + esc(c.status) + '">'
+    + '<span class="tw-case-head">'
+    + (c.priority === 'high' && open ? '<span class="tw-chip tw-chip-bad">דחוף</span>' : '')
+    + '<strong>' + esc(_caseLabels[c.category] || c.category) + '</strong><span>· ' + esc(c.memberName || 'חבר/ה') + '</span>'
+    + (c.unreadMember && open ? '<span class="tw-chip tw-chip-info" data-unread="1">הודעה חדשה מהחבר/ה</span>' : '')
+    + notifChip(c.notification)
+    + '<span class="tw-case-status" data-status-chip="' + esc(c.status) + '">' + esc(CASE_STATUS_HE[c.status] || c.status) + '</span></span>'
+    + (last ? '<span class="tw-case-text">"' + esc(String(last.text).slice(0, 160)) + '"</span>' : '')
+    + '<span class="tw-case-meta">אחראי/ת: ' + esc(owner) + ' · עודכן ' + esc(fmtDate(c.updatedAt))
+    + (open ? ' · ' + esc(c.conversationOwner === 'human' ? 'הצוות עונה' : c.conversationOwner === 'opted_out' ? 'ללא הודעות' : 'תומר עונה') : '')
+    + (c.resolution ? ' · ' + esc(_caseOutcomes[c.resolution.outcome] || 'נסגר') : '') + '</span>'
+    + '</button>';
+}
+
+function renderCounters(counts) {
+  const set = (k, v) => { const el = document.querySelector('#tw-case-counters [data-count="' + k + '"]'); if (el) el.textContent = v; };
+  for (const k of ['open', 'awaiting_staff', 'in_progress', 'awaiting_member', 'resolved']) set(k, counts ? String(counts[k]) : '—');
+  const b = $id('tw-badge-cases'); if (b) b.textContent = counts && counts.open ? String(counts.open) : '';
 }
 
 async function loadCases() {
   const list = $id('tw-cases-list');
   if (!list) return;
-  let d;
-  try { d = await api('/api/tomer/cases?open=' + _casesOpen); } catch { d = null; }
-  if (!d || !d.ok) { list.innerHTML = '<div class="tw-empty">שגיאה בטעינת הפניות</div>'; return; }
-  const w = $id('tw-cases-writes');
-  if (w) {
-    const on = Object.values(d.arboxWrites || {}).some(x => x.executable);
-    w.textContent = on ? 'פעולות מנוי מבוצעות מול Arbox אוטומטית לאחר אישור.' : 'כתיבה ל-Arbox כבויה: אחרי אישור, מבצעים את הפעולה ב-Arbox ולוחצים "בוצע ב-Arbox — אמת". החבר/ה מקבל/ת עדכון רק אחרי ש-Arbox מציג את השינוי.';
+  if (!list.querySelector('.tw-case-card')) list.innerHTML = '<div class="tw-empty" data-state="loading">טוען פניות…</div>';
+  const q = _caseFilter === 'open' ? 'open=1' : _caseFilter === 'resolved' ? 'open=0' : 'status=' + _caseFilter;
+  const d = await caseApi('/api/tomer/cases?' + q);
+  const alertEl = $id('tw-cases-alert');
+  if (!d.ok) {
+    // An unknown count is shown as unknown — never as zero.
+    renderCounters(null);
+    if (alertEl) alertEl.hidden = true;
+    list.innerHTML = '<div class="tw-state-error" data-state="error" role="alert">לא ניתן לטעון את הפניות (' + esc(caseErr(d)) + '). <button type="button" class="btn btn-secondary" id="tw-cases-retry">נסו שוב</button></div>';
+    return;
   }
-  if (_casesOpen === '1') { const b = $id('tw-badge-cases'); if (b) b.textContent = d.cases.length ? String(d.cases.length) : ''; }
-  list.innerHTML = d.cases.length ? d.cases.map(c => renderCase(c, d.categories || {})).join('') : '<div class="tw-empty">' + (_casesOpen === '1' ? 'אין פניות פתוחות' : 'אין פניות סגורות') + '</div>';
+  _caseLabels = d.categories || {}; _caseOutcomes = d.outcomes || {};
+  renderCounters(d.counts);
+  if (alertEl) {
+    const msgs = [];
+    const nf = (d.counts.notifFailed || 0) + (d.counts.notifUncertain || 0) + (d.counts.notifPending || 0);
+    if (nf) msgs.push('ב-' + nf + ' פניות פתוחות ההתראה למנהל לא אושרה כנשלחה — הן מסומנות ברשימה.');
+    if (!d.managerConfigured) msgs.push('לא הוגדר מספר מנהל להתראות (TOMER_MANAGER_PHONE או בעל/ת הסטודיו ברשימת הצוות) — התראות לא יישלחו.');
+    if (!d.serviceEnabled) msgs.push('שירות תומר כבוי (TOMER_SERVICE_ENABLED=false) — הודעות חברים לא נפתחות כפניות.');
+    else if (!d.autoReply) msgs.push('מענה אוטומטי בוואטסאפ כבוי — תומר רושם פניות אך לא שולח תשובות לחברים.');
+    alertEl.hidden = !msgs.length;
+    alertEl.innerHTML = msgs.map(m => '<div>' + esc(m) + '</div>').join('');
+  }
+  const EMPTY = { open: 'אין פניות פתוחות', awaiting_staff: 'אין פניות שממתינות לצוות', in_progress: 'אין פניות בטיפול', awaiting_member: 'אין פניות שממתינות לחבר/ה', resolved: 'אין פניות סגורות' };
+  list.innerHTML = d.cases.length ? d.cases.map(renderCaseCard).join('') : '<div class="tw-empty" data-state="empty">' + EMPTY[_caseFilter] + '</div>';
 }
 
-const CASE_ERR_HE = { invalid_args: 'חסרים פרטים לפעולה (למשל תאריכים או זיהוי מנוי)', not_awaiting_approval: 'הפעולה כבר הוכרעה', writes_disabled: 'כתיבה ל-Arbox כבויה', bad_state: 'הפעולה לא במצב מתאים', action_in_flight: 'פעולה מתבצעת כרגע — לא ניתן לסגור', text_required: 'נדרש טקסט', not_found: 'הפנייה לא נמצאה' };
-async function runCaseOp(id, op, body) {
-  const r = await casePost(id, op, body);
-  if (r.ok === false || r.status >= 400) toast(CASE_ERR_HE[r.error] || 'הפעולה נכשלה', false);
-  else if (op === 'mark-executed' || op === 'recheck') toast(r.verified ? 'אומת ב-Arbox ✓' : 'Arbox עדיין לא מציג את השינוי', !!r.verified);
-  else toast('בוצע');
-  await loadCases();
+// ── One case ────────────────────────────────────────────────────────────────
+function closeCase({ keepHash = false } = {}) {
+  const d = $id('tw-case-drawer'); if (d) d.hidden = true;
+  _openCaseId = null;
+  if (!keepHash && /^#tomer\/case\//.test(location.hash)) history.replaceState(null, '', '#tomer');
 }
+
+function renderConversation(conv) {
+  if (!conv) return '<div class="tw-empty">השיחה לא נטענה</div>';
+  if (!conv.messages.length) return '<div class="tw-empty" data-state="empty">אין הודעות רשומות בלוח הבקרה לשיחה הזו</div>';
+  const more = conv.total > conv.messages.length ? '<div class="tw-case-meta">מוצגות ' + conv.messages.length + ' ההודעות האחרונות מתוך ' + conv.total + '</div>' : '';
+  return more + '<div class="tw-cd-thread">' + conv.messages.map(m =>
+    '<div class="tw-cd-msg tw-cd-' + esc(m.who) + '" data-who="' + esc(m.who) + '">'
+    + '<div class="tw-cd-who">' + esc(WHO_HE[m.who] || m.who) + (m.who === 'staff' && m.by ? ' — ' + esc(m.by) : '') + ' · ' + esc(fmtDate(m.timestamp)) + '</div>'
+    + '<div class="tw-cd-text">' + esc(m.text || (m.mediaType ? '[' + m.mediaType + ']' : '')) + '</div></div>').join('') + '</div>';
+}
+
+function renderCaseDetail(c, conv) {
+  const open = CASE_OPEN.includes(c.status);
+  const membership = MEMBERSHIP_CATS.includes(c.category);
+  const n = c.notification || {};
+  const f = c.facts;
+  const row = (k, v) => '<div class="tw-cd-row"><span class="tw-cd-k">' + k + '</span><span class="tw-cd-v">' + v + '</span></div>';
+  const owner = !c.owner || c.owner === 'tomer' ? 'לא שויכה' : esc(c.owner);
+
+  // Notification to the manager
+  let notif = '<div class="tw-cd-notif" data-notif="' + esc(n.state || 'not_required') + '">' + esc(NOTIF_HE[n.state] || '—')
+    + (n.at ? ' · ' + esc(fmtDate(n.at)) : '') + (n.attempts ? ' · ניסיונות: ' + esc(n.attempts) : '') + '</div>';
+  if (n.state === 'accepted') notif += '<div class="tw-case-meta">"התקבלה אצל הספק" אינו אישור שההודעה נקראה.</div>';
+  if (n.lastError && n.state !== 'accepted') notif += '<div class="tw-case-meta">פירוט: <span dir="ltr">' + esc(n.lastError) + '</span></div>';
+  if (n.state === 'failed' || (n.state === 'pending' && !n.inFlightSince)) notif += '<button type="button" class="btn btn-secondary" data-act="retry-notification">שלח התראה למנהל</button>';
+  if (n.state === 'uncertain') notif += '<div class="tw-case-meta">ייתכן שההתראה הגיעה. שליחה חוזרת עלולה ליצור התראה כפולה.</div><button type="button" class="btn btn-secondary" data-act="retry-notification-force">שלח שוב בכל זאת</button>';
+
+  // Arbox (read-only)
+  let arbox;
+  if (!f) arbox = '<div class="tw-cd-arbox" data-arbox="none">אין נתוני Arbox לפנייה הזו (החבר/ה לא זוהה/תה ב-Arbox בעת פתיחת הפנייה).</div>';
+  else if (f.error) arbox = '<div class="tw-cd-arbox tw-state-error" data-arbox="unavailable">Arbox לא היה זמין — אין נתונים. ' + esc(f.summary || '') + '</div>';
+  else arbox = '<div class="tw-cd-arbox" data-arbox="ok">' + esc(f.summary || '—') + '</div>';
+  if (f && (f.source || f.fetchedAt)) arbox += '<div class="tw-case-meta">מקור: <span dir="ltr">' + esc(f.source || 'Arbox') + '</span> · נקרא ב-' + esc(fmtDate(f.fetchedAt)) + (f.stale ? ' · נתון ישן (Arbox לא ענה בקריאה האחרונה)' : '') + '</div>';
+  const ck = c.arboxCheck;
+  if (membership) {
+    arbox += '<div class="tw-cd-check" data-verified="' + esc(ck ? String(ck.verified) : 'unchecked') + '"><strong>מה Arbox מציג (קריאה בלבד): </strong>'
+      + (ck ? esc(ck.summary) + ' · נבדק ב-' + esc(fmtDate(ck.at)) : 'עדיין לא נבדק') + '</div>';
+  }
+  arbox += '<button type="button" class="btn btn-secondary" data-act="refresh-arbox">קרא שוב מ-Arbox</button>';
+
+  // Request + what staff reported
+  let request = '';
+  if (membership) {
+    request = '<div class="tw-cd-section"><div class="tw-ds-title">הבקשה</div>'
+      + row('סוג', esc(_caseLabels[c.category] || c.category))
+      + (c.category === 'membership_freeze' ? row('תאריכים מבוקשים', c.request && c.request.from ? esc(dmyHe(c.request.from) + ' – ' + dmyHe(c.request.to)) : 'לא נמסרו') : '')
+      + '<div class="tw-cd-note">המערכת לא מבטלת ולא מקפיאה מנויים. את השינוי מבצע הצוות ב-Arbox, ומדווח כאן בסגירת הפנייה.</div></div>';
+  }
+  let resolution = '';
+  if (c.resolution) {
+    resolution = '<div class="tw-cd-section tw-cd-resolution"><div class="tw-ds-title">סיכום</div>'
+      + '<div data-staff-report="' + esc(c.resolution.outcome) + '"><strong>דיווח הצוות: </strong>' + esc(_caseOutcomes[c.resolution.outcome] || c.resolution.outcome) + ' — ' + esc(c.resolution.note || '') + ' (' + esc(c.resolution.by) + ', ' + esc(fmtDate(c.resolution.at)) + ')</div>'
+      + (membership ? '<div data-arbox-verified="' + esc(ck ? String(ck.verified) : 'unchecked') + '"><strong>אימות מול Arbox: </strong>'
+        + (ck ? (ck.verified === true ? 'אומת ✓ — ' : ck.verified === false ? 'לא אומת — ' : 'לא ניתן לבדוק — ') + esc(ck.summary) : 'לא נבדק') + '</div>' : '')
+      + '</div>';
+  }
+
+  // Actions
+  let actions = '';
+  if (open) {
+    const outs = membership ? ['done_in_arbox', 'declined', 'withdrawn', 'other'] : ['handled', 'no_action', 'other'];
+    actions = '<div class="tw-cd-section"><div class="tw-ds-title">טיפול</div>'
+      + '<div class="tw-cd-form"><label for="tw-cd-owner">אחראי/ת</label><div class="tw-cd-inline"><input id="tw-cd-owner" class="field-input" type="text" maxlength="40" value="' + esc(!c.owner || c.owner === 'tomer' ? staffName() : c.owner) + '" placeholder="שם איש/אשת הצוות">'
+      + '<button type="button" class="btn btn-secondary" data-act="assign">שייך</button></div></div>'
+      + '<div class="tw-cd-form"><label for="tw-cd-status">סטטוס</label><div class="tw-cd-inline"><select id="tw-cd-status" class="field-input">'
+      + CASE_OPEN.map(s => '<option value="' + s + '"' + (s === c.status ? ' selected' : '') + '>' + esc(CASE_STATUS_HE[s]) + '</option>').join('') + '</select>'
+      + '<button type="button" class="btn btn-secondary" data-act="status">עדכן סטטוס</button></div></div>'
+      + '<div class="tw-cd-form"><label for="tw-cd-reply">הודעה לחבר/ה בשם הצוות</label>'
+      + (c.conversationOwner === 'opted_out' ? '<div class="tw-cd-note">החבר/ה ביקש/ה לא לקבל הודעות — אי אפשר לשלוח מכאן.</div>'
+        : '<textarea id="tw-cd-reply" class="field-input" rows="3" placeholder="ההודעה נשלחת מהוואטסאפ של הסטודיו ונרשמת כהודעת צוות"></textarea>'
+        + '<label class="tw-cd-check-label"><input type="checkbox" id="tw-cd-await"> אחרי השליחה: ממתין לתשובת החבר/ה</label>'
+        + '<div class="tw-cd-note">שליחה מעבירה את השיחה לצוות — תומר מפסיק לענות לחבר/ה עד שתשחררו את השיחה.</div>'
+        + '<button type="button" class="btn btn-primary" data-act="reply">שלח לחבר/ה</button>') + '</div>'
+      + '<div class="tw-cd-form"><label for="tw-cd-outcome">סגירת הפנייה — מה נעשה</label><select id="tw-cd-outcome" class="field-input">'
+      + (membership ? '<option value="">בחרו…</option>' : '') + outs.map(o => '<option value="' + o + '">' + esc(_caseOutcomes[o] || o) + '</option>').join('') + '</select>'
+      + '<textarea id="tw-cd-note" class="field-input" rows="2" placeholder="הערת סיכום (חובה)"></textarea>'
+      + '<button type="button" class="btn btn-primary" data-act="resolve">סגור פנייה</button></div></div>';
+  } else {
+    actions = '<div class="tw-cd-section"><button type="button" class="btn btn-secondary" data-act="reopen">פתח מחדש</button></div>';
+  }
+
+  const convOwner = conv ? conv.owner : c.conversationOwner;
+  const convBtns = convOwner === 'human' ? '<button type="button" class="btn btn-secondary" data-act="release">שחרר את השיחה לתומר</button>'
+    : convOwner === 'tomer' ? '<button type="button" class="btn btn-secondary" data-act="takeover">קח את השיחה (השתק את תומר)</button>' : '';
+
+  return '<div class="tw-cd-top">'
+    + (c.priority === 'high' ? '<span class="tw-chip tw-chip-bad">דחוף</span>' : '<span class="tw-chip">עדיפות רגילה</span>')
+    + '<span class="tw-case-status" id="tw-cd-status-chip" data-status-chip="' + esc(c.status) + '">' + esc(CASE_STATUS_HE[c.status] || c.status) + '</span>'
+    + (c.unreadMember ? '<span class="tw-chip tw-chip-info">הודעה חדשה מהחבר/ה</span>' : '') + '</div>'
+    + '<div id="tw-cd-msg" class="tw-cd-flash" role="status" aria-live="polite"></div>'
+    + '<div class="tw-cd-section">'
+    + row('חבר/ה', esc(c.memberName || 'שם לא ידוע') + (c.memberUserId ? ' · מזהה Arbox ' + esc(c.memberUserId) : ' · לא זוהה/תה ב-Arbox'))
+    + row('טלפון', '<span dir="ltr">' + esc(c.phone) + '</span> · <a href="https://wa.me/' + esc(c.phone) + '" target="_blank" rel="noopener">פתח בוואטסאפ</a>')
+    + row('אחראי/ת', '<span id="tw-cd-owner-val">' + owner + '</span>')
+    + row('נפתחה', esc(fmtDate(c.createdAt))) + row('עודכנה', esc(fmtDate(c.updatedAt)))
+    + (open && c.nextAction ? row('הצעד הבא', esc(c.nextAction)) : '')
+    + row('מזהה', '<span dir="ltr">' + esc(c.id) + '</span>') + '</div>'
+    + request + resolution
+    + '<div class="tw-cd-section"><div class="tw-ds-title">התראה למנהל</div>' + notif + '</div>'
+    + '<div class="tw-cd-section"><div class="tw-ds-title">נתוני Arbox</div>' + arbox + '</div>'
+    + '<div class="tw-cd-section"><div class="tw-ds-title">השיחה עם החבר/ה</div>'
+    + '<div class="tw-cd-owner" id="tw-cd-conv-owner" data-owner="' + esc(convOwner) + '">' + esc(OWNER_CONV_HE[convOwner] || convOwner)
+    + (conv && conv.ownedBy ? ' (' + esc(conv.ownedBy) + ')' : '') + '</div>' + convBtns + renderConversation(conv) + '</div>'
+    + actions
+    + '<details class="tw-cd-section"><summary>היסטוריית הפנייה (' + (c.events || []).length + ')</summary><div class="tw-cd-events">'
+    + (c.events || []).slice().reverse().map(e => '<div class="tw-case-meta" data-event="' + esc(e.type) + '">' + esc(fmtDate(e.at)) + ' · ' + esc(EVENT_HE[e.type] || e.type) + ' · ' + esc(e.by === 'tomer' ? 'תומר' : e.by === 'system' ? 'מערכת' : e.by === 'member' ? 'חבר/ה' : e.by || '') + (e.detail ? ' · ' + esc(e.detail) : '') + '</div>').join('')
+    + '</div></details>';
+}
+
+async function openCase(id, { flash = null } = {}) {
+  const drawer = $id('tw-case-drawer'), body = $id('tw-case-body'), title = $id('tw-case-title');
+  if (!drawer || !body) return;
+  const same = _openCaseId === id;
+  _openCaseId = id;
+  drawer.hidden = false;
+  if (!same) { body.innerHTML = '<div class="tw-empty" data-state="loading">טוען פנייה…</div>'; if (title) title.textContent = 'פנייה'; }
+  if (location.hash !== '#tomer/case/' + id) history.replaceState(null, '', '#tomer/case/' + id);
+  const d = await caseApi('/api/tomer/cases/' + encodeURIComponent(id));
+  if (_openCaseId !== id) return;                       // another case was opened meanwhile
+  if (!d.ok) {
+    body.innerHTML = '<div class="tw-state-error" data-state="error" role="alert">' + (d.status === 404 ? 'הפנייה לא נמצאה (ייתכן שהקישור שגוי).' : 'לא ניתן לטעון את הפנייה (' + esc(caseErr(d)) + ').')
+      + (d.status === 404 ? '' : ' <button type="button" class="btn btn-secondary" data-act="reload">נסו שוב</button>') + '</div>';
+    return;
+  }
+  _caseLabels = { ..._caseLabels, ...(d.categories || {}) }; _caseOutcomes = d.outcomes || _caseOutcomes;
+  if (title) title.textContent = (_caseLabels[d.case.category] || 'פנייה') + ' — ' + (d.case.memberName || 'חבר/ה');
+  body.innerHTML = renderCaseDetail(d.case, d.conversation);
+  if (flash) caseFlash(flash.text, flash.ok);
+}
+function caseFlash(text, ok = true) {
+  const el = $id('tw-cd-msg'); if (!el) return;
+  el.textContent = text; el.dataset.kind = ok ? 'ok' : 'error';
+}
+
+async function caseAct(act, btn) {
+  const id = _openCaseId; if (!id) return;
+  const by = staffName() || undefined;
+  const val = sel => { const e = $id(sel); return e ? e.value : ''; };
+  let op = act, body = { by };
+  if (act === 'reload') return openCase(id);
+  if (act === 'assign') {
+    const to = val('tw-cd-owner').trim();
+    if (!to) return caseFlash(CASE_ERR_HE.owner_required, false);
+    try { if (!staffName()) localStorage.setItem('tw_staff_name', to); } catch { /* private mode */ }
+    body = { to, by: staffName() || to };
+  } else if (act === 'status') { body.status = val('tw-cd-status'); }
+  else if (act === 'reply') {
+    body.text = val('tw-cd-reply'); body.awaitMember = !!($id('tw-cd-await') && $id('tw-cd-await').checked);
+    if (!body.text.trim()) return caseFlash(CASE_ERR_HE.text_required, false);
+  } else if (act === 'resolve') {
+    body.outcome = val('tw-cd-outcome') || undefined; body.note = val('tw-cd-note');
+    if (!body.outcome) return caseFlash(CASE_ERR_HE.outcome_required, false);
+    if (body.note.trim().length < 2) return caseFlash(CASE_ERR_HE.note_required, false);
+  } else if (act === 'retry-notification-force') { op = 'retry-notification'; body.force = true; }
+  const OK = { assign: 'הפנייה שויכה', status: 'הסטטוס עודכן', reply: 'ההודעה התקבלה אצל ספק הוואטסאפ ונרשמה כהודעת צוות', resolve: 'הפנייה נסגרה', reopen: 'הפנייה נפתחה מחדש',
+    'retry-notification': 'ההתראה למנהל התקבלה אצל ספק הוואטסאפ', 'refresh-arbox': 'הנתונים נקראו מ-Arbox', takeover: 'השיחה אצל הצוות — תומר מושתק', release: 'השיחה שוחררה — תומר חוזר לענות' };
+  if (btn) { btn.disabled = true; btn.dataset.busy = '1'; }
+  caseFlash('מבצע…');
+  const r = await caseApi('/api/tomer/cases/' + encodeURIComponent(id) + '/' + op, { method: 'POST', body });
+  if (btn) { btn.disabled = false; delete btn.dataset.busy; }
+  let text = r.ok ? (r.unchanged ? 'לא נדרש שינוי — זה כבר המצב' : OK[op]) : caseErr(r);
+  let ok = r.ok;
+  if (r.ok && op === 'refresh-arbox' && r.arboxAvailable === false) { text = 'Arbox לא זמין כרגע — אין נתונים עדכניים'; ok = false; }
+  if (r.ok && r.warning === 'sent_not_recorded') { text = 'ההודעה נשלחה, אך לא נרשמה בפנייה (שגיאת שמירה)'; ok = false; }
+  toast(text, ok);
+  await Promise.all([openCase(id, { flash: { text, ok } }), loadCases()]);
+}
+
 $id('tw-cases-list')?.addEventListener('click', e => {
-  const b = e.target.closest('.tw-case-btn');
-  if (!b) return;
-  const id = b.dataset.id, op = b.dataset.op;
-  if (op === 'reject')       return promptModal('דחיית הבקשה — הערה לחבר/ה (לא חובה)', 'סיבה', note => runCaseOp(id, op, { note: note || null }));
-  if (op === 'resolve')      return promptModal('סגירת פנייה — הערת סיכום', 'מה נעשה', note => runCaseOp(id, op, { note: note || null }));
-  if (op === 'reply')        return promptModal('הודעה לחבר/ה (נשלחת בשם הצוות; תומר מפסיק לענות בשיחה)', 'טקסט ההודעה', text => { if (text && text.trim()) runCaseOp(id, op, { text }); });
-  if (op === 'approve')      return confirmModal('לאשר את הפעולה?', () => runCaseOp(id, op, {}));
-  if (op === 'execute-now')  return confirmModal('לבצע עכשיו מול Arbox?', () => runCaseOp(id, op, {}));
-  if (op === 'assign')       return runCaseOp(id, op, { to: 'צוות' });
-  return runCaseOp(id, op, {});
+  if (e.target.closest('#tw-cases-retry')) return loadCases();
+  const card = e.target.closest('.tw-case-card');
+  if (card) openCase(card.dataset.case);
 });
-document.querySelectorAll('#twp-cases .filter-btn').forEach(b => b.addEventListener('click', () => {
-  document.querySelectorAll('#twp-cases .filter-btn').forEach(x => x.classList.remove('active'));
-  b.classList.add('active'); _casesOpen = b.dataset.cf; loadCases();
+$id('tw-case-body')?.addEventListener('click', e => {
+  const b = e.target.closest('[data-act]');
+  if (b && !b.disabled) caseAct(b.dataset.act, b);
+});
+$id('tw-case-close')?.addEventListener('click', () => closeCase());
+$id('tw-case-overlay')?.addEventListener('click', () => closeCase());
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && _openCaseId && !document.querySelector('.modal-overlay')) closeCase(); });
+document.querySelectorAll('#tw-case-counters .tw-counter').forEach(b => b.addEventListener('click', () => {
+  document.querySelectorAll('#tw-case-counters .tw-counter').forEach(x => { x.classList.remove('active'); x.setAttribute('aria-pressed', 'false'); });
+  b.classList.add('active'); b.setAttribute('aria-pressed', 'true'); _caseFilter = b.dataset.cf;
+  const l = $id('tw-cases-list'); if (l) l.innerHTML = '';
+  loadCases();
 }));
 document.querySelector('.tw-tab[data-pane="cases"]')?.addEventListener('click', loadCases);
-$id('tw-refresh')?.addEventListener('click', () => { if (document.querySelector('.tw-tab.active')?.dataset.pane === 'cases') loadCases(); });
+$id('tw-refresh')?.addEventListener('click', () => { if (document.querySelector('.tw-tab.active')?.dataset.pane === 'cases') { loadCases(); if (_openCaseId) openCase(_openCaseId); } });
 document.querySelector('.tab-btn[data-tab="tomer"]')?.addEventListener('click', loadCases);
+$id('tw-staff-name')?.addEventListener('change', e => { try { localStorage.setItem('tw_staff_name', e.target.value.trim().slice(0, 40)); } catch { /* private mode */ } });
+{ const el = $id('tw-staff-name'); if (el) el.value = staffName(); }
+
+// Open a case from anywhere in the workspace (Today list, conversations).
+window.openTomerCase = function (id) {
+  document.querySelector('.tw-tab[data-pane="cases"]')?.click();
+  openCase(id);
+};
+
+// Live updates: another staff member (or an inbound member message) changed a case.
+(function watchCases() {
+  let t = null;
+  const refresh = () => {
+    clearTimeout(t);
+    t = setTimeout(() => {
+      if (!document.querySelector('.tab-btn[data-tab="tomer"].active')) return;
+      loadCases();
+      // Never redraw the open case under someone who is typing in it.
+      const typing = document.activeElement && $id('tw-case-body')?.contains(document.activeElement) && ['TEXTAREA', 'INPUT', 'SELECT'].includes(document.activeElement.tagName);
+      if (_openCaseId && !typing) openCase(_openCaseId);
+    }, 400);
+  };
+  try {
+    const es = new EventSource('/api/whatsapp/stream');
+    es.onmessage = e => { try { if (JSON.parse(e.data).event === 'tomer_case') refresh(); } catch { /* not json */ } };
+  } catch { /* the refresh button still works */ }
+})();
+
+// Deep link from the manager's WhatsApp alert: /#tomer/case/<id> (also after logging in).
+function openCaseFromHash() {
+  const m = /^#tomer\/case\/([A-Za-z0-9_-]+)$/.exec(location.hash || '');
+  if (!m) return false;
+  document.querySelector('.tab-btn[data-tab="tomer"]')?.click();
+  document.querySelector('.tw-tab[data-pane="cases"]')?.click();
+  openCase(m[1]);
+  return true;
+}
+window.addEventListener('hashchange', openCaseFromHash);
+if (document.readyState === 'complete') openCaseFromHash(); else window.addEventListener('load', () => setTimeout(openCaseFromHash, 0));

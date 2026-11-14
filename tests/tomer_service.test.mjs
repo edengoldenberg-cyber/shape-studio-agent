@@ -295,15 +295,16 @@ if (!hasOpenAI) {
       'Tomer mentions Eden/follow-up', reply.slice(0, 80));
   }
 
-  // A freeze request is now a durable service case with a proposed (unapproved) action.
+  // A freeze request is a durable STAFF-HANDLED service case: the request and its dates
+  // are recorded; the system proposes and performs no Arbox action.
   const casesRes = await fetch(`${BASE}/api/tomer/cases?open=1&phone=${encodeURIComponent(memberPhone)}`)
     .then(r => r.json()).catch(() => ({ cases: [] }));
   const freezeCase = casesRes.cases?.find(c => c.category === 'membership_freeze');
   assert(!!freezeCase, 'Service case created for freeze request', casesRes.cases?.length);
-  assert(freezeCase?.action?.op === 'membership_hold' && freezeCase?.action?.state === 'awaiting_approval',
-    'Freeze action is proposed and awaits staff approval', freezeCase?.action?.state);
-  assert(freezeCase?.action?.args?.from === '2027-01-01' && freezeCase?.action?.args?.to === '2027-01-15',
-    'Freeze dates written with month names are captured', JSON.stringify(freezeCase?.action?.args));
+  assert(freezeCase?.request?.type === 'membership_freeze' && freezeCase?.status === 'awaiting_staff' && freezeCase?.action === undefined,
+    'Freeze is recorded as a staff-handled request (no system action)', JSON.stringify({ status: freezeCase?.status, request: freezeCase?.request?.type }));
+  assert(freezeCase?.request?.from === '2027-01-01' && freezeCase?.request?.to === '2027-01-15',
+    'Freeze dates written with month names are captured', JSON.stringify(freezeCase?.request));
   const freezeTask = freezeCase ? { status: 'open', memberMessage: freezeCase.context?.[0]?.text ?? '' } : null;
   if (freezeTask) {
     assert(freezeTask.status === 'open' || freezeTask.status === 'eden_assigned',

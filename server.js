@@ -638,6 +638,8 @@ const CODE_FEATURES = [
   'callback_service_v1',  // services/callback.service.js owns the lead → callback lifecycle
   'tomer_service_v1',     // services/tomer_service.js owns every member message; cases + verified Arbox reads
   'dashboard_auth_v1',    // middleware/auth.js — dashboard and API require a session; fails closed
+  'dashboard_auth_v2',    // revocable sessions (logout), CSRF token on state changes, login throttling
+  'tomer_panel_v2',       // staff-handled membership requests, one manager alert, complete cases panel
   'strict_callback_time', // utils/callback_time.js — no default hour, no AI date guessing
   'apt_persist_strict',   // appointment_store update/updateBatch throw + roll back on failed write
   'staff_confirm_lifecycle', // confirm / outcome endpoints enforce transitions
@@ -1956,8 +1958,20 @@ app.post('/api/leads/:phone/takeover', jsonBody, (req, res) => {
   const { reason = 'manual', staffName = null } = req.body ?? {};
   if (!norm) return res.status(400).json({ error: 'invalid phone' });
 
+  const out = _manualTakeover(norm, { reason, staffName });
+  res.json({ ok: true, phone: norm, status: 'human_owns', prevStatus: out.prevStatus, unchanged: out.unchanged });
+});
+
+/**
+ * Staff take a conversation over from the dashboard. Idempotent: a second takeover
+ * keeps the status recorded by the first one, so release still restores the right state.
+ */
+function _manualTakeover(norm, { reason = 'manual', staffName = null } = {}) {
   const existing = store.getLead(norm) ?? {};
-  const prevStatus = existing.status ?? 'cold';
+  if (existing.status === 'human_owns') {
+    return { prevStatus: existing.meta?.previousStatus ?? null, unchanged: true };
+  }
+  const prevStatus = existing.status ?? (_isKnownMemberPhone(norm) ? 'converted_member' : 'cold');
   store.upsertLead(norm, {
     status: 'human_owns',
     meta: {
@@ -1966,20 +1980,39 @@ app.post('/api/leads/:phone/takeover', jsonBody, (req, res) => {
       humanOwnsSince:     new Date().toISOString(),
       humanOwnsBy:        staffName,
       previousStatus:     prevStatus,     // saved so release can restore it
+      ...(prevStatus === 'converted_member' ? { isConfirmedMember: true } : {}),
     },
   });
   store.logEvent('human_takeover_manual', norm, { reason, staffName, prevStatus });
   persist.saveLeads(store);
   logger.info('[lead-ownership] Takeover — bot suppressed', { phone: norm, reason, staffName });
-  res.json({ ok: true, phone: norm, status: 'human_owns', prevStatus });
-});
+  broadcastSse('message', { phone: norm, route: 'human_owns', reason: 'manual_takeover' });
+  return { prevStatus, unchanged: false };
+}
+
+/** Is this phone a studio member as far as the local identity sources know? (no network) */
+function _isKnownMemberPhone(norm) {
+  try { return !!(memberCache.isConfirmed(norm) || phoneRegistry.isMember(norm)); } catch { return false; }
+}
+
+/** Release human ownership. Idempotent; returns null when there is no record. */
+function _releaseConversation(norm) {
+  if (!store.getLead(norm)) return null;
+  const result = ownership.releaseOwnership(store, norm, { isMember: _isKnownMemberPhone });
+  if (!result || result.unchanged) return result;
+  store.logEvent('human_release', norm, { restoredTo: result.status, automationResumed: result.automationResumed });
+  persist.saveLeads(store);
+  logger.info('[lead-ownership] Released — bot resumed', { phone: norm, restoredTo: result.status });
+  broadcastSse('lead_updated', { phone: norm, status: result.status });
+  return result;
+}
 
 app.post('/api/leads/:phone/release', jsonBody, (req, res) => {
   const norm = normalizeToE164(decodeURIComponent(req.params.phone));
   if (!norm) return res.status(400).json({ error: 'invalid phone' });
   if (!store.getLead(norm)) return res.status(404).json({ error: 'lead not found' });
 
-  const result = ownership.releaseOwnership(store, norm, { isMember: phoneRegistry.isMember.bind(phoneRegistry) });
+  const result = _releaseConversation(norm);
   if (!result) return res.status(404).json({ error: 'lead not found' });
 
   // Idempotent: lead was not in human_owns — preserve current state, no-op.
@@ -1987,11 +2020,6 @@ app.post('/api/leads/:phone/release', jsonBody, (req, res) => {
     logger.info('[lead-ownership] Release no-op — not in human_owns', { phone: norm, status: result.status });
     return res.json({ ok: true, phone: norm, status: result.status, automationResumed: false, unchanged: true });
   }
-
-  store.logEvent('human_release', norm, { restoredTo: result.status, automationResumed: result.automationResumed });
-  persist.saveLeads(store);
-  logger.info('[lead-ownership] Released — bot resumed', { phone: norm, restoredTo: result.status });
-  broadcastSse('lead_updated', { phone: norm, status: result.status });
   return res.json({ ok: true, phone: norm, status: result.status, automationResumed: result.automationResumed });
 });
 
@@ -2742,21 +2770,25 @@ function _applyAttributionReview(norm, idMessage, msgText, prevStatus = null) {
 // Idempotent — if already human_owns or opted_out, does nothing.
 // A converted_member IS taken over: staff replying to a member must silence Tomer too
 // (previousStatus keeps 'converted_member', so releasing ownership restores it).
-function _applyStaffTakeover(norm, idMessage, msgText) {
+function _applyStaffTakeover(norm, idMessage, msgText, { by = 'staff', isMember = false } = {}) {
   const existing  = store.getLead(norm) ?? {};
   const curStatus = existing.status ?? null;
   if (['opted_out', 'human_owns'].includes(curStatus)) return;
+  // A member with no lead record yet must come back as a member after release.
+  const member = isMember || curStatus === 'converted_member' || _isKnownMemberPhone(norm);
   store.upsertLead(norm, {
     status: 'human_owns',
     meta: {
       ...(existing.meta ?? {}),
       humanOwnsReason: 'staff_manual_reply',
       humanOwnsSince:  new Date().toISOString(),
-      humanOwnsBy:     'staff',
-      previousStatus:  curStatus ?? 'cold',
+      humanOwnsBy:     by,
+      previousStatus:  curStatus ?? (member ? 'converted_member' : 'cold'),
+      ...(member ? { isConfirmedMember: true } : {}),
     },
   });
   persist.saveLeads(store);
+  try { tomerService.noteOwnership(norm, 'human_takeover', { by, detail: 'staff reply' }); } catch { /* cases are optional context here */ }
   store.logEvent('human_takeover_staff_reply', norm, {
     idMessage, preview: (msgText ?? '').slice(0, 60),
   });
@@ -2947,17 +2979,27 @@ const callbackSvc = createCallbackService({
 const _tomerOn = () => process.env.TOMER_SERVICE_ENABLED !== 'false';
 let _tomerOpenAI = null;
 const tomerService = app.locals.tomerService = createTomerService({
-  leadStore: store, persist, logger, gateway: arboxGateway, cases: serviceCases, tomerStore, inbox, alertOwner,
+  leadStore: store, persist, logger, gateway: arboxGateway, cases: serviceCases, tomerStore, inbox,
   // Automatic member sends obey WHATSAPP_AUTO_REPLY; a staff reply from the panel
   // (opts.staff) is a human send and is never blocked by it.
   sendText: async (to, text, opts = {}) => {
     if (!opts.staff && process.env.WHATSAPP_AUTO_REPLY !== 'true') return { blocked: true };
     _markBotSent(to);
-    const r = await sendText(to, text, { bypassQuietHours: !!opts.bypassQuietHours, linkPreview: opts.linkPreview !== false });
+    // Tomer only ever ANSWERS a member who has just written, so its replies are not held
+    // for quiet hours: the shared quiet-hours path would send "נחזור אליך מחר בבוקר" (a
+    // promise Tomer must not make) and keep the real answer in an in-memory queue that a
+    // restart loses. TOMER_QUIET_HOURS=true restores the shared quiet-hours behaviour.
+    const _direct = !!opts.bypassQuietHours || process.env.TOMER_QUIET_HOURS !== 'true';
+    const r = await sendText(to, text, { bypassQuietHours: _direct, linkPreview: opts.linkPreview !== false });
+    // Registered so the provider's echo of this send is not mistaken for a phone-side reply.
     if (r?.idMessage) _recordBotSend(r.idMessage, to);
-    _markReplied(to);
+    if (!opts.staff) _markReplied(to);
     return r;
   },
+  // Case alerts go to ONE manager: TOMER_MANAGER_PHONE, else the studio owner / default
+  // assignee in staff_config.json. Quiet hours do not apply to staff alerts.
+  managerPhone: () => _tomerManagerPhone(),
+  sendManager: (phone, text) => sendText(phone, text, { bypassQuietHours: true, linkPreview: false }),
   getAssets:      () => studioAssets.getAssets(),
   getBackendBase: () => getBackendBase(),
   sendTimetable: async (phone) => {
@@ -2970,7 +3012,7 @@ const tomerService = app.locals.tomerService = createTomerService({
     if (url2) { _markBotSent(phone); const r2 = await sendFileByUrl(phone, url2, 'schedule2.png', '').catch(() => null); if (r2?.idMessage) _recordBotSend(r2.idMessage, phone); }
     return !!r?.idMessage;
   },
-  applyTakeover: (phone, text) => _applyStaffTakeover(phone, null, text),
+  applyTakeover: (phone, text, o = {}) => _applyStaffTakeover(phone, null, text, o),
   ai: process.env.OPENAI_API_KEY ? async ({ system, user }) => {
     if (!_tomerOpenAI) { const OpenAI = require('openai'); _tomerOpenAI = new (OpenAI.OpenAI ?? OpenAI)({ apiKey: process.env.OPENAI_API_KEY }); }
     const c = await _tomerOpenAI.chat.completions.create({
@@ -2980,6 +3022,18 @@ const tomerService = app.locals.tomerService = createTomerService({
     return c.choices?.[0]?.message?.content ?? null;
   } : null,
 });
+
+function _tomerManagerPhone() {
+  const clean = p => String(p ?? '').trim().replace(/^\+/, '');
+  const ok = p => /^[0-9]{9,15}$/.test(p);
+  const env = clean(process.env.TOMER_MANAGER_PHONE);
+  if (ok(env)) return env;
+  const list = staffConfig?.staff ?? [];
+  const pick = list.find(s => s.active && s.role === 'owner' && ok(clean(s.phone)))
+            ?? list.find(s => s.active && s.id === staffConfig?.default_assignee_id && ok(clean(s.phone)))
+            ?? null;
+  return pick ? clean(pick.phone) : null;
+}
 
 // A lead asking, in their own words, for someone to call / get back to them.
 const CALLBACK_REQUEST_RE = /נציג|לדבר עם (?:מישהו|מישהי|אדם|בן אדם)|אדם אמיתי|שמישהו יחזור|ש[ית]חזרו אלי|תחזרו אלי|תחזור אלי|חזרו אלי|לחזור אלי|שיתקשרו|שתתקשרו|תתקשרו|תתקשר אלי|להתקשר אלי|שיצרו קשר|צרו (?:איתי |אתי )?קשר|שיחת טלפון|שיחה טלפונית|לדבר בטלפון|אפשר שיחה|רוצה שיחה|לתאם שיחה|לקבוע שיחה|אשמח לשיחה|אשמח לדבר|מעדי(?:ף|פה) (?:לדבר|שיחה)/;
@@ -3751,6 +3805,12 @@ async function processInboundWAMessage(msg) {
         preview: (msg.text ?? '').slice(0, 60),
       });
       logger.info('[pipeline] Reply suppressed — human_owns (universal)', { from: fromNorm, isExistingClient });
+      // Tomer stays silent, but the message is added to the member's open service case
+      // so staff see it in the panel (nothing is sent to anyone).
+      try {
+        const _hc = tomerService.recordWhileHumanOwned({ phone: fromNorm, text: msg.text ?? '', type: msg.type, messageId: msg.messageId ?? null });
+        if (_hc) broadcastSse('tomer_case', { id: _hc.id });
+      } catch (err) { logger.warn('[tomer] could not add a held message to the case', { from: fromNorm, error: err.message }); }
       const hoEntry = inbox.push({
         from: fromNorm, fromIsraeli, name: msg.name ?? clientMatch.arboxName ?? null,
         text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
@@ -3933,6 +3993,7 @@ async function processInboundWAMessage(msg) {
   let timetableImgUrl    = null;   // first timetable image URL (sent with caption)
   let timetable2ImgUrl   = null;   // second timetable image URL (sent as follow-up)
   let _replyAlreadySent  = false;  // true when leadAgent/tomerAgent sent the reply internally
+  let _tomerInboxEntry  = null;   // set when the Tomer route stored the inbound message itself
 
   const isSchedulingMsg  = intent !== 'general';
 
@@ -3965,11 +4026,21 @@ async function processInboundWAMessage(msg) {
     // ════════════════════════════════════════════════════════════════════════
     route = 'tomer';
     _replyAlreadySent = true;
+    // The member's message is recorded in the thread BEFORE Tomer answers, so the
+    // conversation reads in the order it happened (message, then reply) and an answered
+    // conversation is never listed as "unanswered".
+    _tomerInboxEntry = inbox.push({
+      from: fromNorm, fromIsraeli, name: msg.name ?? clientMatch.arboxName ?? null,
+      text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp, receivedAt: new Date(),
+      mediaType: msg.type, mediaCaption: msg.mediaCaption ?? null, mediaId: msg.mediaId ?? null,
+      clientMatch, intent, route, barakReply: null,
+    });
     try {
       const tRes = await tomerService.handleMemberMessage({
         phone: fromNorm, text: msg.type === 'text' ? (msg.text ?? '') : '', type: msg.type,
         caption: msg.mediaCaption ?? null, name: clientMatch.arboxName ?? msg.name ?? null,
         sentAt: msg.timestamp instanceof Date ? msg.timestamp : null,
+        messageId: msg.messageId ?? null,
       });
       route = `tomer_${tRes?.outcome ?? 'handled'}`;
       logger.info('[tomer] member message handled', { from: fromNorm, outcome: tRes?.outcome, category: tRes?.category ?? null, caseId: tRes?.caseId ?? null });
@@ -4162,8 +4233,13 @@ async function processInboundWAMessage(msg) {
     }
   }
 
-  // 4. Store in inbox ring buffer
-  const inboxEntry = inbox.push({
+  // 4. Store in inbox ring buffer (already stored for the Tomer route — only its outcome is added)
+  if (_tomerInboxEntry) {
+    _tomerInboxEntry.route = route;
+    const _tm = inbox.getThread(fromNorm)?.messages.find(x => x.id === _tomerInboxEntry.id);
+    if (_tm) _tm.route = route;
+  }
+  const inboxEntry = _tomerInboxEntry ?? inbox.push({
     from:        fromNorm,
     fromIsraeli,
     name:        msg.name ?? clientMatch.arboxName ?? null,
@@ -4430,7 +4506,9 @@ app.post('/api/green-api/webhook', (req, res) => {
             // staff reply and the conversation is fully visible.
             const _senderName = body?.senderData?.senderName ?? null;
             if (msgText) {
-              inbox.pushOutbound({ phone: norm, name: _senderName, text: msgText, agentId: 'staff' });
+              // Recorded as STAFF. The sender name of an outgoing message is the studio's own
+              // WhatsApp name, so it must not rename the member's thread.
+              inbox.pushOutbound({ phone: norm, name: null, text: msgText, agentId: 'staff', meta: { agent: 'staff', handler: 'phone_reply', trigger: 'outgoing_webhook', by: _senderName, idMessage } });
               persist.saveInbox(inbox);
               broadcastSse('message', { phone: norm, name: _senderName, direction: 'out' });
             }
@@ -5215,25 +5293,79 @@ app.post('/api/tomer/tasks/:id/update', jsonBody, (req, res) => {
 });
 
 // ── Tomer service cases ───────────────────────────────────────────────────────
+// Who is answering this member right now (from the lead store — the same record the
+// inbound pipeline checks before letting Tomer reply).
+function _conversationOwner(phone) {
+  const st = store.getLead(phone)?.status ?? null;
+  return st === 'human_owns' ? 'human' : st === 'opted_out' ? 'opted_out' : st === 'attribution_review' ? 'attribution_review' : 'tomer';
+}
+function _caseRow(c) {
+  return { ...c, conversationOwner: _conversationOwner(c.phone), link: tomerService.caseLink(c.id) };
+}
+/** The member's WhatsApp thread as the dashboard recorded it, with who wrote each message. */
+function _caseConversation(phone) {
+  const lead = store.getLead(phone);
+  const t    = inbox.getThread ? inbox.getThread(phone) : null;
+  const all  = t?.messages ?? [];
+  const who  = m => (m.direction === 'in' ? 'member'
+    : m.agentId === 'tomer' ? 'tomer'
+    : (m.agentId === 'staff' || m.agentId === 'manual') ? 'staff'
+    : m.agentId === 'barak' ? 'bot' : 'unknown');
+  return {
+    owner:      _conversationOwner(phone),
+    ownedBy:    lead?.status === 'human_owns' ? (lead.meta?.humanOwnsBy ?? null) : null,
+    ownedSince: lead?.status === 'human_owns' ? (lead.meta?.humanOwnsSince ?? null) : null,
+    ownedReason: lead?.status === 'human_owns' ? (lead.meta?.humanOwnsReason ?? null) : null,
+    total:      all.length,
+    messages:   all.slice(-40).map(m => ({
+      direction: m.direction, who: who(m), text: String(m.text ?? '').slice(0, 1500), timestamp: m.timestamp,
+      mediaType: m.mediaType && m.mediaType !== 'text' ? m.mediaType : null,
+      by: m.meta?.by ?? null, handler: m.meta?.handler ?? null, sendState: m.meta?.sendState ?? null,
+    })),
+  };
+}
+
 app.get('/api/tomer/cases', (req, res) => {
-  const open = req.query.open === '1' ? true : req.query.open === '0' ? false : undefined;
-  res.json({ ok: true, cases: serviceCases.list({ open, phone: req.query.phone || undefined, limit: Number(req.query.limit) || 200 }),
-    arboxWrites: arboxGateway.writeStatus(), serviceEnabled: _tomerOn(),
-    categories: Object.fromEntries(Object.entries(tomerService.CATEGORY).map(([k, v]) => [k, v.label])) });
+  try {
+    const open = req.query.open === '1' ? true : req.query.open === '0' ? false : undefined;
+    const status = ['awaiting_staff', 'in_progress', 'awaiting_member', 'resolved'].includes(req.query.status) ? req.query.status : undefined;
+    res.json({
+      ok: true,
+      cases: serviceCases.list({ open, status, phone: req.query.phone || undefined, limit: Number(req.query.limit) || 300 }).map(_caseRow),
+      counts: serviceCases.counts(),
+      categories: Object.fromEntries(Object.entries(tomerService.CATEGORY).map(([k, v]) => [k, v.label])),
+      outcomes: tomerService.OUTCOMES,
+      serviceEnabled: _tomerOn(),
+      autoReply: process.env.WHATSAPP_AUTO_REPLY === 'true',
+      managerConfigured: !!_tomerManagerPhone(),
+      ts: new Date(),
+    });
+  } catch (err) {
+    logger.error('[tomer-cases] list failed', { error: err.message });
+    res.status(500).json({ ok: false, error: 'list_failed', detail: err.message });
+  }
 });
 app.get('/api/tomer/cases/:id', (req, res) => {
-  const c = serviceCases.get(req.params.id);
-  return c ? res.json({ ok: true, case: c }) : res.status(404).json({ ok: false, error: 'not_found' });
+  try {
+    const c = serviceCases.get(req.params.id);
+    if (!c) return res.status(404).json({ ok: false, error: 'not_found' });
+    return res.json({ ok: true, case: _caseRow(c), conversation: _caseConversation(c.phone),
+      categories: { [c.category]: tomerService.CATEGORY[c.category]?.label ?? c.category }, outcomes: tomerService.OUTCOMES, ts: new Date() });
+  } catch (err) {
+    logger.error('[tomer-cases] read failed', { id: req.params.id, error: err.message });
+    return res.status(500).json({ ok: false, error: 'read_failed', detail: err.message });
+  }
 });
 {
-  const _by = req => String(req.body?.by ?? 'staff').slice(0, 40);
+  const _by = req => String(req.body?.by ?? '').trim().slice(0, 40) || 'צוות';
   const _caseOp = fn => async (req, res) => {
     try {
       const out = await fn(req.params.id, req);
       if (!out) return res.status(404).json({ ok: false, error: 'not_found' });
-      if (out.ok === false) return res.status(out.error === 'not_found' ? 404 : 409).json(out);
+      if (out.case) out.case = _caseRow(out.case);
+      if (out.ok === false) return res.status(out.error === 'not_found' ? 404 : ['send_failed', 'send_uncertain', 'notify_failed', 'notify_uncertain'].includes(out.error) ? 502 : 409).json(out);
       broadcastSse('tomer_case', { id: req.params.id });
-      return res.json(out.ok === undefined ? { ok: true, case: out } : out);
+      return res.json(out);
     } catch (err) {
       logger.error('[tomer-cases] operation failed', { id: req.params.id, error: err.message });
       return res.status(500).json({ ok: false, error: 'operation_failed', detail: err.message });
@@ -5241,14 +5373,27 @@ app.get('/api/tomer/cases/:id', (req, res) => {
   };
   const S = tomerService.staff;
   app.post('/api/tomer/cases/:id/assign',             jsonBody, _caseOp((id, req) => S.assign(id, { to: req.body?.to, by: _by(req) })));
-  app.post('/api/tomer/cases/:id/approve',            jsonBody, _caseOp((id, req) => S.approve(id, { by: _by(req), note: req.body?.note ?? null })));
-  app.post('/api/tomer/cases/:id/reject',             jsonBody, _caseOp((id, req) => S.reject(id, { by: _by(req), note: req.body?.note ?? null })));
-  app.post('/api/tomer/cases/:id/mark-executed',      jsonBody, _caseOp((id, req) => S.markExecuted(id, { by: _by(req) })));
-  app.post('/api/tomer/cases/:id/execute-now',        jsonBody, _caseOp((id, req) => S.executeNow(id, { by: _by(req) })));
-  app.post('/api/tomer/cases/:id/recheck',            jsonBody, _caseOp((id, req) => S.recheck(id, { by: _by(req) })));
-  app.post('/api/tomer/cases/:id/reply',              jsonBody, _caseOp((id, req) => S.staffReply(id, { text: req.body?.text, by: _by(req) })));
-  app.post('/api/tomer/cases/:id/resolve',            jsonBody, _caseOp((id, req) => S.resolve(id, { note: req.body?.note ?? null, by: _by(req) })));
-  app.post('/api/tomer/cases/:id/retry-notification', jsonBody, _caseOp((id)      => S.retryNotification(id)));
+  app.post('/api/tomer/cases/:id/status',             jsonBody, _caseOp((id, req) => S.setStatus(id, { status: req.body?.status, by: _by(req) })));
+  app.post('/api/tomer/cases/:id/reply',              jsonBody, _caseOp((id, req) => S.staffReply(id, { text: req.body?.text, by: _by(req), awaitMember: req.body?.awaitMember === true })));
+  app.post('/api/tomer/cases/:id/resolve',            jsonBody, _caseOp((id, req) => S.resolve(id, { note: req.body?.note, outcome: req.body?.outcome, by: _by(req) })));
+  app.post('/api/tomer/cases/:id/reopen',             jsonBody, _caseOp((id, req) => S.reopen(id, { by: _by(req) })));
+  app.post('/api/tomer/cases/:id/retry-notification', jsonBody, _caseOp((id, req) => S.retryNotification(id, { force: req.body?.force === true, by: _by(req) })));
+  app.post('/api/tomer/cases/:id/refresh-arbox',      jsonBody, _caseOp((id, req) => S.refreshArbox(id, { by: _by(req) })));
+  // Conversation ownership from the case: the same takeover / release the rest of the
+  // dashboard uses, recorded on the case.
+  app.post('/api/tomer/cases/:id/takeover', jsonBody, _caseOp((id, req) => {
+    const c = serviceCases.get(id); if (!c) return null;
+    const out = _manualTakeover(c.phone, { reason: 'tomer_panel', staffName: _by(req) });
+    if (!out.unchanged) tomerService.noteOwnership(c.phone, 'human_takeover', { by: _by(req), detail: 'panel' });
+    return { ok: true, unchanged: out.unchanged, case: serviceCases.get(id), conversationOwner: _conversationOwner(c.phone) };
+  }));
+  app.post('/api/tomer/cases/:id/release', jsonBody, _caseOp((id, req) => {
+    const c = serviceCases.get(id); if (!c) return null;
+    const out = _releaseConversation(c.phone);
+    const changed = !!out && !out.unchanged;
+    if (changed) tomerService.noteOwnership(c.phone, 'human_release', { by: _by(req), detail: `restored to ${out.status}` });
+    return { ok: true, unchanged: !changed, restoredTo: out?.status ?? null, case: serviceCases.get(id), conversationOwner: _conversationOwner(c.phone) };
+  }));
 }
 
 // GET /api/tomer/audit — action audit log
@@ -5541,6 +5686,8 @@ app.get('/api/tomer/today', async (req, res) => {
         awaitingReply: awaitingReply.length,
         failedSends:   failedSends.length,
       },
+      cases:        serviceCases.counts(),
+      urgentCases:  serviceCases.list({ open: true, limit: 500 }).filter(c => c.priority === 'high' || c.unreadMember || ['failed', 'uncertain'].includes(c.notification?.state)).slice(0, 20).map(_caseRow),
       ts: new Date(),
     });
   } catch (err) {
@@ -5616,6 +5763,7 @@ app.get('/api/tomer/conversations', (req, res) => {
                   : lead?.status === 'opted_out'          ? 'opted_out'
                   : 'bot',
         leadStatus: lead?.status ?? null,
+        caseId:     serviceCases.list({ phone: t.phone, open: true, limit: 50 }).sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))[0]?.id ?? null,
         messages:   msgs.slice(-6).map(m => ({
           direction: m.direction,
           text:      (m.text ?? '').slice(0, 200),
@@ -6331,8 +6479,10 @@ app.post('/api/whatsapp/threads/:phone/send', jsonBody, async (req, res) => {
   if (!phone || !text?.trim()) return res.status(400).json({ error: 'phone and text required' });
 
   try {
-    await sendText(phone, text.trim());
-    inbox.pushOutbound({ phone, name: name ?? null, text: text.trim(), agentId: 'manual' });
+    const _dsRes = await sendText(phone, text.trim());
+    // Registered so the provider's echo of this send is not recorded a second time.
+    if (_dsRes?.idMessage) _recordBotSend(_dsRes.idMessage, normalizeToE164(phone) ?? phone);
+    inbox.pushOutbound({ phone, name: name ?? null, text: text.trim(), agentId: 'staff', meta: { agent: 'staff', handler: 'dashboard_send', trigger: 'panel', idMessage: _dsRes?.idMessage ?? null } });
     // Dashboard manual send = staff is handling this contact. Set human_owns so
     // automated agents (Barak, Tomer, payment ack) stay silent until released.
     _applyStaffTakeover(normalizeToE164(phone) ?? phone, null, text.trim());
@@ -6717,9 +6867,9 @@ if (process.env.TEST_NO_BIND === 'true') {
   persist.loadLeads(store);
   persist.loadInbox(inbox);
   _markStoreReady();
-  // Tomer: an Arbox action left 'executing' by a crash is reconciled by READING Arbox —
-  // never re-sent.
-  tomerService.reconcileOnStartup().catch(err => logger.error('[startup] Tomer action reconciliation failed', { error: err.message }));
+  // Tomer: a manager alert left unfinished by a crash is marked failed / uncertain for
+  // staff to decide — nothing is ever re-sent on startup.
+  tomerService.reconcileOnStartup().catch(err => logger.error('[startup] Tomer notification reconciliation failed', { error: err.message }));
   _startupComplete = true;
 } else {
 
@@ -6830,9 +6980,9 @@ app.listen(PORT, async () => {
   // Mark startup complete AFTER persist.loadLeads + initWorkers so demos and
   // integration tests that poll /health can safely start sending store-modifying
   // requests without racing against persist.loadLeads overwriting in-memory state.
-  // Tomer: an Arbox action left 'executing' by a crash is reconciled by READING Arbox —
-  // never re-sent.
-  tomerService.reconcileOnStartup().catch(err => logger.error('[startup] Tomer action reconciliation failed', { error: err.message }));
+  // Tomer: a manager alert left unfinished by a crash is marked failed / uncertain for
+  // staff to decide — nothing is ever re-sent on startup.
+  tomerService.reconcileOnStartup().catch(err => logger.error('[startup] Tomer notification reconciliation failed', { error: err.message }));
   _startupComplete = true;
   logger.info('[startup] Startup sequence complete — store ready');
 

@@ -2,7 +2,7 @@
 /**
  * tomer_member_flow.test.js — Tomer (existing-member service), end to end.
  *
- * REAL: server.js pipeline, tomer_service, member_intent, member_actions, arbox_gateway
+ * REAL: server.js pipeline, tomer_service, member_intent, arbox_gateway
  * (real HTTP against a LOCAL Arbox stand-in), service_case_store (disk), lead_store,
  * inbox, ownership/takeover — all on a fresh temporary DATA_DIR.
  * MOCKED: outbound WhatsApp transports (captured), OpenAI (scripted), and the member
@@ -34,16 +34,31 @@ fs.writeFileSync(path.join(DATA_DIR, 'studio_assets.json'), JSON.stringify({ waz
 
 jest.mock('../utils/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }));
 
-const mockOut = { texts: [], alerts: [], seq: 0, failManager: false };
+// texts = sends to members · mgr = case alerts that reached the manager · alerts = alertOwner (system alarms)
+const mockOut = { texts: [], alerts: [], mgr: [], seq: 0, mgrMode: 'ok', mgrCalls: 0, memberMode: 'ok' };
 jest.mock('../services/whatsapp.service', () => {
   const actual = jest.requireActual('../services/whatsapp.service');
   return {
     ...actual,
-    sendText: jest.fn((to, text) => { const id = `MSG_${++mockOut.seq}`; mockOut.texts.push({ to, text, id }); return Promise.resolve({ idMessage: id }); }),
+    sendText: jest.fn((to, text, opts = {}) => {
+      const fail = mode => {
+        if (mode === 'reject')  { const e = new Error('Request failed with status code 400'); e.response = { status: 400 }; return Promise.reject(e); }
+        if (mode === 'timeout') { const e = new Error('timeout of 15000ms exceeded'); e.code = 'ECONNABORTED'; return Promise.reject(e); }
+        if (mode === 'noid')    return Promise.resolve({});
+        if (mode === 'slow')    return new Promise(r => setTimeout(() => { const id = `MGR_${++mockOut.seq}`; mockOut.mgr.push({ text, id, opts }); r({ idMessage: id }); }, 150));
+        return null;
+      };
+      if (to === '972509000001') {                                    // the one manager phone
+        mockOut.mgrCalls++;
+        const f = fail(mockOut.mgrMode); if (f) return f;
+        const id = `MGR_${++mockOut.seq}`; mockOut.mgr.push({ text, id, opts }); return Promise.resolve({ idMessage: id });
+      }
+      const f = fail(mockOut.memberMode); if (f) return f;
+      const id = `MSG_${++mockOut.seq}`; mockOut.texts.push({ to, text, id, opts }); return Promise.resolve({ idMessage: id });
+    }),
     alertOwner: jest.fn((subject, body, opts = {}) => {
       const phone = '972509000001';
-      if (mockOut.failManager) return Promise.resolve({ sent: 0, results: [{ phone, skipped: false, idMessage: null, error: 'simulated_mgr_fail' }] });
-      const id = `MGR_${++mockOut.seq}`;
+      const id = `ALERT_${++mockOut.seq}`;
       mockOut.alerts.push({ subject, body, id, linkPreview: opts.linkPreview });
       return Promise.resolve({ sent: 1, results: [{ phone, skipped: false, idMessage: id, error: null }] });
     }),
@@ -116,19 +131,35 @@ function seedSchedule() {
 const book = (m, cls) => arbox.state.bookings.push({ user_id: m.userId, date: cls.date, time: cls.start_time, class_name: cls.session_name, staff_member: cls.staff_member.name, check_in: 'No', sessions_left: null, membership_type_name: 'מנוי חודשי 2 בשבוע' });
 const cls = id => arbox.state.schedule.find(c => c.schedule_id === id);
 
-async function say(phone, text, { type = 'text' } = {}) {
+async function say(phone, text, { type = 'text', messageId = null } = {}) {
   const res = await request(app).post('/api/whatsapp/simulate')
-    .send({ from: phone, text, name: 'WA Profile', type, messageId: `tm-${++msgSeq}`, timestamp: new Date().toISOString() })
+    .send({ from: phone, text, name: 'WA Profile', type, messageId: messageId ?? `tm-${++msgSeq}`, timestamp: new Date().toISOString() })
     .set('Content-Type', 'application/json');
   if (res.status !== 200) throw new Error(`simulate ${res.status}: ${JSON.stringify(res.body)}`);
   return res.body;
 }
 const post = (url, body = {}) => request(app).post(url).send(body).set('Content-Type', 'application/json');
+const get  = url => request(app).get(url);
+/** A message typed by staff on the studio phone: the provider's outgoing-message webhook. */
+async function phoneSend(phone, text) {
+  const chatId = `${phone}@c.us`;
+  const r = await request(app).post('/api/green-api/webhook').set('Content-Type', 'application/json').send({
+    typeWebhook: 'outgoingMessageReceived', instanceData: { idInstance: 1234, wid: '972535716559@c.us' }, timestamp: Math.floor(Date.now() / 1000),
+    idMessage: `PHONE_${++msgSeq}`, senderData: { chatId, sender: chatId, senderName: 'Shape Studio' },
+    messageData: { typeMessage: 'textMessage', textMessageData: { textMessage: text } },
+  });
+  expect(r.status).toBe(200);
+  const ok = await waitFor(() => store.getLead(phone)?.status === 'human_owns');
+  expect(ok).toBeTruthy();
+}
 const textsTo = p => mockOut.texts.filter(t => t.to === p).map(t => t.text);
 const lastTo  = p => textsTo(p).at(-1) ?? null;
 const openCases = p => cases.list({ phone: p, open: true });
 const diskCase  = id => JSON.parse(fs.readFileSync(CASES_FILE, 'utf8')).cases.find(c => c.id === id);
 const FALSE_CONFIRM = /בקשת הביטול התקבלה|קיבלנו את אישור התשלום|רוצה מקום\?|נרשמת בהצלחה|ביטלתי לך|הקפאתי/;
+const PROMISE        = /תוך (?:שעה|יום|\d)|עד מחר|עד סוף היום|בהקדם|אעדכן|נחזור אליך|יחזרו אליך|ניצור איתך קשר/;       // unconfigured deadlines / follow-up promises
+const NOTIFIED_CLAIM = /העברתי|הודעתי לצוות|עדכנתי את הצוות|הצוות קיבל|סימנתי לצוות/;                                // "staff were notified" is never claimed
+const INTRO = 'אני תומר, העוזר הדיגיטלי של Shape Studio.';
 
 beforeAll(async () => {
   jest.useFakeTimers({ now: T0, doNotFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'clearImmediate', 'nextTick', 'queueMicrotask', 'hrtime', 'performance'] });
@@ -137,28 +168,37 @@ beforeAll(async () => {
 });
 beforeEach(() => {
   jest.setSystemTime(T0);
-  mockOut.texts.length = 0; mockOut.alerts.length = 0; mockOut.failManager = false; mockAi.queue.length = 0;
+  mockOut.texts.length = 0; mockOut.alerts.length = 0; mockOut.mgr.length = 0; mockOut.mgrMode = 'ok'; mockOut.memberMode = 'ok'; mockOut.mgrCalls = 0; mockAi.queue.length = 0;
   arbox.reset(); seedSchedule(); gateway.clearCache();
   delete process.env.ARBOX_WRITES_ENABLED; delete process.env.ARBOX_TEST_ASSUME_CONTRACT;
 });
 afterAll(async () => { jest.useRealTimers(); await arbox.close(); });
-const enableWrites = () => { process.env.ARBOX_WRITES_ENABLED = 'true'; process.env.ARBOX_TEST_ASSUME_CONTRACT = 'true'; };
 
 // ══════════════════════════════════════════════════════════════════════════════
 describe('A. No false confirmations, no dropped requests', () => {
-  test('membership cancellation is a staff-approval case — never the class-cancel template', async () => {
+  test('membership cancellation → staff-handled case + ONE manager alert with a link to the case; nothing is written to Arbox', async () => {
     const m = member();
     const r = await say(m.phone, 'רוצה לבטל את המנוי');
     expect(r.route).toBe('tomer_case_opened');
+    expect(lastTo(m.phone)).toMatch(/רשמתי אותה לטיפול הצוות/);
     expect(lastTo(m.phone)).toMatch(/המנוי לא בוטל/);
     expect(textsTo(m.phone).join('\n')).not.toMatch(FALSE_CONFIRM);
+    expect(textsTo(m.phone).join('\n')).not.toMatch(PROMISE);
     const [c] = openCases(m.phone);
-    expect(c.category).toBe('membership_cancel');
-    expect(c.action).toMatchObject({ op: 'membership_cancel', state: 'awaiting_approval', args: { userId: m.userId, membershipUserId: m.mid } });
-    expect(mockOut.alerts).toHaveLength(1);
-    expect(mockOut.alerts[0].body).toContain(c.id);
-    expect(mockOut.alerts[0].linkPreview).toBe(false);
-    expect(diskCase(c.id).notification.state).toBe('accepted');
+    expect(c).toMatchObject({ category: 'membership_cancel', status: 'awaiting_staff', priority: 'high',
+      request: { type: 'membership_cancel', userId: m.userId, membershipUserId: m.mid } });
+    expect(c.action).toBeUndefined();
+    expect(mockOut.mgr).toHaveLength(1);
+    const alert = mockOut.mgr[0].text;
+    expect(alert).toContain('בקשת ביטול מנוי');
+    expect(alert).toContain('דנה בדיקה');
+    expect(alert).toContain(`0${m.phone.slice(3)}`);
+    expect(alert).toContain(`https://wa.me/${m.phone}`);
+    expect(alert).toContain('רוצה לבטל את המנוי');
+    expect(alert).toContain(`https://panel.example.test/#tomer/case/${c.id}`);
+    expect(alert).toMatch(/לא בוצע שום שינוי ב-Arbox/);
+    expect(mockOut.mgr[0].opts).toMatchObject({ bypassQuietHours: true, linkPreview: false });
+    expect(diskCase(c.id).notification).toMatchObject({ state: 'accepted', attempts: 1, sentTo: [MANAGER], inFlightSince: null });
     expect(arbox.writes()).toHaveLength(0);
   });
 
@@ -167,8 +207,18 @@ describe('A. No false confirmations, no dropped requests', () => {
     await say(m.phone, 'אני רוצה לבטל את המנוי שלי');
     await say(m.phone, 'רוצה לבטל את המנוי');
     expect(openCases(m.phone)).toHaveLength(1);
-    expect(mockOut.alerts).toHaveLength(1);
-    expect(lastTo(m.phone)).toMatch(/כבר פתוחה/);
+    expect(openCases(m.phone)[0].context.filter(x => x.from === 'member')).toHaveLength(2);
+    expect(openCases(m.phone)[0].unreadMember).toBe(true);
+    expect(mockOut.mgr).toHaveLength(1);
+    expect(lastTo(m.phone)).toMatch(/כבר רשומה אצל הצוות/);
+  });
+
+  test('an unrelated issue from the same member is a separate case with its own alert', async () => {
+    const m = member();
+    await say(m.phone, 'לא הבנתי על מה חויבתי ועל איזה חודש');
+    await say(m.phone, 'רוצה להקפיא את המנוי מ-1.12 עד 15.12');
+    expect(openCases(m.phone).map(c => c.category).sort()).toEqual(['billing_dispute', 'membership_freeze']);
+    expect(mockOut.mgr).toHaveLength(2);
   });
 
   test.each([
@@ -176,14 +226,17 @@ describe('A. No false confirmations, no dropped requests', () => {
     ['יכול לבדוק עבורי, ולזכות את חשבוני .\nתודה רבה🙏🏻', 'refund_request'],
     ['מוזר זה היה נראה שבוטל באפליקציה', 'app_problem'],
     ['לא הבנתי על מה חויבתי ועל איזה חודש', 'billing_dispute'],
-  ])('short real request %j is not dropped → case %s + one alert', async (text, category) => {
+    ['אני מאוד מאוכזבת מהיחס בשיעור אתמול', 'complaint'],
+  ])('short real request %j is not dropped → case %s + one alert, recorded (not "passed on")', async (text, category) => {
     const m = member();
     await say(m.phone, text);
     const [c] = openCases(m.phone);
     expect(c?.category).toBe(category);
-    expect(mockOut.alerts).toHaveLength(1);
+    expect(mockOut.mgr).toHaveLength(1);
     expect(textsTo(m.phone)).toHaveLength(1);
     expect(lastTo(m.phone)).not.toMatch(FALSE_CONFIRM);
+    expect(lastTo(m.phone)).not.toMatch(PROMISE);
+    expect(lastTo(m.phone)).not.toMatch(NOTIFIED_CLAIM);
   });
 
   test('an unclear request gets ONE clarification, then becomes a case', async () => {
@@ -195,8 +248,23 @@ describe('A. No false confirmations, no dropped requests', () => {
     const [c] = openCases(m.phone);
     expect(c).toBeTruthy();
     expect(c.context[0].text).toContain('אשמח להסבר');
-    expect(mockOut.alerts).toHaveLength(1);
+    expect(mockOut.mgr).toHaveLength(1);
     expect(textsTo(m.phone)).toHaveLength(2);
+  });
+
+  test('an unclear follow-up while a case is open is added to it and acknowledged — never dropped', async () => {
+    const m = member();
+    await say(m.phone, 'לא הבנתי על מה חויבתי ועל איזה חודש');
+    const r = await say(m.phone, 'אפשר עדכון?');
+    expect(r.route).toBe('tomer_case_updated');
+    expect(lastTo(m.phone)).toMatch(/הוספתי את ההודעה לפנייה/);
+    const [c] = openCases(m.phone);
+    expect(c.context.at(-1)).toMatchObject({ from: 'member', text: 'אפשר עדכון?' });
+    expect(mockOut.mgr).toHaveLength(1);
+    // A plain statement adds detail to the case without a reply.
+    const n = textsTo(m.phone).length;
+    await say(m.phone, 'זה היה בחיוב של אוקטובר, 400 שקל');
+    expect(openCases(m.phone)).toHaveLength(1);
   });
 
   test('an image is never acknowledged as a payment or as "handled"', async () => {
@@ -205,10 +273,10 @@ describe('A. No false confirmations, no dropped requests', () => {
     expect(lastTo(m.phone)).toMatch(/אין לי אפשרות לצפות בתמונות/);
     expect(lastTo(m.phone)).not.toMatch(/אישור התשלום|יחזור אליך בהקדם/);
     expect(openCases(m.phone)[0].category).toBe('media_message');
-    expect(mockOut.alerts).toHaveLength(1);
+    expect(mockOut.mgr).toHaveLength(1);
     await say(m.phone, '[תמונה]', { type: 'image' });
     expect(textsTo(m.phone)).toHaveLength(1);
-    expect(mockOut.alerts).toHaveLength(1);
+    expect(mockOut.mgr).toHaveLength(1);
   });
 
   test('"שלחתי ביט" is recorded as an UNVERIFIED payment claim', async () => {
@@ -224,28 +292,29 @@ describe('A. No false confirmations, no dropped requests', () => {
     expect(r.route).toBe('tomer_silent');
     expect(textsTo(m.phone)).toHaveLength(0);
     expect(openCases(m.phone)).toHaveLength(0);
-    expect(mockOut.alerts).toHaveLength(0);
+    expect(mockOut.mgr).toHaveLength(0);
   });
 
-  test('injury and complaint go to staff; Tomer gives no medical advice', async () => {
+  test('injury goes to staff as a high-priority case; Tomer gives no medical advice', async () => {
     const m = member();
     await say(m.phone, 'נפצעתי בברך באימון אתמול, אפשר להמשיך להתאמן?');
     expect(lastTo(m.phone)).toMatch(/לא יכול לתת הנחיה רפואית/);
     expect(openCases(m.phone)[0]).toMatchObject({ category: 'injury', priority: 'high' });
   });
 
-  test('a failed manager alert is recorded and can be retried from the panel', async () => {
+  test('the approved introduction opens a new service conversation once — not every reply', async () => {
     const m = member();
-    mockOut.failManager = true;
+    await say(m.phone, 'מה יש מחר?');
+    expect(textsTo(m.phone)[0].startsWith(INTRO + '\n')).toBe(true);
     await say(m.phone, 'צריכה לדבר איתך בהקדם');
-    const [c] = openCases(m.phone);
-    expect(c.notification).toMatchObject({ state: 'failed', attempts: 1 });
-    mockOut.failManager = false;
-    const r = await post(`/api/tomer/cases/${c.id}/retry-notification`);
-    expect(r.body.case.notification.state).toBe('accepted');
-    const again = await post(`/api/tomer/cases/${c.id}/retry-notification`);
-    expect(again.body.unchanged).toBe(true);
-    expect(mockOut.alerts).toHaveLength(1);
+    await say(m.phone, '[תמונה]', { type: 'image' });
+    expect(textsTo(m.phone)).toHaveLength(3);
+    expect(textsTo(m.phone).slice(1).join('\n')).not.toMatch(/אני תומר/);
+    // More than a week without a Tomer message = a new service conversation.
+    cases.patchMember(m.phone, { lastTomerAt: new Date(T0.getTime() - 8 * 24 * 3600 * 1000).toISOString() });
+    await say(m.phone, 'עד מתי המנוי שלי בתוקף?');
+    expect(lastTo(m.phone).startsWith(INTRO + '\n')).toBe(true);
+    expect(textsTo(m.phone).join('\n')).not.toMatch(/אני עדן|כאן עדן/);          // never speaks as Eden
   });
 });
 
@@ -399,123 +468,96 @@ describe('C. Classes: self-service + verification from Arbox', () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-describe('D. Membership actions: approval, execution, verification', () => {
+describe('D. Membership freeze / cancellation are STAFF-HANDLED', () => {
   async function freezeCase(m, text = 'רוצה להקפיא את המנוי מ-1.12 עד 15.12') {
     await say(m.phone, text);
     return openCases(m.phone).find(c => c.category === 'membership_freeze');
   }
 
-  test('freeze request captures dates; nothing is sent to Arbox before approval', async () => {
+  test('freeze with dates: recorded with the dates, alert carries them, member is told it is NOT frozen', async () => {
     const m = member();
     const c = await freezeCase(m);
-    expect(c.action).toMatchObject({ op: 'membership_hold', state: 'awaiting_approval', args: { from: '2026-12-01', to: '2026-12-15', membershipUserId: m.mid } });
+    expect(c.request).toMatchObject({ type: 'membership_freeze', from: '2026-12-01', to: '2026-12-15', membershipUserId: m.mid });
+    expect(lastTo(m.phone)).toMatch(/01\.12\.2026 – 15\.12\.2026/);
     expect(lastTo(m.phone)).toMatch(/המנוי לא הוקפא בשלב זה/);
+    expect(lastTo(m.phone)).not.toMatch(PROMISE);
+    expect(mockOut.mgr[0].text).toMatch(/תאריכים מבוקשים: 01\.12\.2026 – 15\.12\.2026/);
     expect(arbox.writes()).toHaveLength(0);
   });
 
-  test('freeze without dates → asks once; dates complete the same case', async () => {
+  test('freeze without dates: the case and the alert are created at once; dates are optional and enrich the same case', async () => {
     const m = member();
     const c = await freezeCase(m, 'אפשר להקפיא את המנוי?');
-    expect(lastTo(m.phone)).toMatch(/מאיזה תאריך ועד איזה תאריך\?/);
-    const ap = await post(`/api/tomer/cases/${c.id}/approve`);
-    expect(ap.status).toBe(409);
-    expect(ap.body.error).toBe('invalid_args');
+    expect(c).toBeTruthy();
+    expect(mockOut.mgr).toHaveLength(1);
+    expect(lastTo(m.phone)).toMatch(/רשמתי אותה לטיפול הצוות/);
+    expect(lastTo(m.phone)).not.toMatch(/\?\s*$/);                      // not held behind a question
     await say(m.phone, '1.12.26 עד 20.12.26');
-    expect(cases.get(c.id).action.args).toMatchObject({ from: '2026-12-01', to: '2026-12-20' });
+    expect(cases.get(c.id).request).toMatchObject({ from: '2026-12-01', to: '2026-12-20' });
     expect(openCases(m.phone)).toHaveLength(1);
-    expect(mockOut.alerts).toHaveLength(1);
+    expect(mockOut.mgr).toHaveLength(1);
+    expect(lastTo(m.phone)).toMatch(/הוספתי לפנייה: 01\.12\.2026 – 20\.12\.2026/);
   });
 
-  test('writes disabled (production default): approve → manual execution → member told only after read-back', async () => {
+  test('there is no approve / execute path: the old action endpoints do not exist and no write is ever sent', async () => {
+    process.env.ARBOX_WRITES_ENABLED = 'true'; process.env.ARBOX_TEST_ASSUME_CONTRACT = 'true';   // even if someone flips the switches
     const m = member();
     const c = await freezeCase(m);
-    const before = textsTo(m.phone).length;
-    const ap = await post(`/api/tomer/cases/${c.id}/approve`, { by: 'עדן' });
-    expect(ap.body.case.action.state).toBe('awaiting_manual');
+    for (const op of ['approve', 'reject', 'mark-executed', 'execute-now', 'recheck']) {
+      expect((await post(`/api/tomer/cases/${c.id}/${op}`)).status).toBe(404);
+    }
+    await post(`/api/tomer/cases/${c.id}/resolve`, { outcome: 'done_in_arbox', note: 'הוקפא ידנית', by: 'עדן' });
     expect(arbox.writes()).toHaveLength(0);
-    const nv = await post(`/api/tomer/cases/${c.id}/mark-executed`, { by: 'עדן' });
-    expect(nv.body.verified).toBe(false);
-    expect(cases.get(c.id).action.state).toBe('not_verified');
-    expect(textsTo(m.phone)).toHaveLength(before);               // member told nothing
-    arbox.state.holds.push({ user_id: m.userId, membership_user_id: m.mid, start_date: '2026-12-01', end_date: '2026-12-15' });
-    const ok = await post(`/api/tomer/cases/${c.id}/mark-executed`, { by: 'עדן' });
-    expect(ok.body.verified).toBe(true);
-    expect(cases.get(c.id).action).toMatchObject({ state: 'verified', executor: 'staff_manual' });
-    expect(lastTo(m.phone)).toMatch(/הקפאת המנוי אושרה ונרשמה ב-Arbox ✅ לתאריכים 01\.12\.2026 – 15\.12\.2026/);
-    await post(`/api/tomer/cases/${c.id}/mark-executed`, { by: 'עדן' });
-    expect(textsTo(m.phone)).toHaveLength(before + 1);           // told exactly once
   });
 
-  test('rejection reaches the member with the staff note', async () => {
-    const m = member();
-    const c = await freezeCase(m);
-    await post(`/api/tomer/cases/${c.id}/reject`, { by: 'עדן', note: 'הקפאה אפשרית מהחודש הבא' });
-    expect(lastTo(m.phone)).toMatch(/בקשת הקפאת מנוי לא אושרה על ידי הצוות\.\nהערת הצוות: הקפאה אפשרית מהחודש הבא/);
-    expect(cases.get(c.id).status).toBe('rejected');
-    const again = await post(`/api/tomer/cases/${c.id}/approve`);
-    expect(again.status).toBe(409);
-  });
-
-  test('API executor: one request, verified by read-back; a duplicate approval sends nothing', async () => {
-    enableWrites();
-    const m = member();
-    const c = await freezeCase(m);
-    const [a, b] = await Promise.all([post(`/api/tomer/cases/${c.id}/approve`), post(`/api/tomer/cases/${c.id}/approve`)]);
-    expect([a.status, b.status]).toEqual([200, 200]);
-    expect(arbox.writes()).toHaveLength(1);
-    expect(arbox.writes()[0].body).toMatchObject({ membership_user_id: m.mid, start_date: '2026-12-01', end_date: '2026-12-15' });
-    expect(cases.get(c.id).action).toMatchObject({ state: 'verified', executor: 'api' });
-    expect(textsTo(m.phone).filter(t => /נרשמה ב-Arbox ✅/.test(t))).toHaveLength(1);
-  });
-
-  test('Arbox rejects → failed; member is not told it succeeded', async () => {
-    enableWrites(); arbox.mode.write = 'reject';
-    const m = member();
-    const c = await freezeCase(m);
-    await post(`/api/tomer/cases/${c.id}/approve`);
-    expect(cases.get(c.id)).toMatchObject({ status: 'awaiting_staff', action: { state: 'failed' } });
-    expect(textsTo(m.phone).join('\n')).not.toMatch(/נרשמה ב-Arbox/);
-  });
-
-  test('timeout AFTER Arbox applied the change → verified by read-back, no retry', async () => {
-    enableWrites(); arbox.mode.write = 'timeout_after_apply';
-    const m = member();
-    const c = await freezeCase(m);
-    await post(`/api/tomer/cases/${c.id}/approve`);
-    expect(arbox.writes()).toHaveLength(1);
-    expect(cases.get(c.id).action.state).toBe('verified');
-    expect(cases.get(c.id).action.attempts[0].state).toBe('unknown_then_verified');
-  });
-
-  test.each(['timeout_no_apply', 'error500_no_apply', 'accept_no_apply'])('%s → uncertain: no blind retry, no success message, staff recheck', async (mode) => {
-    enableWrites(); arbox.mode.write = mode;
-    const m = member();
-    const c = await freezeCase(m);
-    await post(`/api/tomer/cases/${c.id}/approve`);
-    expect(cases.get(c.id)).toMatchObject({ status: 'awaiting_staff', action: { state: 'uncertain' } });
-    expect(arbox.writes()).toHaveLength(1);
-    expect(textsTo(m.phone).join('\n')).not.toMatch(/נרשמה ב-Arbox/);
-    const again = await post(`/api/tomer/cases/${c.id}/approve`);
-    expect(again.body.unchanged).toBe(true);
-    await post(`/api/tomer/cases/${c.id}/recheck`);
-    expect(arbox.writes()).toHaveLength(1);
-    expect(cases.get(c.id).action.state).toBe('uncertain');
-    arbox.state.holds.push({ user_id: m.userId, membership_user_id: m.mid });
-    const r = await post(`/api/tomer/cases/${c.id}/recheck`);
-    expect(r.body.verified).toBe(true);
-  });
-
-  test('membership cancel via API executor is verified from the membership record', async () => {
-    enableWrites();
+  test('staff-reported completion is stored apart from what Arbox shows (cancel)', async () => {
     const m = member();
     await say(m.phone, 'רוצה לבטל את המנוי');
     const [c] = openCases(m.phone);
-    await post(`/api/tomer/cases/${c.id}/approve`);
-    expect(cases.get(c.id).action.state).toBe('verified');
-    expect(lastTo(m.phone)).toMatch(/ביטול המנוי אושר ונרשם ב-Arbox ✅/);
+    expect((await post(`/api/tomer/cases/${c.id}/resolve`, { outcome: 'done_in_arbox', by: 'עדן' })).body.error).toBe('note_required');
+    expect((await post(`/api/tomer/cases/${c.id}/resolve`, { note: 'בוטל', by: 'עדן' })).body.error).toBe('outcome_required');
+    expect(cases.get(c.id).status).toBe('awaiting_staff');
+    const before = textsTo(m.phone).length;
+    // Staff say it is done, but Arbox still shows an active membership.
+    const r = await post(`/api/tomer/cases/${c.id}/resolve`, { outcome: 'done_in_arbox', note: 'בוטל בטלפון עם החברה', by: 'עדן' });
+    expect(r.body.case.status).toBe('resolved');
+    expect(r.body.case.resolution).toMatchObject({ outcome: 'done_in_arbox', note: 'בוטל בטלפון עם החברה', by: 'עדן' });
+    expect(r.body.case.arboxCheck).toMatchObject({ verified: false });
+    expect(r.body.case.arboxCheck.summary).toMatch(/מנוי פעיל/);
+    expect(textsTo(m.phone)).toHaveLength(before);                    // closing a case sends the member nothing
+    // Later Arbox shows the cancellation → the read-only check turns true; the staff report is untouched.
+    const ms = arbox.state.memberships.find(x => x.membership_user_id === m.mid); ms.cancelled = 1; ms.active = 0;
+    const chk = await post(`/api/tomer/cases/${c.id}/refresh-arbox`, { by: 'עדן' });
+    expect(chk.body.case.arboxCheck).toMatchObject({ verified: true });
+    expect(chk.body.case.resolution).toMatchObject({ outcome: 'done_in_arbox', by: 'עדן' });
+    expect(arbox.writes()).toHaveLength(0);
   });
 
-  test('disk failure: no case is claimed, the member gets no false "opened", the manager is told', async () => {
+  test('freeze: the read-only check reads the hold report; a declined request is recorded as declined', async () => {
+    const a = member();
+    const ca = await freezeCase(a);
+    arbox.state.holds.push({ user_id: a.userId, membership_user_id: a.mid, start_date: '2026-12-01', end_date: '2026-12-15' });
+    const ra = await post(`/api/tomer/cases/${ca.id}/resolve`, { outcome: 'done_in_arbox', note: 'הוקפא', by: 'עדן' });
+    expect(ra.body.case.arboxCheck).toMatchObject({ verified: true });
+    const b = member();
+    const cb = await freezeCase(b);
+    const rb = await post(`/api/tomer/cases/${cb.id}/resolve`, { outcome: 'declined', note: 'אין זכאות להקפאה החודש', by: 'עדן' });
+    expect(rb.body.case.resolution.outcome).toBe('declined');
+    expect(rb.body.case.arboxCheck).toBeNull();                       // nothing was claimed, nothing to verify
+  });
+
+  test('Arbox unavailable: the check says so (verified = unknown), never "done"', async () => {
+    const m = member();
+    await say(m.phone, 'רוצה לבטל את המנוי');
+    const [c] = openCases(m.phone);
+    arbox.mode.down = true; gateway.clearCache();
+    const r = await post(`/api/tomer/cases/${c.id}/refresh-arbox`, { by: 'עדן' });
+    expect(r.body.arboxAvailable).toBe(false);
+    expect(r.body.case.facts.error).toBeTruthy();
+    expect(r.body.case.arboxCheck).toMatchObject({ verified: null });
+  });
+
+  test('disk failure: no case is claimed, the member gets no false "recorded", the manager is told', async () => {
     const m = member();
     const real = fs.renameSync;
     const spy = jest.spyOn(fs, 'renameSync').mockImplementation((a, b) => { if (String(b).endsWith('service_cases.json')) throw new Error('ENOSPC'); return real(a, b); });
@@ -524,61 +566,250 @@ describe('D. Membership actions: approval, execution, verification', () => {
       expect(r.route).toBe('tomer_error');
       expect(textsTo(m.phone)).toHaveLength(0);
       expect(cases.list({ phone: m.phone })).toHaveLength(0);
+      expect(mockOut.mgr).toHaveLength(0);
       expect(mockOut.alerts).toHaveLength(1);
       expect(mockOut.alerts[0].subject).toMatch(/לא טופלה/);
     } finally { spy.mockRestore(); }
     await say(m.phone, 'רוצה לבטל את המנוי');
     expect(openCases(m.phone)).toHaveLength(1);
   });
+});
 
-  test('restart: cases survive; an action that was in flight is reconciled by reading, never re-sent', async () => {
-    enableWrites();
+// ══════════════════════════════════════════════════════════════════════════════
+describe('E. Manager notification: failure, ambiguity, retry, restart', () => {
+  test('provider rejects the alert → "failed"; the member is told only that it was recorded; panel retry sends once', async () => {
     const m = member();
-    const c = await freezeCase(m);
-    // Simulate a process death between "executing recorded" and the provider answer.
-    cases.update(c.id, { status: 'in_progress' }, { type: 'action_executing', by: 'test' }, { actionPatch: { state: 'executing', approval: { decision: 'approved', by: 'עדן' }, attempts: [{ id: 'x', state: 'submitted' }] } });
+    mockOut.mgrMode = 'reject';
+    await say(m.phone, 'צריכה לדבר איתך בהקדם');
+    const [c] = openCases(m.phone);
+    expect(c.notification).toMatchObject({ state: 'failed', attempts: 1 });
+    expect(lastTo(m.phone)).toMatch(/רשמתי פנייה/);
+    expect(lastTo(m.phone)).not.toMatch(NOTIFIED_CLAIM);
+    const still = await post(`/api/tomer/cases/${c.id}/retry-notification`);
+    expect(still.status).toBe(502);
+    expect(still.body.error).toBe('notify_failed');
+    mockOut.mgrMode = 'slow';                                           // the provider takes a moment: a double click overlaps
+    const [r1, r2] = await Promise.all([post(`/api/tomer/cases/${c.id}/retry-notification`), post(`/api/tomer/cases/${c.id}/retry-notification`)]);
+    expect([r1.status, r2.status].sort()).toEqual([200, 409]);          // the second click finds one in flight
+    expect([r1.body.error, r2.body.error]).toContain('notification_in_flight');
+    expect(cases.get(c.id).notification.state).toBe('accepted');
+    mockOut.mgrMode = 'ok';
+    const again = await post(`/api/tomer/cases/${c.id}/retry-notification`);
+    expect(again.body.unchanged).toBe(true);
+    expect(mockOut.mgr).toHaveLength(1);                                // exactly one alert reached the manager
+  });
+
+  test('timeout → "uncertain": not repeated by itself, not repeated by a plain retry; only an explicit forced retry sends', async () => {
+    const m = member();
+    mockOut.mgrMode = 'timeout';
+    await say(m.phone, 'רוצה לבטל את המנוי');
+    const [c] = openCases(m.phone);
+    expect(c.notification.state).toBe('uncertain');
+    const calls = mockOut.mgrCalls;
+    await say(m.phone, 'רוצה לבטל את המנוי');                          // a follow-up never re-alerts
+    const plain = await post(`/api/tomer/cases/${c.id}/retry-notification`);
+    expect(plain.status).toBe(409);
+    expect(plain.body.error).toBe('uncertain_needs_confirm');
+    expect(mockOut.mgrCalls).toBe(calls);
+    mockOut.mgrMode = 'ok';
+    const forced = await post(`/api/tomer/cases/${c.id}/retry-notification`, { force: true });
+    expect(forced.body.case.notification.state).toBe('accepted');
+    expect(mockOut.mgrCalls).toBe(calls + 1);
+  });
+
+  test('a provider answer without a message id is not "sent"', async () => {
+    const m = member();
+    mockOut.mgrMode = 'noid';
+    await say(m.phone, 'צריכה לדבר איתך בהקדם');
+    expect(openCases(m.phone)[0].notification.state).toBe('failed');
+  });
+
+  test('restart: nothing is replayed — an alert in flight becomes "uncertain", an unsent one "failed", accepted stays', async () => {
+    const [a, b, c] = [member(), member(), member()];
+    await say(a.phone, 'צריכה לדבר איתך בהקדם');
+    await say(b.phone, 'צריכה לדבר איתך בהקדם');
+    await say(c.phone, 'צריכה לדבר איתך בהקדם');
+    const [ca] = openCases(a.phone), [cb] = openCases(b.phone), [cc] = openCases(c.phone);
+    // The only way to produce a process death mid-send / before send: write the durable markers.
+    cases.update(ca.id, {}, null, { notificationPatch: { state: 'pending', inFlightSince: new Date().toISOString() } });
+    cases.update(cb.id, {}, null, { notificationPatch: { state: 'pending', inFlightSince: null } });
+    const calls = mockOut.mgrCalls;
     restart();
-    const got = await waitFor(() => (cases.get(c.id)?.action?.state === 'uncertain' ? cases.get(c.id) : null));
-    expect(got).toBeTruthy();
-    expect(got.status).toBe('awaiting_staff');
-    expect(arbox.writes()).toHaveLength(0);
-    expect(mockOut.texts.filter(t => /נרשמה ב-Arbox/.test(t.text))).toHaveLength(0);
-    expect(openCases(m.phone)).toHaveLength(1);
+    const ok = await waitFor(() => cases.get(ca.id)?.notification?.state === 'uncertain' && cases.get(cb.id)?.notification?.state === 'failed');
+    expect(ok).toBeTruthy();
+    expect(cases.get(cc.id).notification.state).toBe('accepted');
+    expect(mockOut.mgrCalls).toBe(calls);                               // no historical alert was re-sent
+    expect(openCases(a.phone)).toHaveLength(1);
   });
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-describe('E. Ownership, opt-out, attribution, Barak', () => {
-  test('a staff reply from the case takes the conversation over: Tomer goes silent for the member', async () => {
+describe('F. The staff workflow on a case (panel API)', () => {
+  test('assign → in progress; awaiting member → the member\'s answer brings it back; counters follow', async () => {
+    const m = member();
+    await say(m.phone, 'לא הבנתי על מה חויבתי ועל איזה חודש');
+    const [c] = openCases(m.phone);
+    const base = (await get('/api/tomer/cases?open=1')).body.counts;
+    expect((await post(`/api/tomer/cases/${c.id}/assign`, { by: 'עדן' })).body.error).toBe('owner_required');
+    const as = await post(`/api/tomer/cases/${c.id}/assign`, { to: 'עדן', by: 'עדן' });
+    expect(as.body.case).toMatchObject({ owner: 'עדן', status: 'in_progress' });
+    const st = await post(`/api/tomer/cases/${c.id}/status`, { status: 'awaiting_member', by: 'עדן' });
+    expect(st.body.case.status).toBe('awaiting_member');
+    expect((await post(`/api/tomer/cases/${c.id}/status`, { status: 'resolved', by: 'עדן' })).body.error).toBe('bad_status');
+    const mid = (await get('/api/tomer/cases?open=1')).body.counts;
+    expect(mid.awaiting_member).toBe(base.awaiting_member + 1);
+    expect(mid.awaiting_staff).toBe(base.awaiting_staff - 1);
+    expect(mid.open).toBe(base.open);
+    await say(m.phone, 'החיוב של אוקטובר, למה חויבתי 400?');
+    expect(cases.get(c.id)).toMatchObject({ status: 'in_progress', unreadMember: true });
+    expect(mockOut.mgr).toHaveLength(1);
+    const by = (await get('/api/tomer/cases?status=in_progress')).body.cases.map(x => x.id);
+    expect(by).toContain(c.id);
+  });
+
+  test('a staff reply is sent as staff, recorded as staff (never as Tomer), and takes the conversation over', async () => {
     const m = member();
     await say(m.phone, 'צריכה לדבר איתך בהקדם');
     const [c] = openCases(m.phone);
-    const r = await post(`/api/tomer/cases/${c.id}/reply`, { text: 'היי, אני מתקשרת עוד רגע', by: 'עדן' });
+    const r = await post(`/api/tomer/cases/${c.id}/reply`, { text: 'היי, אני מתקשרת עוד רגע', by: 'עדן', awaitMember: true });
     expect(r.body.ok).toBe(true);
-    expect(store.getLead(m.phone).status).toBe('human_owns');
+    const sent = mockOut.texts.filter(t => t.to === m.phone).at(-1);
+    expect(sent.text).toBe('היי, אני מתקשרת עוד רגע');                 // no Tomer introduction on a human message
+    expect(r.body.case).toMatchObject({ status: 'awaiting_member', owner: 'עדן', conversationOwner: 'human' });
+    expect(r.body.case.context.at(-1)).toMatchObject({ from: 'staff', by: 'עדן' });
+    const out = inbox.getThread(m.phone).messages.filter(x => x.direction === 'out').at(-1);
+    expect(out).toMatchObject({ agentId: 'staff', meta: { agent: 'staff', handler: 'case_staff_reply', by: 'עדן' } });
+    expect(store.getLead(m.phone)).toMatchObject({ status: 'human_owns', meta: { humanOwnsBy: 'עדן', previousStatus: 'converted_member' } });
+    const view = (await get(`/api/tomer/cases/${c.id}`)).body;
+    expect(view.conversation.owner).toBe('human');
+    expect(view.conversation.messages.at(-1)).toMatchObject({ who: 'staff', by: 'עדן', text: 'היי, אני מתקשרת עוד רגע' });
+    expect(view.conversation.messages.some(x => x.who === 'tomer')).toBe(true);
+    expect(view.conversation.messages.some(x => x.who === 'member')).toBe(true);
+    // While staff own the conversation Tomer is silent, but the member's message reaches the case.
     const n = textsTo(m.phone).length;
-    const out = await say(m.phone, 'רוצה להקפיא את המנוי מ-1.12 עד 15.12');
-    expect(out.route).toBe('human_owns_hold');
+    const held = await say(m.phone, 'רוצה להקפיא את המנוי מ-1.12 עד 15.12');
+    expect(held.route).toBe('human_owns_hold');
     expect(textsTo(m.phone)).toHaveLength(n);
+    expect(cases.get(c.id)).toMatchObject({ unreadMember: true, status: 'in_progress' });
+    expect(cases.get(c.id).context.at(-1).text).toMatch(/להקפיא/);
   });
 
-  test('takeover with an approved action: nothing is executed automatically; "execute now" is explicit', async () => {
-    enableWrites();
+  test('a staff reply that the provider rejects or times out is reported — no takeover, nothing recorded as sent', async () => {
     const m = member();
-    await say(m.phone, 'רוצה להקפיא את המנוי מ-1.12 עד 15.12');
+    await say(m.phone, 'צריכה לדבר איתך בהקדם');
     const [c] = openCases(m.phone);
-    await post(`/api/tomer/cases/${c.id}/reply`, { text: 'בודקת', by: 'עדן' });
-    await post(`/api/tomer/cases/${c.id}/approve`, { by: 'עדן' });
-    expect(cases.get(c.id).action).toMatchObject({ state: 'approved', heldForTakeover: true });
-    expect(arbox.writes()).toHaveLength(0);
-    const n = textsTo(m.phone).length;
-    await post(`/api/tomer/cases/${c.id}/execute-now`, { by: 'עדן' });
-    expect(arbox.writes()).toHaveLength(1);
-    expect(cases.get(c.id).action.state).toBe('verified');
-    expect(textsTo(m.phone)).toHaveLength(n);                   // human owns the conversation: no bot notice
-    expect(cases.get(c.id).memberNotice).toMatchObject({ state: 'withheld', reason: 'human_owns' });
+    mockOut.memberMode = 'reject';
+    const bad = await post(`/api/tomer/cases/${c.id}/reply`, { text: 'היי', by: 'עדן' });
+    expect(bad.status).toBe(502);
+    expect(bad.body.error).toBe('send_failed');
+    mockOut.memberMode = 'timeout';
+    const unk = await post(`/api/tomer/cases/${c.id}/reply`, { text: 'היי', by: 'עדן' });
+    expect(unk.body.error).toBe('send_uncertain');
+    expect(store.getLead(m.phone)?.status).not.toBe('human_owns');
+    expect(cases.get(c.id).context.some(x => x.from === 'staff')).toBe(false);
+    expect((await post(`/api/tomer/cases/${c.id}/reply`, { text: '  ', by: 'עדן' })).body.error).toBe('text_required');
   });
 
+  test('resolve needs a note; a resolved case leaves the open list, cannot be replied to, and can be reopened', async () => {
+    const m = member();
+    await say(m.phone, 'לא הבנתי על מה חויבתי ועל איזה חודש');
+    const [c] = openCases(m.phone);
+    expect((await post(`/api/tomer/cases/${c.id}/resolve`, { by: 'עדן' })).body.error).toBe('note_required');
+    const r = await post(`/api/tomer/cases/${c.id}/resolve`, { note: 'הוסבר בטלפון, אין טעות בחיוב', by: 'עדן' });
+    expect(r.body.case).toMatchObject({ status: 'resolved', resolution: { outcome: 'handled', by: 'עדן' } });
+    expect(openCases(m.phone)).toHaveLength(0);
+    expect((await post(`/api/tomer/cases/${c.id}/resolve`, { note: 'שוב', by: 'עדן' })).body.unchanged).toBe(true);
+    expect((await post(`/api/tomer/cases/${c.id}/reply`, { text: 'היי', by: 'עדן' })).body.error).toBe('case_closed');
+    expect(diskCase(c.id).resolution.note).toBe('הוסבר בטלפון, אין טעות בחיוב');
+    // The same issue raised again after closing is a NEW case with a new alert.
+    await say(m.phone, 'שוב חויבתי פעמיים החודש');
+    expect(openCases(m.phone)).toHaveLength(1);
+    expect(openCases(m.phone)[0].id).not.toBe(c.id);
+    expect(mockOut.mgr).toHaveLength(2);
+    const ro = await post(`/api/tomer/cases/${c.id}/reopen`, { by: 'עדן' });
+    expect(ro.body.case).toMatchObject({ status: 'in_progress', resolution: null });
+  });
+
+  test('unknown case id → 404 on read and on every operation', async () => {
+    expect((await get('/api/tomer/cases/case-nope')).status).toBe(404);
+    expect((await post('/api/tomer/cases/case-nope/resolve', { note: 'x y' })).status).toBe(404);
+    expect((await post('/api/tomer/cases/case-nope/takeover', {})).status).toBe(404);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+describe('G. Human takeover for members (converted_member), restart, release', () => {
+  test('a reply typed on the studio phone silences Tomer for a member; survives restart; release is idempotent and restores the member state', async () => {
+    const m = member();
+    // A former lead that became a member: the audited case where a phone reply did NOT pause Tomer.
+    store.upsertLead(m.phone, { status: 'converted_member', meta: { isConfirmedMember: true } });
+    await say(m.phone, 'לא הבנתי על מה חויבתי ועל איזה חודש');
+    expect(store.getLead(m.phone)?.status).toBe('converted_member');
+    const [c] = openCases(m.phone);
+    await phoneSend(m.phone, 'היי, בודקת ומעדכנת');
+    expect(store.getLead(m.phone)).toMatchObject({ status: 'human_owns', meta: { previousStatus: 'converted_member' } });
+    const out = inbox.getThread(m.phone).messages.filter(x => x.direction === 'out').at(-1);
+    expect(out).toMatchObject({ agentId: 'staff', text: 'היי, בודקת ומעדכנת', meta: { agent: 'staff', handler: 'phone_reply' } });
+    expect(cases.get(c.id).events.some(e => e.type === 'human_takeover')).toBe(true);
+    const n = textsTo(m.phone).length;
+    expect((await say(m.phone, 'מה יש מחר?')).route).toBe('human_owns_hold');
+    expect(textsTo(m.phone)).toHaveLength(n);
+
+    restart();
+    expect(store.getLead(m.phone)?.status).toBe('human_owns');          // read back from disk
+    expect((await say(m.phone, 'ומה עם מחרתיים?')).route).toBe('human_owns_hold');
+    expect(textsTo(m.phone)).toHaveLength(n);
+
+    // A second takeover (dashboard) must not overwrite the state to restore.
+    await post(`/api/tomer/cases/${c.id}/takeover`, { by: 'עדן' });
+    expect(store.getLead(m.phone).meta.previousStatus).toBe('converted_member');
+    const rel = await post(`/api/tomer/cases/${c.id}/release`, { by: 'עדן' });
+    expect(rel.body).toMatchObject({ ok: true, unchanged: false, restoredTo: 'converted_member', conversationOwner: 'tomer' });
+    const rel2 = await post(`/api/tomer/cases/${c.id}/release`, { by: 'עדן' });
+    expect(rel2.body).toMatchObject({ ok: true, unchanged: true, conversationOwner: 'tomer' });
+    expect(store.getLead(m.phone).status).toBe('converted_member');
+    expect(cases.get(c.id).events.filter(e => e.type === 'human_release')).toHaveLength(1);
+    gateway.clearCache();
+    expect((await say(m.phone, 'מה יש מחר?')).route).toBe('tomer_answered');   // Tomer answers again
+    expect(textsTo(m.phone).length).toBe(n + 1);
+  });
+
+  test('takeover from the case works for a member with no lead record at all and is released back to Tomer', async () => {
+    const m = member();
+    const c = cases.create({ phone: m.phone, memberName: 'דנה בדיקה', category: 'general_request', summary: 'בדיקה', notificationRequired: false });
+    expect(store.getLead(m.phone)).toBeFalsy();
+    const t = await post(`/api/tomer/cases/${c.id}/takeover`, { by: 'עדן' });
+    expect(t.body).toMatchObject({ ok: true, conversationOwner: 'human' });
+    expect((await say(m.phone, 'מה יש מחר?')).route).toBe('human_owns_hold');
+    const r = await post(`/api/tomer/cases/${c.id}/release`, { by: 'עדן' });
+    expect(r.body.conversationOwner).toBe('tomer');
+    expect((await say(m.phone, 'מה יש מחר?')).route).toBe('tomer_answered');
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+describe('H. Duplicate suppression across a restart', () => {
+  test('a provider message id handled before the restart is not handled again after it', async () => {
+    const m = member();
+    await say(m.phone, 'רוצה לבטל את המנוי', { messageId: 'DUP-1' });
+    const [c] = openCases(m.phone);
+    const n = textsTo(m.phone).length, ctx = c.context.length, mgr = mockOut.mgr.length;
+    restart();
+    const r = await say(m.phone, 'רוצה לבטל את המנוי', { messageId: 'DUP-1' });
+    expect(r.route).toBe('tomer_duplicate');
+    expect(textsTo(m.phone)).toHaveLength(n);
+    expect(cases.get(c.id).context).toHaveLength(ctx);
+    expect(mockOut.mgr).toHaveLength(mgr);
+    // A genuinely new message (new id) with the same words is a follow-up on the same case.
+    await say(m.phone, 'רוצה לבטל את המנוי', { messageId: 'DUP-2' });
+    expect(cases.get(c.id).context).toHaveLength(ctx + 1);
+    expect(openCases(m.phone)).toHaveLength(1);
+    expect(mockOut.mgr).toHaveLength(mgr);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+describe('I. Opt-out, attribution, Barak', () => {
   test('member opt-out is honoured and survives the member bookkeeping step', async () => {
     const m = member();
     await say(m.phone, 'הסר אותי מהרשימה');
@@ -590,6 +821,17 @@ describe('E. Ownership, opt-out, attribution, Barak', () => {
     expect(textsTo(m.phone)).toHaveLength(n);
   });
 
+  test('a member who opted out cannot be messaged from a case', async () => {
+    const m = member();
+    await say(m.phone, 'צריכה לדבר איתך בהקדם');
+    const [c] = openCases(m.phone);
+    await say(m.phone, 'הסר אותי מהרשימה');
+    const n = textsTo(m.phone).length;
+    const r = await post(`/api/tomer/cases/${c.id}/reply`, { text: 'היי', by: 'עדן' });
+    expect(r.body.error).toBe('member_opted_out');
+    expect(textsTo(m.phone)).toHaveLength(n);
+  });
+
   test('every Tomer message is attributed (agent, handler, trigger, data source, provider id)', async () => {
     const m = member();
     await say(m.phone, 'מה יש מחר?');
@@ -598,6 +840,9 @@ describe('E. Ownership, opt-out, attribution, Barak', () => {
     expect(msgs.at(-1)).toMatchObject({ agentId: 'tomer', meta: { agent: 'tomer', handler: 'schedule', trigger: 'schedule_query', sendState: 'sent' } });
     expect(msgs.at(-1).meta.idMessage).toMatch(/^MSG_/);
     expect(msgs.at(-1).meta.dataSource).toMatch(/schedule/);
+    // A reply to a member who just wrote is sent directly — never the shared quiet-hours
+    // "נחזור אליך מחר בבוקר" promise + in-memory queue.
+    expect(mockOut.texts.filter(t => t.to === m.phone).at(-1).opts).toMatchObject({ bypassQuietHours: true });
   });
 
   test('a lead is still handled by Barak, and Tomer never sees it', async () => {
@@ -606,6 +851,7 @@ describe('E. Ownership, opt-out, attribution, Barak', () => {
     const r = await say(phone, 'היי, מתעניינת בפילאטיס מכשירים');
     expect(r.route).toBe('barak');
     expect(cases.list({ phone })).toHaveLength(0);
+    expect(mockOut.texts.filter(t => t.to === phone).map(t => t.text).join('\n')).not.toMatch(/אני תומר/);
   });
 
   test('kill switch TOMER_SERVICE_ENABLED=false restores the previous routing', async () => {

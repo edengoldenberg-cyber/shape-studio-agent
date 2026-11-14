@@ -22,6 +22,7 @@
     <div class="header-status">
       <span class="status-dot"></span>
       <span class="status-label" id="status-label">מתחבר...</span>
+      <button type="button" id="btn-logout" class="btn-logout" hidden>יציאה</button>
     </div>
   </header>
 
@@ -437,10 +438,11 @@
 
           <!-- KPI bar -->
           <div class="tw-kpi-row">
-            <div class="tw-kpi urgent"><span class="tw-kpi-val" id="twk-high">—</span><span class="tw-kpi-lbl">דורש עדן</span></div>
-            <div class="tw-kpi urgent"><span class="tw-kpi-val" id="twk-await">—</span><span class="tw-kpi-lbl">ממתינים למענה</span></div>
-            <div class="tw-kpi"><span class="tw-kpi-val" id="twk-open">—</span><span class="tw-kpi-lbl">משימות פתוחות</span></div>
-            <div class="tw-kpi"><span class="tw-kpi-val" id="twk-failed">—</span><span class="tw-kpi-lbl">שגיאות שליחה</span></div>
+            <div class="tw-kpi urgent"><span class="tw-kpi-val" id="twk-high">—</span><span class="tw-kpi-lbl">פניות דחופות פתוחות</span></div>
+            <div class="tw-kpi urgent"><span class="tw-kpi-val" id="twk-await">—</span><span class="tw-kpi-lbl">פניות שממתינות לצוות</span></div>
+            <div class="tw-kpi"><span class="tw-kpi-val" id="twk-open">—</span><span class="tw-kpi-lbl">פניות בטיפול</span></div>
+            <div class="tw-kpi"><span class="tw-kpi-val" id="twk-member">—</span><span class="tw-kpi-lbl">ממתין לחבר/ה</span></div>
+            <div class="tw-kpi"><span class="tw-kpi-val" id="twk-failed">—</span><span class="tw-kpi-lbl">התראות למנהל שלא אושרו</span></div>
             <div class="tw-kpi"><span class="tw-kpi-val" id="twk-arbox">—</span><span class="tw-kpi-lbl">Arbox</span></div>
           </div>
 
@@ -514,12 +516,32 @@
 
         <!-- ── Service cases pane ─────────────────────────────── -->
         <div class="tw-pane" id="twp-cases" dir="rtl">
-          <div class="tw-filter-row">
-            <button class="filter-btn active" data-cf="1">פתוחות</button>
-            <button class="filter-btn" data-cf="0">סגורות</button>
+          <div class="tw-case-counters" id="tw-case-counters" role="group" aria-label="סינון פניות לפי מצב">
+            <button type="button" class="tw-counter active" data-cf="open" aria-pressed="true"><span class="tw-counter-n" data-count="open">—</span><span class="tw-counter-l">כל הפתוחות</span></button>
+            <button type="button" class="tw-counter" data-cf="awaiting_staff" aria-pressed="false"><span class="tw-counter-n" data-count="awaiting_staff">—</span><span class="tw-counter-l">פתוח — ממתין לצוות</span></button>
+            <button type="button" class="tw-counter" data-cf="in_progress" aria-pressed="false"><span class="tw-counter-n" data-count="in_progress">—</span><span class="tw-counter-l">בטיפול</span></button>
+            <button type="button" class="tw-counter" data-cf="awaiting_member" aria-pressed="false"><span class="tw-counter-n" data-count="awaiting_member">—</span><span class="tw-counter-l">ממתין לחבר/ה</span></button>
+            <button type="button" class="tw-counter" data-cf="resolved" aria-pressed="false"><span class="tw-counter-n" data-count="resolved">—</span><span class="tw-counter-l">נסגרו</span></button>
           </div>
-          <div id="tw-cases-writes" class="tw-cases-writes"></div>
-          <div id="tw-cases-list" class="tw-list"><div class="tw-empty">טוען…</div></div>
+          <div class="tw-cases-bar">
+            <label for="tw-staff-name">השם שלך (נרשם בכל פעולה):</label>
+            <input type="text" id="tw-staff-name" class="field-input" maxlength="40" placeholder="למשל: עדן" autocomplete="off"/>
+          </div>
+          <div id="tw-cases-alert" class="tw-cases-alert" role="status" hidden></div>
+          <div class="tw-cases-writes">ביטול והקפאת מנוי מבוצעים על ידי הצוות ב-Arbox. המערכת רק קוראת מ-Arbox — היא לא משנה מנויים ולא רושמת לשיעורים.</div>
+          <div id="tw-cases-list" class="tw-list"><div class="tw-empty" data-state="loading">טוען פניות…</div></div>
+        </div>
+
+        <!-- ── One service case ───────────────────────────────── -->
+        <div id="tw-case-drawer" class="tw-drawer" dir="rtl" hidden>
+          <div class="tw-drawer-overlay" id="tw-case-overlay"></div>
+          <div class="tw-drawer-panel tw-case-panel" role="dialog" aria-modal="true" aria-labelledby="tw-case-title">
+            <div class="tw-drawer-header">
+              <span id="tw-case-title">פנייה</span>
+              <button type="button" class="tw-drawer-close" id="tw-case-close" aria-label="סגור">✕</button>
+            </div>
+            <div class="tw-drawer-body" id="tw-case-body"></div>
+          </div>
         </div>
 
         <!-- ── Eden Tasks pane ────────────────────────────────── -->

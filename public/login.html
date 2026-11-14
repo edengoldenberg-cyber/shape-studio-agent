@@ -39,7 +39,8 @@
     try {
       const r = await fetch('/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: document.getElementById('pw').value }) });
       const j = await r.json().catch(() => ({}));
-      if (r.ok && j.ok) { location.replace('/'); return; }
+      // Keep the address fragment: a manager's link to a case (#tomer/case/<id>) opens it after login.
+      if (r.ok && j.ok) { location.replace('/' + (/^#[A-Za-z0-9_\/-]*$/.test(location.hash) ? location.hash : '')); return; }
       err.textContent = MSG[j.error] || 'הכניסה נכשלה.';
     } catch { err.textContent = 'אין חיבור לשרת.'; }
     go.disabled = false;

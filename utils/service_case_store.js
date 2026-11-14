@@ -7,30 +7,34 @@
  *
  * {
  *   id, phone, memberUserId, memberName,
- *   category,                 // see CATEGORIES in services/tomer_service.js
+ *   category,                 // see CATEGORY in services/tomer_service.js
  *   summary,                  // one line for staff
- *   status,                   // 'awaiting_member' | 'awaiting_staff' | 'in_progress' | 'resolved' | 'rejected' | 'cancelled'
- *   owner,                    // 'tomer' | 'staff' | <staff name>
+ *   status,                   // 'awaiting_staff' (open, nobody on it) | 'in_progress' | 'awaiting_member' | 'resolved'
+ *                             //   (legacy closed values: 'rejected' | 'cancelled')
+ *   owner,                    // 'tomer' (unassigned) | <staff name>
  *   priority,                 // 'high' | 'normal'
  *   nextAction,               // what has to happen next, in words
- *   context:  [{ at, from: 'member'|'tomer'|'staff'|'system', text }]   (last 30)
- *   events:   [{ at, type, by, detail }]                                 (last 60)
- *   facts,                    // verified Arbox data captured when the case opened (+ source, fetchedAt)
- *   action:   null | {        // linked Arbox action — see services/member_actions.js
- *     id, op, args, state, requiresApproval,
- *     approval: { decision, by, at, note }, attempts: [...], verification: {...}, executor
- *   },
- *   notification: { required, state: 'not_required'|'pending'|'accepted'|'failed', sentTo, idMessage, attempts, lastError, at },
- *   memberNotice: { state, text, at, reason },   // last automatic update sent (or withheld) to the member
- *   resolution: null | { note, by, at },
+ *   context:  [{ at, from: 'member'|'tomer'|'staff'|'system', text, messageId? }]   (last 40)
+ *   events:   [{ at, type, by, detail }]                                             (last 80)
+ *   facts,                    // Arbox data read for this case (+ source, fetchedAt | error)
+ *   request:  null | { type, from, to, userId, membershipUserId }   // what the member asked STAFF to do
+ *   notification: { required, state: 'not_required'|'pending'|'accepted'|'failed'|'uncertain',
+ *                   inFlightSince, sentTo, idMessage, attempts, lastError, at },
+ *                             //   accepted  = the WhatsApp provider accepted the alert (not proof of delivery)
+ *                             //   uncertain = the request left but no answer came back — it may have arrived
+ *   unreadMember,             // the member wrote again since staff last touched the case
+ *   resolution: null | { outcome, note, by, at },                                 // what STAFF reported
+ *   arboxCheck: null | { at, verified: true|false|null, summary, source, error }, // what ARBOX shows (read-only)
  *   createdAt, updatedAt,
  * }
  *
- * Also holds per-member conversation state (what Tomer is waiting for).
+ * Also holds: per-member conversation state (what Tomer is waiting for), the ids of
+ * inbound messages already handled (duplicate suppression across restarts), and
+ * per-member service state (when Tomer last wrote / introduced itself).
  *
  * Persistence: DATA_DIR/service_cases.json, atomic (tmp + rename) after every mutation.
- * A failed write THROWS and the in-memory change is rolled back — a case or an action
- * state is never reported as saved when it is not on disk.
+ * A failed write THROWS and the in-memory change is rolled back — a case or a
+ * notification state is never reported as saved when it is not on disk.
  * The legacy data/service_tasks.json is never modified by this module.
  */
 
@@ -42,17 +46,20 @@ const dataDir = () => (process.env.DATA_DIR ?? path.join(__dirname, '../data')).
 const file    = () => path.join(dataDir(), 'service_cases.json');
 
 const OPEN_STATUSES = new Set(['awaiting_member', 'awaiting_staff', 'in_progress']);
+const SEEN_MAX = 2000;
 
-let _state = null;   // { cases: Map<id, case>, conv: Map<phone, state> }
+let _state = null;   // { cases: Map<id, case>, conv: Map<phone, state>, seen: Map<msgId, iso>, members: Map<phone, {...}> }
 
 function _load() {
   if (_state) return _state;
-  const s = { cases: new Map(), conv: new Map() };
+  const s = { cases: new Map(), conv: new Map(), seen: new Map(), members: new Map() };
   try {
     if (fs.existsSync(file())) {
       const raw = JSON.parse(fs.readFileSync(file(), 'utf8'));
       for (const c of raw.cases ?? []) s.cases.set(c.id, c);
       for (const [phone, v] of Object.entries(raw.conv ?? {})) s.conv.set(phone, v);
+      for (const [id, at] of Object.entries(raw.seen ?? {})) s.seen.set(id, at);
+      for (const [phone, v] of Object.entries(raw.members ?? {})) s.members.set(phone, v);
     }
   } catch (err) {
     // A corrupt file must not be silently replaced by an empty one on the next save.
@@ -68,21 +75,26 @@ function _persist() {
   const s = _load();
   if (!fs.existsSync(dataDir())) fs.mkdirSync(dataDir(), { recursive: true });
   const tmp = file() + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify({ cases: [...s.cases.values()], conv: Object.fromEntries(s.conv), savedAt: new Date().toISOString() }, null, 2), 'utf8');
+  fs.writeFileSync(tmp, JSON.stringify({
+    cases: [...s.cases.values()], conv: Object.fromEntries(s.conv), seen: Object.fromEntries(s.seen),
+    members: Object.fromEntries(s.members), savedAt: new Date().toISOString(),
+  }, null, 2), 'utf8');
   fs.renameSync(tmp, file());
 }
 
 /** Run a mutation; on a failed write restore the previous in-memory state and rethrow. */
 function _mutate(fn) {
   const s = _load();
-  const snapCases = new Map([...s.cases].map(([k, v]) => [k, JSON.parse(JSON.stringify(v))]));
-  const snapConv  = new Map([...s.conv].map(([k, v]) => [k, JSON.parse(JSON.stringify(v))]));
+  const snapCases   = new Map([...s.cases].map(([k, v]) => [k, JSON.parse(JSON.stringify(v))]));
+  const snapConv    = new Map([...s.conv].map(([k, v]) => [k, JSON.parse(JSON.stringify(v))]));
+  const snapSeen    = new Map(s.seen);
+  const snapMembers = new Map([...s.members].map(([k, v]) => [k, { ...v }]));
   try {
     const out = fn(s);
     _persist();
     return out;
   } catch (err) {
-    s.cases = snapCases; s.conv = snapConv;
+    s.cases = snapCases; s.conv = snapConv; s.seen = snapSeen; s.members = snapMembers;
     throw err;
   }
 }
@@ -98,18 +110,19 @@ const clone = v => (v == null ? v : JSON.parse(JSON.stringify(v)));
 
 function create({ phone, memberUserId = null, memberName = null, category, summary, status = 'awaiting_staff',
                   owner = 'tomer', priority = 'normal', nextAction = null, memberText = null, facts = null,
-                  notificationRequired = true, action = null }) {
+                  notificationRequired = true, request = null, memberMessageId = null }) {
   return _mutate(s => {
     const at = nowIso();
     const c = {
       id: _id('case'), phone, memberUserId, memberName, category, summary, status, owner, priority, nextAction,
-      context: memberText ? [{ at, from: 'member', text: String(memberText).slice(0, 1000) }] : [],
+      context: memberText ? [{ at, from: 'member', text: String(memberText).slice(0, 1000), ...(memberMessageId ? { messageId: memberMessageId } : {}) }] : [],
       events:  [{ at, type: 'opened', by: 'tomer', detail: category }],
       facts,
-      action,
-      notification: { required: !!notificationRequired, state: notificationRequired ? 'pending' : 'not_required', sentTo: [], idMessage: null, attempts: 0, lastError: null, at: null },
-      memberNotice: null,
+      request,
+      notification: { required: !!notificationRequired, state: notificationRequired ? 'pending' : 'not_required', inFlightSince: null, sentTo: [], idMessage: null, attempts: 0, lastError: null, at: null },
+      unreadMember: false,
       resolution: null,
+      arboxCheck: null,
       createdAt: at, updatedAt: at,
     };
     s.cases.set(c.id, c);
@@ -130,6 +143,25 @@ function list({ phone, status, category, open, limit = 200 } = {}) {
   return clone(rows.slice(0, limit));
 }
 
+/** Counters for the panel — always computed from the stored cases, never cached. */
+function counts() {
+  const out = { total: 0, open: 0, awaiting_staff: 0, in_progress: 0, awaiting_member: 0, resolved: 0,
+                high: 0, unassigned: 0, unread: 0, notifFailed: 0, notifUncertain: 0, notifPending: 0 };
+  for (const c of _load().cases.values()) {
+    out.total++;
+    if (!OPEN_STATUSES.has(c.status)) { out.resolved++; continue; }
+    out.open++; out[c.status]++;
+    if (c.priority === 'high') out.high++;
+    if (!c.owner || c.owner === 'tomer') out.unassigned++;
+    if (c.unreadMember) out.unread++;
+    const n = c.notification?.state;
+    if (n === 'failed') out.notifFailed++;
+    else if (n === 'uncertain') out.notifUncertain++;
+    else if (n === 'pending') out.notifPending++;
+  }
+  return out;
+}
+
 /** The member's open case in a category (one open case per member + category). */
 function findOpen(phone, category) {
   const hit = [..._load().cases.values()]
@@ -140,17 +172,17 @@ function findOpen(phone, category) {
 
 /**
  * Patch a case and append an event. `patch` may contain any top-level field;
- * `actionPatch` is merged into case.action. Returns the updated case (or null).
+ * `notificationPatch` is merged into case.notification. Returns the updated case (or null).
  */
-function update(id, patch = {}, event = null, { actionPatch = null, contextEntry = null } = {}) {
+function update(id, patch = {}, event = null, { notificationPatch = null, contextEntry = null } = {}) {
   return _mutate(s => {
     const c = s.cases.get(id);
     if (!c) return null;
     Object.assign(c, patch);
-    if (actionPatch) c.action = { ...(c.action ?? {}), ...actionPatch };
+    if (notificationPatch) c.notification = { ...(c.notification ?? {}), ...notificationPatch };
     const at = nowIso();
-    if (contextEntry) c.context = [...(c.context ?? []), { at, ...contextEntry, text: String(contextEntry.text ?? '').slice(0, 1000) }].slice(-30);
-    if (event) c.events = [...(c.events ?? []), { at, ...event }].slice(-60);
+    if (contextEntry) c.context = [...(c.context ?? []), { at, ...contextEntry, text: String(contextEntry.text ?? '').slice(0, 1000) }].slice(-40);
+    if (event) c.events = [...(c.events ?? []), { at, ...event }].slice(-80);
     c.updatedAt = at;
     return clone(c);
   });
@@ -180,7 +212,25 @@ function clearConv(phone) {
   _mutate(s => { s.conv.delete(phone); });
 }
 
+// ── Inbound message ids already handled (survives restart / webhook redelivery) ─
+function hasSeen(messageId) { return !!messageId && _load().seen.has(String(messageId)); }
+function markSeen(messageId) {
+  if (!messageId || hasSeen(messageId)) return;
+  _mutate(s => {
+    s.seen.set(String(messageId), nowIso());
+    while (s.seen.size > SEEN_MAX) s.seen.delete(s.seen.keys().next().value);
+  });
+}
+
+// ── Per-member service state ──────────────────────────────────────────────────
+// { lastTomerAt, introAt }
+function getMember(phone) { return clone(_load().members.get(phone) ?? null); }
+function patchMember(phone, patch) {
+  return _mutate(s => { const v = { ...(s.members.get(phone) ?? {}), ...patch }; s.members.set(phone, v); return clone(v); });
+}
+
 /** Drop in-memory state and re-read the file (tests use this to simulate a restart). */
 function reload() { _state = null; return _load(); }
 
-module.exports = { create, get, list, findOpen, update, isOpen, getConv, setConv, clearConv, reload, newActionId: () => _id('act'), OPEN_STATUSES };
+module.exports = { create, get, list, counts, findOpen, update, isOpen, getConv, setConv, clearConv,
+  hasSeen, markSeen, getMember, patchMember, reload, OPEN_STATUSES };

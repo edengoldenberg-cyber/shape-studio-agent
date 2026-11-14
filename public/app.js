@@ -1,7 +1,32 @@
 // session expired → login: any API call answered 401 sends the browser to the login page.
+// Every state-changing request carries the session's CSRF token (cookie ss_csrf, readable
+// by this site's scripts only); the server rejects cookie-authenticated changes without it.
 (() => {
   const _f = window.fetch.bind(window);
-  window.fetch = async (...a) => { const r = await _f(...a); if (r.status === 401 && !location.pathname.endsWith('/login.html')) location.replace('/login.html'); return r; };
+  const csrf = () => { const m = /(?:^|;\s*)ss_csrf=([^;]+)/.exec(document.cookie); return m ? decodeURIComponent(m[1]) : null; };
+  window.fetch = async (input, init = {}) => {
+    const method = String(init.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase();
+    const url = typeof input === 'string' ? input : (input?.url ?? '');
+    const sameSite = url.startsWith('/') || url.startsWith(location.origin);
+    if (sameSite && !['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+      const t = csrf();
+      if (t) { const h = new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined)); h.set('X-CSRF-Token', t); init = { ...init, headers: h }; }
+    }
+    const r = await _f(input, init);
+    // The address fragment (e.g. #tomer/case/<id>) is kept so the page reopens there after login.
+    if (r.status === 401 && !location.pathname.endsWith('/login.html')) location.replace('/login.html' + location.hash);
+    return r;
+  };
+  window.addEventListener('DOMContentLoaded', async () => {
+    const b = document.getElementById('btn-logout');
+    if (!b) return;
+    try { const st = await (await _f('/auth/status')).json(); b.hidden = !!st.authDisabled; } catch { b.hidden = false; }
+    b.addEventListener('click', async () => {
+      b.disabled = true;
+      try { await _f('/auth/logout', { method: 'POST' }); } catch { /* the cookie is cleared by the server when reachable */ }
+      location.replace('/login.html');
+    });
+  });
 })();
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -3024,6 +3049,7 @@ function renderWaThreadMessages(messages) {
       ? m.agentId === 'barak'  ? '🤖 ברק'
       : m.agentId === 'tomer'  ? '💚 תומר'
       : m.agentId === 'manual' ? '✍️ ידני'
+      : m.agentId === 'staff'  ? '👤 צוות'
       : m.agentId              ? esc(m.agentId) : 'שלחנו'
       : null;
 
@@ -3694,7 +3720,8 @@ initMiniChat('barak-chat-input', 'barak-send', 'barak-chat-msgs', '/api/barak/ch
 
 // Deep link: https://…/#barak opens the Barak tab (used in the manager's callback summary).
 window.addEventListener('load', () => {
-  const h = (location.hash || '').replace('#', '');
+  // "#tomer/case/<id>" → the Tomer tab (public/tomer-panel.js then opens the case).
+  const h = (location.hash || '').replace('#', '').split('/')[0];
   if (!h) return;
   const b = document.querySelector('.tab-btn[data-tab="' + h.replace(/[^a-z0-9_-]/gi, '') + '"]');
   if (b) b.click();
