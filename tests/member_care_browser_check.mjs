@@ -135,14 +135,77 @@ try {
     (await evalJs(`[...document.querySelectorAll('#tc-programs tr[data-program]')].map(r => r.dataset.state).join(',')`)) === Array(9).fill('blocked').join(',')
     && /מדיניות הקשר.*עוד לא אושרה על ידי בעלת הסטודיו/.test(await txt(prog('birthday'))) && (await evalJs(`document.querySelector(${q(act('birthday', 'enable'))}).disabled`)) === true);
   check('the API refuses to enable an unapproved program too', (await api('POST', '/api/tomer/care/programs/birthday', { enabled: true, by: 'בדיקה' })).error === 'program_blocked');
-  // The harness now plays the owner: approves the policy exactly as shown and confirms the hold report (synthetic world).
-  const fp0 = (await overview()).policyApproval.fingerprint;
-  const appr = await api('POST', '/api/tomer/care/settings', { policyApproved: true, policyFingerprint: fp0, approvedBy: 'בעלים (בדיקה)', freezeSourceConfirmed: true, by: 'צוות (בדיקה)' });
-  check('owner approval is recorded with the approver and the approved fingerprint', appr.overview?.policyApproval?.approved === true && appr.overview.policyApproval.by === 'בעלים (בדיקה)' && !!appr.overview.freeze?.sourceConfirmed);
-  await cdp('Page.reload');
-  await until(`document.readyState === 'complete' && document.querySelector('.tab-btn.active')?.dataset.tab === 'tomer'`, 15000);
-  await click('.tw-tab[data-pane="care"]');
-  await until(`document.querySelectorAll('#tc-programs tr[data-program]').length === 9`);
+  // ── owner approval of the contact policy — through the panel controls ───────
+  const R1 = '#tc-absence tr[data-abs="1"]';
+  const setVal = (sel, v) => evalJs(`(() => { const e = document.querySelector(${q(sel)}); e.value = ${q(v)}; e.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+  const approvalText = await txt('#tc-approval-values');
+  check('approval card shows the policy that is being approved (hours, Friday, Saturday, birthday rule, cooldowns, program hours, priority) and that it is NOT approved',
+    (await attr('#tc-approval', 'data-approval')) === 'none' && /לא אושרה — אי אפשר להפעיל אף תוכנית/.test(await txt('#tc-approval'))
+    && /שעות שליחה: 09:00–20:00/.test(approvalText) && /יום שישי: עד 13:00/.test(approvalText) && /שבת: לא נשלח/.test(approvalText) && /יום הולדת שחל בשבת: ברכה ביום שישי/.test(approvalText)
+    && /מרווח בין הודעות יזומות: 72 שעות/.test(approvalText) && /מרווח בין הודעות נוכחות: 6 ימים/.test(approvalText) && /יום הולדת 09:00/.test(approvalText) && /ברוכים הבאים › חיוב חודשי שנכשל › יום הולדת/.test(approvalText), approvalText);
+  await click('#tc-approval [data-care="policy-approve"]');
+  check('approval without ticking the confirmation is refused', !!(await flashed('error', /יש לסמן את תיבת האישור/)) && (await overview()).policyApproval.approved === false);
+  await click('#tc-approve-ok');
+  await click('#tc-approval [data-care="policy-approve"]');
+  check('approval without the approver name is refused', !!(await flashed('error', /שם המאשר/)) && (await overview()).policyApproval.approved === false);
+  await fill('#tc-approver', 'בעלים (בדיקה)');
+  await click('#tc-approve-ok');
+  await click('#tc-approval [data-care="policy-approve"]');
+  check('panel approval is recorded with the approver, the time and the approved values; programs are no longer blocked by it',
+    !!(await flashed('ok', /מדיניות הקשר אושרה/)) && (await until(`document.querySelector('#tc-approval')?.dataset.approval === 'approved'`)) === true
+    && /אושרה על ידי בעלים \(בדיקה\)/.test(await txt('#tc-approval-who'))
+    && await (async () => { const a = (await overview()).settings.policyApproval; return a.by === 'בעלים (בדיקה)' && a.approved.policy.windowEnd === 20 && a.approved.hours.birthday === 9 && a.approved.priority[0] === 'welcome'; })()
+    && (await state('birthday')) === 'off');
+  // changing a value voids it — visibly — and it must be approved again
+  await fill('#tc-p-cooldownHours', '48');
+  await click('#tc-save');
+  check('changing a policy value voids the approval in the panel and blocks every program again',
+    !!(await flashed('ok', /ההגדרות נשמרו/)) && (await until(`document.querySelector('#tc-approval')?.dataset.approval === 'stale'`)) === true
+    && /האישור בוטל — ערך שונה אחרי האישור/.test(await txt('#tc-approval')) && /מרווח בין הודעות יזומות: 48 שעות/.test(await txt('#tc-approval-values')) && (await state('birthday')) === 'blocked');
+  await fill('#tc-p-cooldownHours', '72');
+  await click('#tc-save');
+  await flashed('ok', /ההגדרות נשמרו/);
+  await until(`document.querySelector('#tc-approval')?.dataset.approval === 'approved'`);   // the approved values are back → the approval stands again
+  check('restoring the approved values restores the approval (same fingerprint); revoke and re-approve work', (await overview()).policyApproval.approved === true);
+  await click('#tc-approval [data-care="policy-revoke"]');
+  await flashed('ok', /האישור בוטל/);
+  await until(`document.querySelector('#tc-approval')?.dataset.approval === 'none'`);
+  await fill('#tc-approver', 'בעלים (בדיקה)'); await click('#tc-approve-ok'); await click('#tc-approval [data-care="policy-approve"]');
+  await flashed('ok', /מדיניות הקשר אושרה/);
+  await until(`document.querySelector('#tc-approval')?.dataset.approval === 'approved'`);
+
+  // ── freeze status: evidence, one member's staff review, then the source confirmation ──
+  await click('#tc-absence-load');
+  await until(`!!document.querySelector('#tc-freeze') && !!document.querySelector(${q(R1)})`);
+  check('freeze evidence is shown: the report was read, it is NOT confirmed, and every member is "unknown"',
+    (await attr('#tc-freeze', 'data-freeze-confirmed')) === '0' && /דוח ההקפאות של Arbox: נקרא/.test(await txt('#tc-freeze-evidence')) && /לא בהקפאה 0/.test(await txt('#tc-freeze-evidence'))
+    && /לא אושר/.test(await txt('#tc-freeze')) && (await attr(`${R1} [data-freeze]`, 'data-freeze')) === 'unknown' && /הדוח לא אושר כמקור/.test(await txt(`${R1} .tc-freeze-cell`)), await txt('#tc-freeze'));
+  await click(`${R1} .tc-freeze-form summary`);
+  await setVal(`${R1} .tc-fz-status`, 'not_frozen');
+  await fill(`${R1} .tc-fz-by`, 'עדן (בדיקה)');
+  await click(`${R1} [data-care="freeze-review-save"]`);
+  check('a freeze review without evidence is refused', !!(await flashed('error', /מה נבדק ואיפה/)) && (await overview()).freeze.reviews.length === 0);
+  await until(`!!document.querySelector(${q(R1)})`);
+  await click(`${R1} .tc-freeze-form summary`);
+  await setVal(`${R1} .tc-fz-status`, 'not_frozen');
+  await fill(`${R1} .tc-fz-note`, 'כרטיס החברה ב-Arbox: אין הקפאה פעילה');
+  await fill(`${R1} .tc-fz-by`, 'עדן (בדיקה)');
+  await click(`${R1} [data-care="freeze-review-save"]`);
+  check('a staff review of one member is saved and shown with reviewer, evidence and expiry; only that member becomes "not frozen"',
+    !!(await flashed('ok', /בדיקת ההקפאה נשמרה/)) && (await until(`document.querySelector(${q(R1 + ' [data-freeze]')})?.dataset.freeze === 'not_frozen'`)) === true
+    && await (async () => { const c = await txt(`${R1} .tc-freeze-cell`); return /בדיקת צוות/.test(c) && /נבדק על ידי עדן \(בדיקה\)/.test(c) && /ראיה: כרטיס החברה ב-Arbox: אין הקפאה פעילה/.test(c) && /בתוקף עד/.test(c); })()
+    && (await attr('#tc-absence tr[data-abs="2"] [data-freeze]', 'data-freeze')) === 'unknown' && /לא בהקפאה 1/.test(await txt('#tc-freeze-evidence')));
+  await click(`${R1} [data-care="freeze-review-clear"]`);
+  check('clearing the review returns the member to "unknown"', !!(await flashed('ok', /הבדיקה נוקתה/)) && (await until(`document.querySelector(${q(R1 + ' [data-freeze]')})?.dataset.freeze === 'unknown'`)) === true && (await overview()).freeze.reviews.length === 0);
+  await click('#tc-freeze [data-care="freeze-source-confirm"]');
+  check('confirming the hold report needs the tick and a reviewer name', !!(await flashed('error', /יש לסמן את תיבת האישור/)) && (await overview()).freeze.sourceConfirmed === null);
+  await until(`!!document.querySelector('#tc-freeze-source-ok')`);
+  await click('#tc-freeze-source-ok');
+  await fill('#tc-freeze-source-by', 'צוות (בדיקה)');
+  await click('#tc-freeze [data-care="freeze-source-confirm"]');
+  check('the confirmed source is shown with who confirmed it; members without a hold row are now "not frozen"',
+    !!(await flashed('ok', /דוח ההקפאות אושר/)) && (await until(`document.querySelector('#tc-freeze')?.dataset.freezeConfirmed === '1'`)) === true
+    && /אושר כמקור אמין על ידי צוות \(בדיקה\)/.test(await txt('#tc-freeze')) && (await attr(`${R1} [data-freeze]`, 'data-freeze')) === 'not_frozen' && (await overview()).freeze.sourceConfirmed.by === 'צוות (בדיקה)');
   check('every program starts disabled; welcome and failed-payment are BLOCKED with the missing setting named',
     (await evalJs(`[...document.querySelectorAll('#tc-programs tr[data-program]')].map(r => r.dataset.state).join(',')`)) === 'blocked,blocked,off,off,off,off,off,off,off'
     && /קישור מאושר לקבוצת הוואטסאפ/.test(await txt(prog('welcome'))) && /דרך מאושרת ובטוחה/.test(await txt(prog('payment_failed'))) && /עוד לא אושרה/.test(await txt(prog('payment_failed'))));

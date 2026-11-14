@@ -1045,9 +1045,10 @@ describe('14. Freeze status: unknown is unknown, not "not frozen"', () => {
     await enable('absence7');
     expect((await post('/api/tomer/care/freeze-review', { userId: a.userId, status: 'not_frozen' })).body.error).toBe('reviewer_required');
     expect((await post('/api/tomer/care/freeze-review', { userId: a.userId, status: 'maybe', by: 'עדן' })).body.error).toBe('bad_freeze_status');
+    expect((await post('/api/tomer/care/freeze-review', { userId: a.userId, status: 'not_frozen', by: 'עדן' })).body.error).toBe('evidence_required');
     const ok = await post('/api/tomer/care/freeze-review', { userId: a.userId, status: 'not_frozen', by: 'עדן', note: 'נבדק ב-Arbox' });
     expect(ok.body.review).toMatchObject({ status: 'not_frozen', by: 'עדן', validUntil: addIso(MON, 14) });
-    await post('/api/tomer/care/freeze-review', { userId: b.userId, status: 'frozen', by: 'עדן' });
+    await post('/api/tomer/care/freeze-review', { userId: b.userId, status: 'frozen', by: 'עדן', note: 'הקפאה פעילה בכרטיס החבר/ה' });
     at(MON);
     expect(await reasons('absence7', a)).toMatchObject({ decision: 'send' });
     expect(await reasons('absence7', b)).toMatchObject({ decision: 'block', reasons: expect.arrayContaining(['on_hold']) });
@@ -1057,7 +1058,7 @@ describe('14. Freeze status: unknown is unknown, not "not frozen"', () => {
     expect(arbox.writes()).toHaveLength(0);                                    // a review is never written to Arbox
     // expiry: a member reviewed "not frozen" is unknown again after the review's validity
     const d = cm(); attend(d, addIso(MON, 9));
-    await post('/api/tomer/care/freeze-review', { userId: d.userId, status: 'not_frozen', by: 'עדן' });
+    await post('/api/tomer/care/freeze-review', { userId: d.userId, status: 'not_frozen', by: 'עדן', note: 'נבדק ב-Arbox' });
     at(addIso(MON, 16));
     expect(await reasons('absence7', d)).toMatchObject({ decision: 'block', reasons: expect.arrayContaining(['freeze_unknown']) });
   });

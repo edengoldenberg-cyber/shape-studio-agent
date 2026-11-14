@@ -1501,6 +1501,8 @@ const EP_OUTCOME_HE = { vacation: 'חופשה / היעדרות', injury: 'פצי
 const CARE_ERR_HE = { program_blocked: 'התוכנית חסומה — חסרה הגדרה נדרשת', bad_hour: 'השעה חייבת להיות בתוך שעות השליחה', bad_group_link: 'הקישור חייב להיות קישור הזמנה של וואטסאפ (https://chat.whatsapp.com/…)',
   unsafe_payment_text: 'הנוסח מבקש פרטי כרטיס — אסור', bad_policy: 'ערך לא תקין במדיניות', proactive_locked: 'המתג הראשי כבוי (TOMER_PROACTIVE_ENABLED) — לא נשלח דבר', already_running: 'ריצה אחרת מתבצעת כרגע',
   no_test_phone: 'אין מספר בדיקה פעיל (עקיפת הניתוב כבויה)', policy: 'מדיניות הקשר לא מאפשרת כרגע', bad_phone: 'מספר טלפון לא תקין', reason_required: 'יש לכתוב סיבה', bad_date: 'תאריך לא תקין',
+  approver_required: 'יש לכתוב את שם המאשר/ת', approval_fingerprint_mismatch: 'המדיניות השתנתה מאז שהוצגה — רעננו, בדקו שוב את הערכים ואשרו מחדש', approval_not_confirmed: 'יש לסמן את תיבת האישור',
+  reviewer_required: 'יש לכתוב את שם הבודק/ת', evidence_required: 'יש לכתוב מה נבדק ואיפה (ראיה / סיבה)', bad_freeze_status: 'יש לבחור סטטוס הקפאה', user_required: 'חסר מזהה חבר/ה',
   none_remaining: 'לא נותרו אימוני אורח', already_redeemed: 'כבר מומש', not_reserved: 'האימון אינו שמור', no_entitlement: 'אין זכאות', not_uncertain: 'ההודעה אינה במצב שדורש החלטה', network: 'אין חיבור לשרת', operation_failed: 'הפעולה נכשלה בשרת' };
 const SRC_HE = { users: 'חברים', memberships: 'מנויים', types: 'סוגי מנוי', attendance: 'נוכחות (30 יום)', futureBookings: 'רישומים עתידיים', cancellations: 'ביטולי רישום', holds: 'הקפאות', transactions: 'עסקאות / חיובים' };
 let _care = null, _epFilter = 'upcoming';
@@ -1545,8 +1547,64 @@ function renderCareSettings(o) {
     + '<label class="tc-num">יום הולדת בשבת<select id="tc-p-birthdaySaturday" class="field-input"><option value="friday"' + (p.birthdaySaturday === 'friday' ? ' selected' : '') + '>ברכה ביום שישי</option><option value="sunday"' + (p.birthdaySaturday === 'sunday' ? ' selected' : '') + '>ברכה ביום ראשון</option></select></label>'
     + '</div><div class="tw-case-meta">אין שליחה בשבת. סיכום יומי למנהל: כבוי (לא קיים עד אישור).</div>'
     + '<button type="button" class="btn btn-primary" id="tc-save" style="margin-top:10px">שמור הגדרות</button>'
+    + renderCareApproval(o)
     + '<div class="tw-ds-title" style="margin-top:16px">החלטות מדיניות שחסרות לאימוני האורח</div><ul class="tc-missing">' + o.missingPolicy.map(x => '<li>' + esc(x) + '</li>').join('') + '</ul>'
     + '<div class="tw-case-meta">עד שיוחלט — תומר רק רושם בקשה לצוות, ולא מבטיח תוקף, שיעור או רישום.</div>';
+}
+
+/** Owner approval of the contact policy: shows the SAVED values that are being approved, who approved, and when. */
+function renderCareApproval(o) {
+  const a = o.policyApproval, s = o.settings, p = s.policy;
+  const state = a.approved ? 'approved' : a.stale ? 'stale' : 'none';
+  const chip = state === 'approved' ? '<span class="tw-chip tw-chip-info">אושרה</span>' : state === 'stale' ? '<span class="tw-chip tw-chip-bad">האישור בוטל — ערך שונה אחרי האישור</span>' : '<span class="tw-chip tw-chip-warn">לא אושרה — אי אפשר להפעיל אף תוכנית</span>';
+  const li = (k, label, value) => '<li data-approve-item="' + k + '">' + label + ': <strong>' + esc(value) + '</strong></li>';
+  const hh = n => String(n).padStart(2, '0') + ':00';
+  const items = li('window', 'שעות שליחה', hh(p.windowStart) + '–' + hh(p.windowEnd)) + li('friday', 'יום שישי', 'עד ' + hh(p.fridayEnd)) + li('saturday', 'שבת', p.saturday ? 'נשלח' : 'לא נשלח')
+    + li('birthdaySaturday', 'יום הולדת שחל בשבת', p.birthdaySaturday === 'sunday' ? 'ברכה ביום ראשון' : 'ברכה ביום שישי')
+    + li('cooldown', 'מרווח בין הודעות יזומות', p.cooldownHours + ' שעות') + li('attendanceCooldown', 'מרווח בין הודעות נוכחות', p.attendanceCooldownDays + ' ימים')
+    + li('recentConversation', 'לא כותבים אחרי שיחה', p.recentConversationHours + ' שעות') + li('replyWindow', 'תגובה משויכת אוטומטית להודעה עד', p.replyWindowDays + ' ימים')
+    + li('defaultPause', 'השהיה כשאין תאריך חזרה', p.defaultPauseDays + ' ימים') + li('paymentGrace', 'המתנה אחרי חיוב שנכשל', p.paymentGraceHours + ' שעות')
+    + li('hours', 'שעת הריצה של כל תוכנית', o.programs.map(x => x.label + ' ' + hh(x.hour)).join(' · '))
+    + li('priority', 'סדר עדיפויות (הודעה אחת לחבר/ה בריצה)', o.programs.map(x => x.label).join(' › '));
+  return '<div class="tw-ds-title" style="margin-top:16px">אישור מדיניות הקשר על ידי בעלת הסטודיו</div>'
+    + '<div id="tc-approval" data-approval="' + state + '" data-fingerprint="' + esc(a.fingerprint) + '">' + chip
+    + (a.by ? '<div class="tw-case-meta" id="tc-approval-who">' + (a.approved ? 'אושרה' : 'אישור קודם') + ' על ידי ' + esc(a.by) + ' · ' + esc(fmtDate(a.at)) + '</div>' : '')
+    + '<div class="tw-case-meta">אלה הערכים השמורים שעליהם חל האישור (מזהה גרסה <span dir="ltr">' + esc(a.fingerprint) + '</span>). שינוי של ערך כלשהו — כולל שעת ריצה של תוכנית — מבטל את האישור ומכבה את התוכניות. ערך ששונה בטופס ולא נשמר אינו חלק מהאישור.</div>'
+    + '<ul class="tc-approval-values" id="tc-approval-values" style="margin:6px 18px 10px;padding:0;line-height:1.7">' + items + '</ul>'
+    + (a.approved
+      ? '<button type="button" class="btn btn-secondary" data-care="policy-revoke">בטל את האישור</button>'
+      : '<div class="tc-pause-form"><input type="text" id="tc-approver" class="field-input" placeholder="שם המאשר/ת (בעלת הסטודיו)" aria-label="שם המאשר/ת">'
+        + '<label class="tw-cd-check-label"><input type="checkbox" id="tc-approve-ok"> אני בעל/ת הסטודיו ומאשר/ת את מדיניות הקשר בדיוק כפי שהיא מוצגת כאן</label>'
+        + '<button type="button" class="btn btn-primary" data-care="policy-approve">אשר מדיניות</button></div>')
+    + '</div>';
+}
+
+/** Freeze status: the evidence the hold report gives, the source confirmation, and the reviews of single members. */
+function renderFreezeEvidence(f) {
+  const c = f.sourceConfirmedBy;
+  return '<div id="tc-freeze" data-freeze-known="' + (f.known ? '1' : '0') + '" data-freeze-confirmed="' + (c ? '1' : '0') + '"><div class="tw-ds-title">סטטוס הקפאה — מקור וראיות</div>'
+    + '<div class="tw-case-meta" id="tc-freeze-evidence">דוח ההקפאות של Arbox: ' + (f.reportRead ? 'נקרא · ' + f.reportRows + ' שורות בחלון (אתמול עד 29 יום קדימה)' : '<strong>לא נקרא</strong>')
+    + ' · חברים פעילים: בהקפאה ' + f.frozen + ' · לא בהקפאה ' + f.notFrozen + ' · <strong>לא ידוע ' + f.unknown + '</strong></div>'
+    + '<div class="tw-case-meta">' + (c ? 'הדוח אושר כמקור אמין על ידי ' + esc(c.by) + ' · ' + esc(fmtDate(c.at)) + '. חבר/ה בלי שורה בדוח נחשב/ת "לא בהקפאה".'
+      : 'הדוח <strong>לא אושר</strong> כמקור אמין: חבר/ה בלי שורה בדוח נחשב/ת "לא ידוע", והודעות נוכחות וליווי חסומות עבורו/ה — אלא אם נרשמה בדיקת צוות לחבר/ה (תקפה ' + f.reviewDays + ' ימים).') + '</div>'
+    + (c ? '<button type="button" class="btn btn-secondary" data-care="freeze-source-revoke">בטל את אישור המקור</button>'
+      : '<div class="tc-pause-form"><input type="text" id="tc-freeze-source-by" class="field-input" placeholder="שם הבודק/ת" aria-label="שם הבודק/ת">'
+        + '<label class="tw-cd-check-label"><input type="checkbox" id="tc-freeze-source-ok"> השוויתי את הדוח למסך ההקפאות ב-Arbox: מי שבהקפאה מופיע בו, ומי שלא — לא</label>'
+        + '<button type="button" class="btn btn-secondary" data-care="freeze-source-confirm">אשר את הדוח כמקור אמין</button></div>')
+    + '</div>';
+}
+function freezeCell(r) {
+  const FZ = { frozen: 'בהקפאה', not_frozen: 'לא בהקפאה', unknown: 'לא ידוע' };
+  const SRC = { staff_review: 'בדיקת צוות', hold_report: 'דוח ההקפאות', hold_report_unconfirmed: 'הדוח לא אושר כמקור', hold_report_unavailable: 'הדוח לא נקרא' };
+  const rv = r.freezeReview;
+  return '<span class="tw-chip ' + (r.freeze === 'unknown' ? 'tw-chip-warn' : r.freeze === 'frozen' ? 'tw-chip-bad' : '') + '" data-freeze="' + esc(r.freeze) + '">' + FZ[r.freeze] + '</span>'
+    + '<div class="tw-case-meta">' + esc(SRC[r.freezeSource] || r.freezeSource || '') + '</div>'
+    + (rv ? '<div class="tw-case-meta" data-freeze-review="' + esc(rv.status) + '">נבדק על ידי ' + esc(rv.by) + ' · ' + esc(fmtDate(rv.at)) + ' · בתוקף עד ' + esc(dmyHe(rv.validUntil)) + '<br>ראיה: ' + esc(rv.note || '') + ' <button type="button" class="btn-xs btn-xs-sec" data-care="freeze-review-clear">נקה בדיקה</button></div>' : '')
+    + '<details class="tc-freeze-form"><summary>בדיקת צוות</summary>'
+    + '<select class="field-input tc-fz-status" aria-label="סטטוס הקפאה"><option value="">בחרו…</option><option value="not_frozen">לא בהקפאה</option><option value="frozen">בהקפאה</option></select>'
+    + '<input type="text" class="field-input tc-fz-note" placeholder="מה נבדק ואיפה (למשל: כרטיס החבר/ה ב-Arbox, אין הקפאה פעילה)" aria-label="ראיה / סיבה">'
+    + '<input type="text" class="field-input tc-fz-by" placeholder="שם הבודק/ת" aria-label="שם הבודק/ת">'
+    + '<button type="button" class="btn-xs" data-care="freeze-review-save">שמור בדיקה</button></details>';
 }
 
 function renderCarePauses(o) {
@@ -1629,7 +1687,25 @@ async function careAct(act, btn) {
   let r, okText = 'נשמר';
   if (act === 'reload') return loadCare();
   btn.disabled = true;
-  if (act === 'enable' || act === 'disable') { r = await post('/api/tomer/care/programs/' + id, { enabled: act === 'enable' }); okText = act === 'enable' ? 'התוכנית הופעלה — תפעל רק על אירועים מעכשיו' : 'התוכנית כובתה'; }
+  if (act === 'policy-approve') {
+    if (!$id('tc-approve-ok').checked) r = { ok: false, error: 'approval_not_confirmed' };
+    else r = await caseApi('/api/tomer/care/settings', { method: 'POST', body: { policyApproved: true, policyFingerprint: $id('tc-approval').dataset.fingerprint, approvedBy: $id('tc-approver').value, by: careBy() } });
+    okText = 'מדיניות הקשר אושרה';
+  }
+  else if (act === 'policy-revoke') { r = await post('/api/tomer/care/settings', { policyApproved: false }); okText = 'האישור בוטל — התוכניות חסומות וכבויות'; }
+  else if (act === 'freeze-source-confirm') {
+    if (!$id('tc-freeze-source-ok').checked) r = { ok: false, error: 'approval_not_confirmed' };
+    else r = await caseApi('/api/tomer/care/settings', { method: 'POST', body: { freezeSourceConfirmed: true, by: $id('tc-freeze-source-by').value } });
+    okText = 'דוח ההקפאות אושר כמקור אמין';
+  }
+  else if (act === 'freeze-source-revoke') { r = await post('/api/tomer/care/settings', { freezeSourceConfirmed: false }); okText = 'אישור המקור בוטל'; }
+  else if (act === 'freeze-review-save') {
+    const tr = btn.closest('[data-abs]');
+    r = await caseApi('/api/tomer/care/freeze-review', { method: 'POST', body: { userId: tr.dataset.abs, status: tr.querySelector('.tc-fz-status').value || 'none', note: tr.querySelector('.tc-fz-note').value, by: tr.querySelector('.tc-fz-by').value } });
+    okText = 'בדיקת ההקפאה נשמרה';
+  }
+  else if (act === 'freeze-review-clear') { r = await post('/api/tomer/care/freeze-review', { userId: btn.closest('[data-abs]').dataset.abs, status: 'clear' }); okText = 'הבדיקה נוקתה — הסטטוס חוזר למקור'; }
+  else if (act === 'enable' || act === 'disable') { r = await post('/api/tomer/care/programs/' + id, { enabled: act === 'enable' }); okText = act === 'enable' ? 'התוכנית הופעלה — תפעל רק על אירועים מעכשיו' : 'התוכנית כובתה'; }
   else if (act === 'hour') { r = await post('/api/tomer/care/programs/' + id, { hour: Number(row.querySelector('.tc-hour').value) }); okText = 'שעת הריצה נשמרה'; }
   else if (act === 'preview') {
     const card = $id('tc-preview-card'); card.hidden = false; $id('tc-preview-title').textContent = 'תצוגה מקדימה'; $id('tc-preview').innerHTML = '<div class="tw-empty" data-state="loading">קורא נתונים מ-Arbox…</div>';
@@ -1653,6 +1729,7 @@ async function careAct(act, btn) {
   if (!r) return;
   careFlash(r.ok ? okText : careErr(r) + (r.blocks ? ': ' + r.blocks.map(b => b.text).join(' · ') : '') + (r.reasons ? ': ' + r.reasons.map(x => x.text).join(' · ') : ''), r.ok);
   await loadCare();
+  if (act.startsWith('freeze-')) await loadAbsenceReport();
 }
 
 async function saveCareSettings(btn) {
@@ -1672,10 +1749,10 @@ async function loadAbsenceReport() {
   if (!d.ok) { el.innerHTML = '<div class="tw-state-error" data-state="error">לא ניתן להפיק את הדוח — ' + (d.error === 'arbox_unavailable' ? 'Arbox לא זמין' : esc(careErr(d))) + '</div>'; return; }
   const attOk = d.sources.attendance && d.sources.attendance.ok;
   const rows = d.rows.filter(r => r.daysAbsent === null || r.daysAbsent >= 5);
-  el.innerHTML = (attOk ? '' : '<div class="tw-state-error" data-absence="unknown">נתוני הנוכחות לא נקראו מ-Arbox — משך ההיעדרות אינו ידוע (לא מוצג כהיעדרות).</div>')
+  el.innerHTML = (d.freeze ? renderFreezeEvidence(d.freeze) : '') + (attOk ? '' : '<div class="tw-state-error" data-absence="unknown">נתוני הנוכחות לא נקראו מ-Arbox — משך ההיעדרות אינו ידוע (לא מוצג כהיעדרות).</div>')
     + '<div class="tw-case-meta">מוצגים חברים פעילים עם 5+ ימים ללא כניסה מאומתת, או שנוכחותם אינה ידועה · ' + rows.length + ' מתוך ' + d.rows.length + '</div>'
-    + (rows.length ? '<div class="table-wrapper"><table class="leads-table"><thead><tr><th>חבר/ה</th><th>מנוי</th><th>כניסה מאומתת אחרונה</th><th>ימים</th><th>רישום עתידי</th><th>פנייה אחרונה</th><th>תגובה</th><th>אחראי/ת</th><th>הצעד הבא</th></tr></thead><tbody>'
-      + rows.map(r => '<tr data-abs="' + esc(r.userId) + '"><td>' + esc(r.name || r.userId) + '</td><td>' + esc(r.membership) + '</td><td>' + (r.lastAttendance ? esc(dmyHe(r.lastAttendance)) : r.neverAttended ? 'טרם הגיע/ה' : 'לא ידוע (30+ יום או אין נתון)') + '</td>'
+    + (rows.length ? '<div class="table-wrapper"><table class="leads-table"><thead><tr><th>חבר/ה</th><th>מנוי</th><th>הקפאה</th><th>כניסה מאומתת אחרונה</th><th>ימים</th><th>רישום עתידי</th><th>פנייה אחרונה</th><th>תגובה</th><th>אחראי/ת</th><th>הצעד הבא</th></tr></thead><tbody>'
+      + rows.map(r => '<tr data-abs="' + esc(r.userId) + '"><td>' + esc(r.name || r.userId) + '</td><td>' + esc(r.membership) + '</td><td class="tc-freeze-cell">' + freezeCell(r) + '</td><td>' + (r.lastAttendance ? esc(dmyHe(r.lastAttendance)) : r.neverAttended ? 'טרם הגיע/ה' : 'לא ידוע (30+ יום או אין נתון)') + '</td>'
         + '<td data-days="' + esc(r.daysAbsent === null ? 'unknown' : r.daysAbsent) + '">' + (r.daysAbsent === null ? '—' : r.daysAbsent) + '</td><td>' + (r.futureBooking ? esc(dmyHe(r.futureBooking.date)) + ' ' + esc(r.futureBooking.time) : '—') + '</td>'
         + '<td>' + (r.lastOutreach ? esc(r.lastOutreach.label) + '<div class="tw-case-meta">' + esc(fmtDate(r.lastOutreach.at)) + '</div>' : '—') + '</td><td>' + esc(r.response ? (EP_OUTCOME_HE[r.response] || r.response) : '—') + '</td><td>' + esc(r.owner) + '</td>'
         + '<td>' + esc(r.nextAction) + (r.caseId ? ' <button type="button" class="btn-xs" onclick="openTomerCase(\'' + esc(r.caseId) + '\')">פנייה</button>' : '') + '</td></tr>').join('') + '</tbody></table></div>'

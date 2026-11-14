@@ -581,13 +581,16 @@ function createMemberCare(deps) {
       else if (m.daysAbsent >= 7) next = 'בדיקת 7 ימים';
       return {
         userId: m.userId, name: m.name, phone: m.phone, membership: m.freeze === 'frozen' ? 'בהקפאה' : m.freeze === 'unknown' ? 'פעיל (הקפאה לא אומתה)' : 'פעיל', freeze: m.freeze, freezeSource: m.freezeSource,
+        freezeReview: store.getFreezeReview(m.userId, snap.today),
         lastAttendance: attOk ? m.lastAttendance : null, daysAbsent: attOk ? m.daysAbsent : null, attendanceKnown: attOk && (m.lastAttendance !== null || m.neverAttended),
         neverAttended: m.neverAttended, futureBooking: m.future[0] ?? null,
         lastOutreach: last ? { program: last.program, label: PROGRAMS[last.program].label, at: last.send.at, status: last.status } : null,
         response: last?.conversation?.outcome ?? null, owner: openCase?.owner && openCase.owner !== 'tomer' ? openCase.owner : owner === 'human' ? 'צוות' : 'תומר', caseId: openCase?.id ?? null, nextAction: next,
       };
     }).sort((a, b) => (b.daysAbsent ?? 999) - (a.daysAbsent ?? 999));
-    return { ok: true, today: snap.today, sources: snap.src, rows };
+    const fz = s => rows.filter(r => r.freeze === s).length;
+    return { ok: true, today: snap.today, sources: snap.src, rows,
+      freeze: { ...snap.freeze, sourceConfirmedBy: store.getSettings().freezeSourceConfirmed ?? null, frozen: fz('frozen'), notFrozen: fz('not_frozen'), unknown: fz('unknown'), reviewDays: FREEZE_REVIEW_DAYS } };
   }
 
   async function visibility() {
@@ -668,11 +671,16 @@ function createMemberCare(deps) {
     if (!name) return { ok: false, error: 'approver_required' };
     const cur = policyFingerprint(store.getSettings());
     if (fingerprint !== cur) return { ok: false, error: 'approval_fingerprint_mismatch', fingerprint: cur };
-    return { ok: true, settings: store.updateSettings({ policyApproval: { by: name, at: now().toISOString(), fingerprint: cur } }, name) };
+    const s = store.getSettings();
+    // The approved values are kept with the approval, so what was approved can always be shown.
+    const approvedValues = { policy: s.policy, hours: Object.fromEntries(PRIORITY.map(id => [id, s.programs[id].hour])), priority: PRIORITY };
+    audit({ event: 'care_policy_approved', tomerAction: `contact policy approved by ${name} (${cur})` });
+    return { ok: true, settings: store.updateSettings({ policyApproval: { by: name, at: now().toISOString(), fingerprint: cur, approved: approvedValues } }, name) };
   }
   function confirmFreezeSource({ confirmed, by } = {}) {
     const name = String(by ?? '').trim();
     if (confirmed === true && !name) return { ok: false, error: 'reviewer_required' };
+    audit({ event: 'care_freeze_source', tomerAction: confirmed === true ? `hold report confirmed as reliable by ${name}` : `hold report confirmation removed by ${name || 'staff'}` });
     return { ok: true, settings: store.updateSettings({ freezeSourceConfirmed: confirmed === true ? { by: name, at: now().toISOString() } : null }, name || 'staff') };
   }
   /** Staff looked at this member in Arbox and state the freeze status. Valid FREEZE_REVIEW_DAYS, then unknown again. */
@@ -682,7 +690,10 @@ function createMemberCare(deps) {
     if (status === null || status === 'clear') { store.clearFreezeReview(userId); return { ok: true, review: null }; }
     if (!['not_frozen', 'frozen'].includes(status)) return { ok: false, error: 'bad_freeze_status' };
     if (!name) return { ok: false, error: 'reviewer_required' };
-    return { ok: true, review: store.setFreezeReview(userId, { status, by: name, validUntil: addD(ilDateString(now()), FREEZE_REVIEW_DAYS), note: note ? String(note).slice(0, 200) : null }) };
+    const evidence = String(note ?? '').trim().slice(0, 200);
+    if (evidence.length < 3) return { ok: false, error: 'evidence_required' };   // what was checked, and where
+    audit({ event: 'care_freeze_review', tomerAction: `freeze status of member ${userId} reviewed by ${name}: ${status}` });
+    return { ok: true, review: store.setFreezeReview(userId, { status, by: name, validUntil: addD(ilDateString(now()), FREEZE_REVIEW_DAYS), note: evidence }) };
   }
 
   const replies = require('./member_care_replies')({ store, gateway, cases, logger, now, PROGRAMS, addD, diffD, dmy, wday });
