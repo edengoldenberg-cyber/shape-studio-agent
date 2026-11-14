@@ -78,7 +78,12 @@ const WORKFLOW_DEFAULTS = {
 const _config = { ...WORKFLOW_DEFAULTS };
 
 function getConfig()          { return { ..._config }; }
-function enableWorkflow(id)   { if (_config[id]) { _config[id].enabled = true;  logger.info('[retention] enabled', { id }); } }
+// Proactive programs run only when explicitly unlocked (TOMER_MODE=all + TOMER_PROACTIVE_ENABLED=true).
+const _proactive = () => require('../services/tomer_test_mode').proactiveEnabled();
+function enableWorkflow(id)   {
+  if (!_proactive()) { logger.warn('[retention] enable refused — proactive programs are locked', { id }); return; }
+  if (_config[id]) { _config[id].enabled = true;  logger.info('[retention] enabled', { id }); }
+}
 function disableWorkflow(id)  { if (_config[id]) { _config[id].enabled = false; logger.info('[retention] disabled', { id }); } }
 function setWorkflowConfig(id, updates) {
   if (_config[id]) Object.assign(_config[id], updates);
@@ -390,6 +395,7 @@ async function _runFeedback(members, log, result) {
 
 /** Run a single workflow by ID. */
 async function runWorkflow(workflowId) {
+  if (!_proactive()) return { workflow: workflowId, skipped: 0, sent: 0, errors: 0, reason: 'proactive_locked' };
   if (isQuietHours()) {
     logger.info('[retention] Quiet hours — skipping', { workflow: workflowId });
     return { skipped: 0, sent: 0, errors: 0, reason: 'quiet_hours' };
@@ -419,6 +425,7 @@ async function runWorkflow(workflowId) {
 
 /** Run all enabled workflows. */
 async function runAllWorkflows() {
+  if (!_proactive()) return { totalSent: 0, totalSkipped: 0, totalErrors: 0, reason: 'proactive_locked' };
   if (isQuietHours()) {
     logger.info('[retention] Quiet hours — all workflows skipped');
     return { totalSent: 0, totalSkipped: 0, totalErrors: 0, reason: 'quiet_hours' };

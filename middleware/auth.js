@@ -55,7 +55,10 @@ function isPublic(req) {
   return PUBLIC_RE.some(r => r.test(p));
 }
 
-const isDisabled = () => process.env.AUTH_DISABLED === 'true' && process.env.NODE_ENV !== 'production';
+// "Production" = NODE_ENV=production OR running on the hosting platform at all (the
+// deployed service runs with NODE_ENV=development, so NODE_ENV alone cannot be trusted).
+const isProd     = () => process.env.NODE_ENV === 'production' || !!process.env.RAILWAY_ENVIRONMENT_NAME || !!process.env.RAILWAY_PROJECT_ID;
+const isDisabled = () => process.env.AUTH_DISABLED === 'true' && !isProd();
 const password   = () => process.env.DASHBOARD_PASSWORD || null;
 const secret     = () => process.env.SESSION_SECRET || crypto.createHash('sha256').update('shape-session:' + (password() ?? '')).digest('hex');
 
@@ -172,7 +175,7 @@ function recordFail(key, now = Date.now()) {
 const failDelayMs = () => (process.env.NODE_ENV === 'test' ? 0 : _recent.length > 20 ? 1500 : 400);
 
 function cookieHeader(name, value, maxAgeSec, { httpOnly = true, sameSite = 'Lax' } = {}) {
-  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+  const secure = isProd() ? '; Secure' : '';
   return `${name}=${encodeURIComponent(value)}; Path=/; ${httpOnly ? 'HttpOnly; ' : ''}SameSite=${sameSite}; Max-Age=${maxAgeSec}${secure}`;
 }
 

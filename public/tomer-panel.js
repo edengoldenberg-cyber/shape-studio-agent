@@ -1165,7 +1165,7 @@ const EVENT_HE = {
 };
 const CASE_ERR_HE = {
   not_found: 'הפנייה לא נמצאה', case_closed: 'הפנייה סגורה — יש לפתוח אותה מחדש', owner_required: 'יש לכתוב שם', bad_status: 'סטטוס לא חוקי',
-  text_required: 'יש לכתוב הודעה', member_opted_out: 'החבר/ה ביקש/ה לא לקבל הודעות — לא נשלח', send_failed: 'ההודעה לא נשלחה',
+  text_required: 'יש לכתוב הודעה', recipient_not_allowed: 'המספר הזה לא מורשה במצב הבדיקה — לא נשלח', member_opted_out: 'החבר/ה ביקש/ה לא לקבל הודעות — לא נשלח', send_failed: 'ההודעה לא נשלחה',
   send_uncertain: 'לא ברור אם ההודעה נשלחה — בדקו בוואטסאפ לפני שליחה חוזרת', note_required: 'יש לכתוב הערת סיכום', outcome_required: 'יש לבחור מה נעשה',
   not_required: 'לפנייה הזו לא נדרשת התראה', uncertain_needs_confirm: 'ייתכן שההתראה כבר הגיעה — נדרש אישור לשליחה חוזרת', notification_in_flight: 'התראה נשלחת כרגע',
   notify_failed: 'ההתראה למנהל נכשלה שוב', notify_uncertain: 'לא ודאי אם ההתראה נשלחה', operation_failed: 'הפעולה נכשלה בשרת', csrf_token_invalid: 'פג תוקף החיבור — רעננו את הדף',
@@ -1242,6 +1242,7 @@ async function loadCases() {
     const nf = (d.counts.notifFailed || 0) + (d.counts.notifUncertain || 0) + (d.counts.notifPending || 0);
     if (nf) msgs.push('ב-' + nf + ' פניות פתוחות ההתראה למנהל לא אושרה כנשלחה — הן מסומנות ברשימה.');
     if (!d.managerConfigured) msgs.push('לא הוגדר מספר מנהל להתראות (TOMER_MANAGER_PHONE או בעל/ת הסטודיו ברשימת הצוות) — התראות לא יישלחו.');
+    if (d.testMode && d.testMode.mode === 'test_only') msgs.push('מצב בדיקה: תומר החדש פעיל רק עבור ' + (d.testMode.allowlist.length ? d.testMode.allowlist.join(', ') : 'אף מספר') + '. חברים אחרים לא מטופלים על ידו ולא מקבלים ממנו הודעות. תוכניות יזומות נעולות.');
     if (!d.serviceEnabled) msgs.push('שירות תומר כבוי (TOMER_SERVICE_ENABLED=false) — הודעות חברים לא נפתחות כפניות.');
     else if (!d.autoReply) msgs.push('מענה אוטומטי בוואטסאפ כבוי — תומר רושם פניות אך לא שולח תשובות לחברים.');
     alertEl.hidden = !msgs.length;

@@ -75,6 +75,14 @@ describe('fail closed and the public list', () => {
     expect((await request(app).get('/api/tomer/cases')).status).toBe(401);
     process.env.NODE_ENV = 'test';
     expect((await request(app).get('/api/tomer/cases')).status).toBe(200);
+    // The deployed service runs with NODE_ENV=development: the hosting platform's own
+    // variables mark it as production too.
+    process.env.NODE_ENV = 'development'; process.env.RAILWAY_ENVIRONMENT_NAME = 'production';
+    try {
+      expect((await request(app).get('/api/tomer/cases')).status).toBe(401);
+      const lg = await request(app).post('/auth/login').send({ password: PASSWORD });
+      expect(lg.headers['set-cookie'].join('|')).toMatch(/; Secure/);
+    } finally { delete process.env.RAILWAY_ENVIRONMENT_NAME; process.env.NODE_ENV = 'test'; }
   });
 });
 

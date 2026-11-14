@@ -56,6 +56,7 @@ const appointmentWorker                = require('./workers/appointment_worker')
 const tomerStore                       = require('./utils/tomer_store');
 const arboxGateway                     = require('./services/arbox_gateway');
 const serviceCases                     = require('./utils/service_case_store');
+const tomerTest                        = require('./services/tomer_test_mode');
 const { createTomerService }           = require('./services/tomer_service');
 const retentionWorker                  = require('./workers/retention_worker');
 const studioAssets                     = require('./utils/studio_assets');
@@ -640,6 +641,7 @@ const CODE_FEATURES = [
   'dashboard_auth_v1',    // middleware/auth.js — dashboard and API require a session; fails closed
   'dashboard_auth_v2',    // revocable sessions (logout), CSRF token on state changes, login throttling
   'tomer_panel_v2',       // staff-handled membership requests, one manager alert, complete cases panel
+  'tomer_test_only_v1',   // services/tomer_test_mode.js — new flow only for allowlisted phones unless TOMER_MODE=all
   'strict_callback_time', // utils/callback_time.js — no default hour, no AI date guessing
   'apt_persist_strict',   // appointment_store update/updateBatch throw + roll back on failed write
   'staff_confirm_lifecycle', // confirm / outcome endpoints enforce transitions
@@ -653,6 +655,7 @@ app.get('/api/version', (_req, res) => {
     serviceId:       process.env.RAILWAY_SERVICE_ID    ?? 'unknown',
     startedAt:       process.env._SERVER_START_TS      ?? 'unknown',
     codeFeatures:    CODE_FEATURES,
+    tomerMode:       tomerTest.mode(),       // 'test_only' unless TOMER_MODE=all (details: GET /api/tomer/test-mode, authenticated)
     activeWebhooks: {
       greenApi: !!process.env.GREEN_API_ID_INSTANCE || !!process.env.GREEN_API_INSTANCE_ID,
       metaCloud: !!process.env.WHATSAPP_ACCESS_TOKEN,
@@ -1967,6 +1970,7 @@ app.post('/api/leads/:phone/takeover', jsonBody, (req, res) => {
  * keeps the status recorded by the first one, so release still restores the right state.
  */
 function _manualTakeover(norm, { reason = 'manual', staffName = null } = {}) {
+  if (tomerTest.routeOverride(norm)) return _testTakeover(norm, { by: staffName ?? 'staff', reason });
   const existing = store.getLead(norm) ?? {};
   if (existing.status === 'human_owns') {
     return { prevStatus: existing.meta?.previousStatus ?? null, unchanged: true };
@@ -1997,6 +2001,13 @@ function _isKnownMemberPhone(norm) {
 
 /** Release human ownership. Idempotent; returns null when there is no record. */
 function _releaseConversation(norm) {
+  if (tomerTest.routeOverride(norm)) {
+    if (!serviceCases.getMember(norm)?.humanOwned) return { status: 'tomer_test', automationResumed: false, unchanged: true };
+    serviceCases.patchMember(norm, { humanOwned: null });
+    logger.info('[tomer-test] test conversation released — Tomer answers again', { phone: norm });
+    broadcastSse('lead_updated', { phone: norm, status: 'tomer_test' });
+    return { status: 'tomer_test', automationResumed: true };
+  }
   if (!store.getLead(norm)) return null;
   const result = ownership.releaseOwnership(store, norm, { isMember: _isKnownMemberPhone });
   if (!result || result.unchanged) return result;
@@ -2771,6 +2782,11 @@ function _applyAttributionReview(norm, idMessage, msgText, prevStatus = null) {
 // A converted_member IS taken over: staff replying to a member must silence Tomer too
 // (previousStatus keeps 'converted_member', so releasing ownership restores it).
 function _applyStaffTakeover(norm, idMessage, msgText, { by = 'staff', isMember = false } = {}) {
+  if (tomerTest.routeOverride(norm)) {
+    const out = _testTakeover(norm, { by, reason: 'staff_manual_reply' });
+    if (!out.unchanged) { try { tomerService.noteOwnership(norm, 'human_takeover', { by, detail: 'staff reply' }); } catch { /* optional */ } }
+    return;
+  }
   const existing  = store.getLead(norm) ?? {};
   const curStatus = existing.status ?? null;
   if (['opted_out', 'human_owns'].includes(curStatus)) return;
@@ -2976,13 +2992,55 @@ const callbackSvc = createCallbackService({
 // ══════════════════════════════════════════════════════════════════════════════
 // services/tomer_service.js owns every member message (text + media). Kill switch:
 // TOMER_SERVICE_ENABLED=false restores the previous member routing.
-const _tomerOn = () => process.env.TOMER_SERVICE_ENABLED !== 'false';
+// In test_only mode (the default) the new flow exists only for the allowlisted phones;
+// every other member keeps the routing production had before it (see tomer_test_mode.js).
+const _tomerSwitch = () => process.env.TOMER_SERVICE_ENABLED !== 'false';
+const _tomerOn = phone => _tomerSwitch() && tomerTest.isAllowed(phone);
+
+// ── Test identity (route-overridden phone) ────────────────────────────────────
+// Conversation ownership and opt-out of the test identity live in the service-case
+// store, NOT on the phone's lead record: the Barak lead, its appointments and its
+// history are never modified by the Tomer test, and removing the override restores
+// Barak's routing with every stored record exactly as it was.
+function _testIdentityLead(phone) {
+  const m = serviceCases.getMember(phone) ?? {};
+  const status = m.optedOut ? 'opted_out' : m.humanOwned ? 'human_owns' : null;
+  return status ? { phone, status, meta: { humanOwnsBy: m.humanOwned?.by ?? null, humanOwnsSince: m.humanOwned?.since ?? null, humanOwnsReason: m.humanOwned?.reason ?? null } } : null;
+}
+/** The record that decides who answers this phone: the test identity's own state, or the lead store. */
+const _ownerLead = phone => (tomerTest.routeOverride(phone) ? _testIdentityLead(phone) : store.getLead(phone));
+function _testTakeover(phone, { by = 'staff', reason = 'manual' } = {}) {
+  if (serviceCases.getMember(phone)?.humanOwned) return { prevStatus: null, unchanged: true };
+  serviceCases.patchMember(phone, { humanOwned: { by, reason, since: new Date().toISOString() } });
+  logger.info('[tomer-test] staff took the test conversation over — Tomer silenced', { phone, by, reason });
+  broadcastSse('message', { phone, route: 'human_owns', reason });
+  return { prevStatus: null, unchanged: false };
+}
+// What the Tomer service sees as "the lead store": for the test identity only its own state.
+const tomerLeadStore = {
+  getLead:    phone => _ownerLead(phone),
+  upsertLead: (phone, patch) => {
+    if (!tomerTest.routeOverride(phone)) return store.upsertLead(phone, patch);
+    if (patch?.status === 'opted_out') serviceCases.patchMember(phone, { optedOut: { at: new Date().toISOString() } });
+    return _testIdentityLead(phone);
+  },
+  logEvent:   (type, phone, data) => (tomerTest.routeOverride(phone) ? undefined : store.logEvent(type, phone, data)),
+};
 let _tomerOpenAI = null;
 const tomerService = app.locals.tomerService = createTomerService({
-  leadStore: store, persist, logger, gateway: arboxGateway, cases: serviceCases, tomerStore, inbox,
+  leadStore: tomerLeadStore, persist: { saveLeads: () => persist.saveLeads(store) }, logger,
+  gateway: tomerTest.wrapGateway(arboxGateway), cases: serviceCases, tomerStore, inbox,
+  allowed: phone => _tomerOn(phone),
   // Automatic member sends obey WHATSAPP_AUTO_REPLY; a staff reply from the panel
   // (opts.staff) is a human send and is never blocked by it.
   sendText: async (to, text, opts = {}) => {
+    // TEST-ONLY RESTRICTION — the single exit for every member-facing message of the new
+    // flow (replies, follow-ups, staff replies from a case): a phone that is not allowed
+    // receives nothing, whatever called this.
+    if (!_tomerOn(to)) {
+      logger.warn('[tomer] send refused — recipient is not enabled for the new Tomer flow', { tail: String(to).slice(-4), mode: tomerTest.mode() });
+      return { blocked: true, notAllowed: true };
+    }
     if (!opts.staff && process.env.WHATSAPP_AUTO_REPLY !== 'true') return { blocked: true };
     _markBotSent(to);
     // Tomer only ever ANSWERS a member who has just written, so its replies are not held
@@ -3004,7 +3062,7 @@ const tomerService = app.locals.tomerService = createTomerService({
   getBackendBase: () => getBackendBase(),
   sendTimetable: async (phone) => {
     const url = getActiveTimetableUrl();
-    if (!url || process.env.WHATSAPP_AUTO_REPLY !== 'true') return false;
+    if (!url || process.env.WHATSAPP_AUTO_REPLY !== 'true' || !_tomerOn(phone)) return false;
     _markBotSent(phone);
     const r = await sendFileByUrl(phone, url, 'schedule.png', 'מערכת השעות העדכנית של הסטודיו');
     if (r?.idMessage) _recordBotSend(r.idMessage, phone);
@@ -3028,6 +3086,8 @@ function _tomerManagerPhone() {
   const ok = p => /^[0-9]{9,15}$/.test(p);
   const env = clean(process.env.TOMER_MANAGER_PHONE);
   if (ok(env)) return env;
+  // In test_only mode the alert recipient must be named explicitly — never inferred.
+  if (tomerTest.mode() !== 'all') return null;
   const list = staffConfig?.staff ?? [];
   const pick = list.find(s => s.active && s.role === 'owner' && ok(clean(s.phone)))
             ?? list.find(s => s.active && s.id === staffConfig?.default_assignee_id && ok(clean(s.phone)))
@@ -3308,6 +3368,47 @@ async function handleLeadCallbackFlow({ msg, fromNorm, fromIsraeli, clientMatch,
   return acceptAndRespond(isRequest ? 'callback_request' : (awaiting ? 'callback_time' : 'invite_reply'));
 }
 
+/**
+ * A message from a route-overridden test phone. Touches: the inbox thread (appended),
+ * the service-case store, and Tomer's own audit. Never: the lead store, the appointment
+ * store, the callback flow, Barak, the member cache or Arbox member data.
+ */
+async function _processTomerTestMessage(msg, fromNorm, fromIsraeli) {
+  const clientMatch = { found: true, matchType: 'tomer_test_override', arboxName: null, arboxId: null, isActive: true, role: 'test' };
+  const owner = _conversationOwner(fromNorm);
+  const entry = inbox.push({
+    from: fromNorm, fromIsraeli, name: msg.name ?? null, text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
+    receivedAt: new Date(), mediaType: msg.type, mediaCaption: msg.mediaCaption ?? null, mediaId: msg.mediaId ?? null,
+    clientMatch, intent: 'tomer_test', barakReply: null,
+    route: owner === 'human' ? 'human_owns_hold' : owner === 'opted_out' ? 'opted_out_silent' : 'tomer',
+  });
+  const setRoute = r => { entry.route = r; const tm = inbox.getThread(fromNorm)?.messages.find(x => x.id === entry.id); if (tm) tm.route = r; };
+  if (owner === 'human') {
+    try {
+      const hc = tomerService.recordWhileHumanOwned({ phone: fromNorm, text: msg.text ?? '', type: msg.type, messageId: msg.messageId ?? null });
+      if (hc) broadcastSse('tomer_case', { id: hc.id });
+    } catch (err) { logger.warn('[tomer-test] could not add a held message to the case', { error: err.message }); }
+  } else if (owner !== 'opted_out') {
+    try {
+      const tRes = await tomerService.handleMemberMessage({
+        phone: fromNorm, text: msg.type === 'text' ? (msg.text ?? '') : '', type: msg.type, caption: msg.mediaCaption ?? null,
+        name: msg.name ?? null, sentAt: msg.timestamp instanceof Date ? msg.timestamp : null, messageId: msg.messageId ?? null,
+      });
+      setRoute(`tomer_${tRes?.outcome ?? 'handled'}`);
+      if (tRes?.caseId) broadcastSse('tomer_case', { id: tRes.caseId });
+    } catch (err) {
+      setRoute('tomer_error');
+      logger.error('[tomer-test] message handling failed', { from: fromNorm, error: err.message });
+      const mgrPhone = _tomerManagerPhone();
+      if (mgrPhone) sendText(mgrPhone, `⚠️ תומר (בדיקה) — הודעה לא טופלה\n📱 ${fromIsraeli ?? fromNorm}\nשגיאה פנימית: ${err.message}\nלא נשלחה תשובה אוטומטית.`, { bypassQuietHours: true, linkPreview: false }).catch(() => {});
+    }
+  }
+  logger.info('[tomer-test] message from the test phone handled by the routing override', { from: fromNorm, route: entry.route });
+  broadcastSse('message', { phone: fromNorm, name: entry.name ?? null, route: entry.route });
+  persist.saveInbox(inbox);
+  return { inboxEntry: entry, clientMatch, intent: 'tomer_test', route: entry.route, barakReply: null };
+}
+
 async function processInboundWAMessage(msg) {
   // Hold processing until persist.loadLeads has completed. Without this gate a
   // webhook arriving during phoneRegistry.init (~10 s) would process against an
@@ -3386,6 +3487,14 @@ async function processInboundWAMessage(msg) {
       barakReply: null,
     });
     return { inboxEntry: staffEntry, clientMatch: { found: false }, intent: 'staff', route: 'staff_bypass', barakReply: null };
+  }
+
+  // 0c. TOMER TEST ROUTING OVERRIDE — an allowlisted test phone is handled by the new
+  //     Tomer flow and by nothing else. Placed before identity resolution and before every
+  //     lead / callback / appointment step, so the phone's Barak lead record, appointments
+  //     and reminders are neither read-modified nor consumed while the override is on.
+  if (_tomerSwitch() && tomerTest.routeOverride(fromNorm)) {
+    return _processTomerTestMessage(msg, fromNorm, fromIsraeli);
   }
 
   // 1. Four-tier member identity resolution
@@ -3521,7 +3630,7 @@ async function processInboundWAMessage(msg) {
   const leadState = store.getLead(fromNorm);
   // Members (Tomer) only. Leads are handled by handleLeadCallbackFlow, which resolves
   // the time strictly and persists the appointment before replying.
-  if (isExistingClient && !_tomerOn() && leadState?.meta?.awaitingCallbackTime && msg.type === 'text' && msg.text?.trim() &&
+  if (isExistingClient && !_tomerOn(fromNorm) && leadState?.meta?.awaitingCallbackTime && msg.type === 'text' && msg.text?.trim() &&
       intent !== 'representative' && intent !== 'reschedule') {
     const rawTime      = msg.text.trim();
     const callbackName = msg.name ?? clientMatch.arboxName ?? fromNorm;
@@ -3726,7 +3835,7 @@ async function processInboundWAMessage(msg) {
   }
 
   // ── Spam filter — silently discard off-topic messages ────────────────────────
-  if (!(isExistingClient && _tomerOn()) && msg.type === 'text' && isSpamMessage(msg.text)) {
+  if (!(isExistingClient && _tomerOn(fromNorm)) && msg.type === 'text' && isSpamMessage(msg.text)) {
     logger.info('Spam/irrelevant message — skipping AI pipeline', { from: fromNorm, preview: msg.text?.slice(0, 60) });
     store.logEvent('spam_filtered', fromNorm, { preview: msg.text?.slice(0, 60) });
     const spamEntry = inbox.push({
@@ -3745,7 +3854,7 @@ async function processInboundWAMessage(msg) {
   // EXCEPTION: human_owns / opted_out take precedence — staff own the conversation.
   {
     const _pmtOwn = store.getLead(fromNorm)?.status ?? null;
-    if (!(isExistingClient && _tomerOn()) && _pmtOwn !== 'human_owns' && _pmtOwn !== 'opted_out' && isPaymentMessage(msg)) {
+    if (!(isExistingClient && _tomerOn(fromNorm)) && _pmtOwn !== 'human_owns' && _pmtOwn !== 'opted_out' && isPaymentMessage(msg)) {
     const senderName = msg.name ?? clientMatch.arboxName ?? fromIsraeli ?? fromNorm;
     // Wording must not claim the payment was verified — nobody has looked at it yet.
     const paymentAck = `קיבלנו את ההודעה 🙏 הצוות יבדוק את התשלום ויעדכן. זה עדיין לא אישור שהתשלום התקבל.`;
@@ -4018,7 +4127,7 @@ async function processInboundWAMessage(msg) {
   if (awaitingLocation && ackDetected)  logger.info('Brief ack allowed — awaiting location confirmation', { from: fromNorm });
   if (inCooldown)   logger.info('Reply cooldown active — genuine follow-ups still proceed', { from: fromNorm });
 
-  if (isExistingClient && _tomerOn()) {
+  if (isExistingClient && _tomerOn(fromNorm)) {
     // ════════════════════════════════════════════════════════════════════════
     // TOMER SERVICE — every message from a verified member (text and media).
     // The service sends its own replies and records them (agent, handler, trigger,
@@ -5210,6 +5319,7 @@ app.get('/api/tomer/segments', async (_req, res) => {
 app.post('/api/tomer/action', jsonBody, async (req, res) => {
   const { segment, phone, name, context: ctx } = req.body ?? {};
   if (!phone || !segment) return res.status(400).json({ error: 'phone and segment required' });
+  if (!tomerTest.proactiveEnabled()) return res.status(409).json({ ok: false, error: 'proactive_locked', detail: 'תוכניות יזומות נעולות (מצב בדיקה).' });
   if (String(phone).includes('•')) return res.status(400).json({ error: 'Phone masked — cannot send' });
 
   const firstName = (name ?? '').split(/\s+/)[0].trim() || null;
@@ -5296,7 +5406,7 @@ app.post('/api/tomer/tasks/:id/update', jsonBody, (req, res) => {
 // Who is answering this member right now (from the lead store — the same record the
 // inbound pipeline checks before letting Tomer reply).
 function _conversationOwner(phone) {
-  const st = store.getLead(phone)?.status ?? null;
+  const st = _ownerLead(phone)?.status ?? null;
   return st === 'human_owns' ? 'human' : st === 'opted_out' ? 'opted_out' : st === 'attribution_review' ? 'attribution_review' : 'tomer';
 }
 function _caseRow(c) {
@@ -5304,7 +5414,7 @@ function _caseRow(c) {
 }
 /** The member's WhatsApp thread as the dashboard recorded it, with who wrote each message. */
 function _caseConversation(phone) {
-  const lead = store.getLead(phone);
+  const lead = _ownerLead(phone);
   const t    = inbox.getThread ? inbox.getThread(phone) : null;
   const all  = t?.messages ?? [];
   const who  = m => (m.direction === 'in' ? 'member'
@@ -5325,6 +5435,13 @@ function _caseConversation(phone) {
   };
 }
 
+// The effective test restrictions (authenticated — it lists phone numbers).
+app.get('/api/tomer/test-mode', (_req, res) => {
+  res.json({ ok: true, ...tomerTest.status(), serviceEnabled: _tomerSwitch(), managerPhone: _tomerManagerPhone(),
+    autoReply: process.env.WHATSAPP_AUTO_REPLY === 'true', arboxWrites: arboxGateway.writeStatus(),
+    retention: Object.fromEntries(Object.entries(retentionWorker.getConfig()).map(([k, v]) => [k, !!v.enabled])) });
+});
+
 app.get('/api/tomer/cases', (req, res) => {
   try {
     const open = req.query.open === '1' ? true : req.query.open === '0' ? false : undefined;
@@ -5335,7 +5452,8 @@ app.get('/api/tomer/cases', (req, res) => {
       counts: serviceCases.counts(),
       categories: Object.fromEntries(Object.entries(tomerService.CATEGORY).map(([k, v]) => [k, v.label])),
       outcomes: tomerService.OUTCOMES,
-      serviceEnabled: _tomerOn(),
+      serviceEnabled: _tomerSwitch(),
+      testMode: tomerTest.status(),
       autoReply: process.env.WHATSAPP_AUTO_REPLY === 'true',
       managerConfigured: !!_tomerManagerPhone(),
       ts: new Date(),
@@ -5542,6 +5660,7 @@ app.get('/api/tomer/retention/config', (req, res) => {
 app.post('/api/tomer/retention/toggle', jsonBody, (req, res) => {
   const { workflowId, enabled } = req.body ?? {};
   if (!workflowId) return res.status(400).json({ error: 'workflowId required' });
+  if (enabled === true && !tomerTest.proactiveEnabled()) return res.status(409).json({ ok: false, error: 'proactive_locked', detail: 'תוכניות יזומות נעולות (מצב בדיקה).' });
   if (enabled === true) retentionWorker.enableWorkflow(workflowId);
   else retentionWorker.disableWorkflow(workflowId);
   res.json({ ok: true, workflowId, enabled: retentionWorker.getConfig()[workflowId]?.enabled });

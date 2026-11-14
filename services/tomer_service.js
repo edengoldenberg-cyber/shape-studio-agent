@@ -79,6 +79,7 @@ function createTomerService(deps) {
     ai = null,                                  // async ({ system, user }) => string
     sendTimetable = async () => false,          // async (phone) => true when the timetable image was sent
     applyTakeover = () => {},                   // (phone, text) — staff took the conversation
+    allowed = () => true,                       // (phone) => may the new flow handle / message this phone (test-only restriction)
     now = () => new Date(),
   } = deps;
 
@@ -111,6 +112,11 @@ function createTomerService(deps) {
     const introduce = !ms?.introAt || !ms?.lastTomerAt || now().getTime() - new Date(ms.lastTomerAt).getTime() > INTRO_GAP_MS;
     const text = introduce ? `${INTRO}\n${body}` : body;
     let idMessage = null, state = 'sent', error = null;
+    if (!allowed(phone)) {
+      // Defence in depth: the send wrapper refuses too. Nothing is sent, nothing recorded as sent.
+      logger.warn('[tomer] message withheld — recipient is not enabled for the new flow', { tail: String(phone).slice(-4) });
+      return { state: 'blocked', idMessage: null, error: 'recipient_not_allowed' };
+    }
     try {
       const r = await sendText(phone, text);
       if (r?.queued) state = 'queued';
@@ -165,6 +171,7 @@ function createTomerService(deps) {
       if (!err.response && !err.code && !/timeout|socket|network|aborted/i.test(String(err.message))) return { state: 'failed', error: String(err.message).slice(0, 200) };
       return { state: 'uncertain', error: status ? `provider error ${status}` : String(err.code ?? err.message).slice(0, 200) };
     }
+    if (res?.notAllowed) return { state: 'failed', error: 'recipient is not on the Tomer allowlist' };
     if (res?.blocked || res?.testMode) return { state: 'failed', error: 'send blocked (TEST_MODE)' };
     if (res?.demo)   return { state: 'failed', error: 'send intercepted (demo mode)' };
     if (res?.queued) return { state: 'failed', error: 'send was queued, not sent' };
@@ -712,6 +719,7 @@ function createTomerService(deps) {
   async function handleMemberMessage(input) {
     // A provider message id that was already handled (webhook redelivery, also after a
     // restart) is never handled twice.
+    if (!allowed(input.phone)) return R('not_enabled', { reason: 'phone is not enabled for the new Tomer flow' });
     const messageId = input.messageId ? String(input.messageId) : null;
     if (messageId && cases.hasSeen(messageId)) return R('duplicate', { reason: 'message id already handled' });
     const out = await _handle({ ...input, messageId });
@@ -809,6 +817,7 @@ function createTomerService(deps) {
     const body = String(text ?? '').trim();
     if (!body) return { ok: false, error: 'text_required' };
     if (isOptedOut(c.phone)) return { ok: false, error: 'member_opted_out' };
+    if (!allowed(c.phone)) return { ok: false, error: 'recipient_not_allowed' };
     let res = null, err = null;
     try { res = await sendText(c.phone, body, { staff: true, bypassQuietHours: true }); } catch (x) { err = x; }
     const out = classifySend(res, err);

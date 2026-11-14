@@ -78,6 +78,9 @@ function safeExternalEnv() {
     NODE_ENV:                 'test',
     // Dashboard auth is exercised by its own suite; other suites call the API directly.
     AUTH_DISABLED:            'true',
+    // The new Tomer flow is test_only by default (fail closed). The existing suites
+    // exercise it for every synthetic member; tomer_test_mode.test.js covers the restriction.
+    TOMER_MODE:               'all',
     TZ:                       'Asia/Jerusalem',
   };
 }
