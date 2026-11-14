@@ -2,4 +2,6 @@ node_modules/
 .env
 logs/
 *.log
-revision.json
+# revision.json (deployed commit marker) is intentionally NOT listed here: `railway up`
+# skips everything in .gitignore, which made /api/version report "unknown". It is kept
+# out of git through .git/info/exclude instead (add the line `revision.json` there).
