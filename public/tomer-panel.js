@@ -1486,3 +1486,222 @@ function openCaseFromHash() {
 }
 window.addEventListener('hashchange', openCaseFromHash);
 if (document.readyState === 'complete') openCaseFromHash(); else window.addEventListener('load', () => setTimeout(openCaseFromHash, 0));
+
+// ════════════════════════════════════════════════════════════════════════════
+//  MEMBER CARE (ליווי חברים) — proactive programs, previews, pauses, guest sessions
+//
+//  A program sends only when ALL of these hold: the deployment switch is on, the
+//  program is enabled here, its required settings exist, its Arbox data was read, and
+//  the member passes the contact policy. The panel shows which of them is missing.
+// ════════════════════════════════════════════════════════════════════════════
+const EP_STATUS_HE = { pending: 'ממתין לשליחה', deferred: 'נדחה — ייבדק שוב', blocked: 'חסום', sending: 'בשליחה', sent: 'נשלח', failed: 'נכשל — לא נשלח', uncertain: 'לא ודאי אם נשלח', closed: 'נסגר', expired: 'פג — לא נשלח', cancelled: 'בוטל — כבר לא רלוונטי' };
+const EP_OUTCOME_HE = { vacation: 'חופשה / היעדרות', injury: 'פציעה / מחלה', schedule: 'שעות לא מתאימות', data_corrected: 'הנתון תוקן', disputed: 'נתון במחלוקת — לבדיקה', feedback: 'משוב', stop: 'ביקש/ה להפסיק',
+  renew_requested: 'מבקש/ת לחדש', declined: 'לא מעוניין/ת', guest_requested: 'בקשת אימון אורח', guest_none_left: 'אימוני האורח נוצלו', resolved: 'הוסדר', paid_claimed: 'דיווח/ה ששילם/ה', ok: 'הכול בסדר',
+  returned: 'חזר/ה להתאמן', no_reply: 'ללא תגובה', replied: 'השיב/ה', engaged: 'פנה/תה בנושא אחר', thanked: 'תודה' };
+const CARE_ERR_HE = { program_blocked: 'התוכנית חסומה — חסרה הגדרה נדרשת', bad_hour: 'השעה חייבת להיות בתוך שעות השליחה', bad_group_link: 'הקישור חייב להיות קישור הזמנה של וואטסאפ (https://chat.whatsapp.com/…)',
+  unsafe_payment_text: 'הנוסח מבקש פרטי כרטיס — אסור', bad_policy: 'ערך לא תקין במדיניות', proactive_locked: 'המתג הראשי כבוי (TOMER_PROACTIVE_ENABLED) — לא נשלח דבר', already_running: 'ריצה אחרת מתבצעת כרגע',
+  no_test_phone: 'אין מספר בדיקה פעיל (עקיפת הניתוב כבויה)', policy: 'מדיניות הקשר לא מאפשרת כרגע', bad_phone: 'מספר טלפון לא תקין', reason_required: 'יש לכתוב סיבה', bad_date: 'תאריך לא תקין',
+  none_remaining: 'לא נותרו אימוני אורח', already_redeemed: 'כבר מומש', not_reserved: 'האימון אינו שמור', no_entitlement: 'אין זכאות', not_uncertain: 'ההודעה אינה במצב שדורש החלטה', network: 'אין חיבור לשרת', operation_failed: 'הפעולה נכשלה בשרת' };
+const SRC_HE = { users: 'חברים', memberships: 'מנויים', types: 'סוגי מנוי', attendance: 'נוכחות (30 יום)', futureBookings: 'רישומים עתידיים', cancellations: 'ביטולי רישום', holds: 'הקפאות', transactions: 'עסקאות / חיובים' };
+let _care = null, _epFilter = 'upcoming';
+const careErr = r => CARE_ERR_HE[r.error] || (r.detail ? String(r.detail) : 'הפעולה נכשלה');
+function careFlash(text, ok = true) { const el = $id('tc-flash'); if (el) { el.textContent = text; el.dataset.kind = ok ? 'ok' : 'error'; } toast(text, ok); }
+const careBy = () => staffName() || undefined;
+
+function renderCarePrograms(o) {
+  const rows = o.programs.map(p => {
+    const state = p.blocks.length ? 'blocked' : p.enabled ? 'on' : 'off';
+    const chip = state === 'blocked' ? '<span class="tw-chip tw-chip-warn">חסום</span>' : state === 'on' ? '<span class="tw-chip tw-chip-info">מופעל</span>' : '<span class="tw-chip">כבוי</span>';
+    const c = p.counts;
+    return '<tr data-program="' + esc(p.id) + '" data-state="' + state + '">'
+      + '<td><strong>' + esc(p.label) + '</strong>' + (p.blocks.length ? '<div class="tw-case-meta tc-blocks">' + p.blocks.map(b => esc(b.text)).join('<br>') + '</div>' : '')
+      + (p.activatedAt ? '<div class="tw-case-meta">פועל על אירועים מ-' + esc(fmtDate(p.activatedAt)) + ' ואילך</div>' : '<div class="tw-case-meta">טרם הופעל — בהפעלה נקבע קו ההתחלה (בלי שליחה רטרואקטיבית)</div>') + '</td>'
+      + '<td>' + chip + '</td>'
+      + '<td><input type="number" class="field-input tc-hour" min="6" max="21" value="' + esc(p.hour) + '" aria-label="שעת ריצה"> <button type="button" class="btn-xs btn-xs-sec" data-care="hour">שמור</button></td>'
+      + '<td class="tc-counts">נשלחו ' + c.sent + ' · ממתינות ' + c.awaitingSend + ' · חסומות ' + c.blocked + (c.failed ? ' · <strong>נכשלו ' + c.failed + '</strong>' : '') + (c.uncertain ? ' · <strong>לא ודאי ' + c.uncertain + '</strong>' : '') + '<div class="tw-case-meta">ריצה אחרונה: ' + esc(p.lastRun ? dmyHe(p.lastRun) : 'אף פעם') + '</div></td>'
+      + '<td class="tc-actions">'
+      + (p.enabled ? '<button type="button" class="btn-xs btn-xs-sec" data-care="disable">כבה</button>' : '<button type="button" class="btn-xs" data-care="enable"' + (p.blocks.length ? ' disabled title="חסרה הגדרה נדרשת"' : '') + '>הפעל</button>')
+      + ' <button type="button" class="btn-xs btn-xs-sec" data-care="preview">מי זכאי/ת?</button>'
+      + (p.enabled && o.proactiveOn ? ' <button type="button" class="btn-xs btn-xs-sec" data-care="run">הרץ עכשיו</button>' : '')
+      + (o.testMode.routeOverridePhones.length && o.proactiveOn && !p.blocks.length ? ' <button type="button" class="btn-xs btn-xs-sec" data-care="test">שלח הודעת בדיקה למספר הבדיקה</button>' : '')
+      + '</td></tr>';
+  }).join('');
+  return '<div class="table-wrapper"><table class="leads-table tc-table"><thead><tr><th>תוכנית</th><th>מצב</th><th>שעת ריצה</th><th>הודעות</th><th>פעולות</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+}
+
+function renderCareSettings(o) {
+  const s = o.settings, p = s.policy;
+  const num = (k, label, lo, hi) => '<label class="tc-num">' + label + '<input type="number" class="field-input" id="tc-p-' + k + '" min="' + lo + '" max="' + hi + '" value="' + esc(p[k]) + '"></label>';
+  return '<div class="tw-cd-form"><label for="tc-group-link">קישור מאושר לקבוצת הוואטסאפ של הסטודיו (נדרש ל"ברוכים הבאים")</label>'
+    + '<input type="url" id="tc-group-link" class="field-input" dir="ltr" placeholder="https://chat.whatsapp.com/…" value="' + esc(s.groupLink || '') + '"></div>'
+    + '<div class="tw-cd-form"><label for="tc-payment-text">דרך מאושרת ובטוחה להסדרת תשלום שנכשל (משפט אחד שיופיע בהודעה)</label>'
+    + '<textarea id="tc-payment-text" class="field-input" rows="2" placeholder="למשל: אפשר לעדכן אמצעי תשלום באפליקציית Arbox, או מול הצוות בסטודיו.">' + esc(s.paymentResolution || '') + '</textarea>'
+    + '<label class="tw-cd-check-label"><input type="checkbox" id="tc-billing-ok"' + (s.billingDataConfirmed ? ' checked' : '') + '> אני מאשר/ת ש"FAIL" בדוח העסקאות של Arbox פירושו חיוב חודשי שנכשל, ושחיוב מוצלח מאוחר יותר סוגר אותו</label></div>'
+    + '<div class="tw-ds-title" style="margin-top:14px">מדיניות קשר (ברירות מחדל מוצעות — לאישור)</div><div class="tc-policy">'
+    + num('windowStart', 'שליחה משעה', 6, 12) + num('windowEnd', 'עד שעה', 13, 22) + num('fridayEnd', 'בשישי עד', 9, 16)
+    + num('cooldownHours', 'מרווח בין הודעות יזומות (שעות)', 0, 720) + num('attendanceCooldownDays', 'מרווח בין הודעות נוכחות (ימים)', 0, 30)
+    + num('recentConversationHours', 'לא לכתוב אם הייתה שיחה ב-X שעות', 0, 168) + num('replyWindowDays', 'תגובה נחשבת המשך שיחה עד (ימים)', 1, 14)
+    + num('defaultPauseDays', 'השהיה כשאין תאריך חזרה (ימים)', 1, 90) + num('paymentGraceHours', 'המתנה אחרי חיוב שנכשל (שעות)', 0, 168)
+    + '<label class="tc-num">יום הולדת בשבת<select id="tc-p-birthdaySaturday" class="field-input"><option value="friday"' + (p.birthdaySaturday === 'friday' ? ' selected' : '') + '>ברכה ביום שישי</option><option value="sunday"' + (p.birthdaySaturday === 'sunday' ? ' selected' : '') + '>ברכה ביום ראשון</option></select></label>'
+    + '</div><div class="tw-case-meta">אין שליחה בשבת. סיכום יומי למנהל: כבוי (לא קיים עד אישור).</div>'
+    + '<button type="button" class="btn btn-primary" id="tc-save" style="margin-top:10px">שמור הגדרות</button>'
+    + '<div class="tw-ds-title" style="margin-top:16px">החלטות מדיניות שחסרות לאימוני האורח</div><ul class="tc-missing">' + o.missingPolicy.map(x => '<li>' + esc(x) + '</li>').join('') + '</ul>'
+    + '<div class="tw-case-meta">עד שיוחלט — תומר רק רושם בקשה לצוות, ולא מבטיח תוקף, שיעור או רישום.</div>';
+}
+
+function renderCarePauses(o) {
+  const rows = o.pauses.map(p => '<tr data-pause="' + esc(p.phone) + '"><td>' + esc(p.name || '') + ' <span dir="ltr">' + esc(p.phone) + '</span></td><td>' + esc(p.reason === 'vacation' ? 'חופשה' : p.reason === 'injury' ? 'פציעה / מחלה' : p.reason) + (p.note ? '<div class="tw-case-meta">' + esc(p.note) + '</div>' : '') + '</td>'
+    + '<td>' + (p.until ? esc(dmyHe(p.until)) + (p.endKnown ? '' : ' <span class="tw-chip tw-chip-warn">ברירת מחדל — תאריך לא נמסר</span>') : 'ללא תאריך סיום') + '</td><td>' + esc(p.setBy === 'member' ? 'החבר/ה' : p.setBy || '') + '</td>'
+    + '<td><button type="button" class="btn-xs btn-xs-sec" data-care="pause-remove">הסר</button></td></tr>').join('');
+  return '<div class="tc-pause-form"><input type="tel" id="tc-pause-phone" class="field-input" dir="ltr" placeholder="טלפון" aria-label="טלפון"><input type="text" id="tc-pause-reason" class="field-input" placeholder="סיבה (חופשה, מילואים…)" aria-label="סיבה"><input type="date" id="tc-pause-until" class="field-input" aria-label="עד תאריך"><button type="button" class="btn btn-secondary" data-care="pause-add">הוסף השהיה</button></div>'
+    + (rows ? '<div class="table-wrapper"><table class="leads-table"><thead><tr><th>חבר/ה</th><th>סיבה</th><th>עד</th><th>נקבע על ידי</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>' : '<div class="tw-empty" data-state="empty">אין השהיות פעילות</div>');
+}
+
+function renderCareEntitlements(o) {
+  if (!o.entitlements.length) return '<div class="tw-empty" data-state="empty">עוד לא הונפקו אימוני אורח</div>';
+  const ITEM = { reserved: 'שמור', redeemed: 'מומש', released: 'שוחרר' };
+  return o.entitlements.map(e => '<div class="tc-ent" data-ent="' + esc(e.userId) + '"><div><strong>' + esc(e.name || e.userId) + '</strong> · הונפקו ' + e.total + ' ב-' + esc(fmtDate(e.issuedAt))
+    + ' · <span data-ent-remaining="' + e.remaining + '">נותרו ' + e.remaining + '</span> · שמורים ' + e.reserved + ' · מומשו ' + e.redeemed + '</div>'
+    + e.items.map(i => '<div class="tw-case-meta" data-item="' + esc(i.id) + '" data-item-status="' + esc(i.status) + '">' + esc(ITEM[i.status] || i.status) + (i.guestName ? ' — ' + esc(i.guestName) : '') + ' · ' + esc(fmtDate(i.at)) + ' · ' + esc(i.by || '')
+      + (i.status === 'reserved' ? ' <button type="button" class="btn-xs" data-care="ent-redeem">סמן כמומש</button> <button type="button" class="btn-xs btn-xs-sec" data-care="ent-release">שחרר</button>' : '') + '</div>').join('')
+    + (e.remaining > 0 ? '<div class="tc-pause-form"><input type="text" class="field-input tc-guest-name" placeholder="שם האורח/ת" aria-label="שם האורח/ת"><button type="button" class="btn-xs" data-care="ent-reserve">שמור אימון אורח</button></div>' : '<div class="tw-case-meta">לא נותרו אימונים לשמירה</div>')
+    + '</div>').join('');
+}
+
+async function loadCare() {
+  const box = $id('tc-programs'); if (!box) return;
+  if (!_care) box.innerHTML = '<div class="tw-empty" data-state="loading">טוען…</div>';
+  const o = await caseApi('/api/tomer/care/overview');
+  const banner = $id('tc-banner');
+  if (!o.ok) { box.innerHTML = '<div class="tw-state-error" data-state="error" role="alert">לא ניתן לטעון את ליווי החברים (' + esc(careErr(o)) + '). <button type="button" class="btn btn-secondary" data-care="reload">נסו שוב</button></div>'; if (banner) banner.hidden = true; return; }
+  _care = o;
+  const msgs = [];
+  if (!o.proactiveOn) msgs.push('המתג הראשי כבוי (TOMER_PROACTIVE_ENABLED) — שום הודעה יזומה לא נשלחת, גם אם תוכנית מופעלת כאן.');
+  if (o.testMode.mode === 'test_only') msgs.push('מצב בדיקה: הודעות יזומות יכולות להגיע רק אל ' + (o.testMode.allowlist.join(', ') || 'אף מספר') + '. חברים אחרים מופיעים בתצוגה המקדימה כ"חסום — מצב בדיקה".');
+  if (!o.autoReply) msgs.push('מענה אוטומטי בוואטסאפ כבוי — הודעות לא יישלחו.');
+  if (banner) { banner.hidden = !msgs.length; banner.innerHTML = msgs.map(m => '<div>' + esc(m) + '</div>').join(''); }
+  box.innerHTML = renderCarePrograms(o);
+  $id('tc-settings').innerHTML = renderCareSettings(o);
+  $id('tc-pauses').innerHTML = renderCarePauses(o);
+  $id('tc-entitlements').innerHTML = renderCareEntitlements(o);
+  const on = o.programs.filter(p => p.enabled).length; const b = $id('tw-badge-care'); if (b) b.textContent = on ? String(on) : '';
+  loadCareEpisodes();
+}
+
+async function loadCareEpisodes() {
+  const el = $id('tc-episodes'); if (!el) return;
+  const F = { upcoming: 'pending,deferred,blocked,sending', sent: 'sent,closed', problem: 'failed,uncertain', dropped: 'cancelled,expired' };
+  const d = await caseApi('/api/tomer/care/episodes?status=' + F[_epFilter]);
+  if (!d.ok) { el.innerHTML = '<div class="tw-state-error" data-state="error">לא ניתן לטעון את ההודעות (' + esc(careErr(d)) + ')</div>'; return; }
+  const EMPTY = { upcoming: 'אין הודעות שממתינות לשליחה', sent: 'עוד לא נשלחו הודעות', problem: 'אין הודעות שנכשלו או שמצבן לא ודאי', dropped: 'אין הודעות שבוטלו' };
+  if (!d.episodes.length) { el.innerHTML = '<div class="tw-empty" data-state="empty">' + EMPTY[_epFilter] + '</div>'; return; }
+  el.innerHTML = '<div class="table-wrapper"><table class="leads-table"><thead><tr><th>עודכן</th><th>חבר/ה</th><th>תוכנית</th><th>מצב</th><th>תגובה / תוצאה</th><th></th></tr></thead><tbody>'
+    + d.episodes.map(e => '<tr data-episode="' + esc(e.key) + '" data-ep-status="' + esc(e.status) + '"><td>' + esc(fmtDate(e.updatedAt)) + '</td><td>' + esc(e.name || '') + (e.synthetic ? ' <span class="tw-chip">בדיקה</span>' : '') + '</td><td>' + esc(e.label) + '</td>'
+      + '<td>' + esc(EP_STATUS_HE[e.status] || e.status) + (e.reasonsText && e.reasonsText.length ? '<div class="tw-case-meta">' + e.reasonsText.map(esc).join(' · ') + '</div>' : '') + (e.send && e.send.error ? '<div class="tw-case-meta" dir="ltr">' + esc(e.send.error) + '</div>' : '') + '</td>'
+      + '<td>' + esc(e.conversation && e.conversation.outcome ? (EP_OUTCOME_HE[e.conversation.outcome] || e.conversation.outcome) : (e.status === 'sent' ? 'ממתין לתגובה' : '—'))
+      + (e.conversation && e.conversation.replies && e.conversation.replies.length ? '<div class="tw-case-meta">"' + esc(e.conversation.replies[e.conversation.replies.length - 1].text) + '"</div>' : '') + '</td>'
+      + '<td>' + (e.caseId ? '<button type="button" class="btn-xs" onclick="openTomerCase(\'' + esc(e.caseId) + '\')">פתח פנייה</button> ' : '')
+      + (e.status === 'uncertain' || e.status === 'failed' ? '<button type="button" class="btn-xs btn-xs-sec" data-care="ep-sent">ההודעה הגיעה</button> <button type="button" class="btn-xs btn-xs-sec" data-care="ep-retry">לא הגיעה — לשלוח בריצה הבאה</button>' : '')
+      + (e.send && e.send.text ? '<details><summary>נוסח</summary><div class="tw-cd-text">' + esc(e.send.text) + '</div></details>' : '') + '</td></tr>').join('') + '</tbody></table></div>';
+}
+
+function renderCarePreview(p) {
+  const src = Object.entries(p.sources).map(([k, v]) => '<span class="tw-chip ' + (v.ok ? (v.stale ? 'tw-chip-warn' : '') : 'tw-chip-bad') + '" data-src="' + esc(k) + '" data-src-ok="' + (v.ok ? '1' : '0') + '">' + esc(SRC_HE[k] || k) + ': ' + (v.ok ? (v.stale ? 'נתון ישן' : 'נקרא ' + esc(fmtDate(v.fetchedAt))) : 'לא זמין') + '</span>').join(' ');
+  let h = '<div class="tc-src">' + src + '</div>';
+  if (p.blocks.length) h += '<div class="tw-state-error" data-preview="config-blocked">התוכנית חסומה: ' + p.blocks.map(b => esc(b.text)).join(' · ') + '</div>';
+  if (p.dataBlocked) return h + '<div class="tw-state-error" data-preview="data-blocked">לא ניתן לקבוע זכאות — נתוני Arbox חסרים: ' + p.dataBlocked.map(d => esc(SRC_HE[d.source] || d.source)).join(', ') + '. נתון חסר אינו נחשב היעדרות או כשל.</div>';
+  h += '<div class="tw-case-meta">' + (p.activated ? 'קו התחלה: ' + esc(dmyHe(p.baseline)) : 'התוכנית טרם הופעלה — התצוגה מניחה הפעלה היום (' + esc(dmyHe(p.baseline)) + ')') + ' · חברים פעילים: ' + p.totalMembers + '</div>';
+  h += '<div class="tw-ds-title" style="margin-top:10px">זכאים (' + p.included.length + ')</div>';
+  h += p.included.length ? '<div class="table-wrapper"><table class="leads-table"><thead><tr><th>חבר/ה</th><th>החלטה</th><th>על סמך</th><th>ההודעה</th></tr></thead><tbody>'
+    + p.included.map(x => '<tr data-inc="' + esc(x.userId) + '" data-decision="' + esc(x.decision) + '"><td>' + esc(x.name || x.userId) + '</td>'
+      + '<td>' + (x.decision === 'send' ? '<span class="tw-chip tw-chip-info">תישלח</span>' : x.decision === 'defer' ? '<span class="tw-chip tw-chip-warn">תידחה</span>' : '<span class="tw-chip tw-chip-bad">חסומה</span>') + (x.reasons.length ? '<div class="tw-case-meta">' + x.reasons.map(r => esc(r.text)).join(' · ') + '</div>' : '') + '</td>'
+      + '<td class="tw-case-meta" dir="ltr">' + esc(Object.entries(x.sourceDates || {}).map(([k, v]) => k + ': ' + v).join(' · ')) + '</td>'
+      + '<td><details><summary>הצג</summary><div class="tw-cd-text">' + esc(x.message) + '</div></details></td></tr>').join('') + '</tbody></table></div>'
+    : '<div class="tw-empty" data-state="empty">אין כרגע חברים זכאים</div>';
+  h += '<div class="tw-ds-title" style="margin-top:10px">לא נכללים — לפי סיבה</div>' + (p.excludedCounts.length ? '<ul class="tc-missing">' + p.excludedCounts.map(c => '<li data-excl="' + esc(c.code) + '">' + esc(c.text) + ': ' + c.count + '</li>').join('') + '</ul>' : '<div class="tw-empty">—</div>');
+  h += '<details><summary>רשימה מלאה של הלא-נכללים</summary>' + p.excluded.map(x => '<div class="tw-case-meta">' + esc(x.name || x.userId) + ' — ' + x.reasons.map(r => esc(r.text)).join(' · ') + '</div>').join('') + '</details>';
+  return h;
+}
+
+async function careAct(act, btn) {
+  const row = btn.closest('[data-program]'), id = row ? row.dataset.program : null;
+  const post = (url, body = {}) => caseApi(url, { method: 'POST', body: { ...body, by: careBy() } });
+  let r, okText = 'נשמר';
+  if (act === 'reload') return loadCare();
+  btn.disabled = true;
+  if (act === 'enable' || act === 'disable') { r = await post('/api/tomer/care/programs/' + id, { enabled: act === 'enable' }); okText = act === 'enable' ? 'התוכנית הופעלה — תפעל רק על אירועים מעכשיו' : 'התוכנית כובתה'; }
+  else if (act === 'hour') { r = await post('/api/tomer/care/programs/' + id, { hour: Number(row.querySelector('.tc-hour').value) }); okText = 'שעת הריצה נשמרה'; }
+  else if (act === 'preview') {
+    const card = $id('tc-preview-card'); card.hidden = false; $id('tc-preview-title').textContent = 'תצוגה מקדימה'; $id('tc-preview').innerHTML = '<div class="tw-empty" data-state="loading">קורא נתונים מ-Arbox…</div>';
+    r = await caseApi('/api/tomer/care/preview/' + id);
+    btn.disabled = false;
+    if (!r.ok) { $id('tc-preview').innerHTML = '<div class="tw-state-error" data-state="error">התצוגה המקדימה נכשלה (' + esc(careErr(r)) + ')</div>'; return; }
+    $id('tc-preview-title').textContent = 'תצוגה מקדימה — ' + r.label + ' (שום דבר לא נשלח)'; $id('tc-preview-card').dataset.program = id;
+    $id('tc-preview').innerHTML = renderCarePreview(r); card.scrollIntoView({ block: 'nearest' }); return;
+  }
+  else if (act === 'run') { r = await post('/api/tomer/care/run/' + id); if (r.ok) okText = 'הריצה הסתיימה: נשלחו ' + r.run.sent + ', נדחו ' + r.run.deferred + ', חסומות ' + r.run.blocked + (r.run.failed ? ', נכשלו ' + r.run.failed : '') + (r.run.uncertain ? ', לא ודאי ' + r.run.uncertain : '') + (r.run.dataBlocked.length ? ' · נתוני Arbox חסרים — לא בוצע' : ''); }
+  else if (act === 'test') { r = await post('/api/tomer/care/test-send/' + id); okText = 'הודעת בדיקה נשלחה למספר הבדיקה'; }
+  else if (act === 'pause-add') { r = await post('/api/tomer/care/pauses', { phone: $id('tc-pause-phone').value, reason: $id('tc-pause-reason').value, until: $id('tc-pause-until').value }); okText = 'ההשהיה נוספה'; }
+  else if (act === 'pause-remove') { r = await post('/api/tomer/care/pauses/remove', { phone: btn.closest('[data-pause]').dataset.pause }); okText = 'ההשהיה הוסרה'; }
+  else if (act.startsWith('ent-')) {
+    const ent = btn.closest('[data-ent]').dataset.ent, item = btn.closest('[data-item]');
+    if (act === 'ent-reserve') { r = await post('/api/tomer/care/entitlements/' + encodeURIComponent(ent) + '/reserve', { guestName: btn.closest('.tc-pause-form').querySelector('.tc-guest-name').value }); okText = 'אימון אורח נשמר'; }
+    else { r = await post('/api/tomer/care/entitlements/' + encodeURIComponent(ent) + '/' + (act === 'ent-redeem' ? 'redeem' : 'release'), { itemId: item.dataset.item }); okText = act === 'ent-redeem' ? 'סומן כמומש' : 'השמירה שוחררה'; }
+  }
+  else if (act === 'ep-sent' || act === 'ep-retry') { r = await post('/api/tomer/care/episodes/resolve', { key: btn.closest('[data-episode]').dataset.episode, action: act === 'ep-sent' ? 'mark_sent' : 'mark_not_sent' }); okText = act === 'ep-sent' ? 'סומן כנשלח' : 'ייבדק ויישלח בריצה הבאה'; }
+  btn.disabled = false;
+  if (!r) return;
+  careFlash(r.ok ? okText : careErr(r) + (r.blocks ? ': ' + r.blocks.map(b => b.text).join(' · ') : '') + (r.reasons ? ': ' + r.reasons.map(x => x.text).join(' · ') : ''), r.ok);
+  await loadCare();
+}
+
+async function saveCareSettings(btn) {
+  const policy = {};
+  for (const k of ['windowStart', 'windowEnd', 'fridayEnd', 'cooldownHours', 'attendanceCooldownDays', 'recentConversationHours', 'replyWindowDays', 'defaultPauseDays', 'paymentGraceHours']) policy[k] = Number($id('tc-p-' + k).value);
+  policy.birthdaySaturday = $id('tc-p-birthdaySaturday').value;
+  btn.disabled = true;
+  const r = await caseApi('/api/tomer/care/settings', { method: 'POST', body: { groupLink: $id('tc-group-link').value, paymentResolution: $id('tc-payment-text').value, billingDataConfirmed: $id('tc-billing-ok').checked, policy, by: careBy() } });
+  btn.disabled = false;
+  careFlash(r.ok ? 'ההגדרות נשמרו' : careErr(r), r.ok);
+  if (r.ok) await loadCare();
+}
+
+async function loadAbsenceReport() {
+  const el = $id('tc-absence'); el.innerHTML = '<div class="tw-empty" data-state="loading">קורא נתונים מ-Arbox…</div>';
+  const d = await caseApi('/api/tomer/care/absence-report');
+  if (!d.ok) { el.innerHTML = '<div class="tw-state-error" data-state="error">לא ניתן להפיק את הדוח — ' + (d.error === 'arbox_unavailable' ? 'Arbox לא זמין' : esc(careErr(d))) + '</div>'; return; }
+  const attOk = d.sources.attendance && d.sources.attendance.ok;
+  const rows = d.rows.filter(r => r.daysAbsent === null || r.daysAbsent >= 5);
+  el.innerHTML = (attOk ? '' : '<div class="tw-state-error" data-absence="unknown">נתוני הנוכחות לא נקראו מ-Arbox — משך ההיעדרות אינו ידוע (לא מוצג כהיעדרות).</div>')
+    + '<div class="tw-case-meta">מוצגים חברים פעילים עם 5+ ימים ללא כניסה מאומתת, או שנוכחותם אינה ידועה · ' + rows.length + ' מתוך ' + d.rows.length + '</div>'
+    + (rows.length ? '<div class="table-wrapper"><table class="leads-table"><thead><tr><th>חבר/ה</th><th>מנוי</th><th>כניסה מאומתת אחרונה</th><th>ימים</th><th>רישום עתידי</th><th>פנייה אחרונה</th><th>תגובה</th><th>אחראי/ת</th><th>הצעד הבא</th></tr></thead><tbody>'
+      + rows.map(r => '<tr data-abs="' + esc(r.userId) + '"><td>' + esc(r.name || r.userId) + '</td><td>' + esc(r.membership) + '</td><td>' + (r.lastAttendance ? esc(dmyHe(r.lastAttendance)) : r.neverAttended ? 'טרם הגיע/ה' : 'לא ידוע (30+ יום או אין נתון)') + '</td>'
+        + '<td data-days="' + esc(r.daysAbsent === null ? 'unknown' : r.daysAbsent) + '">' + (r.daysAbsent === null ? '—' : r.daysAbsent) + '</td><td>' + (r.futureBooking ? esc(dmyHe(r.futureBooking.date)) + ' ' + esc(r.futureBooking.time) : '—') + '</td>'
+        + '<td>' + (r.lastOutreach ? esc(r.lastOutreach.label) + '<div class="tw-case-meta">' + esc(fmtDate(r.lastOutreach.at)) + '</div>' : '—') + '</td><td>' + esc(r.response ? (EP_OUTCOME_HE[r.response] || r.response) : '—') + '</td><td>' + esc(r.owner) + '</td>'
+        + '<td>' + esc(r.nextAction) + (r.caseId ? ' <button type="button" class="btn-xs" onclick="openTomerCase(\'' + esc(r.caseId) + '\')">פנייה</button>' : '') + '</td></tr>').join('') + '</tbody></table></div>'
+      : '<div class="tw-empty" data-state="empty">אין חברים עם היעדרות של 5 ימים ומעלה</div>');
+}
+
+async function loadCareVisibility() {
+  const el = $id('tc-visibility'); el.innerHTML = '<div class="tw-empty" data-state="loading">קורא נתונים מ-Arbox…</div>';
+  const d = await caseApi('/api/tomer/care/visibility');
+  if (!d.ok) { el.innerHTML = '<div class="tw-state-error" data-state="error">לא ניתן לטעון (' + esc(careErr(d)) + ')</div>'; return; }
+  el.innerHTML = (d.attendanceKnown ? '' : '<div class="tw-state-error">נתוני הנוכחות לא זמינים — הרשימה הראשונה אינה ידועה.</div>')
+    + '<div class="tw-ds-title">חברים חדשים שעוד לא הגיעו לאימון ראשון (' + d.newNotAttended.length + ')</div>'
+    + (d.newNotAttended.length ? d.newNotAttended.map(m => '<div class="tw-case-meta" data-new="' + esc(m.userId) + '">' + esc(m.name || m.userId) + ' · מנוי מ-' + esc(dmyHe(m.membershipStart)) + ' (' + m.daysSinceStart + ' ימים)' + (m.futureBooking ? ' · רשום/ה ל-' + esc(dmyHe(m.futureBooking.date)) : ' · אין רישום עתידי') + '</div>').join('') : '<div class="tw-empty" data-state="empty">אין</div>')
+    + '<div class="tw-ds-title" style="margin-top:10px">חזרו להתאמן אחרי היעדרות (' + d.returned.length + ')</div>'
+    + (d.returned.length ? d.returned.map(m => '<div class="tw-case-meta" data-returned="' + esc(m.userId) + '">' + esc(m.name || m.userId) + ' · נעדר/ה מ-' + esc(dmyHe(m.absentSince)) + ' · חזר/ה ב-' + esc(dmyHe(m.returnedOn)) + '</div>').join('') : '<div class="tw-empty" data-state="empty">אין</div>')
+    + '<div class="tw-case-meta">לשתי הרשימות אין הודעה יזומה — ממתין לאישור.</div>';
+}
+
+$id('twp-care')?.addEventListener('click', e => {
+  const b = e.target.closest('[data-care]');
+  if (b && !b.disabled) return careAct(b.dataset.care, b);
+  if (e.target.closest('#tc-save')) return saveCareSettings(e.target.closest('#tc-save'));
+  if (e.target.closest('#tc-absence-load')) return loadAbsenceReport();
+  if (e.target.closest('#tc-visibility-load')) return loadCareVisibility();
+  const f = e.target.closest('[data-ef]');
+  if (f) { document.querySelectorAll('#twp-care [data-ef]').forEach(x => x.classList.remove('active')); f.classList.add('active'); _epFilter = f.dataset.ef; loadCareEpisodes(); }
+});
+document.querySelector('.tw-tab[data-pane="care"]')?.addEventListener('click', loadCare);
+$id('tw-refresh')?.addEventListener('click', () => { if (document.querySelector('.tw-tab.active')?.dataset.pane === 'care') loadCare(); });

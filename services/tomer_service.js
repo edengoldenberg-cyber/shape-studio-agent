@@ -60,6 +60,10 @@ const CATEGORY = {
   missed_class:      { label: 'שיעור שהוחמץ',             priority: 'normal', next: 'להחליט לגבי חיוב ולעדכן' },
   media_message:     { label: 'הודעת מדיה שלא נקראה',     priority: 'normal', next: 'לפתוח את ההודעה בוואטסאפ' },
   general_request:   { label: 'פנייה כללית',              priority: 'normal', next: 'לענות לחבר/ה' },
+  // opened from proactive member-care conversations
+  member_feedback:   { label: 'משוב מליווי חברים',        priority: 'normal', next: 'ליצור קשר אישי ולהקשיב' },
+  guest_pass:        { label: 'בקשה לאימון אורח',          priority: 'normal', next: 'לתאם אימון אורח ולעדכן את המימוש בפאנל' },
+  data_review:       { label: 'בדיקת נתון ב-Arbox',        priority: 'normal', next: 'לבדוק נוכחות / רישום ב-Arbox ולעדכן את החבר/ה' },
 };
 
 const MEDIA_LABEL = { image: 'את התמונה', audio: 'את ההודעה הקולית', voice: 'את ההודעה הקולית', video: 'את הסרטון', document: 'את הקובץ', location: 'את המיקום', sticker: 'את המדבקה', contact: 'את איש הקשר' };
@@ -80,6 +84,7 @@ function createTomerService(deps) {
     sendTimetable = async () => false,          // async (phone) => true when the timetable image was sent
     applyTakeover = () => {},                   // (phone, text) — staff took the conversation
     allowed = () => true,                       // (phone) => may the new flow handle / message this phone (test-only restriction)
+    getCare = () => null,                       // () => member-care service (proactive conversations) or null
     now = () => new Date(),
   } = deps;
 
@@ -117,13 +122,19 @@ function createTomerService(deps) {
       logger.warn('[tomer] message withheld — recipient is not enabled for the new flow', { tail: String(phone).slice(-4) });
       return { state: 'blocked', idMessage: null, error: 'recipient_not_allowed' };
     }
-    try {
-      const r = await sendText(phone, text);
-      if (r?.queued) state = 'queued';
-      else if (r?.blocked) state = 'blocked';
-      else idMessage = r?.idMessage ?? null;
-      if (state === 'sent' && !idMessage) state = 'no_provider_id';
-    } catch (err) { state = 'failed'; error = err.message; logger.error('[tomer] send failed', { phone, error: err.message }); }
+    {
+      let res = null, err = null;
+      try { res = await sendText(phone, text, meta.sendOpts ?? {}); } catch (e) { err = e; }
+      if (res?.queued) state = 'queued';
+      else if (res?.blocked) state = 'blocked';
+      else {
+        // accepted → 'sent'; refused → 'failed'; no usable answer → 'uncertain' (may have arrived; never repeated blindly)
+        const out = classifySend(res, err);
+        state = out.state === 'accepted' ? 'sent' : out.state;
+        idMessage = out.idMessage ?? null; error = out.error ?? null;
+        if (state !== 'sent') logger.error('[tomer] send not accepted', { phone, state, error });
+      }
+    }
     const record = { agent: 'tomer', handler: meta.handler ?? null, trigger: meta.trigger ?? null, caseId: meta.caseId ?? null, actionId: meta.actionId ?? null, dataSource: meta.dataSource ?? null, sendState: state, idMessage, error };
     try { inbox.pushOutbound({ phone, name: meta.name ?? null, text, agentId: 'tomer', meta: record }); } catch { /* inbox is a view, not the source of truth */ }
     tomerStore.appendAudit({ phone, memberName: meta.name ?? null, event: 'tomer_message', tomerAction: `${meta.handler ?? 'reply'} (${meta.trigger ?? '-'})`, replyPreview: text.slice(0, 160), owner: 'tomer', taskId: meta.caseId ?? null, sendState: state, idMessage, dataSource: meta.dataSource ?? null });
@@ -751,6 +762,13 @@ function createTomerService(deps) {
       if (handled) return { ...handled, category: cls.category, viaState: conv.awaiting };
     }
 
+    // A reply to a proactive member-care message continues THAT conversation.
+    const care = getCare();
+    if (care) {
+      const handled = await care.handleReply(ctx, cls, { say, openCase, R, schedule: c => hSchedule({ ...c, category: 'schedule_query' }) });
+      if (handled) return { ...handled, category: cls.category, viaCare: true };
+    }
+
     let out;
     switch (cls.category) {
       case 'social': case 'statement': {
@@ -975,7 +993,7 @@ function createTomerService(deps) {
   }
 
   return {
-    handleMemberMessage, recordWhileHumanOwned, noteOwnership,
+    handleMemberMessage, recordWhileHumanOwned, noteOwnership, say,
     cases, CATEGORY, OUTCOMES, caseLink,
     staff: { assign, setStatus, staffReply, resolve, reopen, retryNotification, refreshArbox },
     reconcileOnStartup,

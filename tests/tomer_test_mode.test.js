@@ -217,7 +217,7 @@ describe('1. Fail closed and the allowlist', () => {
     expect(tm.routeOverride('972537605023')).toBe(true);
     expect(tm.routeOverride('972537605024')).toBe(false);
     expect(tm.proactiveEnabled()).toBe(false);
-    process.env.TOMER_PROACTIVE_ENABLED = 'true'; expect(tm.proactiveEnabled()).toBe(false); delete process.env.TOMER_PROACTIVE_ENABLED;   // still locked in test_only
+    process.env.TOMER_PROACTIVE_ENABLED = 'true'; expect(tm.proactiveEnabled()).toBe(true); delete process.env.TOMER_PROACTIVE_ENABLED;    // the switch; recipients stay limited to the allowlist
   });
 
   test('no allowlist at all: a real member is not served by the new flow and receives nothing from it', async () => {
@@ -397,12 +397,17 @@ describe('4. Manager alerts and proactive programs', () => {
   test('proactive onboarding / retention programs cannot be enabled or run', async () => {
     setMode({ allow: TESTP, override: true });
     const t = await post('/api/tomer/retention/toggle', { workflowId: 'onboarding1', enabled: true });
-    expect(t.status).toBe(409);
-    expect(t.body.error).toBe('proactive_locked');
+    expect(t.status).toBe(410);
+    expect(t.body.error).toBe('superseded_by_member_care');
     const run = await post('/api/tomer/retention/run/onboarding1', {});
     expect(run.body.reason).toBe('proactive_locked');
     const act = await post('/api/tomer/action', { segment: 'onboarding', phone: TESTP, name: 'x' });
-    expect(act.status).toBe(409);
+    expect(act.status).toBe(410);
+    // the legacy manual Tomer send routes obey the same recipient restriction
+    const other = member();
+    expect((await post('/api/tomer/send-whatsapp', { phone: other.phone, message: 'x' })).status).toBe(403);
+    expect((await post('/api/tomer/send-message', { phone: other.phone, template: 'member_inactive' })).status).toBe(403);
+    expect(sentTo(other.phone)).toHaveLength(0);
     const rw = require('../workers/retention_worker');
     rw.enableWorkflow('birthday');
     expect(Object.values(rw.getConfig()).some(w => w.enabled)).toBe(false);

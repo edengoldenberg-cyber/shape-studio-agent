@@ -57,6 +57,9 @@ const tomerStore                       = require('./utils/tomer_store');
 const arboxGateway                     = require('./services/arbox_gateway');
 const serviceCases                     = require('./utils/service_case_store');
 const tomerTest                        = require('./services/tomer_test_mode');
+const careStore                        = require('./utils/member_care_store');
+const contactPolicy                    = require('./services/contact_policy');
+const { createMemberCare }             = require('./services/member_care');
 const { createTomerService }           = require('./services/tomer_service');
 const retentionWorker                  = require('./workers/retention_worker');
 const studioAssets                     = require('./utils/studio_assets');
@@ -642,6 +645,7 @@ const CODE_FEATURES = [
   'dashboard_auth_v2',    // revocable sessions (logout), CSRF token on state changes, login throttling
   'tomer_panel_v2',       // staff-handled membership requests, one manager alert, complete cases panel
   'tomer_test_only_v1',   // services/tomer_test_mode.js — new flow only for allowlisted phones unless TOMER_MODE=all
+  'member_care_v1',       // services/member_care.js — proactive programs (all off by default) + shared contact policy
   'strict_callback_time', // utils/callback_time.js — no default hour, no AI date guessing
   'apt_persist_strict',   // appointment_store update/updateBatch throw + roll back on failed write
   'staff_confirm_lifecycle', // confirm / outcome endpoints enforce transitions
@@ -1262,6 +1266,7 @@ app.post('/api/tomer/send-whatsapp', jsonBody, async (req, res) => {
   if (!phone || !message) return res.status(400).json({ error: 'phone and message required' });
   // A person who asked not to be contacted is never messaged from the dashboard.
   const _swNorm = normalizeToE164(phone) ?? phone;
+  if (!tomerTest.isAllowed(_swNorm)) return res.status(403).json({ ok: false, error: 'recipient_not_allowed', detail: 'מצב בדיקה — המספר אינו ברשימת המורשים.' });
   if (store.getLead(_swNorm)?.status === 'opted_out') return res.status(409).json({ error: 'opted_out', detail: 'איש הקשר ביקש לא לקבל הודעות' });
   try {
     const _swRes = await sendText(phone, message);
@@ -3027,10 +3032,13 @@ const tomerLeadStore = {
   logEvent:   (type, phone, data) => (tomerTest.routeOverride(phone) ? undefined : store.logEvent(type, phone, data)),
 };
 let _tomerOpenAI = null;
+let memberCare = null;                                   // created right after the service (it sends through it)
+const tomerGateway = tomerTest.wrapGateway(arboxGateway);
 const tomerService = app.locals.tomerService = createTomerService({
   leadStore: tomerLeadStore, persist: { saveLeads: () => persist.saveLeads(store) }, logger,
-  gateway: tomerTest.wrapGateway(arboxGateway), cases: serviceCases, tomerStore, inbox,
+  gateway: tomerGateway, cases: serviceCases, tomerStore, inbox,
   allowed: phone => _tomerOn(phone),
+  getCare: () => memberCare,
   // Automatic member sends obey WHATSAPP_AUTO_REPLY; a staff reply from the panel
   // (opts.staff) is a human send and is never blocked by it.
   sendText: async (to, text, opts = {}) => {
@@ -3080,6 +3088,120 @@ const tomerService = app.locals.tomerService = createTomerService({
     return c.choices?.[0]?.message?.content ?? null;
   } : null,
 });
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TOMER — PROACTIVE MEMBER CARE (services/member_care.js)
+// ══════════════════════════════════════════════════════════════════════════════
+// Three independent gates before any proactive message: the deployment switch
+// TOMER_PROACTIVE_ENABLED, the program's own enable flag (panel, off by default), and the
+// test-only recipient allowlist enforced in the Tomer send wrapper.
+memberCare = createMemberCare({
+  gateway: tomerGateway, store: careStore, cases: serviceCases, logger,
+  sendMember: (phone, text, meta) => tomerService.say(phone, text, meta),
+  state: {
+    proactiveOn: () => _tomerSwitch() && tomerTest.proactiveEnabled(),
+    allowed: phone => _tomerOn(phone),
+    owner: phone => _conversationOwner(phone),
+    // The last message that really was part of a conversation: anything the member wrote, or
+    // anything of ours that went out (a refused / blocked send is not a conversation).
+    lastConversationAt: phone => {
+      const msgs = (inbox.getThread ? inbox.getThread(phone) : null)?.messages ?? [];
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i];
+        if (m.direction === 'out' && ['failed', 'blocked', 'uncertain'].includes(m.meta?.sendState)) continue;
+        return new Date(m.timestamp).getTime();
+      }
+      return null;
+    },
+    testPhones: () => tomerTest.status().routeOverridePhones,
+  },
+  audit: e => { try { tomerStore.appendAudit({ ...e, owner: 'tomer' }); } catch { /* audit is a view */ } },
+  // Automated browser checks only (NODE_ENV=test): a clock that starts at a given instant, so
+  // the check behaves the same at any hour of the day. Never honoured outside tests.
+  ...(process.env.NODE_ENV === 'test' && process.env.MEMBER_CARE_TEST_NOW
+    ? (() => { const base = new Date(process.env.MEMBER_CARE_TEST_NOW).getTime(), t0 = Date.now(); return { now: () => new Date(base + (Date.now() - t0)) }; })() : {}),
+});
+app.locals.memberCare = memberCare;
+// Every 15 minutes: run the programs that are due today. Does nothing while the switch is off.
+if (process.env.TEST_NO_BIND !== 'true') {
+  cron.schedule('*/15 * * * *', () => { memberCare.tick().catch(err => logger.error('[member-care] scheduled run failed', { error: err.message })); }, { timezone: 'Asia/Jerusalem' });
+}
+{
+  const _by = req => String(req.body?.by ?? '').trim().slice(0, 40) || 'צוות';
+  const _care = fn => async (req, res) => {
+    try {
+      const out = await fn(req);
+      if (out && out.ok === false) return res.status(out.error === 'not_found' || out.error === 'unknown_program' ? 404 : 409).json(out);
+      return res.json({ ok: true, ...(out ?? {}) });
+    } catch (err) {
+      logger.error('[member-care] request failed', { path: req.path, error: err.message });
+      return res.status(500).json({ ok: false, error: 'operation_failed', detail: err.message });
+    }
+  };
+  const _epRow = e => ({ ...e, label: memberCare.PROGRAMS[e.program]?.label ?? e.program, reasonsText: (e.reasons ?? []).map(c => contactPolicy.REASON_HE[c] ?? memberCare.EXCL_HE[c] ?? c) });
+
+  app.get('/api/tomer/care/overview', _care(() => ({ ...memberCare.overview(), testMode: tomerTest.status(), autoReply: process.env.WHATSAPP_AUTO_REPLY === 'true' })));
+  app.post('/api/tomer/care/settings', jsonBody, _care(req => {
+    const b = req.body ?? {}, patch = {};
+    if ('groupLink' in b) {
+      const v = String(b.groupLink ?? '').trim();
+      if (v && !/^https:\/\/chat\.whatsapp\.com\/[A-Za-z0-9_-]{10,}$/.test(v)) return { ok: false, error: 'bad_group_link' };
+      patch.groupLink = v || null;
+    }
+    if ('paymentResolution' in b) {
+      const v = String(b.paymentResolution ?? '').trim().slice(0, 400);
+      if (/cvv|שלח[וי]? (?:לי |לנו )?(?:את )?(?:מספר|פרטי) (?:ה)?כרטיס/i.test(v)) return { ok: false, error: 'unsafe_payment_text' };
+      patch.paymentResolution = v || null;
+    }
+    if ('billingDataConfirmed' in b) patch.billingDataConfirmed = b.billingDataConfirmed === true;
+    if (b.policy && typeof b.policy === 'object') {
+      const cur = careStore.getSettings().policy, p = {};
+      const int = (k, lo, hi) => { if (k in b.policy) { const n = Number(b.policy[k]); if (!Number.isInteger(n) || n < lo || n > hi) throw new Error(`bad_policy:${k}`); p[k] = n; } };
+      try { int('windowStart', 6, 12); int('windowEnd', 13, 22); int('fridayEnd', 9, 16); int('cooldownHours', 0, 720); int('attendanceCooldownDays', 0, 30); int('recentConversationHours', 0, 168); int('replyWindowDays', 1, 14); int('defaultPauseDays', 1, 90); int('paymentGraceHours', 0, 168); }
+      catch (err) { return { ok: false, error: 'bad_policy', detail: err.message }; }
+      if ('saturday' in b.policy) p.saturday = b.policy.saturday === true;
+      if (['friday', 'sunday'].includes(b.policy.birthdaySaturday)) p.birthdaySaturday = b.policy.birthdaySaturday;
+      if ((p.windowStart ?? cur.windowStart) >= (p.windowEnd ?? cur.windowEnd)) return { ok: false, error: 'bad_policy' };
+      patch.policy = p;                                    // managerDigest is not settable: no digest exists until approved
+    }
+    const settings = careStore.updateSettings(patch, _by(req));
+    // A program whose required setting was removed cannot stay enabled.
+    for (const id of careStore.PROGRAM_IDS) if (settings.programs[id].enabled && memberCare.programBlocks(id, settings).length) careStore.updateSettings({ programs: { [id]: { enabled: false } } }, 'system');
+    return { overview: memberCare.overview() };
+  }));
+  app.post('/api/tomer/care/programs/:id', jsonBody, _care(req => {
+    const out = memberCare.setProgram(req.params.id, { enabled: req.body?.enabled, hour: req.body?.hour }, _by(req));
+    return out.ok ? { overview: memberCare.overview() } : out;
+  }));
+  app.get('/api/tomer/care/preview/:id', _care(req => memberCare.preview(req.params.id)));
+  app.post('/api/tomer/care/run/:id', jsonBody, _care(async req => {
+    if (!memberCare.PROGRAMS[req.params.id]) return { ok: false, error: 'unknown_program' };
+    const out = await memberCare.run({ programs: [req.params.id], trigger: 'manual', by: _by(req) });
+    return out.ok ? { run: out } : { ok: false, error: out.reason };
+  }));
+  app.post('/api/tomer/care/test-send/:id', jsonBody, _care(req => memberCare.testSend(req.params.id, { by: _by(req) })));
+  app.get('/api/tomer/care/episodes', _care(req => {
+    const status = req.query.status ? String(req.query.status).split(',') : undefined;
+    return { episodes: careStore.listEpisodes({ status, program: req.query.program || undefined, limit: 300 }).map(_epRow) };
+  }));
+  app.post('/api/tomer/care/episodes/resolve', jsonBody, _care(req => { const out = memberCare.resolveUncertain(String(req.body?.key ?? ''), { action: req.body?.action, by: _by(req) }); return out.ok ? { episode: _epRow(out.episode) } : out; }));
+  app.get('/api/tomer/care/absence-report', _care(() => memberCare.absenceReport()));
+  app.get('/api/tomer/care/visibility', _care(() => memberCare.visibility()));
+  app.post('/api/tomer/care/pauses', jsonBody, _care(req => {
+    const phone = normalizeToE164(String(req.body?.phone ?? ''));
+    const reason = String(req.body?.reason ?? '').trim().slice(0, 60);
+    const until = String(req.body?.until ?? '').trim();
+    if (!phone) return { ok: false, error: 'bad_phone' };
+    if (!reason) return { ok: false, error: 'reason_required' };
+    if (until && !/^\d{4}-\d{2}-\d{2}$/.test(until)) return { ok: false, error: 'bad_date' };
+    careStore.setPause(phone, { reason, note: String(req.body?.note ?? '').slice(0, 200) || null, until: until || null, endKnown: !!until, setBy: _by(req), name: String(req.body?.name ?? '').slice(0, 60) || null });
+    return { pauses: careStore.listPauses() };
+  }));
+  app.post('/api/tomer/care/pauses/remove', jsonBody, _care(req => { careStore.clearPause(normalizeToE164(String(req.body?.phone ?? '')) ?? String(req.body?.phone ?? '')); return { pauses: careStore.listPauses() }; }));
+  app.post('/api/tomer/care/entitlements/:userId/reserve', jsonBody, _care(req => careStore.reserveGuest(req.params.userId, { guestName: String(req.body?.guestName ?? '').slice(0, 60) || null, note: String(req.body?.note ?? '').slice(0, 200) || null, by: _by(req), caseId: req.body?.caseId ?? null })));
+  app.post('/api/tomer/care/entitlements/:userId/redeem', jsonBody, _care(req => careStore.redeemGuest(req.params.userId, String(req.body?.itemId ?? ''), _by(req))));
+  app.post('/api/tomer/care/entitlements/:userId/release', jsonBody, _care(req => careStore.releaseGuest(req.params.userId, String(req.body?.itemId ?? ''), _by(req))));
+}
 
 function _tomerManagerPhone() {
   const clean = p => String(p ?? '').trim().replace(/^\+/, '');
@@ -5167,6 +5289,9 @@ app.get('/api/system/events', (_req, res) => {
 app.post('/api/tomer/send-message', jsonBody, async (req, res) => {
   const { phone, name, template, context: ctx } = req.body ?? {};
   if (!phone) return res.status(400).json({ error: 'phone required' });
+  // Test-only restriction applies to every Tomer send route, old and new.
+  if (!tomerTest.isAllowed(normalizeToE164(phone) ?? phone)) return res.status(403).json({ ok: false, error: 'recipient_not_allowed', detail: 'מצב בדיקה — המספר אינו ברשימת המורשים.' });
+  if (store.getLead(normalizeToE164(phone) ?? phone)?.status === 'opted_out') return res.status(409).json({ ok: false, error: 'opted_out' });
 
   const TEMPLATES = {
     lead_touch1: `${name || 'שלום'}, שלום! 😊 Shape Studio בפרדס חנה-כרכור מחכה לך. 2 אימונים ב-60 ש״ח — ניסיון ללא התחייבות. הגיע הזמן? 💪`,
@@ -5319,7 +5444,8 @@ app.get('/api/tomer/segments', async (_req, res) => {
 app.post('/api/tomer/action', jsonBody, async (req, res) => {
   const { segment, phone, name, context: ctx } = req.body ?? {};
   if (!phone || !segment) return res.status(400).json({ error: 'phone and segment required' });
-  if (!tomerTest.proactiveEnabled()) return res.status(409).json({ ok: false, error: 'proactive_locked', detail: 'תוכניות יזומות נעולות (מצב בדיקה).' });
+  // Legacy segment sends (unapproved wording, no contact policy) are superseded by member care.
+  return res.status(410).json({ ok: false, error: 'superseded_by_member_care', detail: 'שליחה יזומה נעשית רק דרך "ליווי חברים".' });
   if (String(phone).includes('•')) return res.status(400).json({ error: 'Phone masked — cannot send' });
 
   const firstName = (name ?? '').split(/\s+/)[0].trim() || null;
@@ -5660,7 +5786,8 @@ app.get('/api/tomer/retention/config', (req, res) => {
 app.post('/api/tomer/retention/toggle', jsonBody, (req, res) => {
   const { workflowId, enabled } = req.body ?? {};
   if (!workflowId) return res.status(400).json({ error: 'workflowId required' });
-  if (enabled === true && !tomerTest.proactiveEnabled()) return res.status(409).json({ ok: false, error: 'proactive_locked', detail: 'תוכניות יזומות נעולות (מצב בדיקה).' });
+  // The legacy retention workflows are superseded by member care (panel: "ליווי חברים") and can no longer be enabled.
+  if (enabled === true) return res.status(410).json({ ok: false, error: 'superseded_by_member_care', detail: 'התוכניות הישנות הוחלפו ב"ליווי חברים".' });
   if (enabled === true) retentionWorker.enableWorkflow(workflowId);
   else retentionWorker.disableWorkflow(workflowId);
   res.json({ ok: true, workflowId, enabled: retentionWorker.getConfig()[workflowId]?.enabled });
@@ -6989,6 +7116,7 @@ if (process.env.TEST_NO_BIND === 'true') {
   // Tomer: a manager alert left unfinished by a crash is marked failed / uncertain for
   // staff to decide — nothing is ever re-sent on startup.
   tomerService.reconcileOnStartup().catch(err => logger.error('[startup] Tomer notification reconciliation failed', { error: err.message }));
+  try { memberCare.reconcileOnStartup(); } catch (err) { logger.error('[startup] member-care reconciliation failed', { error: err.message }); }
   _startupComplete = true;
 } else {
 
@@ -7102,6 +7230,7 @@ app.listen(PORT, async () => {
   // Tomer: a manager alert left unfinished by a crash is marked failed / uncertain for
   // staff to decide — nothing is ever re-sent on startup.
   tomerService.reconcileOnStartup().catch(err => logger.error('[startup] Tomer notification reconciliation failed', { error: err.message }));
+  try { memberCare.reconcileOnStartup(); } catch (err) { logger.error('[startup] member-care reconciliation failed', { error: err.message }); }
   _startupComplete = true;
   logger.info('[startup] Startup sequence complete — store ready');
 

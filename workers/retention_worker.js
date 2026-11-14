@@ -79,7 +79,9 @@ const _config = { ...WORKFLOW_DEFAULTS };
 
 function getConfig()          { return { ..._config }; }
 // Proactive programs run only when explicitly unlocked (TOMER_MODE=all + TOMER_PROACTIVE_ENABLED=true).
-const _proactive = () => require('../services/tomer_test_mode').proactiveEnabled();
+// SUPERSEDED: these legacy workflows are replaced by services/member_care.js, which owns all
+// proactive member messages through the shared contact policy. They can no longer send.
+const _proactive = () => false;
 function enableWorkflow(id)   {
   if (!_proactive()) { logger.warn('[retention] enable refused — proactive programs are locked', { id }); return; }
   if (_config[id]) { _config[id].enabled = true;  logger.info('[retention] enabled', { id }); }

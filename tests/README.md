@@ -60,6 +60,13 @@ failure.
 | `dashboard_auth.test.js` (Jest) | fail-closed, sessions (expiry, tampering, logout revocation across a restart), CSRF, login attempt limiting, public list |
 | `tomer_panel_browser_check.mjs` | real headless Chrome: login, deep link to a case, assign, staff reply, takeover / release, resolve, counters, retry, error / empty states, server restart, logout. Run directly: `node tests/tomer_panel_browser_check.mjs` |
 
+| `tomer_test_mode.test.js` (Jest) | the TEST-ONLY restriction: allowlist, routing override for the test phone, synthetic identity, Barak lead / appointment untouched |
+| `member_care.test.js` (Jest) | proactive member care on a controlled clock: every program, baselines (no backlog), contact policy, reply continuity, guest entitlement, restart / duplicate workers / uncertain sends |
+| `member_care_browser_check.mjs` | real headless Chrome on the "ליווי חברים" area: settings, previews with reasons, run, pauses, guest redemption, absence report, restart. Run directly |
+
+Known time-of-day dependence: `integration_callback_aptstore.test.mjs` asks for a callback "today at 15:00" against the real
+clock, so it fails when run after 15:00 Israel time (the request is correctly rejected as "in the past").
+
 ## Not part of the isolated run
 
 | File | Why | How to run |

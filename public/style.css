@@ -2980,6 +2980,21 @@ input:checked + .toggle-slider::before { transform: translateX(16px); }
 .tw-cd-check-label { font-size: 13px; font-weight: 400; display: flex; gap: 6px; align-items: center; }
 .tw-cd-events { margin-top: 8px; }
 .tw-case-panel summary { cursor: pointer; font-size: 13px; font-weight: 600; }
+.tc-table td { vertical-align: top; white-space: normal; }
+.tc-actions { min-width: 190px; }
+.tc-hour { width: 64px; display: inline-block; }
+.tc-actions .btn-xs { margin: 2px 0; }
+.tc-blocks { color: #92400e; }
+.tc-policy { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 8px 14px; margin-top: 6px; }
+.tc-num { display: flex; flex-direction: column; gap: 3px; font-size: 12.5px; color: var(--muted); }
+.tc-num .field-input { width: 100%; }
+.tc-missing { margin: 6px 18px; font-size: 13px; line-height: 1.7; }
+.tc-src { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.tc-pause-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+.tc-pause-form .field-input { max-width: 200px; }
+.tc-ent { padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 13.5px; }
+#twp-care .tw-card > .btn { margin-bottom: 8px; }
+#twp-care details summary { cursor: pointer; font-size: 12.5px; color: var(--primary); }
 .btn-logout { margin-inline-start: 10px; padding: 4px 12px; font: inherit; font-size: 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--card); color: var(--text); cursor: pointer; }
 .btn-logout:hover { border-color: var(--primary); color: var(--primary); }
 @media (max-width: 640px) { .tw-case-panel { width: 100vw; max-width: 100vw; } .tw-cd-k { flex-basis: 78px; } }

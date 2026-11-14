@@ -421,10 +421,9 @@
             <button class="tw-tab active" data-pane="today">היום <span class="tw-badge" id="tw-badge-today"></span></button>
             <button class="tw-tab" data-pane="cases">פניות <span class="tw-badge" id="tw-badge-cases"></span></button>
             <button class="tw-tab" data-pane="conversations">שיחות <span class="tw-badge" id="tw-badge-conv"></span></button>
-            <button class="tw-tab" data-pane="upcoming">הודעות מתוזמנות</button>
+            <button class="tw-tab" data-pane="care">ליווי חברים <span class="tw-badge" id="tw-badge-care"></span></button>
             <button class="tw-tab" data-pane="members">חברים</button>
             <button class="tw-tab" data-pane="tasks">תורים לעדן <span class="tw-badge" id="tw-badge-tasks"></span></button>
-            <button class="tw-tab" data-pane="automation">אוטומציה</button>
             <button class="tw-tab" data-pane="audit">היסטוריה</button>
           </div>
           <div class="tw-actions">
@@ -530,6 +529,28 @@
           <div id="tw-cases-alert" class="tw-cases-alert" role="status" hidden></div>
           <div class="tw-cases-writes">ביטול והקפאת מנוי מבוצעים על ידי הצוות ב-Arbox. המערכת רק קוראת מ-Arbox — היא לא משנה מנויים ולא רושמת לשיעורים.</div>
           <div id="tw-cases-list" class="tw-list"><div class="tw-empty" data-state="loading">טוען פניות…</div></div>
+        </div>
+
+        <!-- ── Member care (proactive programs) ───────────────── -->
+        <div class="tw-pane" id="twp-care" dir="rtl">
+          <div id="tc-banner" class="tw-cases-alert" role="status" hidden></div>
+          <div id="tc-flash" class="tw-cd-flash" role="status" aria-live="polite"></div>
+          <div class="tw-card"><div class="tw-card-title">תוכניות ליווי — כולן כבויות עד הפעלה</div><div id="tc-programs"><div class="tw-empty" data-state="loading">טוען…</div></div></div>
+          <div class="tw-card" id="tc-preview-card" style="margin-top:12px" hidden><div class="tw-card-title" id="tc-preview-title">תצוגה מקדימה</div><div id="tc-preview"></div></div>
+          <div class="tw-card" style="margin-top:12px"><div class="tw-card-title">הודעות</div>
+            <div class="tw-filter-row">
+              <button type="button" class="filter-btn active" data-ef="upcoming">ממתינות / נדחו</button>
+              <button type="button" class="filter-btn" data-ef="sent">נשלחו ותגובות</button>
+              <button type="button" class="filter-btn" data-ef="problem">נכשלו / לא ודאי</button>
+              <button type="button" class="filter-btn" data-ef="dropped">בוטלו / פגו</button>
+            </div>
+            <div id="tc-episodes"></div>
+          </div>
+          <div class="tw-card" style="margin-top:12px"><div class="tw-card-title">דוח היעדרות</div><button type="button" class="btn btn-secondary" id="tc-absence-load">הפק דוח מ-Arbox</button><div id="tc-absence"></div></div>
+          <div class="tw-card" style="margin-top:12px"><div class="tw-card-title">חדשים שלא הגיעו · חזרו אחרי היעדרות</div><button type="button" class="btn btn-secondary" id="tc-visibility-load">טען</button><div id="tc-visibility"></div></div>
+          <div class="tw-card" style="margin-top:12px"><div class="tw-card-title">השהיות (חופשה / היעדרות ידועה)</div><div id="tc-pauses"></div></div>
+          <div class="tw-card" style="margin-top:12px"><div class="tw-card-title">אימוני אורח — זכאות ומימוש</div><div id="tc-entitlements"></div></div>
+          <div class="tw-card" style="margin-top:12px"><div class="tw-card-title">הגדרות ומדיניות קשר</div><div id="tc-settings"></div></div>
         </div>
 
         <!-- ── One service case ───────────────────────────────── -->

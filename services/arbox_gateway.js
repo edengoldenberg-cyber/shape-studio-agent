@@ -142,6 +142,9 @@ function _mapUser(u) {
     role:      u.user_role ?? null,
     active:    u.active === 1,
     gender:    u.gender === 'female' || u.gender === 'male' ? u.gender : null,
+    birthday:  /^\d{4}-\d{2}-\d{2}$/.test(u.birthday ?? '') ? u.birthday : null,          // YYYY-MM-DD as entered in Arbox
+    memberSince: /^\d{4}-\d{2}-\d{2}/.test(u.membership_start_date ?? '') ? String(u.membership_start_date).slice(0, 10) : null,
+    createdAt: u.created_time ?? null,                                                     // when the USER ROW was created (import time ≠ joining time)
   };
 }
 
@@ -153,7 +156,7 @@ async function _userIndex() {
       byId.set(String(u.userId), u);
       if (u.phone) byPhone.set(u.phone, [...(byPhone.get(u.phone) ?? []), u]);
     }
-    return { byPhone, byId, count: users.length };
+    return { byPhone, byId, count: users.length, all: users };
   });
 }
 
@@ -355,6 +358,102 @@ async function executeWrite(op, args) {
   return { accepted: true, status: res.status };   // accepted ≠ completed: the caller verifies by reading back
 }
 
+// ── Studio-wide reads for member care (all read-only, all paged) ──────────────
+//
+// Field meanings below were OBSERVED with GET-only probes on 2026-11-14
+// (scripts/audit/arbox_care_probe.cjs). Nothing here is assumed from a route name.
+
+/** Every user row (members, staff, aggregator members), with birthday / member-since. */
+async function getAllUsers() {
+  const idx = await _userIndex();
+  return { users: idx.value.all, fetchedAt: idx.fetchedAt, stale: idx.stale, source: '/v3/users' };
+}
+
+/**
+ * Every membership row of the studio (paged, 200 per page; ~1,350 rows observed).
+ *   createdAt  when the membership ROW was created in Arbox (purchase / renewal / import)
+ *   startDate / endDate  validity; a recurring plan has NO end date
+ *   typeId     joins to getMembershipTypes(); types that were deleted are missing there
+ */
+async function getAllMemberships() {
+  const r = await cached('memberships:all', 10 * 60 * 1000, async () => {
+    const rows = await _getAllPages('/v3/users/memberships', {}, { maxPages: 40 });
+    return rows.map(m => ({
+      membershipUserId: m.membership_user_id, userId: m.user_id, typeId: m.membership_type_id ?? null,
+      name: m.membership_type_name ?? null, rowType: m.type ?? null,
+      startDate: m.start_time ?? null, endDate: m.end_time ?? null,
+      createdAt: m.created_at ?? null, active: m.active === 1, cancelled: m.cancelled === 1,
+      debt: typeof m.debt === 'number' ? m.debt : null,
+    }));
+  }, { maxStaleMs: 0 });
+  return { memberships: r.value, fetchedAt: r.fetchedAt, stale: r.stale, source: '/v3/users/memberships (all pages)' };
+}
+
+/** Membership types currently defined: kind ('plan' | 'trial' | 'session' | 'onetime' | 'item' | 'service') and whether they renew by recurring charge. */
+async function getMembershipTypes() {
+  const r = await cached('membershipTypes', 60 * 60 * 1000, async () => {
+    const rows = await _getAllPages('/v3/membershipTypes', {}, { maxPages: 5 });
+    return rows.map(t => ({ typeId: t.membership_type_id, name: t.membership_type_name ?? null, kind: t.type ?? null, recurring: t.is_recurring_payment === 1 }));
+  });
+  return { types: r.value, fetchedAt: r.fetchedAt, stale: r.stale, source: '/v3/membershipTypes' };
+}
+
+/**
+ * All bookings of all members between two Israel dates (inclusive, ≤ 31 days — the API
+ * rejects longer ranges). checkedIn === true is the only VERIFIED attendance signal.
+ * Never served stale: "no attendance" must not be concluded from an old copy.
+ */
+async function getAllBookings({ from, to }) {
+  const r = await cached(`bookings:all:${from}:${to}`, 5 * 60 * 1000, async () => {
+    const rows = await _getAllPages('/v3/reports/bookingsReport', { fromDate: from, toDate: to }, { maxPages: 60 });
+    return rows.filter(b => b.user_role !== 'staffMember').map(b => ({
+      userId: b.user_id, date: b.date, time: b.time, className: b.class_name ?? null,
+      checkedIn: b.check_in === 'Yes', firstSession: b.is_first_session === 'Yes',
+    }));
+  }, { maxStaleMs: 0 });
+  return { bookings: r.value, fetchedAt: r.fetchedAt, stale: r.stale, source: '/v3/reports/bookingsReport (all pages)' };
+}
+
+/** All recorded booking cancellations in a date range (≤ 31 days). */
+async function getAllCancellations({ from, to }) {
+  const r = await cached(`cancellations:all:${from}:${to}`, 5 * 60 * 1000, async () => {
+    const rows = await _getAllPages('/v3/reports/bookingCancellationReport', { fromDate: from, toDate: to }, { maxPages: 30 });
+    return rows.map(c => ({ userId: c.user_id, date: c.date, time: String(c.start_time ?? '').slice(0, 5), className: c.class_name ?? null }));
+  }, { maxStaleMs: 0 });
+  return { cancellations: r.value, fetchedAt: r.fetchedAt, stale: r.stale, source: '/v3/reports/bookingCancellationReport' };
+}
+
+/**
+ * Members on hold in a date range (≤ 31 days). The row shape has never been observed
+ * live (no member was on hold when probed) — matching is by user_id only, and `rowFields`
+ * is returned so the first real row can be inspected.
+ */
+async function getHolds({ from, to }) {
+  const r = await cached(`holds:${from}:${to}`, 10 * 60 * 1000, async () => {
+    const body = await _get('/v3/reports/membersOnHoldReport', { fromDate: from, toDate: to, limit: 200 });
+    const rows = Array.isArray(body?.data) ? body.data : [];
+    return { userIds: [...new Set(rows.map(x => x.user_id).filter(v => v !== undefined && v !== null).map(String))], totalRows: rows.length, rowFields: rows[0] ? Object.keys(rows[0]) : [] };
+  }, { maxStaleMs: 0 });
+  return { ...r.value, fetchedAt: r.fetchedAt, stale: r.stale, source: '/v3/reports/membersOnHoldReport' };
+}
+
+/**
+ * Card transactions in a date range (≤ 31 days). Observed fields: status 'SUCCESS' | 'FAIL',
+ * type 'RECURRING' | 'REGULAR', recurring_payment_id, membership_user_id, date-time.
+ * Card digits, vouchers and receipts are deliberately NOT kept.
+ */
+async function getTransactions({ from, to }) {
+  const r = await cached(`transactions:${from}:${to}`, 10 * 60 * 1000, async () => {
+    const rows = await _getAllPages('/v3/reports/transactionsReport', { fromDate: from, toDate: to }, { maxPages: 30 });
+    return rows.map(t => ({
+      transactionId: t.transaction_id, userId: t.user_id, membershipUserId: t.membership_user_id ?? null,
+      recurringPaymentId: t.recurring_payment_id ?? null, at: t.transaction_date_time ?? t.transaction_date ?? null,
+      date: t.transaction_date ?? String(t.transaction_date_time ?? '').slice(0, 10), kind: t.type ?? null, status: t.status ?? null, itemName: t.item_name ?? null,
+    }));
+  }, { maxStaleMs: 0 });
+  return { transactions: r.value, fetchedAt: r.fetchedAt, stale: r.stale, source: '/v3/reports/transactionsReport' };
+}
+
 // ── Date helpers for callers ──────────────────────────────────────────────────
 function todayIL(now = new Date()) { return ilDateString(now); }
 function dateIL(offsetDays, now = new Date()) { const p = ilParts(now); return ilDateString(addDays({ year: p.year, month: p.month, day: p.day }, offsetDays)); }
@@ -364,6 +463,7 @@ function _resetForTests() { _cache.clear(); _client = null; }
 module.exports = {
   ArboxError, normalizePhone,
   resolveMember, getMemberById, getMemberships, getBookings, getClasses, getCancellations, getHoldStatus,
+  getAllUsers, getAllMemberships, getMembershipTypes, getAllBookings, getAllCancellations, getHolds, getTransactions,
   executeWrite, writesEnabled, writeStatus, WRITE_CONTRACTS,
   todayIL, dateIL, clearCache, _resetForTests,
 };

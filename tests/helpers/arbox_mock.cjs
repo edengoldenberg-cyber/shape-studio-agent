@@ -13,7 +13,7 @@ const http = require('http');
 
 function createArboxMock() {
   const state = {
-    users: [], memberships: [], schedule: [], bookings: [], cancellations: [], holds: [],
+    users: [], memberships: [], schedule: [], bookings: [], cancellations: [], holds: [], membershipTypes: [], transactions: [],
   };
   const mode = {
     down: false,            // every request → 503
@@ -35,6 +35,9 @@ function createArboxMock() {
     req.on('end', () => {
       let body = null; try { body = raw ? JSON.parse(raw) : null; } catch { /* ignore */ }
       log.push({ method: req.method, path: p, query: q, body });
+      // one-shot hook: mutate state right AFTER a studio-wide report was answered (simulates a change between snapshot and send)
+      const hk = !q.user_id && mode.after && mode.after[p];
+      if (hk) { delete mode.after[p]; res.on('finish', () => hk(state)); }
       if (mode.down) return send(res, 503, { error: { message: 'unavailable' } });
       if (req.method === 'GET' && mode.hang) return; // never answers
 
@@ -51,9 +54,16 @@ function createArboxMock() {
           return send(res, 200, { data: state.schedule.filter(c => between(c.date, q.fromDate, q.toDate)).map(c => ({ schedule_id: c.schedule_id, date: c.date, start_time: c.start_time, registration_count: c.registration_count ?? 0, standby_members: c.standby_members ?? 0, status: c.status ?? 'active', service_type: 'class' })) });
         }
         // The real report honours ?user_id; cancellation report IGNORES it (returns all rows).
+        if (p === '/v3/reports/bookingsReport' && mode.bookingsDown) return send(res, 500, { error: { message: 'report failed' } });
+        if (p === '/v3/reports/bookingsReport' && q.fromDate && q.toDate && (new Date(q.toDate) - new Date(q.fromDate)) / 86400000 > 31) return send(res, 400, { error: { message: { toDate: ['The date range should not exceed 31 days.'] } } });
         if (p === '/v3/reports/bookingsReport') return send(res, 200, { data: state.bookings.filter(b => between(b.date, q.fromDate, q.toDate) && (!q.user_id || String(b.user_id) === String(q.user_id))) });
         if (p === '/v3/reports/bookingCancellationReport') return send(res, 200, { data: state.cancellations.filter(c => between(c.date, q.fromDate, q.toDate)) });
         if (p === '/v3/reports/membersOnHoldReport') return send(res, 200, { data: state.holds });
+        if (p === '/v3/membershipTypes') return send(res, 200, { data: state.membershipTypes, extra: { pagination: { next_page_url: null } } });
+        if (p === '/v3/reports/transactionsReport') {
+          if (mode.billingDown) return send(res, 500, { error: { message: 'report failed' } });
+          return send(res, 200, { data: state.transactions.filter(t => between(t.transaction_date, q.fromDate, q.toDate)), extra: { pagination: { next_page_url: null } } });
+        }
         return send(res, 404, { error: { message: 'not found' } });
       }
 
@@ -82,7 +92,7 @@ function createArboxMock() {
     close: () => new Promise(r => { server.closeAllConnections?.(); server.close(() => r()); }),
     reset() {
       for (const k of Object.keys(state)) state[k].length = 0;
-      Object.assign(mode, { down: false, hang: false, occupancyDown: false, write: 'success' });
+      Object.assign(mode, { down: false, hang: false, occupancyDown: false, write: 'success', bookingsDown: false, billingDown: false, after: null });
       log.length = 0;
     },
   };

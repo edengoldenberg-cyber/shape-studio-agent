@@ -12,8 +12,9 @@
  *                              appointments and history are never read-modified by that route.
  *                              Remove the variable (or set 'false') → the phone goes back to its
  *                              normal routing with every stored record exactly as it was.
- *   TOMER_PROACTIVE_ENABLED    'true' AND TOMER_MODE=all → proactive member programs
- *                              (onboarding / retention / segment sends) may run. Otherwise locked.
+ *   TOMER_PROACTIVE_ENABLED    'true' → proactive member-care programs MAY run (each one must
+ *                              still be enabled in the panel). In test_only mode their
+ *                              recipients are still limited to the allowlist. Unset = locked.
  *
  * In test_only mode:
  *   • a member who is not on the allowlist is never handled by the new flow and can never
@@ -39,7 +40,7 @@ function routeOverride(phone) {
   return mode() === 'test_only' && process.env.TOMER_TEST_ROUTE_OVERRIDE === 'true' && allowlist().has(digits(phone));
 }
 
-const proactiveEnabled = () => mode() === 'all' && process.env.TOMER_PROACTIVE_ENABLED === 'true';
+const proactiveEnabled = () => process.env.TOMER_PROACTIVE_ENABLED === 'true';
 
 function status() {
   const list = [...allowlist()];
