@@ -23,7 +23,7 @@ function getAdminPhones() {
     .filter(isRealPhone);
   try {
     const cfg = JSON.parse(
-      fs.readFileSync(path.join(__dirname, '../data/staff_config.json'), 'utf8')
+      fs.readFileSync(process.env.STAFF_CONFIG_PATH ?? path.join(__dirname, '../data/staff_config.json'), 'utf8')
     );
     const cfgPhones = (cfg.staff ?? [])
       .filter(s => s.active && isRealPhone(s.phone))

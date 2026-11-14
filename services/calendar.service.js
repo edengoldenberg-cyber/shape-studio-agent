@@ -30,7 +30,7 @@ const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:3000';
 function loadStaffConfig() {
   try {
     return JSON.parse(
-      fs.readFileSync(path.join(__dirname, '../data/staff_config.json'), 'utf8')
+      fs.readFileSync(process.env.STAFF_CONFIG_PATH ?? path.join(__dirname, '../data/staff_config.json'), 'utf8')
     );
   } catch {
     return { staff: [], default_assignee_id: null };
@@ -207,12 +207,25 @@ const HE_WEEKDAY = {
   שבת:   6,
 };
 
+// ── Hebrew month names → 0-based index ───────────────────────────────────────
+const HE_MONTH = {
+  ינואר: 0, פברואר: 1, מרץ: 2, מארס: 2, אפריל: 3, מאי: 4, יוני: 5,
+  יולי: 6, אוגוסט: 7, ספטמבר: 8, אוקטובר: 9, נובמבר: 10, דצמבר: 11,
+};
+
 /**
  * Deterministic local resolver for common Israeli Hebrew time references.
  * Resolves relative to `ref` in Asia/Jerusalem (defaults to now).
- * Covers: "מחר", "היום", bare "שעה N", "מחר בשעה N", day names.
+ *
+ * Supported patterns (in priority order):
+ *   1. Explicit calendar date: "15 בנובמבר בשעה 10", "15.11.2026 בשעה 10:00"
+ *   2. "מחר", "היום"
+ *   3. Hebrew day name ("ראשון", "חמישי", etc.)
+ *   4. Bare "בשעה N" / "שעה N" (no day reference)
+ *
  * Returns a Date on success, or null when the pattern is unrecognised.
- * Always called FIRST by parseHebrewTime before the OpenAI fallback.
+ * Returns null for invalid calendar dates (e.g. Feb 30) rather than guessing.
+ * Does NOT fall through to bare-hour for explicit-date patterns that fail to parse.
  */
 function parseHebrewTimeLocal(rawText, ref = new Date()) {
   if (!rawText) return null;
@@ -233,9 +246,6 @@ function parseHebrewTimeLocal(rawText, ref = new Date()) {
   function ilDate(year, month, day, hour = 12, minute = 0) {
     // 'month' is 0-based
     const s = `${year}-${String(month + 1).padStart(2,'0')}-${String(day).padStart(2,'0')}T${String(hour).padStart(2,'0')}:${String(minute).padStart(2,'0')}:00`;
-    // Convert IL local time to UTC via known offset (+2 or +3 depending on DST)
-    // Use a date-string that includes timezone offset: Intl.DateTimeFormat cannot
-    // go backwards, so we approximate using a probe.
     const probe = new Date(s + '+00:00');
     const ilOffset = (() => {
       const ilStr = probe.toLocaleString('en-US', { timeZone: 'Asia/Jerusalem', hour12: false,
@@ -249,12 +259,77 @@ function parseHebrewTimeLocal(rawText, ref = new Date()) {
     return new Date(s + (ilOffset >= 0 ? `+0${ilOffset}:00` : `-0${Math.abs(ilOffset)}:00`));
   }
 
+  // Validate that a calendar date actually exists (rejects Feb 30, Apr 31, etc.)
+  function isValidDate(year, month0, day) {
+    const d = new Date(Date.UTC(year, month0, day));
+    return d.getUTCFullYear() === year && d.getUTCMonth() === month0 && d.getUTCDate() === day;
+  }
+
   // Extract hour from text, e.g. "בשעה 12", "שעה 15:30", "ב-9", "ב9"
   function extractHour(text) {
     const m = text.match(/(?:ב[-–]?|שעה\s+|בשעה\s*)(\d{1,2})(?::(\d{2}))?/);
     if (!m) return null;
     return { h: parseInt(m[1]), min: m[2] ? parseInt(m[2]) : 0 };
   }
+
+  // ── 1. Explicit calendar date ─────────────────────────────────────────────
+  //
+  // Pattern A: "15 בנובמבר" / "15 בנובמבר 2027" (Hebrew month name)
+  // Pattern B: "15.11.2026" / "15/11/2026" / "15-11-2026" (numeric DD.MM.YYYY)
+  //
+  // When an explicit date is detected, we NEVER fall through to the bare-hour
+  // branch — if the date is invalid we return null so the caller can fall back
+  // to the async OpenAI parser rather than silently scheduling on the wrong day.
+
+  // Pattern A: DD בMMM [YYYY]
+  for (const [monthName, monthIdx] of Object.entries(HE_MONTH)) {
+    const reName = new RegExp(`(\\d{1,2})\\s+ב${monthName}(?:\\s+(\\d{4}))?`);
+    const mA = t.match(reName);
+    if (mA) {
+      const dayNum = parseInt(mA[1]);
+      let year = mA[2] ? parseInt(mA[2]) : refYear;
+      // Year rollover: if the specified month/day is in the past this year, use next year
+      if (!mA[2]) {
+        const testDate = ilDate(year, monthIdx, dayNum, 12, 0);
+        const refMidnight = ilDate(refYear, refMonth, refDay, 0, 0);
+        if (testDate < refMidnight) year += 1;
+      }
+      if (!isValidDate(year, monthIdx, dayNum)) return null; // e.g. Feb 30
+      const hour = extractHour(t);
+      const h = hour?.h ?? 12, min = hour?.min ?? 0;
+      return ilDate(year, monthIdx, dayNum, h, min);
+    }
+  }
+
+  // Pattern B: DD.MM.YYYY or DD/MM/YYYY or DD-MM-YYYY (with explicit 4-digit year)
+  const mB = t.match(/(\d{1,2})[./\-](\d{1,2})[./\-](\d{4})/);
+  if (mB) {
+    const dayNum = parseInt(mB[1]), monIdx = parseInt(mB[2]) - 1, year = parseInt(mB[3]);
+    if (!isValidDate(year, monIdx, dayNum)) return null;
+    const hour = extractHour(t);
+    const h = hour?.h ?? 12, min = hour?.min ?? 0;
+    return ilDate(year, monIdx, dayNum, h, min);
+  }
+
+  // Pattern B2: DD.MM without year (e.g. "15.11 בשעה 10")
+  // Only matches when the second field is a valid month (01-12) and not year-like (not 4 digits).
+  const mB2 = t.match(/^(\d{1,2})[./](\d{1,2})(?:\s|$|[^./\-\d])/);
+  if (mB2) {
+    const dayNum = parseInt(mB2[1]), monIdx = parseInt(mB2[2]) - 1;
+    if (monIdx >= 0 && monIdx <= 11) {
+      let year = refYear;
+      if (!isValidDate(year, monIdx, dayNum)) return null;
+      const testDate = ilDate(year, monIdx, dayNum, 12, 0);
+      const refMidnight = ilDate(refYear, refMonth, refDay, 0, 0);
+      if (testDate < refMidnight) year += 1;
+      if (!isValidDate(year, monIdx, dayNum)) return null;
+      const hour = extractHour(t);
+      const h = hour?.h ?? 12, min = hour?.min ?? 0;
+      return ilDate(year, monIdx, dayNum, h, min);
+    }
+  }
+
+  // ── 2. Relative day references ────────────────────────────────────────────
 
   // "מחר" or "למחר" (tomorrow)
   if (/מחר/.test(t) && !/מחרתיים/.test(t)) {
@@ -268,16 +343,8 @@ function parseHebrewTimeLocal(rawText, ref = new Date()) {
     const h = hour?.h ?? refHour + 1, min = hour?.min ?? 0;
     return ilDate(refYear, refMonth, refDay, h, min);
   }
-  // Bare "בשעה N" / "שעה N" with no day reference → assume today (or tomorrow if past)
-  if (/(?:בשעה|שעה)\s+\d/.test(t) && !/ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת|מחר|היום/.test(t)) {
-    const hour = extractHour(t);
-    if (hour) {
-      let d = ilDate(refYear, refMonth, refDay, hour.h, hour.min);
-      if (d <= ref) d = ilDate(refYear, refMonth, refDay + 1, hour.h, hour.min); // next day if past
-      return d;
-    }
-  }
-  // Hebrew day name
+
+  // ── 3. Hebrew day name ────────────────────────────────────────────────────
   for (const [name, weekday] of Object.entries(HE_WEEKDAY)) {
     if (t.includes(name)) {
       const refWeekday = new Date(ilDate(refYear, refMonth, refDay, 12)).getDay();
@@ -287,6 +354,17 @@ function parseHebrewTimeLocal(rawText, ref = new Date()) {
       return ilDate(refYear, refMonth, refDay + daysAhead, h, min);
     }
   }
+
+  // ── 4. Bare "בשעה N" / "שעה N" (no other day reference) ──────────────────
+  if (/(?:בשעה|שעה)\s+\d/.test(t) && !/ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת|מחר|היום/.test(t)) {
+    const hour = extractHour(t);
+    if (hour) {
+      let d = ilDate(refYear, refMonth, refDay, hour.h, hour.min);
+      if (d <= ref) d = ilDate(refYear, refMonth, refDay + 1, hour.h, hour.min); // next day if past
+      return d;
+    }
+  }
+
   return null;
 }
 

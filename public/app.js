@@ -960,12 +960,12 @@ document.querySelectorAll('[data-tseg]').forEach(btn => {
   });
 });
 
-document.getElementById('btn-tomer-refresh').addEventListener('click', () => {
+document.getElementById('btn-tomer-refresh')?.addEventListener('click', () => {
   loadTomerQueue();      // sidebar mini-stats (dormant leads, intro offers)
   loadTomerSegments();   // main 5-panel from live Arbox
 });
 
-document.getElementById('btn-tomer-checks').addEventListener('click', async () => {
+document.getElementById('btn-tomer-checks')?.addEventListener('click', async () => {
   const btn    = document.getElementById('btn-tomer-checks');
   const result = document.getElementById('tomer-checks-result');
   btn.disabled = true;
@@ -1874,23 +1874,40 @@ function fmtCallbackTime(apt, qualData) {
   return qualData?.callTimeGiven ?? apt?.rawTime ?? '—';
 }
 
-function cbStatusLabel(leadStatus, aptStatus, qualData) {
-  if (aptStatus === 'completed')       return { label: 'הושלם',             cls: 'muted' };
-  if (aptStatus === 'cancelled')       return { label: 'בוטל',              cls: 'muted' };
-  if (aptStatus === 'no_answer')       return { label: 'לא ענה (שיחה)',     cls: 'hot'   };
-  if (aptStatus === 'no_show')         return { label: 'לא הגיע (שיעור)',   cls: 'hot'   };
-  if (aptStatus === 'confirmed')       return { label: 'מאושר',             cls: 'green' };
-  if (qualData?.nameAsked && !qualData?.confirmedName)
-                                       return { label: 'ממתין לשם',         cls: 'warm'  };
-  if (aptStatus === 'callback_pending') return { label: 'בקשת שיחה',        cls: 'warm'  };
-  if (leadStatus === 'call_scheduled') return { label: 'מתוזמן (ישן)',      cls: 'green' };
-  return                                      { label: 'בקשת שיחה',         cls: 'warm'  };
+// Stage comes from the server (/api/barak/callbacks → row.stage). The three facts —
+// staff approval, prospect availability and call outcome — are shown separately.
+const CB_STAGE_LABELS = {
+  awaiting_time:     { label: 'ממתין למועד מהליד',        cls: 'warm'  },
+  awaiting_new_time: { label: 'הליד ביקש מועד אחר',       cls: 'warm'  },
+  awaiting_name:     { label: 'ממתין לשם',                cls: 'warm'  },
+  pending_staff:     { label: 'ממתין לאישור הצוות',       cls: 'hot'   },
+  staff_confirmed:   { label: 'אושר על ידי הצוות',        cls: 'green' },
+  awaiting_outcome:  { label: 'המועד עבר — לעדכן תוצאה',  cls: 'hot'   },
+  unscheduled:       { label: 'אין מועד תקין',            cls: 'hot'   },
+  no_open_callback:  { label: 'אין בקשה פתוחה',           cls: 'muted' },
+};
+const CB_FLAG_LABELS = {
+  call_time_timestamp_invalid_review: '⚠️ חותמת זמן היסטורית שגויה — לבדיקה (המועד עצמו תקין)',
+  manager_summary_failed:             '⚠️ סיכום למנהל לא נשלח',
+  summary_send_uncertain_review:      '⚠️ לא ידוע אם הסיכום נשלח (המערכת הופסקה באמצע שליחה) — לבדוק ידנית',
+  prospect_summary_failed:            '⚠️ סיכום לליד לא נשלח',
+};
+
+function cbStatusLabel(row) {
+  return CB_STAGE_LABELS[row.stage] ?? { label: 'בקשת שיחה', cls: 'warm' };
 }
 
-// renderCallbackPanel now accepts combined records from /api/barak/callbacks.
+function cbSetMsg(text, isError) {
+  const el = document.getElementById('barak-callbacks-msg');
+  if (!el) return;
+  el.textContent = text ?? '';
+  el.style.display = text ? 'block' : 'none';
+  el.style.color = isError ? 'var(--hot)' : 'var(--green)';
+}
+
+// renderCallbackPanel accepts combined records from /api/barak/callbacks.
 // Each record has fullPhone (E.164, server-authoritative), maskedPhone (display only),
-// and an embedded apt object — all joined server-side by full phone. No client-side
-// phone matching or masked-phone collision risk.
+// a server-computed stage / needsAction, and the lead's OPEN appointment (apt) or null.
 function renderCallbackPanel(callbacks) {
   const bodyEl  = document.getElementById('barak-callbacks-body');
   const badgeEl = document.getElementById('barak-callbacks-badge');
@@ -1898,53 +1915,49 @@ function renderCallbackPanel(callbacks) {
 
   if (!callbacks.length) {
     if (badgeEl) badgeEl.textContent = '';
-    bodyEl.innerHTML = `<div class="empty-state" style="padding:12px">אין שיחות ממתינות</div>`;
+    bodyEl.innerHTML = `<div id="barak-callbacks-msg" style="display:none;padding:6px 16px;font-size:12px"></div>
+      <div class="empty-state" style="padding:12px">אין שיחות ממתינות</div>`;
     return;
   }
 
   if (badgeEl) badgeEl.textContent = callbacks.length;
+  const btn = 'font-size:10px;padding:2px 6px;cursor:pointer;border-radius:3px;border:1px solid var(--border)';
 
   const rows = callbacks.map(l => {
     const qd  = l.meta?.qualData ?? {};
-    const apt = l.apt ?? null; // already joined server-side
+    const apt = l.apt ?? null;
 
     const alertSt   = l.meta?.handoffAlertStatus;
     const alertIdMsg = l.meta?.handoffAlertIdMessage ? ` · idMsg: ${l.meta.handoffAlertIdMessage}` : '';
-    const alertTime  = l.meta?.handoffAlertSentAt
-      ? ` · שנשלח: ${new Date(l.meta.handoffAlertSentAt).toLocaleTimeString('he-IL',{timeZone:'Asia/Jerusalem',hour:'2-digit',minute:'2-digit'})}`
-      : (l.meta?.handoffAlertFailedAt ? ' · נכשל' : '');
     const alertTip  = alertSt === 'sent'
-      ? `ספק קיבל הודעה (לא אישור מסירה)${alertIdMsg}${alertTime}`
-      : alertSt === 'failed' ? `שליחה נכשלה${alertTime}` : 'לא נשלחה';
+      ? `סיכום למנהל: הספק קיבל את ההודעה (לא אישור מסירה)${alertIdMsg}`
+      : alertSt === 'failed' ? 'סיכום למנהל: השליחה נכשלה'
+      : alertSt === 'deferred_pending_name' ? 'סיכום למנהל יישלח כשהליד ימסור שם' : 'סיכום למנהל טרם נשלח';
     const alertIcon =
-      alertSt === 'sent'    ? `<span style="color:var(--green)" title="${alertTip}">✅</span>` :
-      alertSt === 'failed'  ? `<span style="color:var(--hot)"   title="${alertTip}">❌</span>` :
-      alertSt === 'pending' ? `<span style="color:var(--warm)"  title="${alertTip}">⏳</span>` :
-                              `<span style="color:var(--muted)" title="${alertTip}">—</span>`;
+      alertSt === 'sent'    ? `<span style="color:var(--green)" title="${esc(alertTip)}">✅</span>` :
+      alertSt === 'failed'  ? `<span style="color:var(--hot)"   title="${esc(alertTip)}">❌</span>` :
+                              `<span style="color:var(--warm)"  title="${esc(alertTip)}">⏳</span>`;
 
     const reminderSent   = apt?.reminderSent;
-    const reminderSentTo = apt?.reminderSentTo ?? [];
     const reminderTip    = reminderSent
-      ? `תזכורת נשלחה ל-${reminderSentTo.length} נמענ/ים`
-      : (apt ? 'תזכורת טרם נשלחה' : 'אין רשומת תור');
+      ? `תזכורת לצוות נשלחה ל-${(apt.reminderSentTo ?? []).length} נמענ/ים`
+      : (apt ? 'תזכורת לצוות טרם נשלחה' : 'אין בקשה פתוחה');
     const reminderIcon = reminderSent
-      ? `<span style="color:var(--green)" title="${reminderTip}">🔔</span>`
-      : `<span style="color:var(--muted)" title="${reminderTip}">🔕</span>`;
+      ? `<span style="color:var(--green)" title="${esc(reminderTip)}">🔔</span>`
+      : `<span style="color:var(--muted)" title="${esc(reminderTip)}">🔕</span>`;
 
     const scoreNum   = l.score ?? '—';
-    const scoreTip   = `ציון כשירות ליד (1-10): מודד אותות רכישה, לא איכות שיחה\n${l.meta?.qualProfile?.readinessEvidence ?? ''}`;
     const scoreColor = l.score >= 8 ? 'var(--hot)' : l.score >= 5 ? 'var(--warm)' : 'var(--muted)';
 
-    const st     = cbStatusLabel(l.status, apt?.status, qd);
+    const st      = cbStatusLabel(l);
     const stColor = st.cls === 'green' ? 'var(--green)' : st.cls === 'warm' ? 'var(--warm)' : st.cls === 'hot' ? 'var(--hot)' : 'var(--muted)';
 
-    const dispName   = l.name && l.name.trim() ? l.name : null;
     const confirmedN = qd.confirmedName && qd.confirmedName.trim() ? qd.confirmedName : null;
-    const nameDisplay = confirmedN ?? dispName ?? `<span style="color:var(--hot);font-size:11px">שם חסר</span>`;
-    const nameLabel  = confirmedN ? `✓ ${esc(confirmedN)}` : (dispName ? esc(dispName) : nameDisplay);
+    const dispName   = l.name && l.name.trim() ? l.name : null;
+    const nameLabel  = confirmedN ? `✓ ${esc(confirmedN)}`
+      : dispName ? `${esc(dispName)} <span style="color:var(--hot);font-size:10px">(שם לא אושר)</span>`
+      : `<span style="color:var(--hot);font-size:11px">שם חסר</span>`;
 
-    // fullPhone is the authorized E.164 from /api/barak/callbacks (server-side join).
-    // maskedPhone is display-only. Never use masked phone for action routing.
     const fullPhone = l.fullPhone ?? null;
     const dispPhone = fullPhone
       ? (fullPhone.startsWith('972') ? '0' + fullPhone.slice(3) : fullPhone)
@@ -1952,16 +1965,11 @@ function renderCallbackPanel(callbacks) {
     const waPhone   = fullPhone ? fullPhone.replace(/[^0-9]/g, '') : null;
     const waLink    = waPhone ? `https://wa.me/${waPhone}` : null;
 
-    const timeLabel = apt?.scheduledAt
-      ? (() => {
-          try {
-            const d    = new Date(apt.scheduledAt);
-            const days = ['ראשון','שני','שלישי','רביעי','חמישי','שישי','שבת'];
-            const il   = new Date(d.toLocaleString('en-US', { timeZone: 'Asia/Jerusalem' }));
-            return `יום ${days[il.getDay()]} ${String(il.getDate()).padStart(2,'0')}.${String(il.getMonth()+1).padStart(2,'0')}.${il.getFullYear()} בשעה ${String(il.getHours()).padStart(2,'0')}:${String(il.getMinutes()).padStart(2,'0')}`;
-          } catch { return qd?.callTimeGiven ?? apt?.rawTime ?? '—'; }
-        })()
-      : (qd?.callTimeGiven ?? apt?.rawTime ?? '—');
+    // Displayed time always comes from the persisted scheduledAt (formatted server-side
+    // in Asia/Jerusalem). Raw text is shown only as a note when no time was resolved.
+    const timeLabel = apt?.scheduledLabel
+      ? esc(apt.scheduledLabel)
+      : `<span style="color:var(--muted)">לא נקבע מועד${apt?.rawTime ? ` ("${esc(apt.rawTime)}")` : ''}</span>`;
     const assignee  = apt?.assignedStaffId ?? '—';
 
     const convoSum   = l.meta?.qualProfile?.qualificationReason ?? l.meta?.leadBrief?.notes ?? '';
@@ -1969,131 +1977,123 @@ function renderCallbackPanel(callbacks) {
     const readyEmoji = readySt === 'HIGH' ? '🔥' : readySt === 'MEDIUM' ? '🌡️' : readySt === 'LOW' ? '❄️' : '';
     const interests  = [qd.fitnessInterest, qd.goal, qd.location].filter(Boolean).join(' · ');
 
-    const availState = apt?.prospectAvailability;
-    const availLabel = availState === 'confirmed'   ? '✅ זמינות אושרה'
-      : availState === 'rescheduled'                ? '🔄 שינוי זמן'
-      : availState === 'cancelled'                  ? '❌ בוטל ע"י הליד'
-      : apt?.prospectReminderSent                   ? '❓ ממתין לאישור זמינות'
-      : null;
+    const facts = [];
+    if (apt) {
+      facts.push(apt.status === 'confirmed' ? '👩‍💼 צוות: אישר' : '👩‍💼 צוות: טרם אישר');
+      const av = apt.prospectAvailability;
+      facts.push(av === 'confirmed' ? '🙋 ליד: אישר זמינות'
+        : av === 'rescheduled' ? '🙋 ליד: ביקש מועד אחר'
+        : apt.prospectReminderSent ? '🙋 ליד: תזכורת נשלחה, טרם ענה'
+        : '🙋 ליד: טרם נשלחה תזכורת');
+    }
+    if (l.humanOwned) facts.push('🤝 בטיפול אנושי — הבוט לא שולח הודעות');
+    const flagLines = (l.flags ?? []).map(f => CB_FLAG_LABELS[f] ?? f);
 
-    const aptId  = apt?.id ?? '';
+    const aptId   = apt?.id ?? '';
+    const canConfirm = apt && apt.status === 'callback_pending' && !apt.expired && apt.scheduledAt;
     const actions = aptId ? `
-      <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px">
-        <button onclick="cbAction('${aptId}','complete')"   style="font-size:10px;padding:2px 6px;cursor:pointer;border-radius:3px;border:1px solid var(--border)">✔ הושלם</button>
-        <button onclick="cbAction('${aptId}','no_answer')"  style="font-size:10px;padding:2px 6px;cursor:pointer;border-radius:3px;border:1px solid var(--border)">📵 לא ענה</button>
-        <button onclick="cbAction('${aptId}','reschedule')" style="font-size:10px;padding:2px 6px;cursor:pointer;border-radius:3px;border:1px solid var(--border)">🔄 שנה מועד</button>
-        <button onclick="cbAction('${aptId}','assign')"     style="font-size:10px;padding:2px 6px;cursor:pointer;border-radius:3px;border:1px solid var(--border)">👤 נציג</button>
-        <button onclick="cbAction('${aptId}','cancel')"     style="font-size:10px;padding:2px 6px;cursor:pointer;border-radius:3px;border:1px solid var(--border)">🚫 בטל</button>
+      <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px" data-apt-actions="${aptId}">
+        ${canConfirm ? `<button data-cb-action="confirm" onclick="cbAction('${aptId}','confirm')" style="${btn};border-color:#22a55a;background:#22a55a;color:#fff;font-weight:600">✅ אשר שיחה</button>` : ''}
+        <button data-cb-action="complete"   onclick="cbAction('${aptId}','complete')"   style="${btn}">✔ הושלם</button>
+        <button data-cb-action="no_answer"  onclick="cbAction('${aptId}','no_answer')"  style="${btn}">📵 לא ענה</button>
+        <button data-cb-action="reschedule" onclick="cbToggleReschedule('${aptId}')"    style="${btn}">🔄 שנה מועד</button>
+        <button data-cb-action="assign"     onclick="cbAction('${aptId}','assign')"     style="${btn}">👤 נציג</button>
+        <button data-cb-action="cancel"     onclick="cbAction('${aptId}','cancel', this)" style="${btn}">🚫 בטל</button>
+      </div>
+      <div id="cb-resched-${aptId}" style="display:none;margin-top:6px;gap:4px;align-items:center">
+        <input id="cb-resched-input-${aptId}" type="text" dir="rtl" placeholder='מועד חדש — למשל "מחר ב-15:00" או "17.11 בשעה 10:30"' style="font-size:11px;padding:3px 6px;width:260px;border:1px solid var(--border);border-radius:3px">
+        <button data-cb-action="reschedule-save" onclick="cbAction('${aptId}','reschedule')" style="${btn}">שמור מועד</button>
       </div>` : '';
 
-    return `<div class="callback-row" style="padding:10px 16px;border-bottom:1px solid var(--border)">
-      <div style="display:grid;grid-template-columns:160px 130px 1fr 56px 28px 28px 28px;gap:8px;align-items:start">
+    return `<div class="callback-row" data-phone="${esc(fullPhone ?? '')}" data-stage="${esc(l.stage ?? '')}" data-apt-status="${esc(apt?.status ?? '')}" style="padding:10px 16px;border-bottom:1px solid var(--border)">
+      <div style="display:grid;grid-template-columns:160px 170px 1fr 56px 28px 28px 28px;gap:8px;align-items:start">
         <div>
           <div style="font-weight:600;font-size:13px">${nameLabel}</div>
           <div style="font-size:11px;color:var(--muted);direction:ltr">${esc(dispPhone)}</div>
           ${waLink ? `<a href="${waLink}" target="_blank" style="font-size:10px;color:var(--accent);text-decoration:none">💬 WhatsApp</a>` : '<span style="font-size:10px;color:var(--muted)">📵 לא זמין</span>'}
         </div>
         <div>
-          <div style="font-size:12px;color:var(--text);font-weight:500">${esc(timeLabel)}</div>
+          <div class="cb-time" style="font-size:12px;color:var(--text);font-weight:500">${timeLabel}</div>
           <div style="font-size:10px;color:var(--muted);margin-top:2px">נציג: ${esc(assignee)}</div>
-          <div style="font-size:11px;font-weight:600;color:${stColor};margin-top:2px">${esc(st.label)}</div>
-          ${availLabel ? `<div style="font-size:10px;margin-top:3px;color:var(--muted)">${esc(availLabel)}</div>` : ''}
+          <div class="cb-stage" style="font-size:11px;font-weight:600;color:${stColor};margin-top:2px">${esc(st.label)}</div>
+          ${facts.map(x => `<div class="cb-fact" style="font-size:10px;margin-top:2px;color:var(--muted)">${esc(x)}</div>`).join('')}
         </div>
         <div>
           <div style="font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(convoSum)}">${readyEmoji} ${esc(convoSum || interests || '—')}</div>
+          ${l.needsAction ? `<div class="cb-needs-action" style="font-size:11px;margin-top:3px;color:var(--text)">👉 ${esc(l.needsAction)}</div>` : ''}
+          ${flagLines.map(x => `<div class="cb-flag" style="font-size:10px;margin-top:2px;color:var(--hot)">${esc(x)}</div>`).join('')}
           ${actions}
         </div>
-        <div><span style="font-weight:700;color:${scoreColor}" title="${scoreTip}">${scoreNum}/10</span></div>
-        <div title="${alertTip}">${alertIcon}</div>
-        <div title="${reminderTip}">${reminderIcon}</div>
-        <div title="היסטוריית שיחה">${waPhone ? `<button onclick="openThread('${waPhone}')" style="font-size:10px;padding:2px 4px;cursor:pointer;border-radius:3px;border:1px solid var(--border)">💬</button>` : '<span style="color:var(--muted)">—</span>'}</div>
+        <div><span style="font-weight:700;color:${scoreColor}" title="ציון כשירות ליד (1-10)">${scoreNum}/10</span></div>
+        <div>${alertIcon}</div>
+        <div>${reminderIcon}</div>
+        <div title="היסטוריית שיחה">${waPhone ? `<button onclick="openThread('${waPhone}')" style="${btn}">💬</button>` : '<span style="color:var(--muted)">—</span>'}</div>
       </div>
     </div>`;
   }).join('');
 
   bodyEl.innerHTML = `
-    <div style="display:grid;grid-template-columns:160px 130px 1fr 56px 28px 28px 28px;gap:8px;padding:6px 16px;font-size:11px;font-weight:600;color:var(--muted);border-bottom:1px solid var(--border)">
-      <div>שם / טלפון</div><div>זמן / נציג / סטטוס</div><div>סיכום שיחה</div><div>ציון ליד</div><div>🔔</div><div>✅</div><div>💬</div>
+    <div id="barak-callbacks-msg" style="display:none;padding:6px 16px;font-size:12px;font-weight:600"></div>
+    <div style="display:grid;grid-template-columns:160px 170px 1fr 56px 28px 28px 28px;gap:8px;padding:6px 16px;font-size:11px;font-weight:600;color:var(--muted);border-bottom:1px solid var(--border)">
+      <div>שם / טלפון</div><div>מועד / נציג / מצב</div><div>סיכום ופעולה נדרשת</div><div>ציון ליד</div><div title="סיכום למנהל">📨</div><div title="תזכורת לצוות">🔔</div><div>💬</div>
     </div>
     ${rows}`;
 }
 
 // ── Callback action handlers ──────────────────────────────────────────────────
+// No native prompt()/alert(): results and errors are shown in the panel's message bar.
 
-async function cbAction(aptId, action) {
+function cbToggleReschedule(aptId) {
+  const box = document.getElementById(`cb-resched-${aptId}`);
+  if (!box) return;
+  const open = box.style.display !== 'none';
+  box.style.display = open ? 'none' : 'flex';
+  if (!open) document.getElementById(`cb-resched-input-${aptId}`)?.focus();
+}
+
+const CB_ACTION_OK = {
+  confirm: 'השיחה אושרה', complete: 'השיחה סומנה כהושלמה', no_answer: 'נרשם: לא ענה',
+  cancel: 'בקשת השיחה בוטלה', reschedule: 'המועד עודכן', assign: 'הנציג עודכן',
+};
+
+async function cbAction(aptId, action, el) {
   if (!aptId) return;
+  let url, body = {};
 
-  // Actions that need a prompt before POSTing
-  if (action === 'complete') {
-    const notes = window.prompt('הערת סגירה (אופציונלי):') ?? '';
-    try {
-      const res = await fetch(`/api/admin/appointments/${aptId}/complete`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ notes }),
-      });
-      if (!res.ok) throw new Error(await res.text());
-      await loadBarakPanel();
-    } catch (e) { alert('שגיאה: ' + e.message); }
-    return;
-  }
-
-  if (action === 'no_answer') {
-    const note = window.prompt('הערה (אופציונלי — למשל: לא ענה, ננסה מחר):') ?? '';
-    try {
-      const res = await fetch(`/api/admin/appointments/${aptId}/no-answer`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ note }),
-      });
-      if (!res.ok) throw new Error(await res.text());
-      await loadBarakPanel();
-    } catch (e) { alert('שגיאה: ' + e.message); }
-    return;
-  }
-
-  if (action === 'reschedule') {
-    const rawTime = window.prompt('זמן חדש לשיחה (עברית — למשל: מחר בשעה 15:00):');
-    if (!rawTime?.trim()) return;
-    try {
-      // Use dedicated reschedule endpoint: recalculates scheduledAt, clears reminderSentTo,
-      // syncs lead meta, and notifies staff. PATCH rawTime alone is insufficient.
-      const res = await fetch(`/api/admin/appointments/${aptId}/reschedule`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rawTime: rawTime.trim() }),
-      });
-      if (!res.ok) throw new Error(await res.text());
-      await loadBarakPanel();
-    } catch (e) { alert('שגיאה: ' + e.message); }
-    return;
-  }
-
-  if (action === 'assign') {
+  if (action === 'confirm')        url = `/api/admin/appointments/${aptId}/confirm`;
+  else if (action === 'complete')  url = `/api/admin/appointments/${aptId}/complete`;
+  else if (action === 'no_answer') url = `/api/admin/appointments/${aptId}/no-answer`;
+  else if (action === 'cancel') {
+    // Two-step: the first click arms the button, the second (within 5s) cancels.
+    if (el && el.dataset.armed !== '1') {
+      el.dataset.armed = '1';
+      const original = el.textContent;
+      el.textContent = 'לחצו שוב לביטול';
+      setTimeout(() => { if (el.isConnected) { el.dataset.armed = ''; el.textContent = original; } }, 5000);
+      return;
+    }
+    url = `/api/admin/appointments/${aptId}/cancel`;
+  } else if (action === 'reschedule') {
+    const rawTime = document.getElementById(`cb-resched-input-${aptId}`)?.value?.trim();
+    if (!rawTime) { cbSetMsg('יש להקליד מועד חדש', true); return; }
+    url = `/api/admin/appointments/${aptId}/reschedule`;
+    body = { rawTime };
+  } else if (action === 'assign') {
     const staffId = window.prompt('מזהה נציג (eden / melanie / miri):');
     if (!staffId?.trim()) return;
-    try {
-      const res = await fetch(`/api/admin/appointments/${aptId}/assign`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ staffId: staffId.trim() }),
-      });
-      if (!res.ok) throw new Error(await res.text());
-      await loadBarakPanel();
-    } catch (e) { alert('שגיאה: ' + e.message); }
-    return;
-  }
+    url = `/api/admin/appointments/${aptId}/assign`;
+    body = { staffId: staffId.trim() };
+  } else return;
 
-  // Simple one-shot actions (cancel)
-  const urlMap = {
-    cancel: `/api/admin/appointments/${aptId}/cancel`,
-  };
-  const url = urlMap[action];
-  if (!url) return;
   try {
-    const res = await fetch(url, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-    });
-    if (!res.ok) throw new Error(await res.text());
+    const res  = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok === false) throw new Error(data?.error ?? res.statusText);
     await loadBarakPanel();
-  } catch (e) { alert('שגיאה: ' + e.message); }
+    cbSetMsg(data.unchanged ? 'ללא שינוי — הפעולה כבר בוצעה' : (CB_ACTION_OK[action] ?? 'בוצע'), false);
+  } catch (e) {
+    cbSetMsg('שגיאה: ' + e.message, true);
+  }
 }
 
 function openThread(phone) {
@@ -2140,7 +2140,15 @@ function renderBarakTable(leads) {
       : `<span style="color:var(--muted);font-size:12px">—</span>`;
     // qualProfile — computed on every AI turn, stored in meta.qualProfile
     const qp = l.meta?.qualProfile;
-    const nextAction = qp?.nextBestAction ?? '—';
+    // For callback states the next step is defined by the callback itself, not by the
+    // (older) qualification profile computed during the AI conversation.
+    const nextAction = ({
+      callback_requested: 'בקשת שיחה פתוחה — ראו "שיחות ממתינות"',
+      call_scheduled:     'שיחה מאושרת — ראו "שיחות ממתינות"',
+      call_completed:     'השיחה התקיימה — אין פעולה אוטומטית',
+      call_cancelled:     'בקשת השיחה בוטלה — אין פעולה אוטומטית',
+      call_no_answer:     'לא ענה לשיחה — מעקב ידני לפי שיקול הצוות',
+    })[l.status] ?? qp?.nextBestAction ?? '—';
     const qualReason = qp?.qualificationReason ?? '';
     const readyEmoji = qp?.readiness === 'HIGH' ? '🔥' : qp?.readiness === 'MEDIUM' ? '🌡️' : qp?.readiness === 'LOW' ? '❄️' : '';
     // Status badge: show qualification reason as tooltip
@@ -2364,7 +2372,12 @@ async function post(url, body) {
 }
 
 function statusLabel(status) {
-  return { hot:'🔥 חם', warm:'🌡️ פושר', cold:'❄️ קר', crisis:'🚨 משבר', new:'🆕 חדש' }[status] ?? status ?? '—';
+  return {
+    hot:'🔥 חם', warm:'🌡️ פושר', cold:'❄️ קר', crisis:'🚨 משבר', new:'🆕 חדש',
+    callback_requested:'📞 בקשת שיחה', call_scheduled:'📞 שיחה אושרה',
+    call_completed:'✔ שיחה הושלמה', call_cancelled:'🚫 שיחה בוטלה', call_no_answer:'📵 לא ענה',
+    human_owns:'🤝 טיפול אנושי', opted_out:'🔕 הוסר/ה', converted_member:'🏅 מנוי/ה',
+  }[status] ?? status ?? '—';
 }
 
 function timeSince(date) {
@@ -3672,3 +3685,11 @@ setInterval(loadAgentFeed, 10000);
 initMiniChat('dana-chat-input',  'dana-send',  'dana-chat-msgs',  '/api/dana/chat');
 initMiniChat('tomer-chat-input', 'tomer-send', 'tomer-chat-msgs', '/api/tomer/chat');
 initMiniChat('barak-chat-input', 'barak-send', 'barak-chat-msgs', '/api/barak/chat');
+
+// Deep link: https://…/#barak opens the Barak tab (used in the manager's callback summary).
+window.addEventListener('load', () => {
+  const h = (location.hash || '').replace('#', '');
+  if (!h) return;
+  const b = document.querySelector('.tab-btn[data-tab="' + h.replace(/[^a-z0-9_-]/gi, '') + '"]');
+  if (b) b.click();
+});

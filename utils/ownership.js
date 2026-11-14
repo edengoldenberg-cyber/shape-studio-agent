@@ -8,6 +8,8 @@
 
 const AUTOMATION_STATES = new Set([
   'new', 'cold', 'warm', 'hot', 'call_scheduled', 'callback_requested',
+  // callback outcomes — restored as-is so a released lead does not re-enter the queue
+  'call_completed', 'call_cancelled', 'call_no_answer',
 ]);
 
 /**

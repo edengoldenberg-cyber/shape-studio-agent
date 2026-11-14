@@ -50,6 +50,9 @@ const notifySvc                        = require('./services/notification.servic
 const greenApiSvc                      = require('./services/greenapi.service');
 const persist                          = require('./utils/persist');
 const { fmtScheduledAt }               = require('./utils/time');
+const { createCallbackService, AVAIL_RESCHEDULE_RE: _CB_RESCHEDULE_RE } = require('./services/callback.service');
+const callbackTime                     = require('./utils/callback_time');
+const appointmentWorker                = require('./workers/appointment_worker');
 const tomerStore                       = require('./utils/tomer_store');
 const retentionWorker                  = require('./workers/retention_worker');
 const studioAssets                     = require('./utils/studio_assets');
@@ -132,7 +135,8 @@ let staffConfig = loadStaffConfig();
 // When Arbox lookup fails or is slow, staff can manually add phone numbers here
 // to guarantee they always route to Tomer (never to Barak's sales flow).
 // File: data/known_members.json  Format: { "phones": ["972XXXXXXXXX", ...] }
-const KNOWN_MEMBERS_PATH = path.join(__dirname, 'data/known_members.json');
+// KNOWN_MEMBERS_PATH env override exists for test isolation only; production uses the default.
+const KNOWN_MEMBERS_PATH = process.env.KNOWN_MEMBERS_PATH ?? path.join(__dirname, 'data/known_members.json');
 
 function loadKnownMembers() {
   try { return new Set(JSON.parse(fs.readFileSync(KNOWN_MEMBERS_PATH, 'utf8')).phones ?? []); }
@@ -622,6 +626,10 @@ const CODE_FEATURES = [
   'aptstore_save_throws', // appointment_store.create() throws on disk-write failure
   'callTimeGivenAt_anchor', // name-capture path uses callTimeGivenAt for time resolution
   'booking_guard_tests',  // booking_guard.test.js with disk-write spy test
+  'callback_service_v1',  // services/callback.service.js owns the lead → callback lifecycle
+  'strict_callback_time', // utils/callback_time.js — no default hour, no AI date guessing
+  'apt_persist_strict',   // appointment_store update/updateBatch throw + roll back on failed write
+  'staff_confirm_lifecycle', // confirm / outcome endpoints enforce transitions
 ];
 app.get('/api/version', (_req, res) => {
   res.json({
@@ -1264,51 +1272,10 @@ app.post('/api/barak/sync-arbox', async (_req, res) => {
 // Matching is done by full E.164 phone, not by masked phone, so no collision risk.
 // The panel uses this single endpoint instead of client-side joining masked phones.
 app.get('/api/barak/callbacks', (_req, res) => {
-  const CB_STATUSES = new Set(['callback_requested', 'call_scheduled']);
-  const cbLeads = store.getAllLeads()
-    .filter(l => CB_STATUSES.has(l.status));
-
-  // Index latest active appointment by full phone
-  const aptByPhone = {};
-  for (const a of aptStore.getAll()) {
-    if (!a.leadPhone) continue;
-    const existing = aptByPhone[a.leadPhone];
-    // Prefer active statuses (callback_pending / confirmed) over terminal ones
-    const isActive   = a.status === 'callback_pending' || a.status === 'confirmed';
-    const wasActive  = existing?.status === 'callback_pending' || existing?.status === 'confirmed';
-    if (!existing
-        || (isActive && !wasActive)
-        || (isActive === wasActive && new Date(a.createdAt) > new Date(existing.createdAt))) {
-      aptByPhone[a.leadPhone] = a;
-    }
-  }
-
-  const callbacks = cbLeads.map(lead => {
-    const { history, ...safeLeadFields } = lead;
-    const apt = aptByPhone[lead.phone] ?? null;
-    return {
-      ...safeLeadFields,
-      // fullPhone: authorized — this endpoint is staff-only panel use.
-      // The panel must use fullPhone for WA links and conversation lookup.
-      // maskedPhone is provided for display-only; never use it for action routing.
-      fullPhone:   lead.phone,
-      maskedPhone: maskPhone(lead.phone),
-      apt: apt ? {
-        id:              apt.id,
-        status:          apt.status,
-        rawTime:         apt.rawTime,
-        scheduledAt:     apt.scheduledAt,
-        assignedStaffId: apt.assignedStaffId,
-        reminderSent:    apt.reminderSent,
-        reminderSentTo:  apt.reminderSentTo ?? [],
-        handoffSentTo:   apt.handoffSentTo  ?? [],
-        createdAt:       apt.createdAt,
-        updatedAt:       apt.updatedAt,
-      } : null,
-    };
-  });
-
-  res.json({ ok: true, callbacks });
+  // One row per lead needing callback attention — open requests (including human-owned
+  // conversations), requests still waiting for a time or a name, and expired calls
+  // awaiting an outcome. Completed / cancelled / no-answer callbacks leave this queue.
+  res.json({ ok: true, callbacks: callbackSvc.panelRows(maskPhone) });
 });
 
 // GET /api/barak/sync-status — Arbox sync summary for dashboard
@@ -2928,6 +2895,302 @@ function _flushPending(fromNorm) {
 
 // ── Internal processor (shared by webhook + simulate) ─────────────────────────
 
+// ══════════════════════════════════════════════════════════════════════════════
+// BARAK — LEAD → CALLBACK FLOW
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// One service owns the lifecycle (services/callback.service.js); this section only
+// decides which lifecycle step an inbound lead message is.
+
+const callbackSvc = createCallbackService({
+  store, persist, logger, alertOwner,
+  // Prospect sends: register the provider id so the outgoing-message webhook echo is
+  // attributed to the bot and never mistaken for a staff takeover.
+  sendText: async (to, text, opts) => {
+    const r = await sendText(to, text, opts);
+    if (r?.idMessage) _recordBotSend(r.idMessage, to);
+    return r;
+  },
+  markBotSent:         phone => _markBotSent(phone),
+  getBackendBase:      () => getBackendBase(),
+  getStaffId:          () => defaultStaff()?.id ?? 'eden',
+  getDurationMin:      () => staffConfig.appointment_duration_min ?? 30,
+  cancelCalendarEvent: apt => calendarSvc.cancelCalendarEvent(apt),
+});
+
+// A lead asking, in their own words, for someone to call / get back to them.
+const CALLBACK_REQUEST_RE = /נציג|לדבר עם (?:מישהו|מישהי|אדם|בן אדם)|אדם אמיתי|שמישהו יחזור|ש[ית]חזרו אלי|תחזרו אלי|תחזור אלי|חזרו אלי|לחזור אלי|שיתקשרו|שתתקשרו|תתקשרו|תתקשר אלי|להתקשר אלי|שיצרו קשר|צרו (?:איתי |אתי )?קשר|שיחת טלפון|שיחה טלפונית|לדבר בטלפון|אפשר שיחה|רוצה שיחה|לתאם שיחה|לקבוע שיחה|אשמח לשיחה|אשמח לדבר|מעדי(?:ף|פה) (?:לדבר|שיחה)/;
+// A message about classes / prices that happens to contain a day or an hour.
+const CLASS_QUESTION_RE = /שיעור|אימון|מערכת|לוח|פילאטיס|יוגה|רפורמר|מחיר|עולה|פתוח|סטודיו פעיל/;
+
+function _saneDate(ts) {
+  const d = ts instanceof Date ? ts : (ts ? new Date(ts) : null);
+  if (!d || isNaN(d.getTime())) return new Date();
+  const y = d.getUTCFullYear();
+  return (y >= 2020 && y <= 2100) ? d : new Date();
+}
+
+/**
+ * Returns a pipeline result when the message belongs to the callback flow, or null to
+ * let the normal pipeline continue.
+ *
+ *   phase 'active' — the lead already has a callback in progress (status
+ *                    callback_requested / call_scheduled).
+ *   phase 'new'    — the lead is asking for a callback, answering a callback
+ *                    invitation with a time, or supplying a time we asked for.
+ */
+async function handleLeadCallbackFlow({ msg, fromNorm, fromIsraeli, clientMatch, intent, phase }) {
+  const lead   = store.getLead(fromNorm);
+  const status = lead?.status ?? null;
+  const meta   = lead?.meta ?? {};
+  const qd     = meta.qualData ?? {};
+  const text   = (msg.text ?? '').trim();
+  const sentAt = _saneDate(msg.timestamp);
+  const inCallbackState = callbackSvc.CALLBACK_STATUSES.has(status);
+
+  if (phase === 'active' && !inCallbackState) return null;
+  if (phase === 'new' && (inCallbackState || callbackSvc.STOP_STATUSES.has(status))) return null;
+
+  const { extractNameFromMessage, TIME_REJECTION_RE } = leadAgent;
+  const autoReply = process.env.WHATSAPP_AUTO_REPLY === 'true';
+  const who = qd.confirmedName ?? msg.name ?? fromIsraeli ?? fromNorm;
+
+  // Record the turn and return. `alreadySent` = the callback service sent the text itself.
+  async function finish(route, reply, { alreadySent = false, routeIntent = intent } = {}) {
+    if (reply && !alreadySent && autoReply) {
+      _markBotSent(fromNorm);
+      try {
+        const r = await sendText(fromNorm, reply);
+        if (r?.idMessage) _recordBotSend(r.idMessage, fromNorm);
+        _markReplied(fromNorm);
+      } catch (err) {
+        logger.warn('[callback-flow] reply send failed', { from: fromNorm, route, error: err.message });
+      }
+    }
+    if (reply && text) leadAgent.recordSchedulingExchange(fromNorm, text, reply);
+    const cur = store.getLead(fromNorm);
+    if (cur) store.upsertLead(fromNorm, { messageCount: (cur.messageCount ?? 0) + 1, name: cur.name ?? msg.name ?? undefined });
+    const entry = inbox.push({
+      from: fromNorm, fromIsraeli, name: msg.name ?? null,
+      text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
+      receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
+      clientMatch, intent: routeIntent, route, barakReply: reply ?? null,
+    });
+    persist.saveLeads(store);
+    persist.saveInbox(inbox);
+    return { inboxEntry: entry, clientMatch, intent: routeIntent, route, barakReply: reply ?? null };
+  }
+
+  function patchMeta(patch) {
+    const cur = store.getLead(fromNorm);
+    store.upsertLead(fromNorm, { meta: { ...(cur?.meta ?? {}), ...patch } });
+  }
+
+  // Ask for a time and remember that the next time-like message answers it.
+  async function askForTime(reply, route = 'callback_time_requested') {
+    if (!store.getLead(fromNorm)) store.upsertLead(fromNorm, { name: msg.name ?? undefined });
+    patchMeta({ awaitingCallbackTime: true, callbackTimeAttempts: 0, callbackRequestedAt: sentAt.toISOString() });
+    store.logEvent('callback_requested', fromNorm, { preview: text.slice(0, 80) });
+    return finish(route, reply, { routeIntent: 'representative' });
+  }
+
+  // Resolve + persist the time, then either close (name known) or ask for the name.
+  async function acceptAndRespond(source) {
+    if (!store.getLead(fromNorm)) store.upsertLead(fromNorm, { name: msg.name ?? undefined });
+    const r = callbackSvc.acceptTime({ phone: fromNorm, text, sentAt, source });
+
+    if (!r.ok && r.reason === 'persist_failed') {
+      patchMeta({ awaitingCallbackTime: false, callbackNeedsManualAt: new Date().toISOString() });
+      alertOwner(`⚠️ בקשת שיחה לא נשמרה — נדרש טיפול ידני`,
+        `${who} (${fromNorm})\nביקש/ה שיחה: "${text.slice(0, 200)}"\nהמועד לא נשמר במערכת (${r.error}). לא נשלח אישור לליד — נא ליצור קשר ישירות.`,
+        { linkPreview: false }).catch(() => {});
+      return finish('callback_persist_failed', r.clarification, { routeIntent: 'callback_time' });
+    }
+    if (!r.ok) {
+      const attempts = (store.getLead(fromNorm)?.meta?.callbackTimeAttempts ?? 0) + 1;
+      if (attempts >= 3) {
+        // Three unclear answers: stop asking and hand over truthfully.
+        patchMeta({ awaitingCallbackTime: false, callbackTimeAttempts: 0, callbackNeedsManualAt: new Date().toISOString() });
+        alertOwner(`📞 בקשת שיחה ללא מועד ברור — ${who}`,
+          `${who} (${fromNorm})\nביקש/ה שיחה אך לא הצלחנו לקבוע מועד.\nהודעה אחרונה: "${text.slice(0, 200)}"\nלא נקבעה שיחה — נא לתאם ישירות.`,
+          { linkPreview: false }).catch(() => {});
+        store.logEvent('callback_time_unresolved_handoff', fromNorm, { reason: r.reason });
+        return finish('callback_time_unresolved_handoff',
+          `לא הצלחתי להבין את המועד 🙏 העברתי את הבקשה לצוות — יחזרו אליך כאן בוואטסאפ כדי לתאם.`,
+          { routeIntent: 'callback_time' });
+      }
+      patchMeta({ awaitingCallbackTime: true, callbackTimeAttempts: attempts });
+      store.logEvent('callback_time_clarification', fromNorm, { reason: r.reason, attempts });
+      return finish('callback_time_clarify', r.clarification, { routeIntent: 'callback_time' });
+    }
+    if (r.unchanged) {
+      // Same time repeated — the request already exists. No reply, no notification.
+      store.logEvent('post_call_dup_acceptance', fromNorm, { aptId: r.apt.id });
+      return finish('post_call_silent', null);
+    }
+
+    const route = r.isReschedule ? 'appointment_rescheduled' : 'appointment_created';
+    const routeIntent = r.isReschedule ? 'reschedule_time' : 'callback_time';
+    const fmt = callbackTime.formatCallbackTime(r.apt.scheduledAt);
+    const name = store.getLead(fromNorm)?.meta?.qualData?.confirmedName ?? null;
+
+    if (name) {
+      // Name already known → the appointment is on disk, send both summaries now.
+      const fin = await callbackSvc.finalize({ phone: fromNorm, trigger: source });
+      const delivered = fin.prospect?.state === 'accepted' ? fin.prospectMsg : null;
+      return finish(route, delivered, { alreadySent: true, routeIntent });
+    }
+    // Name unknown → say exactly what was recorded and ask for the name. The manager
+    // summary goes out once, when the name arrives.
+    const cur = store.getLead(fromNorm)?.meta ?? {};
+    patchMeta({ qualData: { ...(cur.qualData ?? {}), nameAsked: true } });
+    const reply = r.isReschedule
+      ? `עדכנתי את בקשת השיחה: ${fmt} ✅\nואיך קוראים לך? 😊`
+      : `רשמתי בקשת שיחה: ${fmt} ✅\nואיך קוראים לך? 😊`;
+    return finish(route, reply, { routeIntent });
+  }
+
+  const isRequest = msg.type === 'text' && !CALL_DECLINED_RE.test(text)
+    && (intent === 'representative' || CALLBACK_REQUEST_RE.test(text));
+  const hasTime   = msg.type === 'text' && callbackTime.hasTimeSignal(text) && !TIME_REJECTION_RE.test(text);
+  const looksLikeClassQuestion = /\?/.test(text) && CLASS_QUESTION_RE.test(text);
+
+  // ════════════════════════════════ ACTIVE PHASE ═══════════════════════════════
+  if (phase === 'active') {
+    // Opt-out: close the open callback (no reminders may follow), then let lead_agent
+    // record opted_out and send the single acknowledgement.
+    if (isPostCallOptOut(text)) {
+      callbackSvc.cancelForOptOut(fromNorm);
+      patchMeta({ awaitingCallbackTime: false });
+      return null;
+    }
+    if (msg.type !== 'text' || !text) {
+      store.logEvent('post_call_ack_silent', fromNorm, { status, type: msg.type });
+      return finish('post_call_silent', null);
+    }
+
+    const apt    = callbackSvc.openCallback(fromNorm);
+    const future = callbackSvc.isFuture(apt);
+
+    // 1. Cancellation / "not convenient" / reply to the reminder / late reply.
+    //    Runs before the brief-ack check so a bare "כן" to the reminder is recorded.
+    if (apt) {
+      const av = await callbackSvc.handleAvailabilityReply({ phone: fromNorm, text, sentAt, displayName: msg.name });
+      if (av) return finish(av.route, av.reply, { alreadySent: true });
+    }
+
+    // 2. Brief acknowledgement → silent.
+    if (isBriefAck(text)) {
+      store.logEvent('post_call_ack_silent', fromNorm, { status, preview: text.slice(0, 60) });
+      return finish('post_call_silent', null);
+    }
+
+    // 3. Name, when we asked for it.
+    if (qd.nameAsked && !qd.confirmedName) {
+      const captured = extractNameFromMessage(text);
+      if (captured) {
+        patchMeta({ qualData: { ...qd, confirmedName: captured, nameConfirmed: true } });
+        store.upsertLead(fromNorm, { name: captured });
+        persist.saveLeads(store);
+        store.logEvent('name_captured_post_call', fromNorm, { name: captured, status });
+        if (!future) {
+          // No valid future appointment to confirm — say so and ask for a time.
+          return askForTime(`תודה ${captured}! 🙂 מתי נוח לך שנחזור אליך? (יום ושעה)`, 'post_call_name_captured');
+        }
+        const fin = await callbackSvc.finalize({ phone: fromNorm, trigger: 'name_captured' });
+        const delivered = fin.prospect?.state === 'accepted' ? fin.prospectMsg : null;
+        return finish('post_call_name_captured', delivered, { alreadySent: true });
+      }
+    }
+
+    // 4. A time.
+    if (hasTime && !looksLikeClassQuestion) {
+      const awaitingNew = meta.awaitingCallbackTime === true || apt?.prospectAvailability === 'rescheduled' || intent === 'reschedule';
+      if (awaitingNew) return acceptAndRespond(future ? 'reschedule' : 'callback_time');
+      // No valid future callback (none, or it expired without an outcome): a time
+      // from the lead starts a new request. The expired record is left untouched.
+      if (!future && (isRequest || intent === 'general')) return acceptAndRespond('callback_time');
+      if (future) {
+        // An open future callback exists and nobody asked for a new time.
+        const probe = callbackTime.resolveCallbackTime(text, sentAt);
+        if (probe.ok && probe.scheduledAt.getTime() === apt.scheduledAt.getTime()) {
+          store.logEvent('post_call_dup_acceptance', fromNorm, { aptId: apt.id });
+          return finish('post_call_silent', null);
+        }
+        if (probe.ok && intent === 'general') return acceptAndRespond('reschedule');
+      }
+      // otherwise: fall through (schedule question / staff attention)
+    }
+
+    // 5. Explicit wish to move the call, without a usable time.
+    if (intent === 'reschedule' || (_CB_RESCHEDULE_RE.test(text) && text.length <= 40)) {
+      if (apt && future) {
+        try { aptStore.update(apt.id, { prospectAvailability: 'rescheduled', prospectAvailabilityAt: sentAt.toISOString() }); }
+        catch (err) { logger.error('[callback-flow] reschedule request not persisted', { from: fromNorm, error: err.message }); }
+      }
+      return askForTime(`אין בעיה 🙂 מתי יהיה לך נוח? (יום ושעה)`, 'reschedule_prompt');
+    }
+
+    // 6. Asking for a call again.
+    if (isRequest) {
+      if (future) {
+        const fmt = callbackTime.formatCallbackTime(apt.scheduledAt);
+        store.logEvent('post_call_representative_acknowledged', fromNorm, { existingAptId: apt.id });
+        return finish('post_call_rep_acknowledged',
+          `רשומה אצלנו בקשת שיחה: ${fmt} 😊\nאם המועד לא נוח — כתבו לי יום ושעה אחרים ואעדכן.`);
+      }
+      return askForTime(`בשמחה! 😊 מתי נוח לך שנחזור אליך? (יום ושעה)`);
+    }
+
+    // 7. Schedule question → answer it, no sales funnel.
+    if (intent === 'schedule_query') {
+      const timetableUrl = getActiveTimetableUrl();
+      let postCallReply = null;
+      if (timetableUrl) {
+        postCallReply = `הנה מערכת השעות של Shape Studio! 🏋️‍♀️`;
+        if (autoReply) {
+          _markBotSent(fromNorm);
+          sendFileByUrl(fromNorm, timetableUrl, 'schedule.png', postCallReply)
+            .then(res => { if (res?.idMessage) _recordBotSend(res.idMessage, fromNorm); store.logEvent('timetable_image_sent', fromNorm, { status }); })
+            .catch(() => { _markBotSent(fromNorm); sendText(fromNorm, postCallReply).catch(() => {}); });
+        }
+        store.logEvent('post_call_schedule_answered', fromNorm, { status });
+        return finish('post_call_schedule', postCallReply, { alreadySent: true });
+      }
+      postCallReply = await buildSchedulingReply(intent, msg, clientMatch).catch(() => null);
+      store.logEvent('post_call_schedule_answered', fromNorm, { status });
+      return finish('post_call_schedule', postCallReply);
+    }
+
+    // 8. Anything else is a genuine new message → staff see it, the bot stays silent.
+    alertOwner(
+      `📬 הודעה אחרי ${status === 'call_scheduled' ? 'תיאום' : 'בקשת חזרה'} — ${who}`,
+      `${who} (${fromNorm})\nסטטוס: ${status}\nהודעה: "${text.slice(0, 200)}"\n\nהאדם כתב אחרי בקשת השיחה. אנא בדקו ידנית.`,
+      { linkPreview: false }
+    ).catch(() => {});
+    store.logEvent('post_call_staff_notified', fromNorm, { status, preview: text.slice(0, 80) });
+    return finish('post_call_staff_hold', null);
+  }
+
+  // ═════════════════════════════════ NEW PHASE ═════════════════════════════════
+  if (msg.type !== 'text' || !text) return null;
+  const awaiting  = meta.awaitingCallbackTime === true;
+  const inviteCtx = !CALL_DECLINED_RE.test(text) && leadAgent.isCallbackInviteContext(fromNorm);
+
+  if (!isRequest && !awaiting && !(inviteCtx && hasTime)) return null;
+
+  if (!isRequest && !awaiting) {
+    // Answering Barak's invitation with a time. A question about classes that merely
+    // mentions a day/hour is not a callback time.
+    if (intent !== 'general' || looksLikeClassQuestion) return null;
+  }
+  if (awaiting && !isRequest && !hasTime) return null;      // unrelated message — normal pipeline
+  if (awaiting && !isRequest && looksLikeClassQuestion) return null;
+
+  if (!hasTime) return askForTime(`בשמחה! 😊 מתי נוח לך שנחזור אליך? (יום ושעה)`);
+  return acceptAndRespond(isRequest ? 'callback_request' : (awaiting ? 'callback_time' : 'invite_reply'));
+}
+
 async function processInboundWAMessage(msg) {
   // Hold processing until persist.loadLeads has completed. Without this gate a
   // webhook arriving during phoneRegistry.init (~10 s) would process against an
@@ -3127,38 +3390,8 @@ async function processInboundWAMessage(msg) {
   const inProcessConfirmed    = tier1Fresh || tier1Confirmed;
   const isExistingClient      = arboxConfirmedClient || inProcessConfirmed || tier2File;
 
-  // ── Reschedule intent — LEADS ONLY (existing clients handled via Tomer path) ───
-  if (intent === 'reschedule' && !isExistingClient) {
-    const existingApt = aptStore.getActiveByPhone(fromNorm);
-    if (existingApt) {
-      aptStore.update(existingApt.id, { status: 'rescheduled' });
-      store.logEvent('appointment_reschedule_requested', fromNorm, { aptId: existingApt.id, oldTime: existingApt.rawTime });
-    }
-    // Set awaiting flag so the next message is treated as the new time.
-    // reschedulingAptId lets the callback handler send a reschedule notification
-    // instead of a fresh "confirmed" notification.
-    store.upsertLead(fromNorm, {
-      meta: {
-        ...(store.getLead(fromNorm)?.meta ?? {}),
-        awaitingCallbackTime: true,
-        callbackRequestedAt:  new Date().toISOString(),
-        reschedulingAptId:    existingApt?.id ?? null,
-        reschedulingOldTime:  existingApt?.rawTime ?? null,
-      },
-    });
-    const rescheduleMsg = `בהחלט! באיזו שעה או יום יהיה לך נוח? 🗓️`;
-    if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
-      _markBotSent(fromNorm);
-      await sendText(fromNorm, rescheduleMsg).catch(() => {});
-    }
-    const rscInboxEntry = inbox.push({
-      from: fromNorm, fromIsraeli, name: msg.name ?? clientMatch.arboxName ?? null,
-      text: msg.text, messageId: msg.messageId, timestamp: msg.timestamp,
-      receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
-      clientMatch, intent: 'reschedule', route: 'reschedule_prompt', barakReply: rescheduleMsg,
-    });
-    return { inboxEntry: rscInboxEntry, clientMatch, intent: 'reschedule', route: 'reschedule_prompt', barakReply: rescheduleMsg };
-  }
+  // Lead reschedule requests are handled by handleLeadCallbackFlow (below, AFTER the
+  // human_owns / opted_out gates) — never before ownership has been checked.
 
   // ── Callback-time interception ────────────────────────────────────────────────
   // When this person previously requested a human callback (awaitingCallbackTime),
@@ -3169,7 +3402,9 @@ async function processInboundWAMessage(msg) {
   //   B. reschedulingAptId — lead explicitly asked to reschedule; now providing new time
   //   C. neither         — fresh appointment (first-time callback request)
   const leadState = store.getLead(fromNorm);
-  if (leadState?.meta?.awaitingCallbackTime && msg.type === 'text' && msg.text?.trim() &&
+  // Members (Tomer) only. Leads are handled by handleLeadCallbackFlow, which resolves
+  // the time strictly and persists the appointment before replying.
+  if (isExistingClient && leadState?.meta?.awaitingCallbackTime && msg.type === 'text' && msg.text?.trim() &&
       intent !== 'representative' && intent !== 'reschedule') {
     const rawTime      = msg.text.trim();
     const callbackName = msg.name ?? clientMatch.arboxName ?? fromNorm;
@@ -3544,559 +3779,13 @@ async function processInboundWAMessage(msg) {
     return { inboxEntry: holdEntry, clientMatch, intent, route: 'arbox_outage_hold', barakReply: holdMsg };
   }
 
-  // 2d. Post-call stop-status gate: context-aware handling for call_scheduled / callback_requested.
-  //
-  //   These run AFTER Tier-4 (identity is confirmed enough to route) but BEFORE the main
-  //   AI pipeline. The correct response depends on what the person wrote:
-  //     • brief ack / emoji         → silent (no auto-reply, do not reopen sales)
-  //     • schedule query            → send schedule image (answer the question, no funnel)
-  //     • reschedule intent         → let the reschedule flow handle it (falls through)
-  //     • opt-out                   → handle as opt-out even from post-call status
-  //     • other text (new question) → alert staff, no bot reply (staff owns follow-through)
+  // 2d. Lead callback flow — active phase.
+  //     Runs AFTER the human_owns / opted_out / attribution gates and Tier-4, BEFORE the
+  //     AI pipeline. Handles every message from a lead that already has a callback in
+  //     progress (reminder replies, reschedule, cancellation, name capture, new time…).
   if (!isExistingClient) {
-    const _postCallRec    = store.getLead(fromNorm);
-    const _postCallStatus = _postCallRec?.status;
-
-    if (_postCallStatus === 'call_scheduled' || _postCallStatus === 'callback_requested') {
-      const msgText = (msg.text ?? '').trim();
-
-      // Opt-out: always let this fall through to lead_agent (which sets opted_out + acks).
-      if (isPostCallOptOut(msgText)) {
-        // fall through — lead_agent handles it
-      }
-      // Reschedule intent → let the reschedule interception block handle it
-      else if (intent === 'reschedule') {
-        // fall through to the standard reschedule path below
-      } else if (isBriefAck(msgText) || msg.type !== 'text') {
-        // Before going silent: if availability was already confirmed and this is a
-        // duplicate affirmation, route it distinctly instead of silently dropping it.
-        // This prevents a second "כן" being indistinguishable from the first in logs.
-        const _dupAvailAlready = aptStore.getByPhone(fromNorm).some(
-          a => a.prospectReminderSent === true
-            && a.prospectAvailability !== null
-            && a.status === 'callback_pending'
-        );
-        if (_dupAvailAlready) {
-          store.logEvent('post_call_avail_dup_affirm', fromNorm, { preview: msgText.slice(0, 60) });
-          logger.info('[pipeline] Duplicate availability affirmation — no new alert', { from: fromNorm });
-          const dupAvEntry = inbox.push({
-            from: fromNorm, fromIsraeli, name: msg.name ?? null,
-            text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
-            receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
-            clientMatch, intent, route: 'post_call_avail_already_confirmed', barakReply: null,
-          });
-          return { inboxEntry: dupAvEntry, clientMatch, intent, route: 'post_call_avail_already_confirmed', barakReply: null };
-        }
-        // Brief ack / emoji / non-text → silent. The sales phase is over.
-        store.logEvent('post_call_ack_silent', fromNorm, { status: _postCallStatus, preview: msgText.slice(0, 60) });
-        logger.info('[pipeline] Post-call ack silent', { from: fromNorm, status: _postCallStatus });
-        const silEntry = inbox.push({
-          from: fromNorm, fromIsraeli, name: msg.name ?? null,
-          text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
-          receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
-          clientMatch, intent, route: 'post_call_silent', barakReply: null,
-        });
-        return { inboxEntry: silEntry, clientMatch, intent, route: 'post_call_silent', barakReply: null };
-
-      } else if (intent === 'schedule_query') {
-        // Schedule query → answer request, no sales funnel.
-        const timetableUrl = getActiveTimetableUrl();
-        let postCallReply = null;
-        if (timetableUrl) {
-          postCallReply = `הנה מערכת השעות של Shape Studio! 🏋️‍♀️`;
-          if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
-            _markBotSent(fromNorm);
-            sendFileByUrl(fromNorm, timetableUrl, 'schedule.png', postCallReply)
-              .then(res => { if (res?.idMessage) _recordBotSend(res.idMessage, fromNorm); store.logEvent('timetable_image_sent', fromNorm, { status: _postCallStatus }); })
-              .catch(() => { _markBotSent(fromNorm); sendText(fromNorm, postCallReply).catch(() => {}); });
-          }
-        } else {
-          postCallReply = buildSchedulingReply(intent, msg, clientMatch).catch(() => null);
-          postCallReply = await postCallReply;
-          if (postCallReply && process.env.WHATSAPP_AUTO_REPLY === 'true') {
-            _markBotSent(fromNorm);
-            await sendText(fromNorm, postCallReply).catch(() => {});
-          }
-        }
-        store.logEvent('post_call_schedule_answered', fromNorm, { status: _postCallStatus });
-        const scEntry = inbox.push({
-          from: fromNorm, fromIsraeli, name: msg.name ?? null,
-          text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
-          receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
-          clientMatch, intent, route: 'post_call_schedule', barakReply: postCallReply,
-        });
-        return { inboxEntry: scEntry, clientMatch, intent, route: 'post_call_schedule', barakReply: postCallReply };
-
-      } else if (_postCallRec?.meta?.qualData?.nameAsked && !_postCallRec?.meta?.qualData?.confirmedName) {
-        // The bot asked for a name after confirming the callback time (new behaviour).
-        // If this short message looks like a first name, capture it silently.
-        // Any longer or ambiguous message falls through to the staff-alert path.
-        const { extractNameFromMessage } = require('./agents/lead_agent');
-        const capturedName = extractNameFromMessage(msgText);
-        if (capturedName) {
-          const _nm    = _postCallRec?.meta ?? {};
-          const _prevQd = _nm.qualData ?? {};
-
-          // Skip entirely if closing already completed on a previous message.
-          if (_prevQd.closingSummarySent) {
-            // Name arrived twice — just update aptStore name without re-sending.
-            aptStore.getByPhone(fromNorm)
-              .filter(a => a.status === 'callback_pending' || a.status === 'confirmed')
-              .forEach(a => { if (a.leadName !== capturedName) aptStore.update(a.id, { leadName: capturedName }); });
-            persist.saveLeads(store);
-            logger.info('[pipeline] Post-call name captured (closing already sent — skipping)',
-              { from: fromNorm, name: capturedName });
-            const _skEntry = inbox.push({
-              from: fromNorm, fromIsraeli, name: msg.name ?? null,
-              text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
-              receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
-              clientMatch, intent, route: 'post_call_name_captured', barakReply: null,
-            });
-            return { inboxEntry: _skEntry, clientMatch, intent, route: 'post_call_name_captured', barakReply: null };
-          }
-
-          // Concurrency guard: skip if either send is in-flight or uncertain (outcome unknown).
-          // 'uncertain' means in-flight when the process last crashed — do not auto-send on name repeat.
-          const _BLOCKING_STATES = new Set(['in_flight', 'uncertain']);
-          if (_BLOCKING_STATES.has(_nm.closingSummaryProspectState) || _BLOCKING_STATES.has(_nm.closingSummaryManagerState)) {
-            logger.info('[pipeline] Closing summary in-flight/uncertain — skipping concurrent duplicate', { from: fromNorm });
-            persist.saveLeads(store);
-            const _ifEntry = inbox.push({
-              from: fromNorm, fromIsraeli, name: msg.name ?? null,
-              text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
-              receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
-              clientMatch, intent, route: 'post_call_name_captured', barakReply: null,
-            });
-            return { inboxEntry: _ifEntry, clientMatch, intent, route: 'post_call_name_captured', barakReply: null };
-          }
-
-          const _callTime  = _prevQd.callTimeGiven ?? null;
-          const _interest  = _prevQd.fitnessInterest ?? null;
-          const _location  = _prevQd.location ?? null;
-          const _goal      = _prevQd.goal ?? null;
-          const _readiness = _nm.qualProfile?.readiness ?? null;
-          const _readyEmoji = _readiness === 'HIGH' ? '🔥' : _readiness === 'MEDIUM' ? '🌡️' : _readiness === 'LOW' ? '❄️' : '';
-          const _aptRecord = aptStore.getByPhone(fromNorm)
-            .filter(a => a.status === 'callback_pending' || a.status === 'confirmed')
-            .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0] ?? null;
-
-          // Ensure a persisted aptStore entry exists before sending ANY booking confirmation.
-          // The name-capture path is an early-return (never reaches the aptStore creation
-          // block at line ~4344). Without this, the confirmation reaches the prospect but
-          // no appointment exists — a false booking promise.
-          //
-          // If callTimeGiven is set but no entry exists, create one now.
-          // If the time cannot be parsed → _aptForSend = null → prospect confirmation blocked.
-          // The manager summary is still sent so staff can follow up manually.
-          let _aptForSend = _aptRecord;
-          if (!_aptForSend && _callTime) {
-            try {
-              // Anchor "מחר"/"שישי" etc. to the message that GAVE the callback time,
-              // not the name message (which may arrive hours later or after midnight).
-              const _rawCallTimeGivenAt = _prevQd.callTimeGivenAt ?? _nm.callTimeGivenAt ?? null;
-              const _sentAt = _rawCallTimeGivenAt
-                ? new Date(_rawCallTimeGivenAt)
-                : (msg.timestamp ? new Date(msg.timestamp) : new Date());
-              const _parsed  = calendarSvc.parseHebrewTimeLocal(_callTime, _sentAt);
-              if (_parsed) {
-                _aptForSend = aptStore.createCallbackPending({
-                  leadPhone:       fromNorm,
-                  leadName:        capturedName,
-                  rawTime:         _callTime,
-                  scheduledAt:     _parsed,
-                  assignedStaffId: staffConfig?.staff?.find(s => s.id === 'eden')?.id ?? 'eden',
-                });
-                logger.info('[pipeline] aptStore entry created before closing summary',
-                  { from: fromNorm, rawTime: _callTime, scheduledAt: _parsed.toISOString() });
-              } else {
-                logger.warn('[pipeline] callTimeGiven cannot be parsed — prospect confirmation blocked',
-                  { from: fromNorm, callTime: _callTime });
-              }
-            } catch (aptErr) {
-              logger.warn('[pipeline] aptStore creation failed — prospect confirmation blocked',
-                { from: fromNorm, error: aptErr.message });
-            }
-          }
-
-          // Format the callback time as a full Hebrew date/time for user-facing messages.
-          // rawTime ("מחר ב12") is preserved for reference; formatted time is what users see.
-          // Use _aptForSend (which has a parsed scheduledAt) for the full date+time display.
-          const _fmtTime = fmtScheduledAt(_aptForSend?.scheduledAt, _callTime);
-
-          // Prospect closing: confirmed name, exact formatted time, request status (not confirmed).
-          const _prospectMsg = _callTime ? [
-            `${capturedName}, קיבלנו את בקשת השיחה שלך ✅`,
-            `📞 ${_fmtTime}`,
-            `נציג מהצוות של Shape Studio יצור איתך קשר.`,
-          ].join('\n') : null;
-
-          // ── Consolidated manager summary ──────────────────────────────────────────
-          // ONE message per callback, sent after both name and time are confirmed and the
-          // appointment is successfully persisted. Sent with linkPreview:false to prevent
-          // the wa.me link from rendering the contact's business profile as a preview card.
-          //
-          // Local phone format (05X-XXXXXXX) for readability; E164 preserved in wa.me link.
-          const _localPhone = fromNorm.startsWith('972')
-            ? '0' + fromNorm.slice(3)
-            : fromNorm;
-
-          const _backendBase = getBackendBase();
-          const _panelLink   = _backendBase
-            ? `${_backendBase}/api/barak/callbacks`
-            : null;
-
-          const _managerHandoff = _callTime ? [
-            `📞 בקשת שיחה חדשה — ${capturedName}`,
-            `📅 ${_fmtTime}`,
-            `📱 ${_localPhone}`,
-            _interest ? `💪 עניין: ${_interest}` : null,
-            _location ? `📍 מיקום: ${_location}` : null,
-            _goal     ? `🎯 מטרה: ${_goal}` : null,
-            `⏳ בקשת שיחה — ממתינה לאישור הצוות`,
-            `💬 https://wa.me/${fromNorm}`,
-            _panelLink ? `📋 ${_panelLink}` : null,
-          ].filter(Boolean).join('\n') : null;
-
-          // Read already-covered manager recipients BEFORE sending (use as skipPhones).
-          // This prevents resending to phones that already accepted in a prior attempt.
-          const _alreadyMgrSentTo = new Set(_nm.closingSummaryManagerSentTo ?? []);
-          const _prospectAlreadyAccepted = _nm.closingSummaryProspectState === 'accepted';
-
-          // Set in-flight states synchronously to block concurrent duplicates.
-          // closingSummarySent stays false until both are accepted.
-          store.upsertLead(fromNorm, {
-            name: capturedName,
-            meta: {
-              ..._nm,
-              qualData: {
-                ..._prevQd,
-                confirmedName:          capturedName,
-                nameConfirmed:          true,
-                nameConfirmedAlertSent: true,
-                closingSummarySent:     false,
-              },
-              closingSummaryProspectState: _prospectAlreadyAccepted ? 'accepted' : (_callTime ? 'in_flight' : null),
-              closingSummaryManagerState:  _callTime ? 'in_flight' : null,
-              closingSummaryProspectReply: _prospectMsg ?? null,
-              closingSummarySentAt:        null,
-              closingSummaryManagerSentTo: [..._alreadyMgrSentTo],
-            },
-          });
-
-          // Helper: mark closingSummarySent=true only when BOTH outcomes are accepted.
-          // Writes to both meta.closingSummarySent AND meta.qualData.closingSummarySent so
-          // the inbound guard (_prevQd.closingSummarySent) and admin endpoint both see it.
-          const _markClosingCompleteIfBoth = () => {
-            const cur = store.getLead(fromNorm)?.meta ?? {};
-            if (cur.closingSummaryProspectState === 'accepted' && cur.closingSummaryManagerState === 'accepted') {
-              store.upsertLead(fromNorm, {
-                meta: { ...cur,
-                  closingSummarySent:   true,
-                  closingSummarySentAt: new Date().toISOString(),
-                  qualData: { ...(cur.qualData ?? {}), closingSummarySent: true },
-                },
-              });
-              persist.saveLeads(store);
-            }
-          };
-
-          // Propagate confirmed name to open aptStore entries.
-          aptStore.getByPhone(fromNorm)
-            .filter(a => a.status === 'callback_pending' || a.status === 'confirmed')
-            .forEach(a => { if (a.leadName !== capturedName) aptStore.update(a.id, { leadName: capturedName }); });
-
-          // Send prospect closing summary (skipped if already accepted or if no
-          // persisted appointment could be created — _aptForSend null means the
-          // time could not be resolved; never confirm a booking that doesn't exist).
-          if (_prospectMsg && !_prospectAlreadyAccepted && _aptForSend && process.env.WHATSAPP_AUTO_REPLY === 'true') {
-            _markBotSent(fromNorm);
-            sendText(fromNorm, _prospectMsg)
-              .then(res => {
-                const idMsg = res?.idMessage ?? null;
-                const cur = store.getLead(fromNorm)?.meta ?? {};
-                store.upsertLead(fromNorm, {
-                  meta: { ...cur,
-                    closingSummaryProspectState:    idMsg ? 'accepted' : 'failed',
-                    closingSummaryProspectIdMessage: idMsg,
-                  },
-                });
-                persist.saveLeads(store);
-                _markClosingCompleteIfBoth();
-              })
-              .catch(err => {
-                const cur = store.getLead(fromNorm)?.meta ?? {};
-                store.upsertLead(fromNorm, { meta: { ...cur, closingSummaryProspectState: 'failed' } });
-                persist.saveLeads(store);
-                logger.warn('[pipeline] Prospect closing summary send failed', { from: fromNorm, error: err.message });
-              });
-          }
-
-          // Send manager handoff — pass already-covered phones as skipPhones BEFORE calling.
-          // linkPreview:false prevents the wa.me link from rendering the contact's business
-          // profile card (e.g. "Fit Coach App" preview from the prospect's WhatsApp account).
-          if (_managerHandoff) {
-            alertOwner(`📞 בקשת שיחה — ${capturedName}`, _managerHandoff, { skipPhones: _alreadyMgrSentTo, linkPreview: false })
-              .then(ar => {
-                const newSent   = (ar?.results ?? []).filter(r => r.idMessage && !r.skipped).map(r => r.phone);
-                const allSentTo = [..._alreadyMgrSentTo, ...newSent];
-                const firstId   = ar?.results?.find(r => r.idMessage)?.idMessage ?? null;
-                // Partial failure: any non-skipped recipient without idMessage = failed.
-                const anyFailed = (ar?.results ?? []).some(r => !r.skipped && !r.idMessage);
-                const accepted  = allSentTo.length > 0 && !anyFailed;
-                const cur = store.getLead(fromNorm)?.meta ?? {};
-                store.upsertLead(fromNorm, {
-                  meta: { ...cur,
-                    closingSummaryManagerState:    accepted ? 'accepted' : 'failed',
-                    closingSummaryManagerSentTo:   allSentTo,
-                    closingSummaryManagerIdMessage: firstId,
-                  },
-                });
-                persist.saveLeads(store);
-                _markClosingCompleteIfBoth();
-                logger.info('[pipeline] Manager closing handoff sent',
-                  { from: fromNorm, name: capturedName, accepted, idMsg: firstId, sentTo: allSentTo });
-              })
-              .catch(err => {
-                const cur = store.getLead(fromNorm)?.meta ?? {};
-                store.upsertLead(fromNorm, { meta: { ...cur, closingSummaryManagerState: 'failed' } });
-                persist.saveLeads(store);
-                logger.warn('[pipeline] Manager closing handoff failed', { from: fromNorm, error: err.message });
-              });
-          }
-
-          persist.saveLeads(store);
-          store.logEvent('name_captured_post_call', fromNorm, { name: capturedName, status: _postCallStatus });
-          logger.info('[pipeline] Post-call name captured — closing summaries queued',
-            { from: fromNorm, name: capturedName, hasCallTime: !!_callTime });
-          const nmEntry = inbox.push({
-            from: fromNorm, fromIsraeli, name: msg.name ?? null,
-            text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
-            receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
-            clientMatch, intent, route: 'post_call_name_captured', barakReply: _prospectMsg ?? null,
-          });
-          return { inboxEntry: nmEntry, clientMatch, intent, route: 'post_call_name_captured',
-                   barakReply: _prospectMsg ?? null };
-        }
-        // Fall through for non-name messages.
-        // Before alerting staff, check if this is an availability-confirmation reply
-        // (lead responding to the prospect reminder sent by the worker).
-        {
-          const _availAptN = aptStore.getByPhone(fromNorm).find(
-            a => a.prospectReminderSent === true && a.prospectAvailability === null
-              && a.status === 'callback_pending'
-          );
-          if (_availAptN) {
-            const _lcN = msgText.trim().toLowerCase();
-            const _aptNameN = (_availAptN.leadName ?? '').split(' ')[0] || 'שלום';
-            const { fmtScheduledAt: _fmtN } = require('./utils/time');
-            const _aptTimeN = _fmtN(_availAptN.scheduledAt, _availAptN.rawTime);
-            const _CONFIRM_REN    = /^(כן|בסדר|אוקיי|יופי|מצוין|sure|yes|ok|טוב|בטח|ברור|נכון)(\s|$)/i;
-            const _RESCHEDULE_REN = /לא\s*(נוח|מתאים|יכול|יכולה|אפשרי)|לא\s+ok|לא\s+בסדר|אי\s*אפשר|לשנות|לדחות|reschedule/i;
-            const _CANCEL_REN     = /לבטל|אבטל|לא\s*רוצ[הי]|לא\s*מעוניי?נ|not interested|cancel/i;
-            let _availStateN = null, _availReplyN = null, _aptUpdatesN = {};
-            if (_CONFIRM_REN.test(_lcN)) {
-              _availStateN = 'confirmed';
-              _availReplyN = `מצוין ${_aptNameN}! 🎉 נציג יצור איתך קשר ${_aptTimeN}`;
-              _aptUpdatesN = { prospectAvailability: 'confirmed' };
-            } else if (_RESCHEDULE_REN.test(_lcN)) {
-              _availStateN = 'rescheduled';
-              _availReplyN = `מה הזמן שיהיה לך נוח? נסדר זמן חדש 🗓️`;
-              _aptUpdatesN = { prospectAvailability: 'rescheduled', prospectReminderSent: false };
-            } else if (_CANCEL_REN.test(_lcN)) {
-              _availStateN = 'cancelled';
-              _availReplyN = `הבנתי! אם תרצה/י לתאם שיחה בעתיד — אנחנו כאן 😊`;
-              _aptUpdatesN = { prospectAvailability: 'cancelled' };
-            }
-            if (_availStateN) {
-              aptStore.update(_availAptN.id, _aptUpdatesN);
-              if (_availReplyN && process.env.WHATSAPP_AUTO_REPLY === 'true') {
-                _markBotSent(fromNorm);
-                sendText(fromNorm, _availReplyN).catch(() => {});
-              }
-              if (_availStateN === 'rescheduled' || _availStateN === 'cancelled') {
-                const _subjN = _availStateN === 'cancelled'
-                  ? `📬 ליד ביטל בקשת שיחה — ${msg.name ?? fromNorm}`
-                  : `📬 ליד ביקש לשנות מועד — ${msg.name ?? fromNorm}`;
-                const _bodyN = `*${msg.name ?? fromNorm}* (${fromNorm})\n`
-                  + (_availStateN === 'cancelled'
-                      ? `ביטל/ה את בקשת השיחה (${_aptTimeN}).\nהודעה: "${msgText.slice(0, 200)}"\n\nניתן לסגור את הפנייה.`
-                      : `הזמן ${_aptTimeN} לא נוח לו/לה.\nהודעה: "${msgText.slice(0, 200)}"\n\nאנא תאמו מועד חדש.`);
-                alertOwner(_subjN, _bodyN).catch(() => {});
-              }
-              store.logEvent('prospect_availability_replied', fromNorm, {
-                aptId: _availAptN.id, availState: _availStateN, preview: msgText.slice(0, 80),
-              });
-              logger.info('[pipeline] Prospect availability reply (name-branch fall-through)',
-                { from: fromNorm, state: _availStateN, aptId: _availAptN.id });
-              const _availEntryN = inbox.push({
-                from: fromNorm, fromIsraeli, name: msg.name ?? null,
-                text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
-                receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
-                clientMatch, intent, route: `post_call_avail_${_availStateN}`, barakReply: _availReplyN,
-              });
-              return { inboxEntry: _availEntryN, clientMatch, intent, route: `post_call_avail_${_availStateN}`, barakReply: _availReplyN };
-            }
-          }
-        }
-        // Not an availability reply — alert staff
-        alertOwner(
-          `📬 הודעה אחרי ${_postCallStatus === 'call_scheduled' ? 'תיאום' : 'בקשת חזרה'} — ${msg.name ?? fromNorm}`,
-          `*${msg.name ?? fromNorm}* (${fromNorm})\n*סטטוס:* ${_postCallStatus}\n*הודעה:* "${msgText.slice(0, 200)}"\n\nהאדם כתב אחרי שהתיאום הושלם. אנא בדוק ידנית.`
-        ).catch(() => {});
-        store.logEvent('post_call_staff_notified', fromNorm, { status: _postCallStatus, preview: msgText.slice(0, 80) });
-        logger.info('[pipeline] Post-call message — staff alerted, bot silent', { from: fromNorm, status: _postCallStatus });
-        const pcEntry = inbox.push({
-          from: fromNorm, fromIsraeli, name: msg.name ?? null,
-          text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
-          receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
-          clientMatch, intent, route: 'post_call_staff_hold', barakReply: null,
-        });
-        persist.saveInbox(inbox);
-        return { inboxEntry: pcEntry, clientMatch, intent, route: 'post_call_staff_hold', barakReply: null };
-      } else {
-        // Catch-all for remaining post-call messages.
-        //
-        // Representative request: lead asks for a human representative but already has an
-        // existing callback. Acknowledge the existing appointment and offer to reschedule
-        // rather than creating a duplicate callback or silently alerting staff.
-        if (intent === 'representative') {
-          const _existApts = aptStore.getByPhone(fromNorm)
-            .filter(a => a.status === 'callback_pending' || a.status === 'confirmed')
-            .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-          const _existApt = _existApts[0] ?? null;
-          const _timeRef  = _existApt?.rawTime ?? _postCallRec?.meta?.qualData?.callTimeGiven;
-          const _repReply = _timeRef
-            ? `יש לנו שיחה מתוכננת ${_timeRef} 😊\nאם זה לא נוח — ספר/י לי מה עדיף ואסדר מחדש.`
-            : `יש לנו שיחה מתוכננת בינינו 😊\nאם תרצה/י לשנות מועד — פשוט תגיד/י לי את השעה שנוחה לך.`;
-          if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
-            _markBotSent(fromNorm);
-            sendText(fromNorm, _repReply).catch(() => {});
-          }
-          store.logEvent('post_call_representative_acknowledged', fromNorm, {
-            status: _postCallStatus, existingAptId: _existApt?.id, timeRef: _timeRef,
-          });
-          logger.info('[pipeline] Post-call representative request — acknowledged existing callback', {
-            from: fromNorm, existingAptId: _existApt?.id,
-          });
-          const _repEntry = inbox.push({
-            from: fromNorm, fromIsraeli, name: msg.name ?? null,
-            text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
-            receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
-            clientMatch, intent, route: 'post_call_rep_acknowledged', barakReply: _repReply,
-          });
-          return { inboxEntry: _repEntry, clientMatch, intent, route: 'post_call_rep_acknowledged', barakReply: _repReply };
-        }
-
-        // ── Prospect availability-confirmation reply ───────────────────────
-        // After the worker sends a prospect reminder ("עדיין נוח לך לדבר?"), the
-        // lead may reply to confirm or cancel. Detect this BEFORE the dup-accept
-        // check so a simple "כן" doesn't fall through to staff-alert.
-        const _pendingAvailApt = aptStore.getByPhone(fromNorm).find(
-          a => a.prospectReminderSent === true && a.prospectAvailability === null
-            && a.status === 'callback_pending'
-        );
-        if (_pendingAvailApt) {
-          const _lc = msgText.trim().toLowerCase();
-          const _aptName = (_pendingAvailApt.leadName ?? '').split(' ')[0] || 'שלום';
-          const { fmtScheduledAt: _fmtForAvail } = require('./utils/time');
-          const _aptTime = _fmtForAvail(_pendingAvailApt.scheduledAt, _pendingAvailApt.rawTime);
-
-          // Affirmative — time works
-          const _CONFIRM_RE    = /^(כן|בסדר|אוקיי|יופי|מצוין|sure|yes|ok|טוב|בטח|ברור|נכון)(\s|$)/i;
-          // Time is unsuitable — keep request, ask for another slot
-          const _RESCHEDULE_RE = /לא\s*(נוח|מתאים|יכול|יכולה|אפשרי)|לא\s+ok|לא\s+בסדר|אי\s*אפשר|לשנות|לדחות|reschedule/i;
-          // Explicit withdrawal of the callback request entirely
-          const _CANCEL_RE     = /לבטל|אבטל|לא\s*רוצ[הי]|לא\s*מעוניי?נ|not interested|cancel/i;
-
-          let _availState = null, _availReply = null, _aptUpdates = {};
-          if (_CONFIRM_RE.test(_lc)) {
-            _availState = 'confirmed';
-            _availReply = `מצוין ${_aptName}! 🎉 נציג יצור איתך קשר ${_aptTime}`;
-            _aptUpdates = { prospectAvailability: 'confirmed' };
-          } else if (_RESCHEDULE_RE.test(_lc)) {
-            // Time unsuitable — preserve the request, reset reminder so it can re-fire after
-            // a new time is set, ask for preferred slot.
-            _availState = 'rescheduled';
-            _availReply = `מה הזמן שיהיה לך נוח? נסדר זמן חדש 🗓️`;
-            _aptUpdates = { prospectAvailability: 'rescheduled', prospectReminderSent: false };
-          } else if (_CANCEL_RE.test(_lc)) {
-            _availState = 'cancelled';
-            _availReply = `הבנתי! אם תרצה/י לתאם שיחה בעתיד — אנחנו כאן 😊`;
-            _aptUpdates = { prospectAvailability: 'cancelled' };
-          }
-
-          if (_availState) {
-            aptStore.update(_pendingAvailApt.id, _aptUpdates);
-            if (_availReply && process.env.WHATSAPP_AUTO_REPLY === 'true') {
-              _markBotSent(fromNorm);
-              sendText(fromNorm, _availReply).catch(() => {});
-            }
-            if (_availState === 'rescheduled' || _availState === 'cancelled') {
-              const _subj = _availState === 'cancelled'
-                ? `📬 ליד ביטל בקשת שיחה — ${msg.name ?? fromNorm}`
-                : `📬 ליד ביקש לשנות מועד — ${msg.name ?? fromNorm}`;
-              const _body = `*${msg.name ?? fromNorm}* (${fromNorm})\n`
-                + (_availState === 'cancelled'
-                    ? `ביטל/ה את בקשת השיחה (${_aptTime}).\nהודעה: "${msgText.slice(0, 200)}"\n\nניתן לסגור את הפנייה.`
-                    : `הזמן ${_aptTime} לא נוח לו/לה.\nהודעה: "${msgText.slice(0, 200)}"\n\nאנא תאמו מועד חדש.`);
-              alertOwner(_subj, _body).catch(() => {});
-            }
-            store.logEvent('prospect_availability_replied', fromNorm, {
-              aptId: _pendingAvailApt.id, availState: _availState, preview: msgText.slice(0, 80),
-            });
-            logger.info('[pipeline] Prospect availability reply', { from: fromNorm, state: _availState, aptId: _pendingAvailApt.id });
-            const _availEntry = inbox.push({
-              from: fromNorm, fromIsraeli, name: msg.name ?? null,
-              text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
-              receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
-              clientMatch, intent, route: `post_call_avail_${_availState}`, barakReply: _availReply,
-            });
-            return { inboxEntry: _availEntry, clientMatch, intent, route: `post_call_avail_${_availState}`, barakReply: _availReply };
-          }
-        }
-
-        // Remaining sub-cases:
-        //   (a) Dup acceptance — callTimeGiven is already set AND the message contains
-        //       a callback time/acceptance pattern (TIME_PATTERN). This is a re-send of
-        //       the original acceptance. No staff alert — they were already notified when
-        //       the first acceptance arrived. Route silently.
-        //   (b) Genuine new question after callback (e.g. "מה הסטטוס?") — alert staff
-        //       so they can handle it. The bot stays silent in both cases.
-        const { TIME_PATTERN, TIME_REJECTION_RE } = require('./agents/lead_agent');
-        const _qd         = _postCallRec?.meta?.qualData ?? {};
-
-        const isDupAccept = _qd.callTimeGiven
-          && TIME_PATTERN.test(msgText) && !TIME_REJECTION_RE.test(msgText);
-
-        if (isDupAccept) {
-          store.logEvent('post_call_dup_acceptance', fromNorm, { status: _postCallStatus, preview: msgText.slice(0, 80) });
-          logger.info('[pipeline] Post-call dup acceptance — silent (staff already notified)', { from: fromNorm, status: _postCallStatus });
-          const dupEntry = inbox.push({
-            from: fromNorm, fromIsraeli, name: msg.name ?? null,
-            text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
-            receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
-            clientMatch, intent, route: 'post_call_silent', barakReply: null,
-          });
-          return { inboxEntry: dupEntry, clientMatch, intent, route: 'post_call_silent', barakReply: null };
-        }
-
-        // Genuine new question → alert staff, bot silent.
-        alertOwner(
-          `📬 הודעה אחרי ${_postCallStatus === 'call_scheduled' ? 'תיאום' : 'בקשת חזרה'} — ${msg.name ?? fromNorm}`,
-          `*${msg.name ?? fromNorm}* (${fromNorm})\n*סטטוס:* ${_postCallStatus}\n*הודעה:* "${msgText.slice(0, 200)}"\n\nהאדם כתב אחרי שהתיאום הושלם. אנא בדוק ידנית.`
-        ).catch(() => {});
-        store.logEvent('post_call_staff_notified', fromNorm, { status: _postCallStatus, preview: msgText.slice(0, 80) });
-        logger.info('[pipeline] Post-call genuine new message — staff alerted, bot silent', { from: fromNorm, status: _postCallStatus });
-        const pcCatchEntry = inbox.push({
-          from: fromNorm, fromIsraeli, name: msg.name ?? null,
-          text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
-          receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
-          clientMatch, intent, route: 'post_call_staff_hold', barakReply: null,
-        });
-        persist.saveInbox(inbox);
-        return { inboxEntry: pcCatchEntry, clientMatch, intent, route: 'post_call_staff_hold', barakReply: null };
-      }
-    }
+    const _cbActive = await handleLeadCallbackFlow({ msg, fromNorm, fromIsraeli, clientMatch, intent, phase: 'active' });
+    if (_cbActive) return _cbActive;
   }
 
   // 2e. UNCLASSIFIED HOLD — unknown contact with no identity evidence.
@@ -4123,7 +3812,7 @@ async function processInboundWAMessage(msg) {
     // the funnel. Unknown contacts without clear studio intent go to the unclassified
     // inbox first; a neutral greeting gives them the chance to clarify.
     // Weight-loss phrases: "להוריד 20 קילו" / "לרדת במשקל" are fitness-specific in this context.
-    const SALES_INTENT_RE = /פילאטיס|כושר|שיעור|אימון|להצטרף|מנוי|להתנסות|ניסיון|רפורמר|בארה|קנגו|yoga|יוגה|בריאות|ירידה.*משקל|להוריד.*(?:קילו|משקל)|לרדת.*(?:קילו|משקל|במשקל)|חיזוק|גמישות|שייפ\s*סטודיו|מחיר|כמה.*עולה|שעות.*פעילות|לוח.*שיעורים|מערכת\s*שעות|הצעת\s+היכרות|60\s+ש|60\s+₪/i;
+    const SALES_INTENT_RE = /פילאטיס|כושר|שיעור|אימו[נן]|להצטרף|מנוי|להתנסות|ניסיון|רפורמר|בארה|קנגו|yoga|יוגה|בריאות|ירידה.*משקל|להוריד.*(?:קילו|משקל)|לרדת.*(?:קילו|משקל|במשקל)|חיזוק|גמישות|שייפ\s*סטודיו|מחיר|כמה.*עולה|שעות.*פעילות|לוח.*שיעורים|מערכת\s*שעות|הצעת\s+היכרות|60\s+ש|60\s+₪/i;
     const _hasSalesIntent = SALES_INTENT_RE.test(msg.text ?? '');
 
     if (!_hasLeadHistory && !_hasSalesIntent && msg.type === 'text') {
@@ -4152,6 +3841,13 @@ async function processInboundWAMessage(msg) {
       });
       return { inboxEntry: _ucEntry, clientMatch, intent, route: 'unclassified', barakReply: _unclassifiedReply };
     }
+  }
+
+  // 2f. Lead callback flow — new-request phase (after the unclassified hold, so an
+  //     unknown contact with no studio intent is never pulled into a callback).
+  if (!isExistingClient) {
+    const _cbNew = await handleLeadCallbackFlow({ msg, fromNorm, fromIsraeli, clientMatch, intent, phase: 'new' });
+    if (_cbNew) return _cbNew;
   }
 
   // 3. Routing decision — strict Barak / Tomer boundary
@@ -4310,19 +4006,9 @@ async function processInboundWAMessage(msg) {
           }
         }
       }
-      if (intent === 'representative') {
-        // Suppress if awaitingCallbackTime was set by buildSchedulingReply — normal flow.
-        // Consolidated summary fires after name capture. Keep for urgent/non-callback cases.
-        const _awaitingNow = store.getLead(fromNorm)?.meta?.awaitingCallbackTime === true;
-        if (!_awaitingNow) {
-          const clientName = msg.name ?? fromIsraeli ?? fromNorm;
-          notifySvc.notifyRepresentativeRequest(fromNorm, clientName).catch(err =>
-            logger.warn('Representative request staff alert failed', { error: err.message })
-          );
-        } else {
-          logger.info('[pipeline] Representative alert suppressed — consolidated summary pending name', { from: fromNorm });
-        }
-      }
+      // A lead's request for a representative never reaches this point: it is taken by
+      // handleLeadCallbackFlow, and the manager receives exactly one consolidated summary
+      // once time + name are known and the appointment is persisted.
     } else {
       // General / sales qualification → lead_agent (Barak's AI persona)
       try {
@@ -4381,51 +4067,6 @@ async function processInboundWAMessage(msg) {
         logger.error('Barak (lead_agent) error in WA pipeline', { error: err.message, from: fromNorm });
       }
 
-      // Auto-create callback_pending aptStore entry when Barak's AI flow captures
-      // callTimeGiven for the first time. This makes the entry visible in the
-      // appointments panel and eligible for the scheduled reminder worker.
-      // Only fires when no existing callback_pending entry exists for this phone
-      // (idempotent — the handoff idempotency gate in lead_agent already deduplicates
-      // the alert, this just mirrors that for the aptStore).
-      {
-        const _postHandoffLead = store.getLead(fromNorm);
-        // callTimeGiven lives in meta.qualData (set by setQualData in lead_agent step 3a);
-        // callTimeGivenAt lives in meta directly (set by store.upsertLead in the same step).
-        const _phCallTime = _postHandoffLead?.meta?.qualData?.callTimeGiven
-                          ?? _postHandoffLead?.meta?.callbackTime ?? null;
-        if (_postHandoffLead?.status === 'callback_requested' && _phCallTime) {
-          const _existing = aptStore.getByPhone(fromNorm).find(a => a.status === 'callback_pending');
-          if (!_existing) {
-            try {
-              const _rawTime    = _phCallTime;
-              const _sentAt     = _postHandoffLead.meta.callTimeGivenAt
-                ? new Date(_postHandoffLead.meta.callTimeGivenAt)
-                : new Date();
-              const _parsedAt   = calendarSvc.parseHebrewTimeLocal(_rawTime, _sentAt);
-              const _newApt = aptStore.createCallbackPending({
-                leadPhone:       fromNorm,
-                leadName:        _postHandoffLead.name ?? null,
-                rawTime:         _rawTime,
-                scheduledAt:     _parsedAt ?? null,
-                assignedStaffId: staffConfig?.staff?.find(s => s.id === 'eden')?.id ?? 'eden',
-              });
-              // Backfill handoffSentTo from the phones reliableHandoffAlert already
-              // reached. Without this the retry-notify endpoint would resend to staff
-              // who already received the initial alert via the AI-path flow.
-              const _aiHandoffPhones = _postHandoffLead.meta?.handoffSentPhones ?? [];
-              if (_aiHandoffPhones.length) {
-                aptStore.update(_newApt.id, { handoffSentTo: _aiHandoffPhones });
-              }
-              logger.info('[pipeline] callback_pending aptStore entry created from AI flow',
-                { from: fromNorm, rawTime: _rawTime, scheduledAt: _parsedAt?.toISOString() ?? null,
-                  handoffSentTo: _aiHandoffPhones.length });
-            } catch (aptErr) {
-              logger.warn('[pipeline] Failed to create callback_pending aptStore entry',
-                { from: fromNorm, error: aptErr.message });
-            }
-          }
-        }
-      }
     }
   }
 
@@ -4784,8 +4425,10 @@ app.post('/api/whatsapp/simulate', jsonBody, async (req, res) => {
     from,
     name:      name ?? null,
     text,
-    messageId: `sim-${Date.now()}`,
-    timestamp: new Date(),
+    messageId: (process.env.TEST_MODE === 'true' && req.body?.messageId) || `sim-${Date.now()}`,
+    // TEST_MODE only: tests may state when the message was "sent" to exercise
+    // timestamp-anchored date resolution. Production always uses the real clock.
+    timestamp: (process.env.TEST_MODE === 'true' && req.body?.timestamp) ? new Date(req.body.timestamp) : new Date(),
     type,
     mediaType: type,
     mediaCaption: null,
@@ -4804,7 +4447,8 @@ app.post('/api/whatsapp/simulate', jsonBody, async (req, res) => {
     })() : undefined;
     const _simApts = process.env.TEST_MODE === 'true'
       ? aptStore.getByPhone(normalizeToE164(from) ?? from).map(a => ({
-          id: a.id, status: a.status,
+          id: a.id, status: a.status, scheduledAt: a.scheduledAt, rawTime: a.rawTime,
+          staffConfirmedAt: a.staffConfirmedAt ?? null, reminderSent: a.reminderSent,
           prospectReminderSent: a.prospectReminderSent,
           prospectAvailability: a.prospectAvailability,
         }))
@@ -6228,130 +5872,43 @@ app.post('/api/admin/reset-lead-state/:phone', (req, res) => {
 // Uses fmtScheduledAt for the formatted time visible to humans.
 // Returns a result object for the caller to report or log.
 async function _retryClosingSummary(phone, { force = false } = {}) {
+  // Same code path as the automatic flow (callbackSvc.finalize): identical wording,
+  // persisted-appointment requirement and durable per-appointment / per-recipient dedup.
+  // `force` only bypasses the "already complete" short-circuit — it can never resend to
+  // a recipient who already accepted this appointment's summary, and nothing is sent for
+  // an expired or missing appointment (historical summaries are not replayed).
   const lead = store.getLead(phone);
   if (!lead) return { ok: false, error: 'lead_not_found' };
   const meta     = lead.meta ?? {};
   const qd       = meta.qualData ?? {};
-  const name     = qd.confirmedName ?? lead.name ?? null;
   const callTime = qd.callTimeGiven ?? meta.callbackTime ?? null;
-  if (!name)     return { ok: false, error: 'no_name' };
-  if (!callTime) return { ok: false, error: 'no_call_time' };
+  if (!qd.confirmedName) return { ok: false, error: 'no_name' };
+  if (!callTime)         return { ok: false, error: 'no_call_time' };
   if (qd.closingSummarySent && !force) {
     return { ok: false, error: 'already_sent',
       existing: { managerIdMessage: meta.closingSummaryManagerIdMessage, sentTo: meta.closingSummaryManagerSentTo } };
   }
 
-  const interest   = qd.fitnessInterest ?? null;
-  const location   = qd.location ?? null;
-  const goal       = qd.goal ?? null;
-  const readiness  = meta.qualProfile?.readiness ?? null;
-  const readyEmoji = readiness === 'HIGH' ? '🔥' : readiness === 'MEDIUM' ? '🌡️' : '❄️';
-  const missingParts = [...(!goal ? ['מטרה ספציפית'] : [])];
-
-  const apt = aptStore.getByPhone(phone)
-    .filter(a => a.status === 'callback_pending' || a.status === 'confirmed')
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0] ?? null;
-  const fmtTime = fmtScheduledAt(apt?.scheduledAt, callTime);
-
-  const prospectMsg = [
-    `${name}, קיבלנו את בקשת השיחה שלך ✅`,
-    `📞 ${fmtTime}`,
-    `נציג מהצוות של Shape Studio יצור איתך קשר.`,
-  ].join('\n');
-
-  const managerLines = [
-    `━━━━━━━━━━━━━━━━━━━━━`,
-    `📋 ליד — Shape Studio`,
-    `━━━━━━━━━━━━━━━━━━━━━`,
-    `👤 שם: ${name}`,
-    `📱 ${phone}`,
-    `💬 https://wa.me/${phone}`,
-    `📞 שיחה מבוקשת: ${fmtTime}`,
-    callTime !== fmtTime ? `   (מקורי: ${callTime})` : null,
-    `⚠️ בקשה — לא אושרה עדיין על ידי הצוות`,
-    `━━━━━━━━━━━━━━━━━━━━━`,
-    interest  ? `💪 ענין: ${interest}` : null,
-    location  ? `📍 מיקום: ${location}` : null,
-    goal      ? `🎯 מטרה: ${goal}` : null,
-    readiness ? `📊 מוכנות: ${readyEmoji} ${readiness}` : null,
-    missingParts.length ? `━━━━━━━━━━━━━━━━━━━━━\n⚠️ חסר: ${missingParts.join(', ')}` : null,
-  ].filter(Boolean).join('\n');
-
-  const prospectAlreadyAccepted = meta.closingSummaryProspectState === 'accepted';
-  const alreadySentTo = new Set(meta.closingSummaryManagerSentTo ?? []);
-
-  let prospectIdMessage = null, prospectError = null;
-  if (!prospectAlreadyAccepted) {
-    // Final ownership check: if staff has taken over, skip the automated prospect
-    // message. The manager summary is still sent — they need to know the lead qualified.
-    const _prospectOwn = store.getLead(phone)?.status;
-    if (_prospectOwn === 'human_owns') {
-      prospectError = 'skipped_human_owns';
-      logger.info('[closing] Prospect closing summary skipped — human_owns', { phone });
-      store.logEvent('closing_prospect_suppressed_human_owns', phone, {});
-    } else {
-      try {
-        const pr = await sendText(phone, prospectMsg);
-        prospectIdMessage = pr?.idMessage ?? null;
-      } catch (err) {
-        prospectError = err.message;
-        logger.warn('[closing] Prospect send failed', { phone, error: err.message });
-      }
-    }
-  }
-
-  let managerResults = [], managerIdMessage = null;
-  try {
-    const ar = await alertOwner(`📋 ליד מוכן — ${name}`, managerLines, { skipPhones: alreadySentTo });
-    managerResults = ar?.results ?? [];
-    managerIdMessage = managerResults.find(r => r.idMessage)?.idMessage ?? null;
-  } catch (err) {
-    logger.warn('[closing] Manager send failed', { phone, error: err.message });
-  }
-
-  const newSentTo     = managerResults.filter(r => r.idMessage && !r.skipped && !alreadySentTo.has(r.phone)).map(r => r.phone);
-  const updatedSentTo = [...alreadySentTo, ...newSentTo];
-  const anyMgrFailed  = managerResults.some(r => !r.skipped && !r.idMessage);
-
-  const prospectAccepted = prospectAlreadyAccepted || !!prospectIdMessage;
-  const managerAccepted  = updatedSentTo.length > 0 && !anyMgrFailed;
-  const bothAccepted     = prospectAccepted && managerAccepted;
-
-  const curMeta = store.getLead(phone)?.meta ?? {};
-  store.upsertLead(phone, {
-    meta: {
-      ...curMeta,
-      qualData: { ...(curMeta.qualData ?? {}), closingSummarySent: bothAccepted },
-      closingSummarySent:              bothAccepted,
-      closingSummarySentAt:            bothAccepted ? new Date().toISOString() : (curMeta.closingSummarySentAt ?? null),
-      closingSummaryProspectState:     prospectAccepted ? 'accepted' : (prospectError ? 'failed' : (curMeta.closingSummaryProspectState ?? null)),
-      closingSummaryProspectReply:     prospectMsg,
-      closingSummaryProspectIdMessage: prospectIdMessage ?? curMeta.closingSummaryProspectIdMessage ?? null,
-      closingSummaryManagerState:      managerAccepted ? 'accepted' : (anyMgrFailed ? 'failed' : (curMeta.closingSummaryManagerState ?? null)),
-      closingSummaryManagerIdMessage:  managerIdMessage ?? curMeta.closingSummaryManagerIdMessage ?? null,
-      closingSummaryManagerSentTo:     updatedSentTo,
-    },
-  });
-  persist.saveLeads(store);
-  store.logEvent('closing_summary_sent', phone, {
-    name, callTimeFmt: fmtTime, bothAccepted, managerIdMessage, sentTo: updatedSentTo,
-  });
+  const skippedBefore = [...(meta.closingSummaryManagerSentTo ?? [])];
+  const fin = await callbackSvc.finalize({ phone, trigger: force ? 'admin_retry_force' : 'retry' });
+  if (!fin.apt) return { ok: false, error: fin.error };
 
   return {
-    ok:                      bothAccepted,
-    prospectMsg,
+    ok:                      fin.bothAccepted,
+    prospectMsg:             fin.prospectMsg,
     prospectRecipient:       phone,
-    prospectIdMessage,
-    prospectError,
-    prospectAlreadyAccepted,
-    managerMsg:              managerLines,
-    managerResults,
-    managerIdMessage,
-    sentTo:                  updatedSentTo,
-    skipped:                 [...alreadySentTo],
-    bothAccepted,
+    prospectIdMessage:       fin.prospect.idMessage ?? null,
+    prospectError:           fin.prospect.state === 'accepted' ? null : (fin.prospect.reason ?? fin.prospect.state),
+    prospectAlreadyAccepted: fin.prospect.alreadySent === true,
+    managerMsg:              fin.managerMsg,
+    managerResults:          fin.manager.results ?? [],
+    managerIdMessage:        fin.manager.idMessage ?? null,
+    sentTo:                  (fin.manager.allSentTo ?? []).filter(p => p !== 'staff_action'),
+    skipped:                 skippedBefore,
+    bothAccepted:            fin.bothAccepted,
   };
 }
+
 
 // POST /api/admin/send-closing-summary/:phone — manually trigger the closing summary
 // for a lead whose name and callTimeGiven are already known. Used for recovery when
@@ -6367,6 +5924,9 @@ app.post('/api/admin/send-closing-summary/:phone', jsonBody, async (req, res) =>
   const result = await _retryClosingSummary(phone, { force });
 
   if (result.error === 'no_name')     return res.status(422).json({ ok: false, error: 'confirmedName not set' });
+  if (result.error === 'no_persisted_callback') return res.status(422).json({ ok: false, error: 'no persisted callback with a valid time — nothing to confirm' });
+  if (result.error === 'callback_expired')      return res.status(409).json({ ok: false, error: 'callback time already passed — summaries are not replayed' });
+  if (result.error === 'in_flight')             return res.status(409).json({ ok: false, error: 'a summary send is already in progress' });
   if (result.error === 'no_call_time') return res.status(422).json({ ok: false, error: 'callTimeGiven not set' });
   if (result.error === 'already_sent') {
     return res.status(409).json({ ok: false, error: 'closingSummarySent already true — pass force:true to override',
@@ -6396,148 +5956,153 @@ app.get('/api/admin/appointments', (req, res) => {
   res.json({ ok: true, total: apts.length, appointments: apts.slice(0, limit) });
 });
 
-// PATCH /api/admin/appointments/:id — update status
+// GET /api/admin/appointments/worker-status — effective reminder-worker configuration
+app.get('/api/admin/appointments/worker-status', (_req, res) => {
+  res.json({ ok: true, worker: appointmentWorker.workerStatus(), callingHours: callbackTime.callingHours() });
+});
+
+// Lifecycle transitions are NOT available through the generic PATCH: status, time and
+// reminder state change only through the dedicated endpoints below, which enforce the
+// allowed transitions and keep the lead and the panel consistent.
+const _APT_PATCHABLE = new Set(['assignedStaffId', 'completionNotes', 'noAnswerNote']);
+
+// PATCH /api/admin/appointments/:id — edit descriptive fields only
 app.patch('/api/admin/appointments/:id', jsonBody, (req, res) => {
-  const apt = aptStore.update(req.params.id, req.body);
-  if (!apt) return res.status(404).json({ ok: false, error: 'Appointment not found' });
-  store.logEvent('appointment_updated_manual', apt.leadPhone, { aptId: apt.id, ...req.body });
-  res.json({ ok: true, appointment: apt });
+  const body = req.body ?? {};
+  const refused = Object.keys(body).filter(k => !_APT_PATCHABLE.has(k));
+  if (refused.length) {
+    return res.status(400).json({ ok: false, error: `Fields not editable here: ${refused.join(', ')}. Use confirm / complete / cancel / no-answer / reschedule.` });
+  }
+  try {
+    const apt = aptStore.update(req.params.id, body);
+    if (!apt) return res.status(404).json({ ok: false, error: 'Appointment not found' });
+    store.logEvent('appointment_updated_manual', apt.leadPhone, { aptId: apt.id, ...body });
+    res.json({ ok: true, appointment: apt });
+  } catch (err) {
+    logger.error('[api] appointment update not persisted', { aptId: req.params.id, error: err.message });
+    res.status(500).json({ ok: false, error: 'persist_failed', message: 'השינוי לא נשמר — נסו שוב' });
+  }
 });
 
-// POST /api/admin/appointments/:id/complete — mark completed with optional notes
+const _APT_ERRORS = {
+  not_found:   [404, 'Appointment not found'],
+  not_pending: [409, 'רק בקשת שיחה שממתינה לאישור אפשר לאשר'],
+  not_open:    [409, 'הבקשה כבר נסגרה (הושלמה / בוטלה / לא ענה) — אי אפשר לשנות אותה'],
+  no_time:     [409, 'לבקשה אין מועד תקין — קבעו מועד ("שנה מועד") לפני אישור'],
+  expired:     [409, 'מועד השיחה כבר עבר — עדכנו תוצאה או קבעו מועד חדש'],
+};
+function _aptFail(res, r) {
+  const [code, message] = _APT_ERRORS[r.error] ?? [400, r.error];
+  return res.status(code).json({ ok: false, error: message, code: r.error, status: r.apt?.status ?? null });
+}
+function _aptPersistFail(res, id, err) {
+  logger.error('[api] appointment change not persisted', { aptId: id, error: err.message });
+  return res.status(500).json({ ok: false, error: 'השינוי לא נשמר — נסו שוב', code: 'persist_failed' });
+}
+
+// POST /api/admin/appointments/:id/confirm — staff approves a pending callback.
+//   callback_pending (valid future time) → confirmed; lead → call_scheduled.
+//   Repeat = no-op (unchanged:true). Closed or expired records are refused (409).
+//   Reminder records already sent for this time are preserved — approving never
+//   re-triggers a reminder. Human ownership / opt-out on the lead are never overridden.
+app.post('/api/admin/appointments/:id/confirm', jsonBody, (req, res) => {
+  try {
+    const r = callbackSvc.staffConfirm(req.params.id);
+    if (!r.ok) return _aptFail(res, r);
+    if (!r.unchanged) logger.info('[api] Appointment confirmed by staff', { aptId: r.apt.id, phone: r.apt.leadPhone });
+    res.json({ ok: true, unchanged: !!r.unchanged, appointment: r.apt });
+  } catch (err) { _aptPersistFail(res, req.params.id, err); }
+});
+
+// POST /api/admin/appointments/:id/complete — the call took place
 app.post('/api/admin/appointments/:id/complete', jsonBody, (req, res) => {
-  const fields = { status: 'completed' };
-  if (req.body?.notes) fields.completionNotes = req.body.notes;
-  const apt = aptStore.update(req.params.id, fields);
-  if (!apt) return res.status(404).json({ ok: false, error: 'Appointment not found' });
-  store.logEvent('appointment_completed', apt.leadPhone, { aptId: apt.id, notes: req.body?.notes });
-  res.json({ ok: true, appointment: apt });
+  try {
+    const r = callbackSvc.staffOutcome(req.params.id, 'completed', { notes: req.body?.notes || null });
+    if (!r.ok) return _aptFail(res, r);
+    res.json({ ok: true, unchanged: !!r.unchanged, appointment: r.apt });
+  } catch (err) { _aptPersistFail(res, req.params.id, err); }
 });
 
-// POST /api/admin/appointments/:id/cancel — cancel and alert staff
-app.post('/api/admin/appointments/:id/cancel', async (req, res) => {
-  const apt = aptStore.markCancelled(req.params.id);
-  if (!apt) return res.status(404).json({ ok: false, error: 'Appointment not found' });
-  calendarSvc.cancelCalendarEvent(apt).catch(() => {});
-  store.logEvent('appointment_cancelled', apt.leadPhone, { aptId: apt.id });
-  res.json({ ok: true, appointment: apt });
+// POST /api/admin/appointments/:id/cancel — staff cancels the callback (no prospect message)
+app.post('/api/admin/appointments/:id/cancel', jsonBody, (req, res) => {
+  try {
+    const r = callbackSvc.staffOutcome(req.params.id, 'cancelled', { reason: req.body?.reason || null });
+    if (!r.ok) return _aptFail(res, r);
+    res.json({ ok: true, unchanged: !!r.unchanged, appointment: r.apt });
+  } catch (err) { _aptPersistFail(res, req.params.id, err); }
 });
 
-// POST /api/admin/appointments/:id/no-answer — record a no-answer outcome (not a class no-show)
+// POST /api/admin/appointments/:id/no-answer — staff called, the prospect did not answer.
+// Recorded as an outcome only: no automated message is sent to the prospect.
 app.post('/api/admin/appointments/:id/no-answer', jsonBody, (req, res) => {
-  const apt = aptStore.update(req.params.id, {
-    status:       'no_answer',
-    noAnswerNote: req.body?.note ?? null,
-    noAnswerAt:   new Date().toISOString(),
-  });
-  if (!apt) return res.status(404).json({ ok: false, error: 'Appointment not found' });
-  store.logEvent('appointment_no_answer', apt.leadPhone, { aptId: apt.id, note: req.body?.note });
-  res.json({ ok: true, appointment: apt });
+  try {
+    const r = callbackSvc.staffOutcome(req.params.id, 'no_answer', { note: req.body?.note || null });
+    if (!r.ok) return _aptFail(res, r);
+    res.json({ ok: true, unchanged: !!r.unchanged, appointment: r.apt });
+  } catch (err) { _aptPersistFail(res, req.params.id, err); }
 });
 
-// POST /api/admin/appointments/:id/reschedule — reparse time, reset reminder state, notify staff
-// PATCH rawTime alone is insufficient: scheduledAt must be recalculated, reminderSentTo cleared
-// (not just reminderSent), and lead meta synced so the lead store reflects the new time.
+// POST /api/admin/appointments/:id/reschedule — staff move an OPEN callback.
+// The new time is resolved strictly (same resolver as prospect messages, anchored to
+// now, Asia/Jerusalem); an unclear or past time is refused with an explanation instead
+// of being guessed. The old reminder cycle is invalidated, staff approval is required
+// again, and the prospect receives the updated summary.
 app.post('/api/admin/appointments/:id/reschedule', jsonBody, async (req, res) => {
   const { rawTime } = req.body ?? {};
   if (!rawTime?.trim()) return res.status(400).json({ ok: false, error: 'rawTime required' });
-
-  const apt = aptStore.get(req.params.id);
-  if (!apt) return res.status(404).json({ ok: false, error: 'Appointment not found' });
-
-  const oldTimeLabel = apt.rawTime;
-
-  // 1. Re-parse the new time in Asia/Jerusalem
-  const newScheduledAt = await calendarSvc.parseHebrewTime(rawTime.trim()).catch(() => null);
-
-  // 2. Cancel old Google Calendar event
-  if (apt.calendarEventId) {
-    calendarSvc.cancelCalendarEvent(apt).catch(() => {});
-  }
-
-  // 3. Update appointment: new time, reset all reminder state, stay callback_pending
-  //    reminderSentTo must be cleared along with reminderSent so per-recipient state
-  //    matches the new schedule. The old recipients list is stale for the new time.
-  const updated = aptStore.update(apt.id, {
-    rawTime:       rawTime.trim(),
-    scheduledAt:   newScheduledAt ?? null,
-    status:        'callback_pending', // staff must re-confirm
-    reminderSent:  false,
-    reminderSentTo: [],
-  });
-
-  // 4. Sync lead meta so callTimeGiven reflects the new schedule
-  if (apt.leadPhone) {
-    const curMeta = store.getLead(apt.leadPhone)?.meta ?? {};
-    store.upsertLead(apt.leadPhone, {
-      meta: {
-        ...curMeta,
-        handoffCallTime: rawTime.trim(),
-        qualData: {
-          ...(curMeta.qualData ?? {}),
-          callTimeGiven: rawTime.trim(),
-        },
-      },
-    });
-    persist.saveLeads(store);
-  }
-
-  // 5. Notify staff of reschedule (fire-and-forget)
-  const staff = findStaff(updated.assignedStaffId);
-  notifySvc.notifyStaffRescheduled(
-    { ...updated, scheduledAt: newScheduledAt },
-    staff,
-    oldTimeLabel ?? '—'
-  ).catch(err => logger.warn('[api] reschedule notify failed', { error: err.message }));
-
-  store.logEvent('appointment_rescheduled_manual', apt.leadPhone, {
-    aptId: apt.id, oldTime: oldTimeLabel, newTime: rawTime, parsedAt: newScheduledAt,
-  });
-  res.json({ ok: true, appointment: updated, scheduledAt: newScheduledAt });
+  try {
+    const r = await callbackSvc.staffReschedule(req.params.id, rawTime.trim());
+    if (r.error === 'invalid_time') {
+      return res.status(422).json({ ok: false, error: `לא ניתן לקבוע את המועד: ${r.clarification}`, code: r.reason });
+    }
+    if (!r.ok) return _aptFail(res, r);
+    res.json({ ok: true, appointment: r.appointment, scheduledAt: r.scheduledAt,
+      prospectNotified: r.summary?.prospect?.state ?? null });
+  } catch (err) { _aptPersistFail(res, req.params.id, err); }
 });
 
 // POST /api/admin/appointments/:id/assign — reassign to a different staff member
 app.post('/api/admin/appointments/:id/assign', jsonBody, (req, res) => {
   const { staffId } = req.body ?? {};
   if (!staffId) return res.status(400).json({ ok: false, error: 'staffId required' });
-  const apt = aptStore.update(req.params.id, { assignedStaffId: staffId });
-  if (!apt) return res.status(404).json({ ok: false, error: 'Appointment not found' });
-  store.logEvent('appointment_staff_reassigned', apt.leadPhone, { aptId: apt.id, staffId });
-  res.json({ ok: true, appointment: apt });
+  try {
+    const apt = aptStore.update(req.params.id, { assignedStaffId: staffId });
+    if (!apt) return res.status(404).json({ ok: false, error: 'Appointment not found' });
+    store.logEvent('appointment_staff_reassigned', apt.leadPhone, { aptId: apt.id, staffId });
+    res.json({ ok: true, appointment: apt });
+  } catch (err) { _aptPersistFail(res, req.params.id, err); }
 });
 
-// POST /api/admin/appointments/:id/retry-notify — resend handoff alert, skipping already-covered phones
+// POST /api/admin/appointments/:id/retry-notify — (re)send the consolidated manager
+// summary for this appointment to recipients who have not accepted it yet. Uses the same
+// builder and durable dedup as the automatic flow: never a second copy, never a
+// different wording, never for an expired or closed appointment.
 app.post('/api/admin/appointments/:id/retry-notify', async (req, res) => {
   const apt = aptStore.get(req.params.id);
   if (!apt) return res.status(404).json({ ok: false, error: 'Appointment not found' });
-  const skipPhones = new Set(apt.handoffSentTo ?? []);
-  const staff      = findStaff(apt.assignedStaffId);
+  const open = callbackSvc.openCallback(apt.leadPhone);
+  if (!open || open.id !== apt.id) {
+    return res.status(409).json({ ok: false, error: 'הבקשה אינה הבקשה הפתוחה העדכנית של הליד — לא נשלח סיכום' });
+  }
   try {
-    const notifResult = await notifySvc.notifyStaffCallbackConfirmed(apt, staff, null, { skipPhones });
-    const newSucceeded = (notifResult?.results ?? []).filter(r => r.ok && !r.skipped).map(r => r.phone);
-    if (newSucceeded.length) {
-      const updatedHST = [...new Set([...(apt.handoffSentTo ?? []), ...newSucceeded])];
-      aptStore.update(apt.id, { handoffSentTo: updatedHST });
-      const curMeta = store.getLead(apt.leadPhone)?.meta ?? {};
-      store.upsertLead(apt.leadPhone, {
-        meta: {
-          ...curMeta,
-          handoffAlertStatus:    'sent',
-          handoffAlertSentAt:    new Date().toISOString(),
-          handoffAlertIdMessage: notifResult.firstIdMessage ?? curMeta.handoffAlertIdMessage,
-        },
-      });
-      persist.saveLeads(store);
+    const fin = await callbackSvc.finalize({ phone: apt.leadPhone, trigger: 'admin_retry_notify' });
+    if (!fin.apt) {
+      const msg = fin.error === 'no_name' ? 'חסר שם לליד — הסיכום נשלח רק אחרי שהליד מוסר שם'
+                : fin.error === 'callback_expired' ? 'מועד השיחה כבר עבר — סיכומים ישנים לא נשלחים מחדש'
+                : fin.error;
+      return res.status(422).json({ ok: false, error: msg, code: fin.error });
     }
     store.logEvent('appointment_handoff_retried', apt.leadPhone, {
-      aptId: apt.id, newSent: newSucceeded.length, skipped: skipPhones.size,
+      aptId: apt.id, newSent: fin.manager.newSent.length,
     });
-    res.json({ ok: true, sent: notifResult.sent, skipped: skipPhones.size, results: notifResult.results });
+    res.json({ ok: fin.manager.accepted, sent: fin.manager.newSent.length,
+      skipped: (fin.manager.results ?? []).filter(r => r.skipped).length, results: fin.manager.results ?? [] });
   } catch (err) {
     logger.error('[api] retry-notify failed', { aptId: req.params.id, error: err.message });
     res.status(500).json({ ok: false, error: err.message });
   }
 });
+
 
 // ══════════════════════════════════════════════════════════════════════════════
 // CALENDAR — ICS file serving
@@ -6947,6 +6512,49 @@ app.post('/api/demo/flags', express.json(), (req, res) => {
   res.json({ ok: true, qualData: { ...current, ...flags } });
 });
 
+// ── Startup closing-summary recovery ──────────────────────────────────────────
+// in_flight after a crash = UNKNOWN outcome: the provider may have accepted the send
+// before the process died. It becomes 'uncertain' and is surfaced for review in the
+// panel — it is never resent automatically. Only definitively 'failed' sends (the
+// provider never accepted them) are retried, through the same persisted-appointment
+// and durable-dedup rules as every other summary (callbackSvc.finalize), so nothing is
+// sent for an expired or closed callback.
+function _recoverClosingSummaries() {
+  let uncertain = 0;
+  for (const l of store.getAllLeads()) {
+    const m = l.meta ?? {};
+    if (m.closingSummaryProspectState === 'in_flight' || m.closingSummaryManagerState === 'in_flight') {
+      store.upsertLead(l.phone, {
+        meta: {
+          ...m,
+          closingSummaryProspectState: m.closingSummaryProspectState === 'in_flight' ? 'uncertain' : m.closingSummaryProspectState,
+          closingSummaryManagerState:  m.closingSummaryManagerState  === 'in_flight' ? 'uncertain' : m.closingSummaryManagerState,
+        },
+      });
+      uncertain++;
+    }
+  }
+  if (uncertain > 0) {
+    persist.saveLeads(store);
+    logger.warn('[startup] Closing summary uncertain states found (crash recovery) — review in the panel', { count: uncertain });
+  }
+  const retries = [];
+  if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
+    for (const l of store.getAllLeads()) {
+      const m  = l.meta ?? {};
+      const qd = m.qualData ?? {};
+      const failed  = m.closingSummaryProspectState === 'failed'    || m.closingSummaryManagerState === 'failed';
+      const unknown = m.closingSummaryProspectState === 'uncertain' || m.closingSummaryManagerState === 'uncertain';
+      if (qd.closingSummarySent || !failed || unknown) continue;
+      retries.push(_retryClosingSummary(l.phone).catch(err =>
+        logger.warn('[startup] Closing summary retry failed', { phone: l.phone, error: err.message })
+      ));
+    }
+    if (retries.length) logger.info('[startup] Retrying definitively-failed closing summaries', { count: retries.length });
+  }
+  return { uncertain, retries: Promise.all(retries) };
+}
+
 // ── SIGTERM — save state before Railway kills the container ───────────────────
 // Railway sends SIGTERM ~10s before hard-killing the process on each deploy.
 // Writing snapshots here means a new deploy picks them back up immediately.
@@ -6972,9 +6580,11 @@ try {
   _deployedRevision = _rev.sha?.slice(0, 8) ?? _deployedRevision;
 } catch { /* revision.json absent in development — not an error */ }
 
-// In test mode (TEST_MODE=true) the server is loaded via require() without binding
-// a port. Mark the store ready immediately so webhook processing doesn't block.
-if (process.env.TEST_MODE === 'true') {
+// TEST_NO_BIND=true: used by Jest tests (via jest_global_setup.js) to load the server
+// module without binding a port. Supertest creates its own ephemeral server from the
+// express app object, so a bound port would conflict. TEST_MODE=true enables test
+// endpoints and must remain set; TEST_NO_BIND controls only port binding.
+if (process.env.TEST_NO_BIND === 'true') {
   persist.loadLeads(store);
   persist.loadInbox(inbox);
   _markStoreReady();
@@ -7057,56 +6667,14 @@ app.listen(PORT, async () => {
   _markStoreReady();
 
   // ── Startup closing-summary recovery ──────────────────────────────────────
-  // in_flight after a crash = UNKNOWN outcome. The provider may have accepted the
-  // send before the process died; treating it as 'failed' and auto-resending could
-  // duplicate a message already delivered. Mark uncertain, expose for review only.
-  //
-  // 'failed' states (confirmed failure before crash) ARE safe to auto-retry because
-  // the previous attempt never reached the provider.
-  {
-    const _closingLeads = store.getAllLeads().filter(l => {
-      const m = l.meta ?? {};
-      return m.closingSummaryProspectState != null || m.closingSummaryManagerState != null;
-    });
-    let _uncertainCount = 0;
-    for (const l of _closingLeads) {
-      const m = l.meta ?? {};
-      if (m.closingSummaryProspectState === 'in_flight' || m.closingSummaryManagerState === 'in_flight') {
-        store.upsertLead(l.phone, {
-          meta: {
-            ...m,
-            // 'uncertain': send was in-flight when process died; outcome unknown.
-            // Admin must review (GET /api/admin/send-closing-summary/:phone with force).
-            closingSummaryProspectState: m.closingSummaryProspectState === 'in_flight' ? 'uncertain' : m.closingSummaryProspectState,
-            closingSummaryManagerState:  m.closingSummaryManagerState  === 'in_flight' ? 'uncertain' : m.closingSummaryManagerState,
-          },
-        });
-        _uncertainCount++;
-      }
-    }
-    if (_uncertainCount > 0) {
-      persist.saveLeads(store);
-      logger.warn('[startup] Closing summary uncertain states found (crash recovery) — review via admin endpoint',
-        { count: _uncertainCount });
-    }
-    // Auto-retry only definitively-failed states (never uncertain).
-    if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
-      const _toRetry = store.getAllLeads().filter(l => {
-        const m  = l.meta ?? {};
-        const qd = m.qualData ?? {};
-        return !qd.closingSummarySent &&
-               (m.closingSummaryProspectState === 'failed' || m.closingSummaryManagerState === 'failed');
-      });
-      if (_toRetry.length) {
-        logger.info('[startup] Retrying definitively-failed closing summaries', { count: _toRetry.length });
-        for (const l of _toRetry) {
-          _retryClosingSummary(l.phone).catch(err =>
-            logger.warn('[startup] Closing summary retry failed', { phone: l.phone, error: err.message })
-          );
-        }
-      }
-    }
-  }
+  _recoverClosingSummaries();
+
+  // Historical corrupt callTimeGivenAt values (year 58838+, from the old double-×1000
+  // bug) are deliberately NOT repaired automatically. callbackRequestedAt is not proof of
+  // when the time message was sent, and guessing would overwrite evidence. Original
+  // values are preserved; affected leads are flagged for review in /api/barak/callbacks
+  // (flags: call_time_timestamp_invalid_review). The appointment's persisted scheduledAt
+  // is the source of truth and is never recomputed from these fields.
 
   // ── Startup purge: remove stale lead records for phones now in the registry ──
   // phoneRegistry is already warm from the await above — zero extra Arbox calls.
@@ -7171,7 +6739,10 @@ app.listen(PORT, async () => {
   }
 });
 
-} // end else (TEST_MODE !== 'true')
+} // end else (TEST_NO_BIND !== 'true')
 
 module.exports = app;
+// Exposed for tests only: the real startup-recovery routine (production runs it from
+// the listen callback).
+module.exports._recoverClosingSummaries = _recoverClosingSummaries;
 

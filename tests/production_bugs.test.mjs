@@ -157,7 +157,7 @@ function startMock(port) {
       reqHttp.on('data', d => b += d);
       reqHttp.on('end', () => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ idMessage: `MOCK-${Date.now()}` }));
+        res.end(JSON.stringify(reqHttp.url.includes('/arbox') ? { data: [] } : { idMessage: `MOCK-${Date.now()}-${Math.random().toString(36).slice(2, 6)}` }));
       });
     });
     srv.listen(port, () => resolve(srv));
@@ -175,6 +175,8 @@ function startApp(appPort, mockPort) {
         GREEN_API_URL:            `localhost:${mockPort}`,
         GREEN_API_ID_INSTANCE:    '9999099',
         GREEN_API_TOKEN_INSTANCE: 'mock-tok-pb',
+        ARBOX_BASE_URL:           `http://localhost:${mockPort}/arbox`,
+        ARBOX_API_KEY:            'mock-arbox',
         STUDIO_OWNER_PHONE:       '972509000001',
         NOTIFY_PHONES:            '972509000001',
         TEST_ALLOWLIST_PHONES:    '972509000001',
@@ -284,8 +286,10 @@ try {
     /איך קוראים|מה שמ|קוראים לך|שמך/i.test(confirmReply));
   truthy('confirmation reply does NOT end with generic question',
     !/יש עוד משהו שאוכל לעזור/i.test(confirmReply));
-  truthy('confirmation reply preserves the callback time',
-    /מחר.*12|12.*מחר/i.test(confirmReply));
+  // Changed deliberately: the reply no longer echoes the raw text ("מחר ב12") — it states
+  // the RESOLVED calendar date and Israel time taken from the persisted appointment.
+  truthy('confirmation reply states the explicit resolved date and time',
+    /יום \S+, \d{2}\.\d{2}\.\d{4} בשעה 12:00/.test(confirmReply));
   truthy('confirmation reply uses "request" wording (not "booked")',
     /רשמנו.*בקשת|בקשת.*שיחה/i.test(confirmReply) || !/השיחה נקבעה/i.test(confirmReply));
 

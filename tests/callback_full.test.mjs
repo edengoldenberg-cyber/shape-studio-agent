@@ -20,6 +20,14 @@ import { readFileSync, existsSync, mkdtempSync, writeFileSync, rmSync, mkdirSync
 import { tmpdir }              from 'os';
 import path                    from 'path';
 
+// Never the repo's data/ folder: run through `node tests/run_mjs_tests.mjs`, which gives
+// every harness its own temporary DATA_DIR and dummy external credentials.
+const ISOLATED_DATA_DIR = process.env.MJS_ISOLATED_DATA_DIR;
+if (!ISOLATED_DATA_DIR) {
+  console.error('[FATAL] Run via: node tests/run_mjs_tests.mjs --filter callback_full (isolated DATA_DIR required)');
+  process.exit(2);
+}
+
 const __dirname  = path.dirname(fileURLToPath(import.meta.url));
 const require    = createRequire(import.meta.url);
 
@@ -197,9 +205,9 @@ function startMock(port) {
       let body = '';
       req.on('data', d => body += d);
       req.on('end', () => {
-        capturedMockBodies.push(body);
+        if (!req.url.includes('/arbox')) capturedMockBodies.push(body);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ idMessage: `MOCK-${Date.now()}` }));
+        res.end(JSON.stringify(req.url.includes('/arbox') ? { data: [] } : { idMessage: `MOCK-${Date.now()}-${Math.random().toString(36).slice(2, 6)}` }));
       });
     });
     srv.listen(port, resolve);
@@ -223,15 +231,24 @@ function startApp(appPort, mockPort, extraEnv = {}) {
         GREEN_API_URL:            `localhost:${mockPort}`,
         GREEN_API_ID_INSTANCE:    '9999099',
         GREEN_API_TOKEN_INSTANCE: 'mock-tok-s2',
+        // Arbox lookups go to the same local mock (returns: not a member).
+        ARBOX_BASE_URL:           `http://localhost:${mockPort}/arbox`,
+        ARBOX_API_KEY:            'mock-arbox',
         // Use synthetic staff phone so team alerts reach the mock (not demoCapture).
+        // Also allowlist the test lead so prospect closing-summary sendText is not
+        // blocked by TEST_MODE's default-deny. The mock returns idMessage for all calls.
         STUDIO_OWNER_PHONE:       ALLOWLISTED_STAFF_PHONE,
         NOTIFY_PHONES:            ALLOWLISTED_STAFF_PHONE,
-        TEST_ALLOWLIST_PHONES:    ALLOWLISTED_STAFF_PHONE,
+        TEST_ALLOWLIST_PHONES:    `${ALLOWLISTED_STAFF_PHONE},${TEST2_LEAD}`,
         // Force sk-test: we verify the deterministic fallback path (name-ask reply
         // when callTimeGiven is set + OpenAI is unavailable). With a real key the AI
         // would naturally ask for the name, but the test must work without one.
         OPENAI_API_KEY:           'sk-test',
-        DATA_DIR:                 path.join(__dirname, '../data'),
+        // Enable auto-reply so the prospect closing summary is sent and
+        // closingSummarySentAt is populated after both sides are accepted.
+        WHATSAPP_AUTO_REPLY:      'true',
+        // Isolated: the runner (tests/run_mjs_tests.mjs) supplies a fresh temporary DATA_DIR.
+        DATA_DIR:                 ISOLATED_DATA_DIR,
         NODE_ENV:                 'test',
         ...extraEnv,
       },
@@ -298,12 +315,14 @@ try {
   s2truthy('Actual reply asks for name (deterministic fallback or AI)', asksForName);
   s2truthy('Reply confirms the callback time', /מחר|12/.test(barakReply));
 
-  // ── 2c. Initial handoff alert sent ───────────────────────────────────────
-  // The brief fires when callTimeGiven is captured (BEFORE the name arrives).
-  // Ordering: 1) brief sent now (may show "שם: לא צוין"), 2) name arrives, 3) name
-  // update alert sent — two distinct events, not duplicates.
-  s2truthy('handoffAlertStatus is sent or failed',
-    leadAfterAcc?.meta?.handoffAlertStatus === 'sent' || leadAfterAcc?.meta?.handoffAlertStatus === 'failed');
+  // ── 2c. Initial handoff alert deferred until name captured ──────────────
+  // With the notification-consolidation fix (3a35b0c), the manager summary is
+  // deferred to 'deferred_pending_name' at time-only stage.
+  // After name arrives the full summary fires ('sent' or 'failed').
+  s2truthy('handoffAlertStatus is deferred, sent, or failed',
+    leadAfterAcc?.meta?.handoffAlertStatus === 'deferred_pending_name' ||
+    leadAfterAcc?.meta?.handoffAlertStatus === 'sent' ||
+    leadAfterAcc?.meta?.handoffAlertStatus === 'failed');
 
   // ── 2d. nameAsked set automatically by agent (production path) ──────────────
   // The agent should have set nameAsked=true when it replied with the name-ask phrase.
@@ -339,13 +358,24 @@ try {
   // Ordering: 1) initial brief sent on callTimeGiven (may show no name),
   //           2) 'שרה' captured silently by post_call gate + name-confirmed alert fires.
   //           3) dup acceptance → post_call_staff_notified (staff alert, no second brief).
-  // The fire-and-forget alert is async; sleep to let it complete.
-  await sleep(500);
-  const nameInAlert = capturedMockBodies.some(b => {
-    try { const parsed = JSON.parse(b); return (parsed.message ?? '').includes('שרה'); }
-    catch { return b.includes('שרה'); }
-  });
+  // The pipeline awaits both summaries before the simulate call returns, so no fixed
+  // sleep is needed. A bounded wait (max 5s) on the captured provider request guards
+  // against scheduling jitter without hiding a missing send.
+  const summaryPayloads = () => capturedMockBodies
+    .map(b => { try { return JSON.parse(b); } catch { return null; } })
+    .filter(p => p && /בקשת שיחה חדשה/.test(p.message ?? ''));
+  for (const deadline = Date.now() + 5000; summaryPayloads().length < 1 && Date.now() < deadline;) await sleep(50);
+  const nameInAlert = summaryPayloads().some(p => p.message.includes('שרה'));
   s2truthy('Name-confirmed alert captured by mock with name', nameInAlert);
+  // What actually reached the provider (real whatsapp.service → HTTP mock):
+  s2test('Exactly ONE consolidated manager summary reached the provider', summaryPayloads().length, 1);
+  s2test('Manager summary is sent with link preview disabled', summaryPayloads()[0]?.linkPreview, false);
+  s2test('Manager summary goes to the configured manager only',
+    summaryPayloads()[0]?.chatId, `${ALLOWLISTED_STAFF_PHONE}@c.us`);
+  s2truthy('Manager summary carries an explicit date and Israel time',
+    /יום \S+, \d{2}\.\d{2}\.\d{4} בשעה 12:00/.test(summaryPayloads()[0]?.message ?? ''));
+  s2truthy('No legacy pre-alerts ("נציג התבקש" / "שיחת ייעוץ נקבעה" / "ליד מוכן") were sent',
+    !capturedMockBodies.some(b => /נציג התבקש|שיחת ייעוץ נקבעה|ליד מוכן/.test(b)));
   // closingSummarySentAt is set by the new complete closing flow; re-read lead
   const leadAfterNameFresh = await getLead2();
   s2truthy('closingSummarySentAt set in lead meta after closing summary fires',
@@ -525,8 +555,11 @@ console.log('\n── Section 4 — callback_pending: aptStore correctness ─�
   // ── 4e. Reschedule ────────────────────────────────────────────────────────
   const newTime = new Date(Date.now() + 60 * 60 * 1000); // 1h from now
   const rescheduled = aptStore.reschedule(apt.id, { rawTime: 'מחר ב-13:00', scheduledAt: newTime });
-  // reschedule resets to 'confirmed' — expected for a staff-confirmed reschedule
-  test('S4: reschedule resets to confirmed',   rescheduled?.status, 'confirmed');
+  // A moved callback needs staff approval again and starts a fresh reminder cycle
+  // (changed from 'confirmed': a reschedule must not carry the old approval forward).
+  test('S4: reschedule returns to callback_pending', rescheduled?.status, 'callback_pending');
+  test('S4: reschedule clears staff approval',       rescheduled?.staffConfirmedAt, null);
+  test('S4: reschedule resets prospect reminder',    rescheduled?.prospectReminderSent, false);
   test('S4: reschedule resets reminderSent',   rescheduled?.reminderSent, false);
   test('S4: reschedule resets noShowAlerted',  rescheduled?.noShowAlerted, false);
   test('S4: reschedule updates rawTime',       rescheduled?.rawTime, 'מחר ב-13:00');
@@ -540,7 +573,7 @@ console.log('\n── Section 4 — callback_pending: aptStore correctness ─�
 
   // ── 4g. Persistence to disk ───────────────────────────────────────────────
   // aptStore._save() is called after every mutation; verify the file exists
-  const aptsFile = path.join(path.dirname(fileURLToPath(import.meta.url)), '../data/appointments.json');
+  const aptsFile = path.join(process.env.DATA_DIR, 'appointments.json');
   testTruthy('S4: appointments.json written to disk', existsSync(aptsFile));
 
   if (existsSync(aptsFile)) {
@@ -672,7 +705,7 @@ console.log('\n── Section 6 — Startup race: webhook held until persist.loa
     // Minimal mock — just confirms receipt
     const s6MockSrv = createServer((req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ idMessage: `S6-${Date.now()}` }));
+      res.end(JSON.stringify(req.url.includes('/arbox') ? { data: [] } : { idMessage: `S6-${Date.now()}` }));
     });
     await new Promise(r => s6MockSrv.listen(s6MockPort, r));
     s6Mock = s6MockSrv;
@@ -688,6 +721,10 @@ console.log('\n── Section 6 — Startup race: webhook held until persist.loa
           GREEN_API_URL:             `localhost:${s6MockPort}`,
           GREEN_API_ID_INSTANCE:     '9906',
           GREEN_API_TOKEN_INSTANCE:  'tok-s6',
+          ARBOX_BASE_URL:            `http://localhost:${s6MockPort}/arbox`,
+          ARBOX_API_KEY:             'mock-arbox',
+          KNOWN_MEMBERS_PATH:        path.join(s6TmpDir, 'known_members.json'),
+          STAFF_CONFIG_PATH:         path.join(s6TmpDir, 'staff_config.json'),
           STUDIO_OWNER_PHONE:        '972509000001',
           NOTIFY_PHONES:             '972509000001',
           TEST_ALLOWLIST_PHONES:     '972509000001',

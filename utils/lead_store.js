@@ -147,8 +147,11 @@ class LeadStore {
     // callback_requested: lead expressed time in AI flow, team was alerted, but no aptStore entry yet.
     // call_scheduled: aptStore appointment exists — confirmed by real scheduling mechanism.
     // Both must be excluded from automated re-engagement.
+    // call_completed / call_cancelled / call_no_answer: a staff member already handled
+    // (or closed) this person's callback — no automated re-engagement on top of that.
     const SKIP = new Set(['converted_member', 'opted_out', 'human_owns',
-                          'call_scheduled', 'callback_requested', 'escalated', 'crisis']);
+                          'call_scheduled', 'callback_requested', 'escalated', 'crisis',
+                          'call_completed', 'call_cancelled', 'call_no_answer']);
     return this.getAllLeads().filter(l => !SKIP.has(l.status));
   }
 

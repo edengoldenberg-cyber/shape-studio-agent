@@ -69,7 +69,7 @@ function startMock(port) {
       reqHttp.on('data', d => b += d);
       reqHttp.on('end', () => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ idMessage: `MOCK-${Date.now()}` }));
+        res.end(JSON.stringify(reqHttp.url.includes('/arbox') ? { data: [] } : { idMessage: `MOCK-${Date.now()}-${Math.random().toString(36).slice(2, 6)}` }));
       });
     });
     srv.listen(port, () => resolve(srv));
@@ -89,6 +89,8 @@ function startApp(appPort, mockPort) {
         GREEN_API_URL:            `localhost:${mockPort}`,
         GREEN_API_ID_INSTANCE:    '9999099',
         GREEN_API_TOKEN_INSTANCE: 'mock-tok-ica',
+        ARBOX_BASE_URL:           `http://localhost:${mockPort}/arbox`,
+        ARBOX_API_KEY:            'mock-arbox',
         STUDIO_OWNER_PHONE:       '972509000001',
         NOTIFY_PHONES:            '972509000001',
         TEST_ALLOWLIST_PHONES:    '972509000001',
@@ -245,15 +247,17 @@ try {
     const pending3 = apts3.filter(a => a.leadPhone === LEAD && a.status === 'callback_pending');
     test('still exactly 1 callback_pending after dup', pending3.length, 1);
 
-    // ── 4. handoffSentTo backfill — AI-path initial alert phones recorded ──
-    // reliableHandoffAlert fires before the aptStore entry exists. When the entry
-    // is created, it must backfill handoffSentTo from lead.meta.handoffSentPhones
-    // so retry-notify does not resend to already-covered staff.
-    console.log('\n── 4. handoffSentTo backfilled from AI-path alert ──');
+    // ── 4. handoffSentTo populated after name-capture manager alert ──
+    // With the notification-consolidation fix (3a35b0c), the manager summary is
+    // deferred until name is confirmed. So handoffSentTo is empty at apt creation
+    // (time-only stage) and is populated after the name-capture manager alert fires.
+    // The name was captured in step 2; by now the alert has completed.
+    console.log('\n── 4. handoffSentTo populated after name-capture manager alert ──');
 
     const aptAfter3 = apts3.find(a => a.id === apt.id);
-    // The mock returns a real idMessage so NOTIFY_PHONES phone is in handoffSentPhones.
-    truthy('handoffSentTo is not empty after AI-path creation', (aptAfter3?.handoffSentTo ?? []).length > 0);
+    // The mock returns a real idMessage so NOTIFY_PHONES phone is in handoffSentTo
+    // after the name-capture manager alert fires and propagates to the apt entry.
+    truthy('handoffSentTo is not empty after name-capture manager alert', (aptAfter3?.handoffSentTo ?? []).length > 0);
     truthy('handoffSentTo includes NOTIFY_PHONES phone',
       (aptAfter3?.handoffSentTo ?? []).includes('972509000001'));
   }

@@ -224,9 +224,14 @@ describe('C — Yifat: "לא הצלחתי להגיע" is attendance, not resched
 
   test('לשנות שעה → still classified as reschedule (explicit request)', async () => {
     const r = await simulate(YIFAT_PHONE, 'רוצה לשנות שעה');
-    // This IS a genuine reschedule request — template OK
-    const schedulingTemplate = 'באיזו שעה או יום יהיה לך נוח? 🗓️';
-    expect(mockSentTexts.some(s => s.text.includes(schedulingTemplate))).toBe(true);
+    // Classification is unchanged: an explicit request IS a reschedule intent.
+    expect(r.intent).toBe('reschedule');
+    // Behaviour change: a contact with no callback on record is no longer put into
+    // "awaiting callback time" by this sentence alone (that happened before the
+    // ownership gates and turned the next message into a callback). Nothing is created.
+    const lead = store.getLead(YIFAT_PHONE);
+    expect(lead?.meta?.awaitingCallbackTime).not.toBe(true);
+    expect(require('../utils/appointment_store').getByPhone(YIFAT_PHONE)).toHaveLength(0);
   });
 });
 

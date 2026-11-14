@@ -21,6 +21,14 @@ import { fileURLToPath }    from 'url';
 import { readFileSync }     from 'fs';
 import path                 from 'path';
 
+// Never the repo's data/ folder: run through `node tests/run_mjs_tests.mjs`, which gives
+// every harness its own temporary DATA_DIR and dummy external credentials.
+const ISOLATED_DATA_DIR = process.env.MJS_ISOLATED_DATA_DIR;
+if (!ISOLATED_DATA_DIR) {
+  console.error('[FATAL] Run via: node tests/run_mjs_tests.mjs --filter callback_time (isolated DATA_DIR required)');
+  process.exit(2);
+}
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require   = createRequire(import.meta.url);
 
@@ -187,7 +195,7 @@ function startMockServer() {
       req.on('data', d => body += d);
       req.on('end', () => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ idMessage: `MOCK-${Date.now()}` }));
+        res.end(JSON.stringify(req.url.includes('/arbox') ? { data: [] } : { idMessage: `MOCK-${Date.now()}-${Math.random().toString(36).slice(2, 6)}` }));
       });
     });
     mockServer.listen(MOCK_PORT, resolve);
@@ -205,11 +213,14 @@ function startAppServer() {
         GREEN_API_URL:            `localhost:${MOCK_PORT}`,
         GREEN_API_ID_INSTANCE:    '9999999999',
         GREEN_API_TOKEN_INSTANCE: 'mock-token-flow',
+        ARBOX_BASE_URL:           `http://localhost:${MOCK_PORT}/arbox`,
+        ARBOX_API_KEY:            'mock-arbox',
         // 972000000099 is a demo phone — alertOwner calls are intercepted, not sent
         STUDIO_OWNER_PHONE:       '972000000099',
         NOTIFY_PHONES:            '972000000099',
         OPENAI_API_KEY:           process.env.OPENAI_API_KEY ?? 'sk-test',
-        DATA_DIR:                 path.join(__dirname, '../data'),
+        // Isolated: the runner (tests/run_mjs_tests.mjs) supplies a fresh temporary DATA_DIR.
+        DATA_DIR:                 ISOLATED_DATA_DIR,
         NODE_ENV:                 'test',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -315,13 +326,12 @@ try {
     captureEvt != null, true);
 
   // ── 2d. Handoff alert ─────────────────────────────────────────────────────
-  // Admin phone is a demo phone (972000000099) — alertOwner dispatch is intercepted
-  // by demoCapture and returns {idMessage:'demo-...', demo:true}.
-  // So handoffAlertStatus = 'sent'. If OpenAI brief times out, it's 'failed'.
-  // Both indicate the alert was attempted. Neither is 'pending'.
+  // With the notification-consolidation fix (3a35b0c), the manager summary is
+  // deferred until the name is known. So at time-only stage the status is
+  // 'deferred_pending_name'. After name capture it becomes 'sent' or 'failed'.
   const alertStatus = lead?.meta?.handoffAlertStatus;
-  flowTest('handoffAlert attempted (sent or failed, not pending)',
-    alertStatus === 'sent' || alertStatus === 'failed', true);
+  flowTest('handoffAlert status set after time given (deferred or sent/failed)',
+    alertStatus === 'deferred_pending_name' || alertStatus === 'sent' || alertStatus === 'failed', true);
 
   // ── 2e. Persistence: leads_persist.json updated ───────────────────────────
   // Flush immediately via test endpoint (periodic save runs every 60s — too slow for tests)

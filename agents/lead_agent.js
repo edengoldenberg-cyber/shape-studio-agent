@@ -14,6 +14,7 @@ const memoryService = require('../services/memory.service');
 const handoffService = require('../services/handoff.service');
 const memberCache   = require('../utils/member_cache');
 const { checkOperationalIntent } = require('../utils/operational_interceptor');
+const aptStore = require('../utils/appointment_store');
 
 const SYSTEM_PROMPT = fs.readFileSync(
   path.join(__dirname, '../prompts/system_prompt.md'),
@@ -188,7 +189,13 @@ const ARABIC_HEBREW_MARKERS = /חביבי|יאללה|אהלן|ואלה|אינש�
 // whether the model followed prompt instructions.  Called synchronously after
 // completion.choices[0].message.content is retrieved.
 
-function postProcessReply(reply, qualData, assets) {
+// Declarative statements that a call is arranged or that someone will make contact.
+const COMMITMENT_RE = /(?:י?יצור|יצרו|ניצור|אצור)\s+(?:איתך\s+|אתך\s+|עמך\s+)?קשר|(?:יתקשר|יתקשרו|נתקשר|אתקשר|יחזור|יחזרו|נחזור|אחזור|ידבר|ידברו|נדבר)\s+(?:אליך|אלייך|איתך|אתך)|(?:קבענו|קבעתי|נקבעה?|תואמה?|תיאמנו|תיאמתי|שריינתי|שריינו)[^.!?\n]{0,30}(?:שיחה|שיחת|מועד|זמן)|השיחה\s+(?:נקבעה|תתקיים|מתוכננת)|שיחה\s+מתוכננת/;
+
+// The sentence OFFERS a call (invitation marker before the verb) rather than announcing one.
+const OFFER_RE = /(?:רוצה|רוצים|תרצה|תרצי|תרצו|מעוניינ|בא לך|אפשר ש|אשמח ש|נשמח ש|האם|מתאים לך ש|נוח לך ש|כדאי ש)[^.!?\n]*(?:יצור|ייצור|יצרו|ניצור|יתקשר|נתקשר|יחזור|יחזרו|נחזור|אחזור|ידבר|נדבר)/;
+
+function postProcessReply(reply, qualData, assets, ctx = {}) {
   if (!reply) return reply;
   let out = reply;
   const ppChanges = [];
@@ -247,23 +254,25 @@ function postProcessReply(reply, qualData, assets) {
     }
   }
 
-  // Gate 3b — Premature booking commitment guard.
-  // A scheduling commitment is only authorised when BOTH callTimeGiven AND confirmedName
-  // are present (the CLOSE state) — meaning the aptStore entry was created by the pipeline
-  // and the closing summary has already been sent.
+  // Gate 3b — False scheduling-promise guard.
+  // A statement that a call is arranged / that someone will call is only truthful when
+  // a matching appointment is PERSISTED (open, with a future scheduledAt). That fact is
+  // passed in by the caller from appointment_store — it is not inferred from
+  // callTimeGiven / confirmedName flags, and not from one specific phrase.
   //
-  // Any earlier AI output that commits to a specific call time is a false promise:
-  //   • callTimeGiven absent: the AI read a time from conversation history and fabricated
-  //     a commitment (e.g. "הצוות יצור קשר ב19:00") without any pipeline validation.
-  //   • callTimeGiven set but confirmedName absent: the aptStore entry may not yet exist;
-  //     the closing summary (the persisted confirmation) has not been sent.
-  //
-  // Guard fires unless BOTH are present. Only the closing summary is authorised to commit.
-  if (!qualData.callTimeGiven || !qualData.confirmedName) {
-    const prematureBookingRE = /[^.!?\n]*(?:הצוות\s+יצור\s+קשר|נציג\s+יצור\s+קשר|נציג\s+מהסטודיו\s+יצור\s+קשר|ייצור\s+קשר\s+ב|יצרו\s+קשר|אתקשר\s+אליך\s+ב|נתקשר\s+ב)[^.!?\n]*[.!?\n]?/gi;
-    const stripped = out.replace(prematureBookingRE, '').trim();
-    if (stripped.length >= 10 && stripped !== out) {
-      out = stripped;
+  // Works per sentence: a commitment is removed; an OFFER ("רוצה שנציג יחזור אליך?",
+  // "אשמח שנחזור אליך — מתי נוח?") is kept. A promise with a question tacked on
+  // ("הצוות יצור קשר ב-19:00 ומה שמך?") is still a promise and is removed with its
+  // sentence. If nothing usable remains, a truthful
+  // next step replaces the reply so the conversation is not abandoned.
+  if (!ctx?.hasPersistedCallback) {
+    const sentences = out.split(/(?<=[.!?\n])/u);
+    const kept = sentences.filter(sn => !(COMMITMENT_RE.test(sn) && !OFFER_RE.test(sn)));
+    if (kept.length !== sentences.length) {
+      const stripped = kept.join('').trim();
+      out = stripped.length > 0
+        ? stripped
+        : (qualData.callTimeGiven && !qualData.confirmedName ? `מצוין! 😊 ואיך קוראים לך?` : `מתי יהיה לך נוח שנחזור אליך? (יום ושעה)`);
       ppChanges.push('gate3b_premature_booking_stripped');
     }
   }
@@ -971,7 +980,7 @@ function extractNameFromMessage(text) {
 function _loadKnownMemberPhones() {
   try {
     const data = JSON.parse(
-      require('fs').readFileSync(require('path').join(__dirname, '../data/known_members.json'), 'utf8')
+      require('fs').readFileSync(process.env.KNOWN_MEMBERS_PATH ?? require('path').join(__dirname, '../data/known_members.json'), 'utf8')
     );
     return new Set(data.phones ?? []);
   } catch { return new Set(); }
@@ -1175,43 +1184,11 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
     logger.info('[lead_agent] Callback declined by lead', { from });
   }
 
-  // 3a. Detect callback time in this inbound message.
-  // TIME_REJECTION_RE prevents "מחר לא מתאים" / "לא מחר" from being captured
-  // as a time even though TIME_PATTERN matches the keyword.
-  if (qualData.callProposed && !qualData.callTimeGiven
-      && TIME_PATTERN.test(text) && !TIME_REJECTION_RE.test(text)) {
-    const callTime = text.trim().slice(0, 80);
-    // callTimeGivenAt = the ORIGINAL inbound message timestamp, not the processing
-    // time. This anchors relative date resolution ("מחר" → tomorrow relative to when
-    // the lead SENT the message). For delayed processing or retries, using new Date()
-    // here would resolve "מחר" against the WRONG calendar day.
-    const capturedAt = msgTimestamp
-      ? new Date(msgTimestamp).toISOString()
-      : new Date().toISOString();
-    setQualData(from, { callTimeGiven: callTime, callTimeGivenAt: capturedAt });
-    // Mark callback_requested (NOT call_scheduled):
-    //   • Tomer/Barak workers skip this lead (getSendableLeads excludes callback_requested)
-    //   • This is the AI qualification path — team was alerted via handoffService but
-    //     no aptStore appointment was created. Use callback_requested to distinguish
-    //     from call_scheduled (which requires a real aptStore entry).
-    //   • Server.js stop-gate will send a soft ack, not "confirmed as agreed".
-    store.upsertLead(from, {
-      status: 'callback_requested',
-      meta: {
-        ...(store.getLead(from)?.meta ?? {}),
-        callbackTime:         callTime,
-        callbackRequestedAt:  capturedAt,
-        callTimeGivenAt:      capturedAt,
-        awaitingCallbackTime: false,
-      },
-    });
-    store.logEvent('call_time_captured', from, { callTime, statusSet: 'callback_requested' });
-    logger.info('[lead_agent] Call time captured — status → callback_requested', { from, callTime });
-    // Persist immediately so callTimeGiven survives a server restart before the
-    // closing summary fires. Without this, a crash between capture and summary
-    // would lose the callback commitment.
-    _persist.saveLeads(store);
-  }
+  // 3a. Callback-time capture does NOT happen here any more.
+  //     A requested time is resolved strictly and PERSISTED as an appointment by the
+  //     pipeline (services/callback.service.js, called from server.js) before any reply
+  //     is produced. qualData.callTimeGiven is written only by that flow, i.e. only
+  //     after a matching appointment exists.
 
   // 3b. Location detection — runs on every message so early mentions are caught.
   //     Both NEARBY and FAR set locationCheckNeeded=true so Barak always asks
@@ -1426,7 +1403,10 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
     //   • Strips "אין לי תמונה" hallucinations
     //   • Injects Waze link if address is present but link is absent
     //   • Appends a question if the reply ends without one
-    reply = postProcessReply(reply, freshQualData, assets);
+    const _openCb = aptStore.getActiveCallback(from);
+    const hasPersistedCallback = !!_openCb && _openCb.scheduledAt instanceof Date
+      && !isNaN(_openCb.scheduledAt.getTime()) && _openCb.scheduledAt.getTime() > Date.now();
+    reply = postProcessReply(reply, freshQualData, assets, { hasPersistedCallback });
 
     // ── State flags: set ONLY when AI reply confirms the action happened ──────
     //
@@ -1563,36 +1543,13 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
   //    • !locationCheckNeeded      — don't alert while travel feasibility is pending
   const latestQualData      = getQualData(from);
   const locationOk          = latestQualData.locationViable !== false && !latestQualData.locationCheckNeeded;
-  const callTimeCapturedNow = !qualData.callTimeGiven && !!latestQualData.callTimeGiven && locationOk;
   const enteringStage3      = completedTurns >= 3 && !latestQualData.briefGeneratedAt && locationOk;
 
-  if (enteringStage3 || callTimeCapturedNow) {
-    // Always persist the JSON brief for the dashboard (no WhatsApp alert here)
+  if (enteringStage3) {
+    // Persist the JSON brief for the dashboard (no WhatsApp alert here). The manager is
+    // notified exactly once, by the consolidated callback summary in callback.service.js.
     generateLeadBrief(from, history, latestQualData.callTimeGiven ?? null, { alertTeam: false })
       .catch(err => logger.warn('[lead_agent] JSON brief error', { from, error: err.message }));
-  }
-
-  if (callTimeCapturedNow) {
-    // Only send the handoff alert immediately when the name is ALREADY known (CLOSE state:
-    // name and time captured in the same turn). When the name is still unknown, the
-    // name-capture path in server.js fires the consolidated manager summary once
-    // the prospect provides their name — sending it here would create a premature,
-    // incomplete duplicate.
-    const handoffLead = store.getLead(from);
-    if (latestQualData.confirmedName) {
-      await reliableHandoffAlert(from, handoffLead?.name ?? from, history, latestQualData);
-    } else {
-      const _deferMeta = handoffLead?.meta ?? {};
-      store.upsertLead(from, {
-        meta: { ..._deferMeta, handoffAlertStatus: 'deferred_pending_name' },
-      });
-      logger.info('[lead_agent] Handoff deferred — consolidated summary fires after name capture', { from });
-    }
-
-    // Save a persistent session summary to the memory store (fire-and-forget is acceptable
-    // here — it enriches future conversations but is not required for the team handoff)
-    memoryService.generateAndSaveSessionSummary(from, history, latestQualData)
-      .catch(err => logger.warn('[lead_agent] Session summary error', { from, error: err.message }));
   }
 
   return { reply, score, status, sendState };
@@ -1724,5 +1681,21 @@ function recordSchedulingExchange(phone, userText, agentReply) {
   }
 }
 
-module.exports = { handleInbound, clearSession, generateLeadBrief, sendIntroOffer, getLastDebugContext, recordSchedulingExchange, computeLeadProfile, TIME_PATTERN, TIME_REJECTION_RE, extractNameFromMessage, postProcessReply };
+/**
+ * True when Barak has invited a callback and the lead has not declined — judged from
+ * state AND from the wording of the last assistant message, so it does not depend on
+ * the AI having used one exact proposal phrase.
+ */
+const INVITE_CONTEXT_RE = /שיחה|נציג|יחזור אליך|יחזרו אליך|לחזור אליך|נחזור אליך|יתקשר|להתקשר|מתי נוח|באיזו שעה|איזה שעה|מתי אפשר/;
+function isCallbackInviteContext(phone) {
+  const lead = store.getLead(phone);
+  if (!lead) return false;
+  const qd = lead.meta?.qualData ?? {};
+  if (qd.callbackDeclined || qd.locationViable === false) return false;
+  if (qd.callProposed) return true;
+  const lastAssistant = [...(lead.history ?? [])].reverse().find(m => m.role === 'assistant');
+  return !!lastAssistant && INVITE_CONTEXT_RE.test(String(lastAssistant.content ?? ''));
+}
+
+module.exports = { isCallbackInviteContext, handleInbound, clearSession, generateLeadBrief, sendIntroOffer, getLastDebugContext, recordSchedulingExchange, computeLeadProfile, TIME_PATTERN, TIME_REJECTION_RE, extractNameFromMessage, postProcessReply };
 

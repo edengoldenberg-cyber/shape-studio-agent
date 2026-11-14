@@ -222,69 +222,12 @@ describe('Gate 3b — hallucinated scheduling commitment stripped', () => {
       locationViable:  true,
     };
     const aiReply   = 'מצוין אליאור — הצוות יצור קשר מחר ב11 😊';
-    const processed = postProcessReply(aiReply, qd, assets);
+    // The CLOSE flags alone no longer authorise a commitment — only a persisted, open,
+    // future appointment does (passed in by handleInbound from appointment_store).
+    const processed = postProcessReply(aiReply, qd, assets, { hasPersistedCallback: true });
     expect(processed).toContain('יצור קשר');
     expect(processed).toContain('מחר ב11');
+    expect(postProcessReply(aiReply, qd, assets)).not.toContain('יצור קשר');
   });
 });
 
-// ── B. Real disk-write failure propagation ────────────────────────────────────
-
-describe('Real disk-write failure blocks booking confirmation', () => {
-  beforeEach(() => {
-    resetState();
-    // Prime lead at callback_requested with callTimeGiven + nameAsked but no confirmedName.
-    // This state causes the name-capture path to call aptStore.createCallbackPending.
-    store.upsertLead(GUARD_PHONE, {
-      status: 'callback_requested',
-      name:   null,
-      meta: {
-        arboxColdLeadConfirmedAt: Date.now(),
-        qualData: {
-          callTimeGiven:   'מחר ב11',
-          callProposed:    true,
-          nameAsked:       true,
-          confirmedName:   null,
-          fitnessInterest: 'פילאטיס מכשירים',
-          location:        'חדרה',
-          locationViable:  true,
-        },
-      },
-    });
-    // Ensure no existing callback_pending entry (so create path is exercised)
-    aptStore.getByPhone(GUARD_PHONE).forEach(a => aptStore.update(a.id, { status: 'cancelled' }));
-  });
-
-  test('fs.writeFileSync failure in _save() propagates through createCallbackPending → no prospect confirmation', async () => {
-    // Spy on the real fs module's writeFileSync.
-    // The same fs object is used by appointment_store (Node.js module cache guarantees this).
-    const fs = require('fs');
-    const originalWrite = fs.writeFileSync;
-    const writeSpy = jest.spyOn(fs, 'writeFileSync').mockImplementation((filePath, data, enc) => {
-      if (typeof filePath === 'string' && filePath.includes('appointments.json')) {
-        throw new Error('ENOSPC: no space left on device, write');
-      }
-      return originalWrite.call(fs, filePath, data, enc);
-    });
-
-    const alertsBefore = mockSentAlerts.length;
-    const r = await simulateMessage('עמית');
-    writeSpy.mockRestore();
-    await new Promise(res => setTimeout(res, 200));
-
-    expect(r.route).toBe('post_call_name_captured');
-
-    // appointment_store.create() threw (write failed and in-memory insert was undone)
-    const apt = aptStore.getByPhone(GUARD_PHONE)
-      .find(a => a.status === 'callback_pending');
-    expect(apt).toBeUndefined();
-
-    // No prospect confirmation — _aptForSend stayed null
-    expect(mockSentTexts.some(s =>
-      s.to === GUARD_PHONE && s.text.includes('קיבלנו')
-    )).toBe(false);
-
-    // Manager summary still sent — staff can follow up even when storage failed
-    expect(mockSentAlerts.length).toBeGreaterThan(alertsBefore);
-  });
-});

@@ -1,19 +1,33 @@
 'use strict';
 
 /**
- * appointment_worker.js — Background worker for appointment reminders & no-show detection.
+ * appointment_worker.js — Background worker for callback reminders.
  *
- * Runs every 15 minutes:
- *  • Reminder pass: finds appointments starting in the next 20 min → sends WhatsApp to staff
- *  • No-show pass: finds confirmed appointments 15+ min overdue → sends follow-up to lead,
- *    updates status to 'no_show'
+ * Runs every 15 minutes (Asia/Jerusalem):
+ *  • Staff reminder     — open callbacks (pending AND staff-confirmed) starting within the
+ *                         reminder window → WhatsApp to staff, once per recipient per time.
+ *  • Prospect reminder  — the same callbacks → "עדיין נוח לך?" to the prospect, once per time.
+ *
+ * Eligibility (enforced by appointment_store):
+ *  • only the LATEST open record of a lead — superseded records never remind
+ *  • scheduledAt strictly in the future — expired records never remind
+ *  • cancelled / completed / no_answer records never remind
+ *  • a rescheduled record starts a fresh reminder cycle (its flags were reset)
+ *
+ * Telephone callbacks are never sent an automated "we missed our call" message: the
+ * no-show pass only applies to in-person appointments, which this system does not create.
+ *
+ * Configuration (Railway Variables):
+ *   CALLBACK_PENDING_REMINDER_ENABLED=true   activates pending-callback + prospect reminders
+ *   CALLBACK_PENDING_REMINDER_MIN=30         minutes before the call (floor: 20)
+ *   CALLBACK_PENDING_REMINDER_PHONES=…       optional lead-phone allowlist (controlled tests)
  */
 
 const cron         = require('node-cron');
 const logger       = require('../utils/logger');
 const aptStore     = require('../utils/appointment_store');
 const { sendStaffReminder, sendNoShowFollowUp, sendProspectReminder } = require('../services/notification.service');
-const { fmtScheduledAt } = require('../utils/time');
+const { formatCallbackTime } = require('../utils/callback_time');
 
 // Loaded lazily to avoid circular dependency with server.js
 let _staffConfig = null;
@@ -21,8 +35,7 @@ function getStaffConfig() {
   if (_staffConfig) return _staffConfig;
   try {
     const nodePath = require('path');
-    // Respects DATA_DIR so production (Railway Volume) and local share the same path.
-    const dataDir  = (process.env.DATA_DIR ?? nodePath.join(__dirname, '../data')).replace(/\/$/, '');
+    const dataDir  = (process.env.DATA_DIR ?? nodePath.join(__dirname, '../data')).replace(/[/\\]$/, '');
     _staffConfig   = JSON.parse(
       require('fs').readFileSync(nodePath.join(dataDir, 'staff_config.json'), 'utf8')
     );
@@ -34,234 +47,209 @@ function findStaff(staffId) {
   return getStaffConfig().staff?.find(s => s.id === staffId) ?? null;
 }
 
-// ── Reminder pass ─────────────────────────────────────────────────────────────
+// ── Effective configuration ───────────────────────────────────────────────────
+
+function reminderConfig() {
+  const enabled = process.env.CALLBACK_PENDING_REMINDER_ENABLED === 'true';
+  const raw     = parseInt(process.env.CALLBACK_PENDING_REMINDER_MIN ?? '30', 10);
+  // Floor at 20 min: the worker polls every 15 min, so a smaller window could be missed.
+  const minutes = Math.max(Number.isFinite(raw) ? raw : 30, 20);
+  const listRaw = (process.env.CALLBACK_PENDING_REMINDER_PHONES ?? '').trim();
+  const allowlist = listRaw ? new Set(listRaw.split(',').map(s => s.trim()).filter(Boolean)) : null;
+  return { enabled, minutes, windowMs: minutes * 60 * 1000, allowlist };
+}
+
+function applyAllowlist(due, allowlist) {
+  return allowlist ? due.filter(a => allowlist.has(a.leadPhone)) : due;
+}
+
+// ── Staff reminder (shared by confirmed + pending passes) ─────────────────────
+
+async function remindStaffFor(apt, store, eventName, extra = {}) {
+  // Re-read: the record may have been cancelled / rescheduled since the list was built.
+  const fresh = aptStore.get(apt.id);
+  if (!fresh || !aptStore.ACTIVE_STATUSES.has(fresh.status) || fresh.reminderSent) return false;
+  if (!(fresh.scheduledAt instanceof Date) || fresh.scheduledAt.getTime() <= Date.now()) return false;
+  if (aptStore.isSuperseded(fresh)) return false;
+
+  const lead = store?.getLead?.(fresh.leadPhone);
+  const displayName = lead?.meta?.qualData?.confirmedName ?? fresh.leadName ?? lead?.name ?? null;
+  const staff   = findStaff(fresh.assignedStaffId);
+  const already = new Set(fresh.reminderSentTo ?? []);
+  const results = await sendStaffReminder({ ...fresh, leadName: displayName }, staff, { skipPhones: already });
+
+  const newSucceeded = results.filter(r => r.ok && !r.skipped).map(r => r.phone);
+  if (newSucceeded.length) {
+    aptStore.update(fresh.id, { reminderSentTo: [...new Set([...already, ...newSucceeded])] });
+  }
+  if (results.length > 0 && results.every(r => r.ok)) {
+    aptStore.markReminderSent(fresh.id);
+    store?.logEvent(eventName, fresh.leadPhone, { aptId: fresh.id, rawTime: fresh.rawTime, ...extra });
+    return true;
+  }
+  if (results.length === 0) {
+    // Zero recipients = configuration failure, not success. Stays due for the next cycle.
+    logger.warn('[apt-worker] Staff reminder: no recipients configured — entry stays pending', {
+      aptId: fresh.id, leadPhone: fresh.leadPhone,
+    });
+  } else {
+    logger.warn('[apt-worker] Staff reminder: partial/full failure — will retry next cycle', {
+      aptId: fresh.id, results: results.map(r => ({ phone: r.phone, ok: r.ok })),
+    });
+  }
+  return false;
+}
+
+// ── Staff reminder: staff-confirmed callbacks ─────────────────────────────────
 
 async function runReminderPass(store) {
-  // Apply the same per-phone allowlist as runCallbackPendingReminderPass.
-  // During controlled tests (CALLBACK_PENDING_REMINDER_PHONES set), only the
-  // listed phones receive reminders. This prevents the existing confirmed callback
-  // record from firing outside the controlled test window.
-  // When the env var is absent or empty, all due confirmed entries are reminded.
-  const _rawAllowlist = (process.env.CALLBACK_PENDING_REMINDER_PHONES ?? '').trim();
-  const _allowlist    = _rawAllowlist ? new Set(_rawAllowlist.split(',').map(s => s.trim()).filter(Boolean)) : null;
-
-  let due = aptStore.getDueForReminder(20 * 60 * 1000); // 20-min window
-  if (_allowlist) due = due.filter(a => _allowlist.has(a.leadPhone));
+  const cfg = reminderConfig();
+  const due = applyAllowlist(aptStore.getDueForReminder(cfg.windowMs), cfg.allowlist);
   if (!due.length) return { reminders: 0 };
-
-  logger.info('[apt-worker] Reminder pass', { due: due.length, allowlist: _allowlist ? [..._allowlist] : 'all' });
+  logger.info('[apt-worker] Reminder pass (staff-confirmed)', { due: due.length, windowMin: cfg.minutes, allowlist: cfg.allowlist ? [...cfg.allowlist] : 'all' });
   let sent = 0;
   for (const apt of due) {
-    const staff = findStaff(apt.assignedStaffId);
-    const results = await sendStaffReminder(apt, staff, {
-      skipPhones: new Set(apt.reminderSentTo ?? []),
-    });
-    const newSucceeded = results.filter(r => r.ok && !r.skipped).map(r => r.phone);
-    if (newSucceeded.length) {
-      aptStore.update(apt.id, { reminderSentTo: [...new Set([...(apt.reminderSentTo ?? []), ...newSucceeded])] });
-    }
-    if (results.length > 0 && results.every(r => r.ok)) {
-      aptStore.markReminderSent(apt.id);
-      store?.logEvent('appointment_reminder_sent', apt.leadPhone, { aptId: apt.id });
-      sent++;
-    } else if (results.length === 0) {
-      // Zero recipients = configuration failure, not success. Leave reminderSent=false
-      // so the entry is retried next cycle once staff_config.json is populated.
-      logger.warn('[apt-worker] Reminder pass: no recipients configured — entry stays pending', {
-        aptId: apt.id, leadPhone: apt.leadPhone,
-      });
-    }
+    if (await remindStaffFor(apt, store, 'appointment_reminder_sent')) sent++;
   }
   return { reminders: sent };
 }
 
-// ── No-show pass ──────────────────────────────────────────────────────────────
+// ── No-show pass (in-person appointments only — never telephone callbacks) ────
 
 async function runNoShowPass(store) {
-  const overdue = aptStore.getOverdue(15 * 60 * 1000); // 15-min buffer
+  const overdue = aptStore.getOverdue(15 * 60 * 1000);
   if (!overdue.length) return { noShows: 0 };
 
   logger.info('[apt-worker] No-show pass', { overdue: overdue.length });
   let flagged = 0;
   for (const apt of overdue) {
-    // Final ownership check: if staff took over this conversation, skip automated
-    // no-show follow-up — the staff member is handling it directly.
-    if (store?.getLead(apt.leadPhone)?.status === 'human_owns') {
-      logger.info('[apt-worker] No-show follow-up skipped — human_owns', { aptId: apt.id, leadPhone: apt.leadPhone });
-      store?.logEvent('no_show_followup_suppressed_human_owns', apt.leadPhone, { aptId: apt.id });
+    const st = store?.getLead(apt.leadPhone)?.status;
+    if (st === 'human_owns' || st === 'opted_out') {
+      logger.info('[apt-worker] No-show follow-up skipped', { aptId: apt.id, status: st });
+      store?.logEvent(`no_show_followup_suppressed_${st}`, apt.leadPhone, { aptId: apt.id });
       continue;
     }
-    // Mark as no_show and alert the lead
     aptStore.update(apt.id, { status: 'no_show', noShowAlerted: true });
     await sendNoShowFollowUp(apt);
     store?.logEvent('appointment_no_show', apt.leadPhone, { aptId: apt.id, rawTime: apt.rawTime });
-    // Set lead meta back to awaitingCallbackTime so the NEXT reply is treated as a new time
-    store?.upsertLead(apt.leadPhone, {
-      meta: {
-        ...(store.getLead(apt.leadPhone)?.meta ?? {}),
-        awaitingCallbackTime: true,
-        callbackRequestedAt:  new Date().toISOString(),
-        noShowAptId:          apt.id,
-      },
-    });
     flagged++;
   }
   return { noShows: flagged };
 }
 
-// ── Callback-pending reminder pass ────────────────────────────────────────────
-//
-// Staff-only reminder for AI-detected callbacks (callback_pending status).
-// Unlike the confirmed reminder, this never contacts the prospect.
-//
-// ACTIVATION:
-//   Set CALLBACK_PENDING_REMINDER_ENABLED=true in Railway Variables to activate.
-//   Default: disabled. The timing window is CALLBACK_PENDING_REMINDER_MIN (default 30).
-//   Remind staff N minutes before the requested callback time so they're not caught
-//   off-guard. Must be > 15 min to avoid missing the reminder due to the 15-min poll.
-//
-// Deduplication: reminderSent flag on the aptStore entry (same as confirmed reminder).
-// A restart will not re-send if reminderSent is already true.
+// ── Staff reminder: pending (not yet staff-approved) callbacks ────────────────
 
 async function runCallbackPendingReminderPass(store) {
-  if (process.env.CALLBACK_PENDING_REMINDER_ENABLED !== 'true') return { pendingReminders: 0 };
-
-  const reminderMinutes = parseInt(process.env.CALLBACK_PENDING_REMINDER_MIN ?? '30', 10);
-  const windowMs        = Math.max(reminderMinutes, 20) * 60 * 1000; // floor at 20 min
-
-  // Per-phone allowlist: when CALLBACK_PENDING_REMINDER_PHONES is set (comma-separated)
-  // only remind entries whose leadPhone is in the list. Used for controlled tests.
-  // When the var is absent or empty, all due entries are reminded.
-  const _allowlistRaw = (process.env.CALLBACK_PENDING_REMINDER_PHONES ?? '').trim();
-  const _allowlist    = _allowlistRaw ? new Set(_allowlistRaw.split(',').map(s => s.trim()).filter(Boolean)) : null;
-
-  let due = aptStore.getPendingCallbacksDueForReminder(windowMs);
-  if (_allowlist) due = due.filter(a => _allowlist.has(a.leadPhone));
+  const cfg = reminderConfig();
+  if (!cfg.enabled) return { pendingReminders: 0 };
+  const due = applyAllowlist(aptStore.getPendingCallbacksDueForReminder(cfg.windowMs), cfg.allowlist);
   if (!due.length) return { pendingReminders: 0 };
-
-  logger.info('[apt-worker] Callback-pending reminder pass', { due: due.length, windowMin: reminderMinutes, allowlist: _allowlist ? [..._allowlist] : 'all' });
-
-  const { sendStaffReminder } = require('../services/notification.service');
+  logger.info('[apt-worker] Callback-pending reminder pass', { due: due.length, windowMin: cfg.minutes, allowlist: cfg.allowlist ? [...cfg.allowlist] : 'all' });
   let attempted = 0;
   for (const apt of due) {
-    const staff = findStaff(apt.assignedStaffId);
-
-    // Build the set of phones that have already confirmed receipt so we never resend.
-    const alreadyAccepted = new Set(apt.reminderSentTo ?? []);
-
-    // Send to remaining recipients (broadcastToStaff skips phones in alreadyAccepted).
-    const results = await sendStaffReminder(apt, staff, { skipPhones: alreadyAccepted });
-
-    // Record newly-succeeded phones.
-    const newSucceeded = results.filter(r => r.ok && !r.skipped).map(r => r.phone);
-    if (newSucceeded.length) {
-      const updatedSentTo = [...alreadyAccepted, ...newSucceeded];
-      aptStore.update(apt.id, { reminderSentTo: updatedSentTo });
-    }
-
-    // Mark complete only when every current active recipient is covered (sent or skipped-ok).
-    // If any recipient failed, the entry stays in the next cycle's due list for retry.
-    const allCovered = results.length > 0 && results.every(r => r.ok);
-    if (allCovered) {
-      aptStore.markReminderSent(apt.id);
-      store?.logEvent('callback_pending_reminder_sent', apt.leadPhone, {
-        aptId:          apt.id,
-        rawTime:        apt.rawTime,
-        reminderMinutes,
-      });
-    } else {
-      const failedCount = results.filter(r => !r.ok).length;
-      logger.warn('[apt-worker] Callback-pending reminder: partial/full failure — will retry next cycle', {
-        aptId: apt.id, failedCount, results: results.map(r => ({ phone: r.phone, ok: r.ok })),
-      });
-    }
-
+    await remindStaffFor(apt, store, 'callback_pending_reminder_sent', { reminderMinutes: cfg.minutes });
     attempted++;
   }
   return { pendingReminders: attempted };
 }
 
-// ── Prospect reminder pass ─────────────────────────────────────────────────────
-//
-// Sends a WhatsApp reminder DIRECTLY to the lead (not staff) before their scheduled
-// callback. Only fires when CALLBACK_PENDING_REMINDER_ENABLED=true.
-//
-// Uses the same reminderMinutes window and per-phone allowlist as
-// runCallbackPendingReminderPass so the two passes stay in sync.
+// ── Prospect reminder: pending AND staff-confirmed callbacks ──────────────────
 
 async function runProspectReminderPass(store) {
-  if (process.env.CALLBACK_PENDING_REMINDER_ENABLED !== 'true') return { prospectReminders: 0 };
-
-  const reminderMinutes = Math.max(parseInt(process.env.CALLBACK_PENDING_REMINDER_MIN ?? '30', 10), 20);
-  const windowMs        = reminderMinutes * 60 * 1000;
-
-  const _allowlistRaw = (process.env.CALLBACK_PENDING_REMINDER_PHONES ?? '').trim();
-  const _allowlist    = _allowlistRaw ? new Set(_allowlistRaw.split(',').map(s => s.trim()).filter(Boolean)) : null;
-
-  let due = aptStore.getCallbacksDueForProspectReminder(windowMs);
-  if (_allowlist) due = due.filter(a => _allowlist.has(a.leadPhone));
+  const cfg = reminderConfig();
+  if (!cfg.enabled) return { prospectReminders: 0 };
+  const due = applyAllowlist(aptStore.getCallbacksDueForProspectReminder(cfg.windowMs), cfg.allowlist);
   if (!due.length) return { prospectReminders: 0 };
 
-  logger.info('[apt-worker] Prospect reminder pass', { due: due.length, windowMin: reminderMinutes, allowlist: _allowlist ? [..._allowlist] : 'all' });
+  logger.info('[apt-worker] Prospect reminder pass', { due: due.length, windowMin: cfg.minutes, allowlist: cfg.allowlist ? [...cfg.allowlist] : 'all' });
 
   let sent = 0;
-  for (const apt of due) {
-    // Final ownership check: if staff took over this conversation, do not send
-    // automated prospect messages regardless of the appointment state.
-    if (store?.getLead(apt.leadPhone)?.status === 'human_owns') {
-      logger.info('[apt-worker] Prospect reminder skipped — human_owns', { aptId: apt.id, leadPhone: apt.leadPhone });
-      store?.logEvent('prospect_reminder_suppressed_human_owns', apt.leadPhone, { aptId: apt.id });
+  for (const listed of due) {
+    const apt = aptStore.get(listed.id);
+    if (!apt || !aptStore.ACTIVE_STATUSES.has(apt.status) || apt.prospectReminderSent === true) continue;
+    if (!(apt.scheduledAt instanceof Date) || apt.scheduledAt.getTime() <= Date.now()) continue;
+    if (aptStore.isSuperseded(apt)) continue;
+
+    // Ownership / opt-out: never send an automated prospect message to a conversation
+    // a human owns or to someone who opted out — whatever the appointment state.
+    const lead = store?.getLead(apt.leadPhone);
+    const st   = lead?.status;
+    if (st === 'human_owns' || st === 'opted_out' || st === 'converted_member') {
+      logger.info('[apt-worker] Prospect reminder skipped', { aptId: apt.id, leadPhone: apt.leadPhone, status: st });
+      store?.logEvent(`prospect_reminder_suppressed_${st}`, apt.leadPhone, { aptId: apt.id });
       continue;
     }
-    const name          = (apt.leadName ?? '').split(' ')[0] || 'שלום';
-    const formattedTime = fmtScheduledAt(apt.scheduledAt, apt.rawTime);
+    const fullName      = lead?.meta?.qualData?.confirmedName ?? apt.leadName ?? '';
+    const name          = String(fullName).trim().split(/\s+/)[0] || 'שלום';
+    const formattedTime = formatCallbackTime(apt.scheduledAt);
     const result        = await sendProspectReminder(apt, name, formattedTime);
-    if (result.ok) {
+    if (result.ok && result.idMessage) {
       aptStore.update(apt.id, {
         prospectReminderSent:   true,
         prospectReminderSentTo: result.idMessage,
+        prospectReminderSentAt: new Date().toISOString(),
       });
       store?.logEvent('prospect_reminder_sent', apt.leadPhone, {
-        aptId:     apt.id,
-        idMessage: result.idMessage,
-        reminderMinutes,
+        aptId: apt.id, idMessage: result.idMessage, reminderMinutes: cfg.minutes,
       });
       sent++;
     } else {
-      logger.warn('[apt-worker] Prospect reminder failed — will retry next cycle', {
-        aptId:     apt.id,
-        leadPhone: apt.leadPhone,
-        error:     result.error,
+      logger.warn('[apt-worker] Prospect reminder not accepted — will retry next cycle', {
+        aptId: apt.id, leadPhone: apt.leadPhone, error: result.error ?? 'no_provider_id',
       });
     }
   }
   return { prospectReminders: sent };
 }
 
+// ── One full cycle (exported so tests drive the real worker logic) ────────────
+
+async function runCycle(store) {
+  const r  = await runReminderPass(store);
+  const n  = await runNoShowPass(store);
+  const p  = await runCallbackPendingReminderPass(store);
+  const pr = await runProspectReminderPass(store);
+  return { ...r, ...n, ...p, ...pr };
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
+
+let _registered = false;
 
 function initAppointmentWorker(store) {
   // Every 15 minutes
   cron.schedule('*/15 * * * *', async () => {
     try {
-      const r  = await runReminderPass(store);
-      const n  = await runNoShowPass(store);
-      const p  = await runCallbackPendingReminderPass(store);
-      const pr = await runProspectReminderPass(store);
-      if (r.reminders || n.noShows || p.pendingReminders || pr.prospectReminders) {
-        logger.info('[apt-worker] Cycle complete', { ...r, ...n, ...p, ...pr });
+      const out = await runCycle(store);
+      if (out.reminders || out.noShows || out.pendingReminders || out.prospectReminders) {
+        logger.info('[apt-worker] Cycle complete', out);
       }
     } catch (err) {
       logger.error('[apt-worker] Error', { error: err.message });
     }
   }, { timezone: 'Asia/Jerusalem' });
+  _registered = true;
 
-  const reminderStatus = process.env.CALLBACK_PENDING_REMINDER_ENABLED === 'true'
-    ? `enabled — ${process.env.CALLBACK_PENDING_REMINDER_MIN ?? '30'} min window`
-    : 'disabled (set CALLBACK_PENDING_REMINDER_ENABLED=true to activate)';
-  logger.info('Worker[Appointments]: reminder + no-show worker scheduled — every 15 min', {
-    callbackPendingReminder: reminderStatus,
+  const cfg = reminderConfig();
+  logger.info('Worker[Appointments]: reminder worker scheduled — every 15 min', {
+    callbackPendingReminder: cfg.enabled ? `enabled — ${cfg.minutes} min window` : 'disabled (set CALLBACK_PENDING_REMINDER_ENABLED=true to activate)',
+    allowlist: cfg.allowlist ? [...cfg.allowlist] : 'all leads',
   });
 }
 
-module.exports = { initAppointmentWorker, runReminderPass, runNoShowPass, runCallbackPendingReminderPass, runProspectReminderPass };
+/** Effective worker state, exposed read-only via /api/admin/appointments/worker-status. */
+function workerStatus() {
+  const cfg = reminderConfig();
+  return {
+    registered:       _registered,
+    schedule:         '*/15 * * * * (Asia/Jerusalem)',
+    pendingAndProspectRemindersEnabled: cfg.enabled,
+    reminderMinutes:  cfg.minutes,
+    leadAllowlist:    cfg.allowlist ? [...cfg.allowlist] : null,
+  };
+}
+
+module.exports = {
+  initAppointmentWorker, runCycle, workerStatus, reminderConfig,
+  runReminderPass, runNoShowPass, runCallbackPendingReminderPass, runProspectReminderPass,
+};

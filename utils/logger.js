@@ -10,10 +10,14 @@ const logger = createLogger({
       return `[${timestamp}] ${level.toUpperCase()}: ${message}${metaStr}`;
     })
   ),
+  // File logs are size-capped and rotated (previously unbounded — grew to hundreds of GB
+  // locally). Test processes (NODE_ENV=test or LOG_TO_FILE=false) never write log files.
   transports: [
-    new transports.Console(),
-    new transports.File({ filename: 'logs/error.log', level: 'error' }),
-    new transports.File({ filename: 'logs/combined.log' }),
+    new transports.Console({ silent: process.env.LOG_SILENT === 'true' }),
+    ...(process.env.NODE_ENV === 'test' || process.env.LOG_TO_FILE === 'false' ? [] : [
+      new transports.File({ filename: 'logs/error.log', level: 'error', maxsize: 20 * 1024 * 1024, maxFiles: 3, tailable: true }),
+      new transports.File({ filename: 'logs/combined.log',              maxsize: 20 * 1024 * 1024, maxFiles: 3, tailable: true }),
+    ]),
   ],
 });
 

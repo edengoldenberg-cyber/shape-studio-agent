@@ -328,23 +328,22 @@ console.log('\n── Section I — Rescheduling ──');
   aptStore.reschedule(apt.id, {
     rawTime: 'מחר בשעה 15', scheduledAt: new Date(Date.now() + 10 * 60_000),
   });
-  // After reschedule: status reset to 'confirmed' by aptStore.reschedule.
-  // callback_pending → confirmed is intentional: once a staff member reschedules
-  // in the panel, they are confirming the appointment.
+  // Changed deliberately (was: reschedule → 'confirmed'): a moved callback goes back to
+  // callback_pending — the new time needs staff approval again — and its reminder
+  // cycle starts over. The OLD time's reminder record must not block the new one.
   const rescheduled = aptStore.get(apt.id);
-  test('I: status after reschedule = confirmed', rescheduled?.status, 'confirmed');
+  test('I: status after reschedule = callback_pending', rescheduled?.status, 'callback_pending');
   test('I: reminderSent=false after reschedule', rescheduled?.reminderSent, false);
+  test('I: reminderSentTo cleared after reschedule', (rescheduled?.reminderSentTo ?? []).length, 0);
 
-  // Run again — now it's confirmed (getDueForReminder query) in the 10-min window
+  // Run again — the rescheduled entry is due again and gets exactly one new reminder.
   sendCalls = [];
   const r2 = await runCallbackPendingReminderPass(null);
-  // runCallbackPendingReminderPass only queries getPendingCallbacksDueForReminder
-  // (status=callback_pending). After reschedule the entry is 'confirmed' and would
-  // be picked up by runReminderPass instead (getDueForReminder). We test that the
-  // callback_pending pass itself returns 0 — the confirmed reminder would be a
-  // separate runReminderPass call.
-  test('I: callback_pending pass returns 0 for confirmed entry', r2.pendingReminders, 0);
-  note('I: After reschedule: status=confirmed → runReminderPass (not callback_pending pass) handles it.');
+  test('I: pending pass reminds the rescheduled entry once', r2.pendingReminders, 1);
+  test('I: reminderSent=true after the new cycle', aptStore.get(apt.id)?.reminderSent, true);
+  const r3 = await runCallbackPendingReminderPass(null);
+  test('I: no second reminder for the same new time', r3.pendingReminders, 0);
+  note('I: After reschedule: status=callback_pending, fresh reminder cycle for the new time.');
 }
 
 // ── Section J — Retry behavior ────────────────────────────────────────────────

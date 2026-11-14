@@ -16,6 +16,7 @@ const path       = require('path');
 const fs         = require('fs');
 const logger     = require('../utils/logger');
 const { sendText } = require('./whatsapp.service');
+const { formatCallbackTime } = require('../utils/callback_time');
 
 // ── Staff roster loader ───────────────────────────────────────────────────────
 // Reads from DATA_DIR (Railway Volume) so the same file edited through the
@@ -206,34 +207,31 @@ async function notifyStaffCallbackConfirmed(apt, assignedStaff, icsDownloadUrl, 
  * @returns {Array}  per-recipient result array from broadcastToStaff
  */
 async function sendStaffReminder(apt, assignedStaff, { skipPhones = new Set() } = {}) {
-  const timeLabel = formatTime(apt.scheduledAt, apt.rawTime);
-  const lead      = apt.leadName ?? apt.leadPhone;
+  // Displayed time comes from the persisted scheduledAt, in Asia/Jerusalem.
+  const hasTime   = apt.scheduledAt instanceof Date && !isNaN(apt.scheduledAt.getTime());
+  const timeLabel = hasTime ? formatCallbackTime(apt.scheduledAt) : formatTime(apt.scheduledAt, apt.rawTime);
+  const lead      = apt.leadName || (String(apt.leadPhone).startsWith('972') ? '0' + String(apt.leadPhone).slice(3) : apt.leadPhone);
 
-  // Calculate actual minutes remaining so the text matches the real timing.
-  // The reminder window can be 20–30 min, so "בעוד 15 דקות" is not always accurate.
-  const minRemaining = apt.scheduledAt
-    ? Math.max(1, Math.round((new Date(apt.scheduledAt).getTime() - Date.now()) / 60000))
+  // Actual minutes remaining so the text matches the real timing.
+  const minRemaining = hasTime
+    ? Math.max(1, Math.round((apt.scheduledAt.getTime() - Date.now()) / 60000))
     : null;
   const countdownLabel = minRemaining != null ? `בעוד ${minRemaining} דקות` : 'בקרוב';
 
   const msg = [
-    `⏰ *תזכורת: שיחה ${countdownLabel}!*`,
+    `⏰ *תזכורת: שיחה ${countdownLabel}*`,
     ``,
     `👤 ${lead}`,
-    `📱 ${apt.leadPhone}`,
+    `📱 ${String(apt.leadPhone).startsWith('972') ? '0' + String(apt.leadPhone).slice(3) : apt.leadPhone}`,
+    `📅 ${timeLabel}`,
+    apt.status === 'confirmed' ? `✅ השיחה אושרה על ידי הצוות` : `⏳ השיחה עדיין ממתינה לאישור הצוות`,
+    apt.prospectAvailability === 'confirmed' ? `🙋 הליד אישר/ה זמינות` : null,
     `💬 ${waLink(apt.leadPhone)}`,
-    `🕐 ${timeLabel}`,
-  ].join('\n');
+  ].filter(l => l !== null).join('\n');
 
-  const results = await broadcastToStaff(msg, { skipPhones });
+  const results = await broadcastToStaff(msg, { skipPhones, linkPreview: false });
   const sent    = results.filter(r => r.ok && !r.skipped).length;
   const failed  = results.filter(r => !r.ok).length;
-  if (!results.length && assignedStaff?.phone) {
-    // No roster configured — fall back to assigned staff only (not tracked per-recipient)
-    await sendText(assignedStaff.phone, msg).catch(err =>
-      logger.warn('[notify] Reminder fallback failed', { error: err.message })
-    );
-  }
   logger.info('[notify] Staff reminder attempted', { aptId: apt.id, sent, failed, skipped: results.filter(r => r.skipped).length });
   return results;
 }
@@ -376,7 +374,7 @@ async function sendProspectReminder(apt, name, formattedTime) {
   if (!apt.leadPhone) {
     return { ok: false, idMessage: null, error: 'no_lead_phone' };
   }
-  const msg = `היי ${name}, תזכורת לבקשת השיחה שלך עם Shape Studio ${formattedTime} 📞\nעדיין נוח לך לדבר בשעה הזו?`;
+  const msg = `היי ${name}, תזכורת לבקשת השיחה שלך עם Shape Studio — ${formattedTime} 📞\nעדיין נוח לך לדבר בשעה הזו?`;
   try {
     const res = await sendText(apt.leadPhone, msg);
     const idMessage = res?.idMessage ?? null;

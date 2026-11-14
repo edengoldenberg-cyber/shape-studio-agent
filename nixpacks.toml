@@ -11,7 +11,7 @@
 nixPkgs = ["nodejs_20", "python3"]
 
 [phases.install]
-cmds = ["npm ci --omit=dev", "node -e \"const fs=require('fs'),cp=require('child_process');const sha=cp.execSync('git rev-parse HEAD',{encoding:'utf8'}).trim();const at=cp.execSync('git log -1 --format=%ai',{encoding:'utf8'}).trim();fs.writeFileSync('revision.json',JSON.stringify({sha,deployedAt:at}))\" || echo '{\"sha\":\"unknown\",\"deployedAt\":\"unknown\"}' > revision.json"]
+cmds = ["npm ci --omit=dev", "node -e \"const fs=require('fs'),cp=require('child_process');if(fs.existsSync('revision.json')){try{if(JSON.parse(fs.readFileSync('revision.json','utf8')).sha)process.exit(0)}catch(e){}}const sha=cp.execSync('git rev-parse HEAD',{encoding:'utf8'}).trim();const at=cp.execSync('git log -1 --format=%ai',{encoding:'utf8'}).trim();fs.writeFileSync('revision.json',JSON.stringify({sha,deployedAt:at}))\" || test -s revision.json || echo '{\"sha\":\"unknown\",\"deployedAt\":\"unknown\"}' > revision.json"]
 
 [start]
 cmd = "node server.js"
