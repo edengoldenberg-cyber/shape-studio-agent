@@ -377,6 +377,7 @@ async function sendProspectReminder(apt, name, formattedTime) {
   const msg = `היי ${name}, תזכורת לבקשת השיחה שלך עם Shape Studio — ${formattedTime} 📞\nעדיין נוח לך לדבר בשעה הזו?`;
   try {
     const res = await sendText(apt.leadPhone, msg);
+    if (res?.blocked) return { ok: false, idMessage: null, error: 'blocked (TEST_MODE allowlist)' };
     const idMessage = res?.idMessage ?? null;
     logger.info('[notify] Prospect reminder sent', { aptId: apt.id, leadPhone: apt.leadPhone, idMessage });
     return { ok: true, idMessage, error: null };

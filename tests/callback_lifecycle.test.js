@@ -754,6 +754,33 @@ describe('5. Staff confirmation and outcomes', () => {
     expect(summaries()).toHaveLength(1);
   });
 
+  test('an older request left open (expired, no outcome) never resurfaces after a newer request is closed', async () => {
+    // Same shape as the production test record: an expired pending request with no outcome…
+    const phone = await leadWithCallback({ timeText: 'היום ב-11:00' });
+    const oldId = openApt(phone).id;
+    setNow(il(2026, 11, 16, 12, 0));
+    const oldBefore = JSON.stringify(diskApts().find(a => a.id === oldId));
+    // …then a new request, confirmed and completed.
+    await say(phone, 'אשמח שיחזרו אליי היום ב-14:00');
+    const newId = openApt(phone).id;
+    expect(newId).not.toBe(oldId);
+    await post(`/api/admin/appointments/${newId}/confirm`);
+    expect(store.getLead(phone).status).toBe('call_scheduled');
+    await post(`/api/admin/appointments/${newId}/complete`, {});
+
+    expect(store.getLead(phone).status).toBe('call_completed');           // lead follows the CURRENT request
+    expect(openApt(phone)).toBeNull();                                     // the old one is not "current" again
+    expect(await panelRow(phone)).toBeNull();                              // and does not reappear in the queue
+    expect(JSON.stringify(diskApts().find(a => a.id === oldId))).toBe(oldBefore);   // history untouched, byte for byte
+    restart();
+    expect(openApt(phone)).toBeNull();
+    clearOut();
+    setNow(il(2026, 11, 16, 13, 35));
+    await worker.runCycle(store);
+    expect(textsTo(phone)).toHaveLength(0);
+    expect(staffRemindersFor(phone)).toHaveLength(0);
+  });
+
   test('an expired callback cannot be confirmed; it waits for an outcome and no "missed call" message is sent', async () => {
     const phone = await leadWithCallback({ timeText: 'היום ב-11:00' });
     const apt = openApt(phone);

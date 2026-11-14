@@ -630,6 +630,7 @@ const CODE_FEATURES = [
   'strict_callback_time', // utils/callback_time.js — no default hour, no AI date guessing
   'apt_persist_strict',   // appointment_store update/updateBatch throw + roll back on failed write
   'staff_confirm_lifecycle', // confirm / outcome endpoints enforce transitions
+  'current_callback_latest', // a lead's current callback = its most recent request only
 ];
 app.get('/api/version', (_req, res) => {
   res.json({

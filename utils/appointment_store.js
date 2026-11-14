@@ -194,15 +194,30 @@ class AppointmentStore {
    * superseded and never receive reminders.
    */
   getActiveCallback(phone) {
-    return this.getByPhone(phone)
-      .filter(a => ACTIVE_STATUSES.has(a.status))
-      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0] ?? null;
+    const latest = this._latestFor(phone);
+    return latest && ACTIVE_STATUSES.has(latest.status) ? latest : null;
   }
 
-  /** True when a newer open record exists for the same lead. */
+  /**
+   * The lead's most recent request (any status). A lead has ONE current callback: the
+   * latest request. An older record that was left open (e.g. it expired and nobody
+   * recorded an outcome) is superseded for good once a newer request exists — it is
+   * never modified, never reminded, and never becomes "current" again when the newer
+   * one is completed or cancelled.
+   */
+  _latestFor(phone) {
+    let latest = null;
+    for (const a of this._apts.values()) {
+      if (a.leadPhone !== phone) continue;
+      if (!latest || new Date(a.createdAt) >= new Date(latest.createdAt)) latest = a;
+    }
+    return latest;
+  }
+
+  /** True when a newer request exists for the same lead. */
   isSuperseded(apt) {
-    const active = this.getActiveCallback(apt.leadPhone);
-    return !!active && active.id !== apt.id;
+    const latest = this._latestFor(apt.leadPhone);
+    return !!latest && latest.id !== apt.id;
   }
 
   getAll() { return Array.from(this._apts.values()); }

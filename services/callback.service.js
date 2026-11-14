@@ -330,12 +330,13 @@ function createCallbackService(deps) {
           markBotSent(phone);
           try {
             const r  = await sendText(phone, prospectMsg);
-            const id = r?.idMessage ?? null;
+            // A send intercepted by the TEST_MODE allowlist never reached the provider.
+            const id = r?.blocked ? null : (r?.idMessage ?? null);
             if (id) {
               recordNotified(apt, 'prospect_summary', [phone]);
               prospect = { state: 'accepted', idMessage: id };
             } else {
-              prospect = { state: 'failed', reason: 'no_provider_id' };
+              prospect = { state: 'failed', reason: r?.blocked ? 'blocked_test_mode' : 'no_provider_id' };
             }
           } catch (err) {
             prospect = { state: 'failed', reason: err.message };
