@@ -294,7 +294,13 @@ function resolveTargetDate(query, anchorDate = null) {
  *   Anchors relative day resolution ("חמישי") to the send time, not processing time.
  */
 async function checkSchedule(dateOrQuery, msgTimestamp = null) {
-  const anchor = msgTimestamp ? new Date(msgTimestamp * 1000) : null;
+  // The pipeline passes a Date (parseGreenApiWebhook already converted Unix seconds);
+  // older callers pass Unix seconds. Multiplying a Date by 1000 produced an invalid
+  // anchor and "no classes" answers.
+  let anchor = null;
+  if (msgTimestamp instanceof Date) anchor = msgTimestamp;
+  else if (typeof msgTimestamp === 'number' && Number.isFinite(msgTimestamp)) anchor = new Date(msgTimestamp < 1e11 ? msgTimestamp * 1000 : msgTimestamp);
+  if (anchor && (isNaN(anchor.getTime()) || anchor.getUTCFullYear() < 2020 || anchor.getUTCFullYear() > 2100)) anchor = null;
   const targetDate = resolveTargetDate(dateOrQuery ?? null, anchor);
 
   try {

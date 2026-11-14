@@ -418,6 +418,7 @@
         <div class="tw-topbar" dir="rtl">
           <div class="tw-tabs">
             <button class="tw-tab active" data-pane="today">היום <span class="tw-badge" id="tw-badge-today"></span></button>
+            <button class="tw-tab" data-pane="cases">פניות <span class="tw-badge" id="tw-badge-cases"></span></button>
             <button class="tw-tab" data-pane="conversations">שיחות <span class="tw-badge" id="tw-badge-conv"></span></button>
             <button class="tw-tab" data-pane="upcoming">הודעות מתוזמנות</button>
             <button class="tw-tab" data-pane="members">חברים</button>
@@ -509,6 +510,16 @@
               <tbody id="tw-members-tbody"><tr><td colspan="7" class="empty-state">לחץ "טען מ-Arbox" לטעינת חברים</td></tr></tbody>
             </table>
           </div>
+        </div>
+
+        <!-- ── Service cases pane ─────────────────────────────── -->
+        <div class="tw-pane" id="twp-cases" dir="rtl">
+          <div class="tw-filter-row">
+            <button class="filter-btn active" data-cf="1">פתוחות</button>
+            <button class="filter-btn" data-cf="0">סגורות</button>
+          </div>
+          <div id="tw-cases-writes" class="tw-cases-writes"></div>
+          <div id="tw-cases-list" class="tw-list"><div class="tw-empty">טוען…</div></div>
         </div>
 
         <!-- ── Eden Tasks pane ────────────────────────────────── -->

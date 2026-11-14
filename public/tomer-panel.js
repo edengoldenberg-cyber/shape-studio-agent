@@ -1113,3 +1113,101 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
 if (document.querySelector('.tab-btn[data-tab="tomer"].active')) {
   loadToday();
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+//  SERVICE CASES (פניות) — one card per member issue, with its Arbox action
+// ════════════════════════════════════════════════════════════════════════════
+const CASE_STATUS_HE = { awaiting_member: 'ממתין לחבר/ה', awaiting_staff: 'ממתין לצוות', in_progress: 'בטיפול', resolved: 'נסגר', rejected: 'נדחה', cancelled: 'בוטל' };
+const ACTION_STATE_HE = {
+  awaiting_approval: 'ממתין לאישור', approved: 'אושר — ממתין להפעלה', awaiting_manual: 'אושר — לביצוע ידני ב-Arbox',
+  executing: 'מתבצע מול Arbox', verified: 'בוצע ואומת ב-Arbox ✓', failed: 'נכשל — Arbox דחה', uncertain: 'תוצאה לא ודאית — לבדוק ב-Arbox',
+  not_verified: 'דווח כבוצע — Arbox לא מציג', rejected: 'נדחה על ידי הצוות',
+};
+const ACTION_OP_HE = { membership_hold: 'הקפאת מנוי', membership_cancel: 'ביטול מנוי' };
+const NOTIF_HE = { accepted: 'התראה למנהל: נשלחה', failed: 'התראה למנהל: נכשלה', pending: 'התראה למנהל: ממתינה', not_required: '' };
+let _casesOpen = '1';
+
+async function casePost(id, op, body = {}) {
+  const r = await fetch('/api/tomer/cases/' + encodeURIComponent(id) + '/' + op, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const j = await r.json().catch(() => ({}));
+  return { status: r.status, ...j };
+}
+
+function renderCase(c, labels) {
+  const a = c.action;
+  const open = ['awaiting_member', 'awaiting_staff', 'in_progress'].includes(c.status);
+  const last = [...(c.context || [])].reverse().find(x => x.from === 'member');
+  const btn = (op, label, cls = 'btn-secondary') => '<button class="btn ' + cls + ' tw-case-btn" data-op="' + op + '" data-id="' + esc(c.id) + '">' + label + '</button>';
+  const buttons = [];
+  if (a && open) {
+    if (a.state === 'awaiting_approval') { buttons.push(btn('approve', 'אשר', 'btn-primary')); buttons.push(btn('reject', 'דחה', 'btn-danger')); }
+    if (a.state === 'approved') buttons.push(btn('execute-now', 'בצע עכשיו ב-Arbox', 'btn-primary'));
+    if (['awaiting_manual', 'not_verified', 'failed', 'uncertain'].includes(a.state)) buttons.push(btn('mark-executed', 'בוצע ב-Arbox — אמת', 'btn-primary'));
+    if (['uncertain', 'not_verified', 'executing'].includes(a.state)) buttons.push(btn('recheck', 'בדוק שוב ב-Arbox'));
+  }
+  if (open) { buttons.push(btn('assign', 'שייך אליי')); buttons.push(btn('reply', 'השב לחבר/ה')); buttons.push(btn('resolve', 'סגור פנייה')); }
+  if (c.notification && c.notification.state === 'failed') buttons.push(btn('retry-notification', 'שלח שוב התראה למנהל'));
+  const actionLine = a
+    ? '<div class="tw-case-action" data-state="' + esc(a.state) + '">⚙️ ' + esc(ACTION_OP_HE[a.op] || a.op)
+      + (a.args && a.args.from ? ' · ' + esc(a.args.from) + ' – ' + esc(a.args.to) : '')
+      + ' · <strong>' + esc(ACTION_STATE_HE[a.state] || a.state) + '</strong>'
+      + (a.heldForTakeover ? ' · השיחה בטיפול אנושי' : '') + '</div>'
+    : '';
+  const notice = c.memberNotice ? '<div class="tw-case-meta">עדכון לחבר/ה: ' + esc(c.memberNotice.state === 'withheld' ? 'לא נשלח (' + (c.memberNotice.reason === 'human_owns' ? 'שיחה בטיפול אנושי' : 'ביקש/ה לא לקבל הודעות') + ')' : 'נשלח') + '</div>' : '';
+  return '<div class="tw-case-card" data-case="' + esc(c.id) + '" data-status="' + esc(c.status) + '">'
+    + '<div class="tw-case-head">' + (c.priority === 'high' ? '<span class="tw-case-prio">דחוף</span> ' : '')
+    + '<strong>' + esc(labels[c.category] || c.category) + '</strong> · ' + esc(c.memberName || 'חבר/ה') + ' · <span dir="ltr">' + esc(c.phone) + '</span>'
+    + '<span class="tw-case-status">' + esc(CASE_STATUS_HE[c.status] || c.status) + '</span></div>'
+    + (last ? '<div class="tw-case-text">"' + esc(last.text) + '"</div>' : '')
+    + (c.facts && c.facts.summary ? '<div class="tw-case-meta">📊 Arbox: ' + esc(c.facts.summary) + '</div>' : '')
+    + actionLine
+    + (c.nextAction && open ? '<div class="tw-case-meta">➡️ ' + esc(c.nextAction) + '</div>' : '')
+    + (c.resolution ? '<div class="tw-case-meta">נסגר: ' + esc(c.resolution.note || 'ללא הערה') + ' (' + esc(c.resolution.by) + ')</div>' : '')
+    + notice
+    + '<div class="tw-case-meta">' + esc(c.id) + ' · אחראי/ת: ' + esc(c.owner) + ' · ' + esc(fmtDate(c.updatedAt)) + (c.notification ? ' · ' + esc(NOTIF_HE[c.notification.state] || '') : '') + '</div>'
+    + (buttons.length ? '<div class="tw-case-btns">' + buttons.join('') + '</div>' : '')
+    + '</div>';
+}
+
+async function loadCases() {
+  const list = $id('tw-cases-list');
+  if (!list) return;
+  let d;
+  try { d = await api('/api/tomer/cases?open=' + _casesOpen); } catch { d = null; }
+  if (!d || !d.ok) { list.innerHTML = '<div class="tw-empty">שגיאה בטעינת הפניות</div>'; return; }
+  const w = $id('tw-cases-writes');
+  if (w) {
+    const on = Object.values(d.arboxWrites || {}).some(x => x.executable);
+    w.textContent = on ? 'פעולות מנוי מבוצעות מול Arbox אוטומטית לאחר אישור.' : 'כתיבה ל-Arbox כבויה: אחרי אישור, מבצעים את הפעולה ב-Arbox ולוחצים "בוצע ב-Arbox — אמת". החבר/ה מקבל/ת עדכון רק אחרי ש-Arbox מציג את השינוי.';
+  }
+  if (_casesOpen === '1') { const b = $id('tw-badge-cases'); if (b) b.textContent = d.cases.length ? String(d.cases.length) : ''; }
+  list.innerHTML = d.cases.length ? d.cases.map(c => renderCase(c, d.categories || {})).join('') : '<div class="tw-empty">' + (_casesOpen === '1' ? 'אין פניות פתוחות' : 'אין פניות סגורות') + '</div>';
+}
+
+const CASE_ERR_HE = { invalid_args: 'חסרים פרטים לפעולה (למשל תאריכים או זיהוי מנוי)', not_awaiting_approval: 'הפעולה כבר הוכרעה', writes_disabled: 'כתיבה ל-Arbox כבויה', bad_state: 'הפעולה לא במצב מתאים', action_in_flight: 'פעולה מתבצעת כרגע — לא ניתן לסגור', text_required: 'נדרש טקסט', not_found: 'הפנייה לא נמצאה' };
+async function runCaseOp(id, op, body) {
+  const r = await casePost(id, op, body);
+  if (r.ok === false || r.status >= 400) toast(CASE_ERR_HE[r.error] || 'הפעולה נכשלה', false);
+  else if (op === 'mark-executed' || op === 'recheck') toast(r.verified ? 'אומת ב-Arbox ✓' : 'Arbox עדיין לא מציג את השינוי', !!r.verified);
+  else toast('בוצע');
+  await loadCases();
+}
+$id('tw-cases-list')?.addEventListener('click', e => {
+  const b = e.target.closest('.tw-case-btn');
+  if (!b) return;
+  const id = b.dataset.id, op = b.dataset.op;
+  if (op === 'reject')       return promptModal('דחיית הבקשה — הערה לחבר/ה (לא חובה)', 'סיבה', note => runCaseOp(id, op, { note: note || null }));
+  if (op === 'resolve')      return promptModal('סגירת פנייה — הערת סיכום', 'מה נעשה', note => runCaseOp(id, op, { note: note || null }));
+  if (op === 'reply')        return promptModal('הודעה לחבר/ה (נשלחת בשם הצוות; תומר מפסיק לענות בשיחה)', 'טקסט ההודעה', text => { if (text && text.trim()) runCaseOp(id, op, { text }); });
+  if (op === 'approve')      return confirmModal('לאשר את הפעולה?', () => runCaseOp(id, op, {}));
+  if (op === 'execute-now')  return confirmModal('לבצע עכשיו מול Arbox?', () => runCaseOp(id, op, {}));
+  if (op === 'assign')       return runCaseOp(id, op, { to: 'צוות' });
+  return runCaseOp(id, op, {});
+});
+document.querySelectorAll('#twp-cases .filter-btn').forEach(b => b.addEventListener('click', () => {
+  document.querySelectorAll('#twp-cases .filter-btn').forEach(x => x.classList.remove('active'));
+  b.classList.add('active'); _casesOpen = b.dataset.cf; loadCases();
+}));
+document.querySelector('.tw-tab[data-pane="cases"]')?.addEventListener('click', loadCases);
+$id('tw-refresh')?.addEventListener('click', () => { if (document.querySelector('.tw-tab.active')?.dataset.pane === 'cases') loadCases(); });
+document.querySelector('.tab-btn[data-tab="tomer"]')?.addEventListener('click', loadCases);

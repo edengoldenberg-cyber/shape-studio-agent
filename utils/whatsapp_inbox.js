@@ -99,7 +99,9 @@ class WhatsAppInbox {
   }
 
   /** Add a message sent outbound from the dashboard (manual reply). */
-  pushOutbound({ phone, name, text, agentId = 'manual', fromIsraeli = null }) {
+  // `meta` (optional) records who/why: { agent, handler, trigger, caseId, actionId,
+  // dataSource, sendState, idMessage } — shown in the dashboard thread view.
+  pushOutbound({ phone, name, text, agentId = 'manual', fromIsraeli = null, meta = null }) {
     const thread = this._getOrCreateThread(phone, name, fromIsraeli);
     const id     = `wa-out-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     thread.messages.push({
@@ -108,6 +110,7 @@ class WhatsAppInbox {
       text,
       timestamp: new Date(),
       agentId,
+      ...(meta ? { meta, idMessage: meta.idMessage ?? null } : {}),
     });
     thread.lastText = text.slice(0, 60);
     thread.lastAt   = new Date();

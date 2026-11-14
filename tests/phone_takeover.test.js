@@ -302,7 +302,9 @@ describe('T6 — Payment ACK respects human_owns gate order', () => {
   test('without human_owns, payment ACK fires normally', async () => {
     const r = await simulateInbound(MEMBER_PHONE, 'שלחתי ביט');
     expect(r.route).toBe('payment_ack');
-    expect(mockSentTexts.some(s => s.text.includes('קיבלנו את אישור התשלום'))).toBe(true);
+    // The ack must not claim the payment was verified.
+    expect(mockSentTexts.some(s => s.text.includes('קיבלנו את אישור התשלום'))).toBe(false);
+    expect(mockSentTexts.some(s => s.text.includes('עדיין לא אישור שהתשלום התקבל'))).toBe(true);
   });
 });
 

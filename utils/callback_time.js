@@ -441,7 +441,52 @@ function hasTimeSignal(rawText) {
   return hr.found || !!hr.qualifierAm || !!hr.qualifierPm;
 }
 
+/**
+ * Day (and optional clock time) named in a text, WITHOUT callback rules (no calling
+ * hours, no "must be in the future"). Used for class questions: "מה יש מחר?",
+ * "ביום שלישי ב-9". Returns { day:{year,month,day}|null, hour:{h,min,ambiguous}|null,
+ * invalid:reason|null }. month is 0-based.
+ */
+function extractDayAndTime(rawText, ref = new Date()) {
+  const refDate = ref instanceof Date ? ref : new Date(ref);
+  const t = normalize(rawText);
+  const now = ilParts(refDate);
+  const today = { year: now.year, month: now.month, day: now.day };
+  const explicit = extractExplicitDate(t);
+  if (explicit.found && !explicit.valid) return { day: null, hour: null, invalid: 'invalid_date' };
+  const rest = explicit.found ? explicit.rest : t;
+  let day = null;
+  if (explicit.found) {
+    let year = explicit.year ?? now.year;
+    if (!isValidYmd(year, explicit.month, explicit.day)) return { day: null, hour: null, invalid: 'invalid_date' };
+    if (explicit.year === null && Date.UTC(year, explicit.month, explicit.day) < Date.UTC(today.year, today.month, today.day) - 300 * 86400000) year += 1;
+    day = { year, month: explicit.month, day: explicit.day };
+  } else if (heWord('מחרתיים').test(rest)) day = addDays(today, 2);
+  else if (heWord('מחר').test(rest)) day = addDays(today, 1);
+  else if (heWord('אתמול').test(rest)) day = addDays(today, -1);
+  else if (heWord('היום').test(rest) || heWord('הערב').test(rest) || heWord('הבוקר').test(rest)) day = today;
+  else {
+    const wd = extractWeekday(rest);
+    if (wd !== null) day = addDays(today, (wd - now.weekday + 7) % 7);   // today counts as "this <weekday>"
+  }
+  const hr = extractHour(rest, { dayKnown: true });
+  let hour = null;
+  if (hr.found && hr.valid) {
+    let h = hr.h;
+    const ambiguous = !hr.explicit24 && !hr.qualifierPm && !hr.qualifierAm && h >= 1 && h <= 11;
+    if (hr.qualifierPm && h < 12) h += 12;
+    hour = { h, min: hr.min, ambiguous };
+  }
+  return { day, hour, invalid: null };
+}
+
+/** YYYY-MM-DD of an instant, or of a {year,month,day} triple, in Israel time. */
+function ilDateString(v = new Date()) {
+  const p = v instanceof Date ? ilParts(v) : v;
+  return `${p.year}-${String(p.month + 1).padStart(2, '0')}-${String(p.day).padStart(2, '0')}`;
+}
+
 module.exports = {
-  resolveCallbackTime, hasTimeSignal, formatCallbackTime,
-  ilParts, ilDate, callingHours, TZ, MAX_DAYS_AHEAD,
+  resolveCallbackTime, hasTimeSignal, formatCallbackTime, extractDayAndTime, ilDateString,
+  ilParts, ilDate, addDays, callingHours, TZ, MAX_DAYS_AHEAD, HE_WEEKDAY_NAMES,
 };

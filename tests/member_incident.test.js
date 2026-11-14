@@ -168,7 +168,9 @@ describe('A — Neta: "ביטלתי היום" is a cancellation, not a payment',
   test('שלחתי ביט → payment ack fires (genuine Bit payment)', async () => {
     const r = await simulate(NETA_PHONE, 'שלחתי ביט');
     expect(r.route).toBe('payment_ack');
-    expect(mockSentTexts.some(s => s.text.includes('קיבלנו את אישור התשלום'))).toBe(true);
+    // The ack must not claim the payment was verified.
+    expect(mockSentTexts.some(s => s.text.includes('קיבלנו את אישור התשלום'))).toBe(false);
+    expect(mockSentTexts.some(s => s.text.includes('עדיין לא אישור שהתשלום התקבל'))).toBe(true);
   });
 
   test('שלמתי → payment ack fires', async () => {

@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shape Studio — כניסה</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; font: 16px/1.5 system-ui, "Segoe UI", Arial, sans-serif; background: #f4f5f7; color: #1c1f24; }
+  form { width: min(360px, calc(100vw - 32px)); background: #fff; padding: 28px; border-radius: 14px; box-shadow: 0 6px 24px rgba(0,0,0,.08); }
+  h1 { margin: 0 0 4px; font-size: 20px; }
+  p { margin: 0 0 18px; color: #5b6470; font-size: 14px; }
+  label { display: block; font-size: 14px; margin-bottom: 6px; }
+  input { width: 100%; box-sizing: border-box; padding: 11px 12px; font: inherit; border: 1px solid #c9ced6; border-radius: 9px; background: #fff; color: inherit; }
+  input:focus-visible, button:focus-visible { outline: 2px solid #2f6fed; outline-offset: 2px; }
+  button { margin-top: 14px; width: 100%; padding: 11px; font: inherit; font-weight: 600; border: 0; border-radius: 9px; background: #2f6fed; color: #fff; cursor: pointer; }
+  button[disabled] { opacity: .6; cursor: default; }
+  #err { min-height: 22px; margin-top: 10px; color: #b3261e; font-size: 14px; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #14171c; color: #e8eaee; } form { background: #1e232b; box-shadow: none; }
+    p { color: #a3acb9; } input { background: #14171c; border-color: #3a424e; } #err { color: #ff8a80; }
+  }
+</style>
+</head>
+<body>
+<form id="f" autocomplete="on">
+  <h1>Shape Studio</h1>
+  <p>הכניסה ללוח הבקרה מיועדת לצוות הסטודיו.</p>
+  <label for="pw">סיסמה</label>
+  <input id="pw" name="password" type="password" autocomplete="current-password" required autofocus>
+  <button id="go" type="submit">כניסה</button>
+  <div id="err" role="alert"></div>
+</form>
+<script>
+  const f = document.getElementById('f'), err = document.getElementById('err'), go = document.getElementById('go');
+  const MSG = { wrong_password: 'סיסמה שגויה.', too_many_attempts: 'יותר מדי ניסיונות. נסו שוב בעוד 15 דקות.', auth_not_configured: 'הכניסה לא הוגדרה בשרת (DASHBOARD_PASSWORD חסר).' };
+  f.addEventListener('submit', async (e) => {
+    e.preventDefault(); err.textContent = ''; go.disabled = true;
+    try {
+      const r = await fetch('/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: document.getElementById('pw').value }) });
+      const j = await r.json().catch(() => ({}));
+      if (r.ok && j.ok) { location.replace('/'); return; }
+      err.textContent = MSG[j.error] || 'הכניסה נכשלה.';
+    } catch { err.textContent = 'אין חיבור לשרת.'; }
+    go.disabled = false;
+  });
+</script>
+</body>
+</html>

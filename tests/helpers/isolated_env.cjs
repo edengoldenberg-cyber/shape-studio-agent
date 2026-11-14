@@ -76,6 +76,8 @@ function safeExternalEnv() {
     QUIET_HOUR_START:         '0',
     QUIET_HOUR_END:           '0',
     NODE_ENV:                 'test',
+    // Dashboard auth is exercised by its own suite; other suites call the API directly.
+    AUTH_DISABLED:            'true',
     TZ:                       'Asia/Jerusalem',
   };
 }

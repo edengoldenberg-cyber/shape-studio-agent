@@ -1,3 +1,9 @@
+// session expired → login: any API call answered 401 sends the browser to the login page.
+(() => {
+  const _f = window.fetch.bind(window);
+  window.fetch = async (...a) => { const r = await _f(...a); if (r.status === 401 && !location.pathname.endsWith('/login.html')) location.replace('/login.html'); return r; };
+})();
+
 /* ════════════════════════════════════════════════════════════════════════════
    Shape Studio — Multi-Agent Dashboard
    Tabs: Maya · Dana · Tomer · Barak · Health
