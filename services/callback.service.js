@@ -335,6 +335,12 @@ function createCallbackService(deps) {
             if (id) {
               recordNotified(apt, 'prospect_summary', [phone]);
               prospect = { state: 'accepted', idMessage: id };
+            } else if (r?.queued) {
+              // Quiet hours: the prospect got the short receipt now and the summary is
+              // queued for the morning release. Recorded as covered so no retry can send
+              // a second copy; reported as 'queued', not as delivered.
+              recordNotified(apt, 'prospect_summary', [phone]);
+              prospect = { state: 'queued', idMessage: null, releaseAt: r.releaseAt ?? null };
             } else {
               prospect = { state: 'failed', reason: r?.blocked ? 'blocked_test_mode' : 'no_provider_id' };
             }
@@ -361,7 +367,7 @@ function createCallbackService(deps) {
 
       // ── Lead meta (panel / admin compatibility) ───────────────────────────
       const cur = getLead(phone)?.meta ?? {};
-      const prospectAccepted = prospect.state === 'accepted';
+      const prospectAccepted = prospect.state === 'accepted' || prospect.state === 'queued';
       const both = prospectAccepted && manager.accepted;
       patchLead(phone, {}, {
         closingSummaryProspectState:     prospect.state,

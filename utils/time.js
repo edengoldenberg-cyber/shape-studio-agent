@@ -11,15 +11,16 @@ function nowInIsrael() {
  * Quiet window: QUIET_START (inclusive) → midnight → QUIET_END (exclusive).
  */
 function isQuietHours() {
-  // ── QUIET HOURS DISABLED FOR TESTING ──────────────────────────────────────
-  // Re-enable by removing this line and uncommenting the original logic below.
-  return false;
-
-  // const hour = nowInIsrael().getHours();
-  // if (QUIET_START > QUIET_END) {
-  //   return hour >= QUIET_START || hour < QUIET_END;
-  // }
-  // return hour >= QUIET_START && hour < QUIET_END;
+  // Restored 2026-11-14 (was hard-disabled for testing in b5dd083).
+  // Agreed production rule: no automated outbound to contacts during quiet hours;
+  // an inbound message gets a short receipt and the full reply is queued for the
+  // 08:30 release. Staff alerts bypass quiet hours.
+  const hour = nowInIsrael().getHours();
+  if (QUIET_START > QUIET_END) {
+    // spans midnight: e.g. 22 → 08
+    return hour >= QUIET_START || hour < QUIET_END;
+  }
+  return hour >= QUIET_START && hour < QUIET_END;
 }
 
 /**

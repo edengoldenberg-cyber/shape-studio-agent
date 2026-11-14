@@ -28,6 +28,7 @@ const logger       = require('../utils/logger');
 const aptStore     = require('../utils/appointment_store');
 const { sendStaffReminder, sendNoShowFollowUp, sendProspectReminder } = require('../services/notification.service');
 const { formatCallbackTime } = require('../utils/callback_time');
+const { isQuietHours } = require('../utils/time');
 
 // Loaded lazily to avoid circular dependency with server.js
 let _staffConfig = null;
@@ -158,6 +159,10 @@ async function runCallbackPendingReminderPass(store) {
 async function runProspectReminderPass(store) {
   const cfg = reminderConfig();
   if (!cfg.enabled) return { prospectReminders: 0 };
+  // Quiet hours: no automated message to a prospect. Sending now would only queue the
+  // reminder for the 08:30 release — i.e. possibly AFTER the call it is about — so the
+  // reminder is simply not sent while quiet hours are in force. Staff are still reminded.
+  if (isQuietHours()) return { prospectReminders: 0, skippedQuietHours: true };
   const due = applyAllowlist(aptStore.getCallbacksDueForProspectReminder(cfg.windowMs), cfg.allowlist);
   if (!due.length) return { prospectReminders: 0 };
 

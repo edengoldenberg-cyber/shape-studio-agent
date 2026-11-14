@@ -631,6 +631,7 @@ const CODE_FEATURES = [
   'apt_persist_strict',   // appointment_store update/updateBatch throw + roll back on failed write
   'staff_confirm_lifecycle', // confirm / outcome endpoints enforce transitions
   'current_callback_latest', // a lead's current callback = its most recent request only
+  'quiet_hours_restored',    // utils/time.isQuietHours active again (22:00–08:00 Israel)
 ];
 app.get('/api/version', (_req, res) => {
   res.json({
@@ -3038,7 +3039,7 @@ async function handleLeadCallbackFlow({ msg, fromNorm, fromIsraeli, clientMatch,
     if (name) {
       // Name already known → the appointment is on disk, send both summaries now.
       const fin = await callbackSvc.finalize({ phone: fromNorm, trigger: source });
-      const delivered = fin.prospect?.state === 'accepted' ? fin.prospectMsg : null;
+      const delivered = ['accepted', 'queued'].includes(fin.prospect?.state) ? fin.prospectMsg : null;
       return finish(route, delivered, { alreadySent: true, routeIntent });
     }
     // Name unknown → say exactly what was recorded and ask for the name. The manager
@@ -3099,7 +3100,7 @@ async function handleLeadCallbackFlow({ msg, fromNorm, fromIsraeli, clientMatch,
           return askForTime(`תודה ${captured}! 🙂 מתי נוח לך שנחזור אליך? (יום ושעה)`, 'post_call_name_captured');
         }
         const fin = await callbackSvc.finalize({ phone: fromNorm, trigger: 'name_captured' });
-        const delivered = fin.prospect?.state === 'accepted' ? fin.prospectMsg : null;
+        const delivered = ['accepted', 'queued'].includes(fin.prospect?.state) ? fin.prospectMsg : null;
         return finish('post_call_name_captured', delivered, { alreadySent: true });
       }
     }

@@ -71,6 +71,10 @@ function safeExternalEnv() {
     STUDIO_OWNER_PHONE:       TEST_MANAGER_PHONE,
     NOTIFY_PHONES:            TEST_MANAGER_PHONE,
     BACKEND_URL:              '',
+    // Quiet hours off by default (start === end) so suites behave the same at any hour of
+    // the day; suites that test quiet hours set these explicitly with a fixed clock.
+    QUIET_HOUR_START:         '0',
+    QUIET_HOUR_END:           '0',
     NODE_ENV:                 'test',
     TZ:                       'Asia/Jerusalem',
   };

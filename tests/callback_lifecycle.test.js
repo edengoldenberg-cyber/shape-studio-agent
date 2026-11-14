@@ -40,6 +40,8 @@ const mockOut = {
   texts: [],          // { to, text, id, aptFileAtSend }
   alerts: [],         // { phone, subject, body, id, linkPreview }
   failTextTo: null,   // phone → sendText rejects
+  queueTextTo: null,  // phone → sendText answers like the real quiet-hours path: { queued: true }
+  queued: [],
   hangTextTo: null,   // phone → sendText never settles (provider hang / process killed mid-send)
   failManager: false, // manager dispatch returns no idMessage
   seq: 0,
@@ -54,6 +56,7 @@ jest.mock('../services/whatsapp.service', () => {
     sendText: jest.fn((to, text, opts = {}) => {
       if (mockOut.failTextTo === to) return Promise.reject(new Error('simulated_send_fail'));
       if (mockOut.hangTextTo === to) return new Promise(() => {});
+      if (mockOut.queueTextTo === to) { mockOut.queued.push({ to, text }); return Promise.resolve({ queued: true, releaseAt: new Date() }); }
       const id = `MSG_${++mockOut.seq}`;
       let aptFileAtSend = null;
       try { aptFileAtSend = mfs.readFileSync(mockOut.aptsFile, 'utf8'); } catch { /* no file yet */ }
@@ -167,7 +170,7 @@ const local = phone => '0' + phone.slice(3);
 /** Staff reminders that concern one specific lead (the store is shared across tests). */
 const staffRemindersFor    = phone => textsTo(MANAGER).filter(t => /תזכורת: שיחה/.test(t.text) && t.text.includes(local(phone)));
 const prospectRemindersFor = phone => textsTo(phone).filter(t => /עדיין נוח לך/.test(t.text));
-function clearOut() { mockOut.texts.length = 0; mockOut.alerts.length = 0; mockOut.failTextTo = null; mockOut.hangTextTo = null; mockOut.failManager = false; }
+function clearOut() { mockOut.texts.length = 0; mockOut.alerts.length = 0; mockOut.failTextTo = null; mockOut.hangTextTo = null; mockOut.queueTextTo = null; mockOut.queued.length = 0; mockOut.failManager = false; }
 
 /** A genuine lead: first message shows studio interest so Barak (not unclassified) owns it. */
 async function newLead() {
@@ -1262,5 +1265,58 @@ describe('10. Crash recovery and startup retry (real startup routine)', () => {
     clearOut();
     await app._recoverClosingSummaries().retries;
     expect(summaries()).toHaveLength(0);                       // not retried twice
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+describe('11. Quiet hours (22:00–08:00 Israel) are in force', () => {
+  test('isQuietHours follows the configured window', () => {
+    const { isQuietHours } = require('../utils/time');
+    setNow(il(2026, 11, 16, 23, 0));  expect(isQuietHours()).toBe(true);
+    setNow(il(2026, 11, 17, 3, 30));  expect(isQuietHours()).toBe(true);
+    setNow(il(2026, 11, 17, 7, 59));  expect(isQuietHours()).toBe(true);
+    setNow(il(2026, 11, 17, 8, 0));   expect(isQuietHours()).toBe(false);
+    setNow(il(2026, 11, 17, 21, 59)); expect(isQuietHours()).toBe(false);
+    setNow(il(2026, 11, 17, 22, 0));  expect(isQuietHours()).toBe(true);
+  });
+
+  test('no prospect reminder is sent (or queued) during quiet hours; staff are still reminded', async () => {
+    const phone = await leadWithCallback({ timeText: 'מחר ב-8 בבוקר' });
+    expect(openApt(phone).scheduledAt.toISOString()).toBe(il(2026, 11, 17, 8, 0).toISOString());
+    clearOut();
+    setNow(il(2026, 11, 17, 7, 35));                          // 25 min before, still quiet hours
+    const res = await worker.runCycle(store);
+    expect(res.skippedQuietHours).toBe(true);
+    expect(prospectRemindersFor(phone)).toHaveLength(0);
+    expect(openApt(phone).prospectReminderSent).toBe(false);
+    expect(staffRemindersFor(phone)).toHaveLength(1);
+    setNow(il(2026, 11, 17, 8, 5));                           // the call time has passed
+    await worker.runCycle(store);
+    expect(prospectRemindersFor(phone)).toHaveLength(0);      // never sent late
+  });
+
+  test('summary queued at night is recorded as queued, covered once, and never duplicated', async () => {
+    const phone = await newLead();
+    setNow(il(2026, 11, 16, 23, 10));
+    mockOut.queueTextTo = phone;                              // what sendText returns in quiet hours
+    await say(phone, 'תתקשרו אליי מחר ב-10:00');
+    const apt = openApt(phone);
+    expect(apt.scheduledAt.toISOString()).toBe(il(2026, 11, 17, 10, 0).toISOString());   // persisted regardless
+    clearOut(); mockOut.queueTextTo = phone;
+    await say(phone, 'דנה');
+    expect(summaries()).toHaveLength(1);                      // the manager is told now
+    const m = store.getLead(phone).meta;
+    expect(m.closingSummaryProspectState).toBe('queued');     // not reported as delivered
+    expect(m.closingSummaryProspectIdMessage).toBeNull();
+    expect(aptStore.getNotified(apt.id, 'prospect_summary')).toEqual([phone]);
+    // Morning: a retry must not send a second copy on top of the queued one.
+    mockOut.queueTextTo = null;
+    setNow(il(2026, 11, 17, 8, 40));
+    restart();
+    await app._recoverClosingSummaries().retries;
+    const forced = await post(`/api/admin/send-closing-summary/${phone}`, { force: true });
+    expect(forced.status).toBe(200);
+    expect(textsTo(phone).filter(t => /קיבלנו את בקשת השיחה/.test(t.text))).toHaveLength(0);
+    expect(summaries()).toHaveLength(1);
   });
 });
