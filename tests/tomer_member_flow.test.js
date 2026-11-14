@@ -369,6 +369,7 @@ describe('B. Verified Arbox reads', () => {
 
   test('Arbox timeout is handled like unavailability (no hang, no guess)', async () => {
     const m = member();
+    await require('../services/identity_resolver').shared().refresh();      // she is a known member before Arbox stops answering
     arbox.mode.hang = true; gateway.clearCache();
     await say(m.phone, 'לאיזה שיעורים אני רשומה השבוע?');
     expect(lastTo(m.phone)).toMatch(/לא הצלחתי לזהות|אין לי כרגע גישה/);

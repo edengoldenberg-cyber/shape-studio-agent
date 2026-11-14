@@ -64,6 +64,7 @@ const { createTomerService }           = require('./services/tomer_service');
 const retentionWorker                  = require('./workers/retention_worker');
 const studioAssets                     = require('./utils/studio_assets');
 const memberCache                      = require('./utils/member_cache');
+const identity                         = require('./services/identity_resolver').shared();   // the ONE identity resolver
 const { detectAndMarkConversions, isMemberPhoneSync } = require('./utils/conversion_detector');
 
 // ── Staff configuration (hot-reloadable) ─────────────────────────────────────
@@ -646,6 +647,7 @@ const CODE_FEATURES = [
   'tomer_panel_v2',       // staff-handled membership requests, one manager alert, complete cases panel
   'tomer_test_only_v1',   // services/tomer_test_mode.js — new flow only for allowlisted phones unless TOMER_MODE=all
   'member_care_v1',       // services/member_care.js — proactive programs (all off by default) + shared contact policy
+  'identity_resolver_v1', // services/identity_resolver.js — one resolver for registry, cache and live lookup; active flag ≠ membership
   'member_care_gates_v2', // owner approval of the contact policy gates activation; unknown freeze status blocks absence outreach; late replies → context or one clarification
   'strict_callback_time', // utils/callback_time.js — no default hour, no AI date guessing
   'apt_persist_strict',   // appointment_store update/updateBatch throw + roll back on failed write
@@ -2000,10 +2002,17 @@ function _manualTakeover(norm, { reason = 'manual', staffName = null } = {}) {
   return { prevStatus, unchanged: false };
 }
 
-/** Is this phone a studio member as far as the local identity sources know? (no network) */
+/** Is this phone a studio member as far as the shared identity resolver knows? (no network) */
 function _isKnownMemberPhone(norm) {
-  try { return !!(memberCache.isConfirmed(norm) || phoneRegistry.isMember(norm)); } catch { return false; }
+  try {
+    const e = memberCache.getEntry(norm);
+    if (e && String(e.source ?? '').startsWith('manual_') && memberCache.isConfirmed(norm)) return true;   // explicit staff decision
+    return ['member', 'aggregator'].includes(identity.peek(norm).category);
+  } catch { return false; }
 }
+// Topics a FORMER member is sent to staff for (never Barak, never Tomer).
+const FORMER_MEMBER_STAFF_TOPICS = new Set(['complaint', 'refund_request', 'billing_dispute', 'payment_issue', 'receipt_request', 'payment_claim',
+  'billing_question', 'membership_cancel', 'membership_freeze', 'app_problem', 'staff_request', 'injury']);
 
 /** Release human ownership. Idempotent; returns null when there is no record. */
 function _releaseConversation(norm) {
@@ -3596,19 +3605,8 @@ async function processInboundWAMessage(msg) {
     return { inboxEntry: reactionEntry, clientMatch: { found: false }, intent: 'reaction', route: 'reaction_bypass', barakReply: null };
   }
 
-  // ── REGISTRY GATE: synchronous O(1) identity check ───────────────────────────
-  // This runs before ANY async work. isMember() is a plain Set.has() — no I/O,
-  // no TTL math, no Arbox call.
-  // On hit: pre-seeds memberCache so the 4-tier lookup immediately classifies
-  // this phone as a confirmed member (tier1Fresh=true), which sets isExistingClient=true
-  // and routes to Tomer. We do NOT return early here — we let the existing pipeline
-  // proceed with a guaranteed memberCache hit so inbox logging, SSE, and persist
-  // all run normally. The routing outcome is now deterministic: isExistingClient=true.
-  const _registryHit = phoneRegistry.isMember(fromNorm) || phoneRegistry.isMember(fromIsraeli);
-  if (_registryHit) {
-    logger.info('[registry-gate] MEMBER confirmed — pre-seeding cache for guaranteed Tomer routing', { from: fromNorm });
-    memberCache.markConfirmed(fromNorm, { source: 'phone_registry', name: msg.name ?? null, role: 'client' });
-  }
+  // (Identity is resolved once, below, by services/identity_resolver.js — the registry, the
+  //  member cache and the live lookup no longer decide separately.)
 
   // 0b. Staff bypass — messages from Eden/Melanie are stored in the inbox for
   //     visibility but are never processed through the lead/client pipeline.
@@ -3640,124 +3638,87 @@ async function processInboundWAMessage(msg) {
     return _processTomerTestMessage(msg, fromNorm, fromIsraeli);
   }
 
-  // 1. Four-tier member identity resolution
+  // 1. Identity — ONE shared resolver (services/identity_resolver.js).
   //
-  //   Tier 1 (fastest): in-process memberCache — sub-millisecond, no I/O.
-  //     If fresh (< 5 min), skip the Arbox lookup entirely.
-  //     If confirmed (< 24 hr), skip the lookup and use cached identity.
+  //   member         client row with a verified, currently valid membership   → Tomer
+  //   aggregator     aggregator member, identified separately                 → existing member handling
+  //   former_member  client row with membership history, none valid today     → Barak (renewal) / staff (service, billing)
+  //   staff          active Arbox staff row                                   → staff bypass, never Barak
+  //   lead / unknown lead row, client row without any membership, not in Arbox → Barak
+  //   unavailable    could not be determined                                  → neither agent: hold + staff alert
   //
-  //   Tier 2: known_members.json file — < 2ms disk read.
-  //     Populated proactively by the 15-min seed cron and reactively on every
-  //     successful Arbox confirmation.
-  //
-  //   Tier 3: Live Arbox lookup — only fires when both caches miss (genuine
-  //     first-contact or entry older than 24hr).
-  //     On hit: seeds Tier 1 + Tier 2 so future messages are instant.
-  //
-  //   Tier 4 (degraded): Arbox is unreachable AND no cache record exists.
-  //     Cannot determine member vs. lead — sends a neutral hold message and
-  //     alerts staff. Never runs Barak's qualification funnel. This is
-  //     intentionally conservative: a false silence is safer than a false sale.
+  //   The Arbox `active` flag is not a membership, and a row merely existing proves nothing.
+  //   Complete pagination, normalised phones, shared phones and stale data are handled in
+  //   the resolver; the result is recorded on the inbox entry (clientMatch.identity).
+  const ident = await identity.resolve(fromNorm);
+  // A member confirmed by hand in the admin panel (an explicit staff decision, valid 24 h) is honoured.
+  const _manualMember = (() => {
+    const e = memberCache.getEntry(fromNorm);
+    return !!e && String(e.source ?? '').startsWith('manual_') && memberCache.isConfirmed(fromNorm);
+  })();
+  const identCategory = _manualMember && !['member', 'aggregator', 'staff'].includes(ident.category) ? 'member' : ident.category;
+  const _identInfo = { category: identCategory, resolved: ident.category, manual: _manualMember && identCategory !== ident.category,
+    stale: !!ident.stale, refreshFailed: !!ident.refreshFailed, shared: !!ident.shared, ambiguous: !!ident.ambiguous, others: ident.others ?? [], reason: ident.reason ?? null };
 
-  let clientMatch = { found: false, matchType: null, arboxName: null, arboxId: null, isActive: false, role: null };
-  let arboxLookupFailed = false;
+  // 1a. Arbox staff who are not in the local staff roster: same bypass as roster staff.
+  if (identCategory === 'staff') {
+    logger.info('Inbound message from Arbox staff member — bypassing pipeline', { from: fromNorm });
+    const _sm = { found: true, matchType: 'staff', arboxName: ident.name ?? null, arboxId: ident.userIds?.[0] ?? null, isActive: true, role: 'staff', identity: _identInfo };
+    const staffEntry2 = inbox.push({
+      from: fromNorm, fromIsraeli, name: msg.name ?? ident.name ?? null, text: msg.text ?? '', messageId: msg.messageId,
+      timestamp: msg.timestamp, receivedAt: new Date(), mediaType: msg.type, mediaCaption: msg.mediaCaption ?? null, mediaId: msg.mediaId ?? null,
+      clientMatch: _sm, intent: 'staff', route: 'staff_bypass', barakReply: null,
+    });
+    return { inboxEntry: staffEntry2, clientMatch: _sm, intent: 'staff', route: 'staff_bypass', barakReply: null };
+  }
 
-  const tier1Fresh     = memberCache.isFresh(fromNorm);
-  const tier1Confirmed = !tier1Fresh && memberCache.isConfirmed(fromNorm);
-  const tier2File      = !tier1Fresh && !tier1Confirmed && (isKnownMember(fromNorm) || isKnownMember(fromIsraeli));
+  const isAggregator     = identCategory === 'aggregator';
+  const isFormerMember   = identCategory === 'former_member';
+  const isExistingClient = identCategory === 'member' || isAggregator;
+  const arboxConfirmedClient = isExistingClient && !_identInfo.manual;
+  // Identity could not be determined → the degraded-mode guard below holds the message.
+  // Also when Arbox could not be read just now and the older copy does not know this phone as a
+  // member: "not a member" is unproven (they may have joined since), so Barak must not start.
+  // (A lead that fresh data confirmed in the last 2 hours passes — see the guard below.)
+  const arboxLookupFailed = identCategory === 'unavailable' || (!!ident.refreshFailed && !isExistingClient);
+  if (arboxLookupFailed) logger.warn('[pipeline] Identity unavailable — degraded-mode hold will apply', { from: fromNorm, reason: ident.reason });
 
-  const skipArboxLookup = tier1Fresh || tier1Confirmed || tier2File;
+  const clientMatch = {
+    found:     !['unknown', 'unavailable'].includes(identCategory),
+    matchType: isExistingClient ? 'member' : ['former_member', 'lead'].includes(identCategory) ? identCategory : null,
+    arboxName: ident.name ?? null,
+    arboxId:   ident.userIds?.[0] ?? null,
+    isActive:  isExistingClient,
+    role:      isAggregator ? 'aggregatorMember' : identCategory === 'member' || isFormerMember ? 'client' : identCategory === 'lead' ? 'lead' : null,
+    identity:  _identInfo,
+  };
 
-  if (skipArboxLookup) {
-    // Satisfy the clientMatch shape from cache so downstream code stays intact
-    const cached = memberCache.getEntry(fromNorm);
-    if (cached) {
-      clientMatch = {
-        found:     true,
-        matchType: 'member',
-        arboxName: cached.name ?? null,
-        arboxId:   null,   // not needed after routing decision
-        isActive:  true,
-        role:      cached.role ?? 'client',
-      };
-    } else if (tier2File) {
-      // known_members.json hit but no in-process entry — backfill the cache so the
-      // next message is sub-millisecond instead of incurring another disk read.
-      memberCache.markConfirmed(fromNorm, { source: 'known_members_backfill' });
-      clientMatch = { found: true, matchType: 'member', arboxName: null, arboxId: null, isActive: true, role: 'client' };
+  // A contact that fresh Arbox data shows is NOT a member: stamp it, so a short Arbox outage
+  // right afterwards does not hold their next message (see the degraded-mode guard).
+  if (['lead', 'unknown', 'former_member'].includes(identCategory) && !ident.stale) {
+    const existing = store.getLead(fromNorm);
+    if (existing && existing.status !== 'converted_member') {
+      store.upsertLead(fromNorm, { meta: { ...(existing.meta ?? {}), arboxConfirmedColdLead: true, arboxColdLeadConfirmedAt: Date.now() } });
     }
-  } else {
-    // Tier 3: live Arbox lookup — only reaches here on genuine cache miss
-    try {
-      const lookup = await barakAgent.lookupClient(fromIsraeli ?? fromNorm ?? '');
-      if (lookup.total > 0) {
-        // Always prefer a member record over a lead record for the routing decision.
-        // If getMembers() partially failed and only the lead record was returned,
-        // results[0] would be type='lead' — routing the person to Barak despite being a member.
-        const best = lookup.results.find(r => r.type === 'member') ?? lookup.results[0];
-        clientMatch = {
-          found:     true,
-          matchType: best.type,
-          arboxName: best.name,
-          arboxId:   String(best.user_id ?? ''),
-          isActive:  best.active ?? false,
-          role:      best.role ?? null,
-        };
-        // Seed Tier 1 + Tier 2 immediately so the next message is cache-fast
-        if (best.type === 'member' || best.role === 'aggregatorMember') {
-          memberCache.markConfirmed(fromNorm, { name: best.name, role: best.role ?? 'client', source: 'arbox_live' });
-          _autoAddKnownMember(fromNorm, best.name ?? msg.name);
-        } else if (best.type === 'lead' && !lookup.memberLookupFailed) {
-          // Arbox confirmed this person as a cold lead — stamp the flag + a timestamp so
-          // Tier-4 can safely bypass during RECENT outages.
-          //
-          // Guard: !memberLookupFailed is REQUIRED before stamping.
-          // When getMembers() fails and only the lead record is returned, we have NOT
-          // confirmed there is no member record for this phone. Stamping here would let
-          // the next message bypass Tier-4 (via _tier4ActiveLead freshness window) even
-          // though member status is unknown — sending a potential subscriber to Barak.
-          const existing = store.getLead(fromNorm);
-          if (existing && existing.status !== 'converted_member') {
-            store.upsertLead(fromNorm, {
-              meta: { ...(existing.meta ?? {}), arboxConfirmedColdLead: true, arboxColdLeadConfirmedAt: Date.now() },
-            });
-          }
-        }
-      }
+  }
 
-      // If getMembers() specifically failed and no member was found, we cannot confirm
-      // cold-lead status — treat this as an Arbox failure so Tier-4 fires correctly.
-      if (lookup.memberLookupFailed) {
-        arboxLookupFailed = true;
-        logger.warn('[pipeline] Member lookup failed in lookupClient — identity uncertain, triggering Tier-4', {
-          from: fromNorm,
-        });
-      }
-    } catch (lookupErr) {
-      arboxLookupFailed = true;
-      logger.warn('[pipeline] Arbox lookup failed — falling back to cached member data', {
-        from: fromNorm, error: lookupErr.message, tier1Confirmed, tier2File,
-      });
+  // 1b. Former member: identified as such and kept in the lead world WITH their history.
+  //     A record that was parked as 'converted_member' while they were a member is reopened
+  //     (history and meta untouched) so that renewal interest can reach Barak.
+  if (isFormerMember) {
+    const rec = store.getLead(fromNorm);
+    const meta = { ...(rec?.meta ?? {}), formerMember: true, formerMemberArboxId: ident.userIds?.[0] ?? null, formerMemberSeenAt: new Date().toISOString() };
+    if (rec && rec.status === 'converted_member') {
+      store.upsertLead(fromNorm, { status: 'cold', meta: { ...meta, reopenedFromConvertedMemberAt: new Date().toISOString() } });
+      store.logEvent('former_member_reopened_as_lead', fromNorm, { historyPreserved: (rec.history ?? []).length });
+      logger.info('[pipeline] Former member — lead record reopened (history preserved)', { from: fromNorm });
+    } else if (rec) {
+      store.upsertLead(fromNorm, { meta });
     }
   }
 
   // 2. Intent detection (only meaningful for text messages)
   const intent = msg.type === 'text' ? detectSchedulingIntent(msg.text) : 'general';
-
-  // ── Client identity — resolved HERE, before any early-return path ─────────────
-  // Four-tier resolution (see lookup block above for full commentary).
-  //
-  //   Tier 1a — memberCache.isFresh    → skipArboxLookup=true, clientMatch already set
-  //   Tier 1b — memberCache.isConfirmed → skipArboxLookup=true, clientMatch already set
-  //   Tier 2  — known_members.json     → skipArboxLookup=true, clientMatch already set
-  //   Tier 3  — Live Arbox             → clientMatch set above if lookup succeeded
-  //
-  // aggregatorMember (ClassPass/Gympass) is treated as an existing client for routing.
-  const arboxConfirmedClient = clientMatch.found &&
-    (clientMatch.matchType === 'member' || clientMatch.role === 'aggregatorMember');
-  const isAggregator          = clientMatch.found && clientMatch.role === 'aggregatorMember';
-  const inProcessConfirmed    = tier1Fresh || tier1Confirmed;
-  const isExistingClient      = arboxConfirmedClient || inProcessConfirmed || tier2File;
 
   // Lead reschedule requests are handled by handleLeadCallbackFlow (below, AFTER the
   // human_owns / opted_out gates) — never before ownership has been checked.
@@ -4153,6 +4114,32 @@ async function processInboundWAMessage(msg) {
       clientMatch, intent, route: 'arbox_outage_hold', barakReply: holdMsg,
     });
     return { inboxEntry: holdEntry, clientMatch, intent, route: 'arbox_outage_hold', barakReply: holdMsg };
+  }
+
+  // 2c-bis. FORMER MEMBER with a service / billing issue → staff, not Barak and not Tomer.
+  //     Renewal or training interest continues below to Barak like any lead.
+  if (isFormerMember && msg.type === 'text' && (msg.text ?? '').trim()) {
+    const _fmCat = require('./services/member_intent').classify(msg.text).category;
+    if (FORMER_MEMBER_STAFF_TOPICS.has(_fmCat)) {
+      const ackMsg = `קיבלנו את הודעתך 🙏 הפנייה נרשמה לטיפול צוות הסטודיו.`;
+      store.logEvent('former_member_service_to_staff', fromNorm, { category: _fmCat, preview: (msg.text ?? '').slice(0, 80) });
+      alertOwner('📋 חבר/ה לשעבר — פנייה בנושא שירות / חיוב',
+        `📱 ${fromIsraeli ?? fromNorm}${ident.name ? `\n👤 ${ident.name}` : ''}\n📝 "${(msg.text ?? '').slice(0, 300)}"\n\nלפי Arbox אין מנוי בתוקף (חבר/ה לשעבר). ההודעה לא הועברה לברק ולא נענתה על ידי תומר — נדרש טיפול צוות.\n💬 https://wa.me/${fromNorm}`,
+        { linkPreview: false }).catch(() => {});
+      let _fmSent = null;
+      if (process.env.WHATSAPP_AUTO_REPLY === 'true') {
+        _markBotSent(fromNorm);
+        const r = await sendText(fromNorm, ackMsg).catch(() => null);
+        if (r?.idMessage) { _recordBotSend(r.idMessage, fromNorm); _fmSent = ackMsg; }
+      }
+      const fmEntry = inbox.push({
+        from: fromNorm, fromIsraeli, name: msg.name ?? ident.name ?? null, text: msg.text ?? '', messageId: msg.messageId,
+        timestamp: msg.timestamp, receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
+        clientMatch, intent, route: 'former_member_staff', barakReply: _fmSent,
+      });
+      persist.saveInbox(inbox);
+      return { inboxEntry: fmEntry, clientMatch, intent, route: 'former_member_staff', barakReply: _fmSent };
+    }
   }
 
   // 2d. Lead callback flow — active phase.
@@ -4561,6 +4548,9 @@ async function processInboundWAMessage(msg) {
         ...(existing.meta ?? {}),
         lastIntent: intent,
         source:     'whatsapp_live',
+        // Fresh Arbox data showed this contact is not a member (also on their very first message).
+        ...(['lead', 'unknown', 'former_member'].includes(identCategory) && !ident.stale
+          ? { arboxConfirmedColdLead: true, arboxColdLeadConfirmedAt: Date.now() } : {}),
       },
     });
 
@@ -7201,6 +7191,9 @@ app.listen(PORT, async () => {
   // 10s timeout — if Arbox is unreachable at deploy time, the registry starts
   // empty; Gate 1 (memberCache) and Gate 2 (operational interceptor) remain
   // active as independent safety layers throughout the warm-up window.
+  // Identity: the last saved directory is loaded first, so a restart during an Arbox outage
+  // still knows who the members are (marked stale); phoneRegistry.init then reads Arbox afresh.
+  try { if (identity.load()) logger.info('[startup] identity directory loaded from disk (stale until refreshed)'); } catch (err) { logger.warn('[startup] identity directory not loaded', { error: err.message }); }
   await phoneRegistry.init({ timeoutMs: 10_000 });
 
   // TEST_STARTUP_DELAY_MS: artificial pause injected between loadLeads and

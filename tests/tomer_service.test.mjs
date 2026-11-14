@@ -263,11 +263,12 @@ if (!hasOpenAI) {
     });
   }
 
-  // Seed member into memberCache so the pipeline routes to Tomer
-  // (PhoneRegistry doesn't expose forceAdd; memberCache.markConfirmed is the right hook)
+  // Routing follows the shared identity resolver. This harness's Arbox stand-in knows nobody,
+  // so the member is declared the way staff do it in the admin panel: an explicit manual
+  // confirmation (source 'manual_*'), the only cache entry the pipeline honours by itself.
   const memberCache = require('../utils/member_cache');
   const memberPhone = '972509930006';
-  memberCache.markConfirmed(memberPhone, { name: 'Test Member', role: 'client', source: 'test' });
+  memberCache.markConfirmed(memberPhone, { name: 'Test Member', role: 'client', source: 'manual_conversion' });
 
   _sends.length = 0;
 

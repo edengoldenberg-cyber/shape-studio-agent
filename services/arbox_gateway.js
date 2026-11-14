@@ -126,7 +126,9 @@ async function cached(key, ttlMs, loader, { maxStaleMs = 30 * 60 * 1000 } = {}) 
     throw err;
   }
 }
-function clearCache(prefix = '') { for (const k of [..._cache.keys()]) if (k.startsWith(prefix)) _cache.delete(k); }
+let _cacheEpoch = 0;   // bumped whenever cached Arbox data is dropped, so holders of derived data (identity resolver) re-read
+function clearCache(prefix = '') { for (const k of [..._cache.keys()]) if (k.startsWith(prefix)) _cache.delete(k); _cacheEpoch++; }
+const cacheEpoch = () => _cacheEpoch;
 
 // ── Members ───────────────────────────────────────────────────────────────────
 const USERS_TTL = 5 * 60 * 1000;
@@ -465,5 +467,5 @@ module.exports = {
   resolveMember, getMemberById, getMemberships, getBookings, getClasses, getCancellations, getHoldStatus,
   getAllUsers, getAllMemberships, getMembershipTypes, getAllBookings, getAllCancellations, getHolds, getTransactions,
   executeWrite, writesEnabled, writeStatus, WRITE_CONTRACTS,
-  todayIL, dateIL, clearCache, _resetForTests,
+  todayIL, dateIL, clearCache, cacheEpoch, _resetForTests,
 };

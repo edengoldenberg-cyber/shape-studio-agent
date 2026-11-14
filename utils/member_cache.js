@@ -165,43 +165,37 @@ function flush() { _dirty = true; _flush(); }
  *   Pass the normalization and auto-add helpers from server.js to avoid circular deps.
  * @returns {Promise<{ seeded: number, skipped: number, error?: string }>}
  */
-async function seedFromArbox({ normalizeToE164, _autoAddKnownMember } = {}) {
-  let arboxSvc;
-  try { arboxSvc = require('../services/arbox.service'); } catch {
-    return { seeded: 0, skipped: 0, error: 'arbox_service_unavailable' };
+async function seedFromArbox() {
+  // The cache has no rule of its own: it mirrors what the shared identity resolver says.
+  // Confirmed = member (verified, currently valid membership) or aggregator member.
+  // Everything else that was cached earlier (leads and staff with the Arbox `active` flag,
+  // expired members) is REMOVED — except entries a staff member confirmed by hand.
+  let identity;
+  try { identity = require('../services/identity_resolver').shared(); } catch (err) {
+    return { seeded: 0, skipped: 0, error: 'identity_resolver_unavailable' };
   }
-
-  let users = [];
-  try {
-    // getAllUsers fetches active + inactive so we don't miss aggregators with active=0
-    users = await arboxSvc.getAllUsers({ limit: 1000 });
-  } catch (err) {
-    logger.warn('[member-cache] Arbox seed failed — API unreachable', { error: err.message });
+  let summary;
+  try { summary = await identity.refresh(); } catch (err) {
+    logger.warn('[member-cache] seed skipped — Arbox unreachable, cache left as it is', { error: err.message });
     return { seeded: 0, skipped: 0, error: err.message };
   }
-
-  let seeded = 0, skipped = 0;
-  for (const u of users) {
-    if (!u.phone) { skipped++; continue; }
-
-    // Only cache confirmed members: active clients and aggregators
-    const isMember = u.active === 1 || u.user_role === 'aggregatorMember';
-    if (!isMember) { skipped++; continue; }
-
-    const phone = normalizeToE164 ? normalizeToE164(u.phone) : u.phone.replace(/[\s\-+()]/g, '');
-    if (!phone) { skipped++; continue; }
-
-    const name = `${u.first_name ?? ''} ${u.last_name ?? ''}`.trim() || null;
-    markConfirmed(phone, { name, role: u.user_role ?? 'client', source: 'arbox_scheduled' });
-
-    if (_autoAddKnownMember) {
-      _autoAddKnownMember(phone, name);
+  const keep = new Map(identity.phonesIn(['member', 'aggregator']).map(x => [x.phone, x]));
+  let seeded = 0, removed = 0;
+  // Purge only on complete data: with unreadable memberships nobody is un-confirmed by a guess.
+  if (summary.membershipsFresh) {
+    for (const [phone, e] of [..._map]) {
+      if (String(e.source ?? '').startsWith('manual_') || keep.has(phone)) continue;
+      _map.delete(phone); removed++; _dirty = true;
     }
+  }
+  for (const [phone, x] of keep) {
+    const cur = _map.get(phone);
+    if (cur && String(cur.source ?? '').startsWith('manual_')) continue;
+    markConfirmed(phone, { name: x.name ?? null, role: x.category === 'aggregator' ? 'aggregatorMember' : 'client', source: 'identity_resolver' });
     seeded++;
   }
-
-  logger.info('[member-cache] Arbox seed complete', { seeded, skipped, total: users.length });
-  return { seeded, skipped };
+  logger.info('[member-cache] seeded from the identity resolver', { seeded, removed, counts: summary.counts });
+  return { seeded, skipped: removed, removed };
 }
 
 // Initialize: load from file on first require

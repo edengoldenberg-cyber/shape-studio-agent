@@ -42,6 +42,12 @@ function createArboxMock() {
       if (req.method === 'GET' && mode.hang) return; // never answers
 
       if (req.method === 'GET') {
+        if (p === '/v3/users' && mode.usersDown) return send(res, 500, { error: { message: 'users failed' } });
+        if (p === '/v3/users/memberships' && mode.membershipsDown) return send(res, 500, { error: { message: 'memberships failed' } });
+        if (p === '/v3/users/memberships' && !q.user_id && q.page) {          // studio-wide read: paged like the real API
+          const page = Number(q.page), limit = Number(q.limit ?? 200);
+          return send(res, 200, { data: state.memberships.slice((page - 1) * limit, page * limit), extra: { pagination: { next_page_url: page * limit < state.memberships.length ? 'next' : null } } });
+        }
         if (p === '/v3/users') {
           const page = Number(q.page ?? 1), limit = Number(q.limit ?? 200);
           const slice = state.users.slice((page - 1) * limit, page * limit);
@@ -93,7 +99,7 @@ function createArboxMock() {
     close: () => new Promise(r => { server.closeAllConnections?.(); server.close(() => r()); }),
     reset() {
       for (const k of Object.keys(state)) state[k].length = 0;
-      Object.assign(mode, { down: false, hang: false, occupancyDown: false, write: 'success', bookingsDown: false, billingDown: false, after: null });
+      Object.assign(mode, { down: false, hang: false, occupancyDown: false, write: 'success', bookingsDown: false, billingDown: false, holdsDown: false, usersDown: false, membershipsDown: false, after: null });
       log.length = 0;
     },
   };

@@ -59,6 +59,8 @@ jest.mock('../services/whatsapp.service', () => {
   };
 });
 
+// Identity is not this suite's subject: the stand-in follows the member_cache / phone_registry mocks below.
+jest.mock('../services/identity_resolver', () => require('./helpers/identity_mock.cjs'));
 jest.mock('../utils/member_cache', () => ({
   isConfirmed: jest.fn(() => false), isFresh: jest.fn(() => false),
   getEntry: jest.fn(() => null), markConfirmed: jest.fn(),
