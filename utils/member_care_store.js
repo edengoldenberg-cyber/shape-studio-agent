@@ -8,7 +8,10 @@
  *
  * {
  *   settings: { programs: { <id>: { enabled, hour, activatedAt } }, groupLink, paymentResolution,
- *               billingDataConfirmed, policy: {...}, updatedAt, updatedBy },
+ *               billingDataConfirmed, policy: {...}, updatedAt, updatedBy,
+ *               policyApproval: null | { by, at, fingerprint },   // owner approval of the contact policy AS SHOWN
+ *               freezeSourceConfirmed: null | { by, at } },       // staff confirmed the Arbox hold report is reliable
+ *   freezeReviews: { <userId>: { status: 'not_frozen'|'frozen', by, at, validUntil, note } },   // staff-reviewed, expires
  *   episodes: { <key>: episode },      // one per member + program + eligibility episode
  *   pauses:   { <phone>: { reason, note, until, endKnown, setBy, setAt, userId, name } },
  *   careOptOut: { <phone>: { at, via } },                 // "stop writing to me" — proactive only
@@ -62,8 +65,10 @@ function defaults() {
       programs: Object.fromEntries(PROGRAM_IDS.map(id => [id, { enabled: false, hour: DEFAULT_HOURS[id], activatedAt: null }])),
       groupLink: null, paymentResolution: null, billingDataConfirmed: false,
       policy: { ...DEFAULT_POLICY }, updatedAt: null, updatedBy: null,
+      policyApproval: null,            // nothing can be activated until the owner approves the policy
+      freezeSourceConfirmed: null,     // until confirmed, "no row in the hold report" means UNKNOWN, not "not frozen"
     },
-    episodes: {}, pauses: {}, careOptOut: {}, entitlements: {}, runs: [], lastRun: {}, lock: null,
+    episodes: {}, pauses: {}, careOptOut: {}, entitlements: {}, freezeReviews: {}, runs: [], lastRun: {}, lock: null,
   };
 }
 
@@ -79,7 +84,7 @@ function _load() {
       s.settings = { ...d.settings, ...(raw.settings ?? {}) };
       s.settings.policy = { ...DEFAULT_POLICY, ...(raw.settings?.policy ?? {}) };
       s.settings.programs = Object.fromEntries(PROGRAM_IDS.map(id => [id, { ...d.settings.programs[id], ...(raw.settings?.programs?.[id] ?? {}) }]));
-      for (const k of ['episodes', 'pauses', 'careOptOut', 'entitlements', 'lastRun']) s[k] = raw[k] ?? {};
+      for (const k of ['episodes', 'pauses', 'careOptOut', 'entitlements', 'freezeReviews', 'lastRun']) s[k] = raw[k] ?? {};
       s.runs = raw.runs ?? []; s.lock = raw.lock ?? null;
     }
   } catch (err) {
@@ -163,6 +168,22 @@ const isCareOptedOut = phone => !!_load().careOptOut[phone];
 function setCareOptOut(phone, via = 'member') { return mutate(s => { s.careOptOut[phone] = { at: nowIso(), via }; return s.careOptOut[phone]; }); }
 function clearCareOptOut(phone) { if (_load().careOptOut[phone]) mutate(s => { delete s.careOptOut[phone]; }); }
 
+// ── staff-reviewed freeze status (explicit, per member, expires) ──────────────
+/** The review that is still valid on `today` (Israel date), or null. An expired review is ignored, never deleted. */
+function getFreezeReview(userId, today) {
+  const r = _load().freezeReviews[String(userId)];
+  if (!r || !['not_frozen', 'frozen'].includes(r.status)) return null;
+  if (!r.validUntil || (today && r.validUntil < today)) return null;
+  return clone(r);
+}
+const listFreezeReviews = () => clone(Object.entries(_load().freezeReviews).map(([userId, r]) => ({ userId, ...r })));
+function setFreezeReview(userId, { status, by, validUntil, note = null }) {
+  if (!['not_frozen', 'frozen'].includes(status)) throw new Error('bad_freeze_status');
+  if (!by || !validUntil) throw new Error('freeze_review_needs_reviewer_and_validity');
+  return mutate(s => { s.freezeReviews[String(userId)] = { status, by, at: nowIso(), validUntil, note }; return s.freezeReviews[String(userId)]; });
+}
+function clearFreezeReview(userId) { if (_load().freezeReviews[String(userId)]) mutate(s => { delete s.freezeReviews[String(userId)]; }); }
+
 // ── guest-session entitlements ────────────────────────────────────────────────
 const ACTIVE_ITEM = new Set(['reserved', 'redeemed']);
 function _view(e) { const used = e.items.filter(i => ACTIVE_ITEM.has(i.status)); return { ...e, reserved: used.filter(i => i.status === 'reserved').length, redeemed: used.filter(i => i.status === 'redeemed').length, remaining: e.total - used.length }; }
@@ -219,6 +240,7 @@ module.exports = {
   PROGRAM_IDS, DEFAULT_POLICY, getSettings, updateSettings,
   episodeKey, getEpisode, listEpisodes, upsertEpisode,
   getPause, listPauses, setPause, clearPause, isCareOptedOut, setCareOptOut, clearCareOptOut,
+  getFreezeReview, listFreezeReviews, setFreezeReview, clearFreezeReview,
   getEntitlement, listEntitlements, issueEntitlement, reserveGuest, redeemGuest, releaseGuest,
   recordRun, listRuns, lastRunDate, markRan, acquireLock, releaseLock, reload,
 };

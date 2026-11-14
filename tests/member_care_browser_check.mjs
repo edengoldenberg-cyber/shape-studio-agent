@@ -130,6 +130,19 @@ try {
   await click('.tw-tab[data-pane="care"]');
   check('the "ליווי חברים" tab lists the nine programs', (await until(`document.querySelectorAll('#tc-programs tr[data-program]').length === 9`)) === true, JSON.stringify(pageErrors));
   check('the old "אוטומציה" / "הודעות מתוזמנות" tabs are gone', !(await exists('.tw-tab[data-pane="automation"]')) && !(await exists('.tw-tab[data-pane="upcoming"]')));
+  // ── as shipped: the contact policy is not owner-approved → nothing can be activated ──
+  check('as shipped, ALL nine programs are blocked: the contact policy is not owner-approved yet',
+    (await evalJs(`[...document.querySelectorAll('#tc-programs tr[data-program]')].map(r => r.dataset.state).join(',')`)) === Array(9).fill('blocked').join(',')
+    && /מדיניות הקשר.*עוד לא אושרה על ידי בעלת הסטודיו/.test(await txt(prog('birthday'))) && (await evalJs(`document.querySelector(${q(act('birthday', 'enable'))}).disabled`)) === true);
+  check('the API refuses to enable an unapproved program too', (await api('POST', '/api/tomer/care/programs/birthday', { enabled: true, by: 'בדיקה' })).error === 'program_blocked');
+  // The harness now plays the owner: approves the policy exactly as shown and confirms the hold report (synthetic world).
+  const fp0 = (await overview()).policyApproval.fingerprint;
+  const appr = await api('POST', '/api/tomer/care/settings', { policyApproved: true, policyFingerprint: fp0, approvedBy: 'בעלים (בדיקה)', freezeSourceConfirmed: true, by: 'צוות (בדיקה)' });
+  check('owner approval is recorded with the approver and the approved fingerprint', appr.overview?.policyApproval?.approved === true && appr.overview.policyApproval.by === 'בעלים (בדיקה)' && !!appr.overview.freeze?.sourceConfirmed);
+  await cdp('Page.reload');
+  await until(`document.readyState === 'complete' && document.querySelector('.tab-btn.active')?.dataset.tab === 'tomer'`, 15000);
+  await click('.tw-tab[data-pane="care"]');
+  await until(`document.querySelectorAll('#tc-programs tr[data-program]').length === 9`);
   check('every program starts disabled; welcome and failed-payment are BLOCKED with the missing setting named',
     (await evalJs(`[...document.querySelectorAll('#tc-programs tr[data-program]')].map(r => r.dataset.state).join(',')`)) === 'blocked,blocked,off,off,off,off,off,off,off'
     && /קישור מאושר לקבוצת הוואטסאפ/.test(await txt(prog('welcome'))) && /דרך מאושרת ובטוחה/.test(await txt(prog('payment_failed'))) && /עוד לא אושרה/.test(await txt(prog('payment_failed'))));

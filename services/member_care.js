@@ -12,7 +12,12 @@
  *   • No historical backlog: a program only acts on events that happen on / after its
  *     activation baseline (the moment it was first enabled).
  *   • Unknown is never treated as negative: no attendance DATA ≠ absence; no billing data
- *     ≠ failed payment; a membership ROW's creation time ≠ joining time (see firstMembership).
+ *     ≠ failed payment; a membership ROW's creation time ≠ joining time (see firstMembership);
+ *     no row in the hold report ≠ "not frozen" (see freezeOf) — absence-related outreach needs
+ *     a KNOWN "not frozen": a staff-confirmed source, or a staff review of that member.
+ *   • Nothing can be activated until the owner approved the contact policy exactly as it is
+ *     now (sending hours, birthday handling, cooldowns, priorities). A later change to any of
+ *     those values voids the approval.
  *   • One eligibility episode = one durable record (member, program, source dates, message
  *     id, conversation outcome). An episode is sent at most once; an ambiguous provider
  *     result is 'uncertain' and is never re-sent automatically.
@@ -30,6 +35,7 @@
  *   failed charges           /v3/reports/transactionsReport    (status 'FAIL', type 'RECURRING')
  */
 
+const crypto = require('crypto');
 const { ilParts, ilDateString } = require('../utils/callback_time');
 const policyLib = require('./contact_policy');
 
@@ -54,6 +60,18 @@ const PROGRAMS = {
 };
 const PRIORITY = ['welcome', 'payment_failed', 'birthday', 'expiry5', 'absence14', 'absence7', 'tuesday', 'onboarding14', 'month1'];
 const DONE = new Set(['sending', 'sent', 'uncertain', 'closed', 'expired', 'cancelled']);   // never (re)sent by a run
+const FREEZE_REVIEW_DAYS = 14;   // a staff review of one member's freeze status is valid this long, then it is unknown again
+
+/** Identity of everything the owner approves: every policy value, each program's hour, the priority order. */
+function policyFingerprint(settings) {
+  const pol = settings.policy ?? {};
+  const canon = JSON.stringify({
+    policy: Object.keys(pol).sort().map(k => [k, pol[k]]),
+    hours: PRIORITY.map(id => [id, settings.programs?.[id]?.hour ?? null]),
+    priority: PRIORITY,
+  });
+  return crypto.createHash('sha256').update(canon).digest('hex').slice(0, 16);
+}
 
 const EXCL_HE = {
   not_active: 'אין מנוי פעיל', joined_this_week: 'הצטרף/ה השבוע', attended_this_week: 'כבר התאמן/ה השבוע (כניסה מאומתת)',
@@ -77,8 +95,16 @@ function createMemberCare(deps) {
   const OWNER = 'care-' + Math.random().toString(36).slice(2, 10);
 
   // ── configuration / blocking ────────────────────────────────────────────────
+  function policyApproval(settings = store.getSettings()) {
+    const a = settings.policyApproval ?? null, fingerprint = policyFingerprint(settings);
+    return { approved: !!a && a.fingerprint === fingerprint, stale: !!a && a.fingerprint !== fingerprint, by: a?.by ?? null, at: a?.at ?? null, fingerprint };
+  }
   function programBlocks(id, settings = store.getSettings()) {
     const out = [];
+    const ap = policyApproval(settings);
+    if (!ap.approved) out.push({ code: 'policy_unapproved', text: ap.stale
+      ? 'מדיניות הקשר שונתה אחרי האישור — נדרש אישור מחודש של בעלת הסטודיו'
+      : 'מדיניות הקשר (שעות שליחה, יום הולדת, מרווחים, סדר עדיפויות) עוד לא אושרה על ידי בעלת הסטודיו' });
     if (id === 'welcome' && !/^https:\/\/chat\.whatsapp\.com\/\S{10,}$/.test(String(settings.groupLink ?? ''))) out.push({ code: 'group_link_missing', text: 'לא הוגדר קישור מאושר לקבוצת הוואטסאפ של הסטודיו' });
     if (id === 'payment_failed') {
       if (!String(settings.paymentResolution ?? '').trim()) out.push({ code: 'payment_resolution_missing', text: 'לא הוגדרה דרך מאושרת ובטוחה להסדרת התשלום (קישור / הנחיה)' });
@@ -120,7 +146,19 @@ function createMemberCare(deps) {
       if (b.checkedIn && b.date <= today) { if (!checkins.has(k)) checkins.set(k, new Set()); checkins.get(k).add(b.date); }
       else if ((b.date > today || (b.date === today && b.time > hhmm)) && !cancelled.has(`${b.userId}|${b.date}|${b.time}`)) { if (!future.has(k)) future.set(k, []); future.get(k).push({ date: b.date, time: b.time, className: b.className }); }
     }
+    // Freeze status is three-valued. A staff review of the member wins while it is valid; a row
+    // in the hold report means frozen; "no row" means not frozen ONLY when staff confirmed the
+    // report is a reliable source. Report unreadable or unconfirmed → unknown.
     const onHold = new Set(holds?.userIds ?? []);
+    const holdsOk = !!holds, sourceConfirmed = !!store.getSettings().freezeSourceConfirmed;
+    const freezeInfo = { known: holdsOk && sourceConfirmed, reportRead: holdsOk, sourceConfirmed, reportRows: holds?.totalRows ?? null, rowFields: holds?.rowFields ?? [] };
+    const freezeOf = id => {
+      const rv = store.getFreezeReview(id, today);
+      if (rv) return { status: rv.status, source: 'staff_review' };
+      if (holdsOk && onHold.has(id)) return { status: 'frozen', source: 'hold_report' };
+      if (holdsOk && sourceConfirmed) return { status: 'not_frozen', source: 'hold_report' };
+      return { status: 'unknown', source: holdsOk ? 'hold_report_unconfirmed' : 'hold_report_unavailable' };
+    };
     const clients = (users?.users ?? []).filter(u => u.role === 'client');
     const phoneCount = new Map(); for (const u of clients) if (u.active && u.phone) phoneCount.set(u.phone, (phoneCount.get(u.phone) ?? 0) + 1);
     const weekStart = addD(today, -wday(today)), weekEnd = addD(weekStart, 6);
@@ -141,10 +179,12 @@ function createMemberCare(deps) {
       const last = ci.at(-1) ?? null;
       const fb = (future.get(id) ?? []).sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
       const earliestStart = activeMs.map(m => m.startDate).filter(Boolean).sort()[0] ?? null;
+      const fz = freezeOf(id);
       return {
+        freeze: fz.status, freezeSource: fz.source,
         userId: id, phone: u.phone ?? null, phoneShared: !!u.phone && (phoneCount.get(u.phone) ?? 0) > 1,
         name: u.name, firstName: u.firstName, gender: u.gender, birthday: u.birthday, memberSince: u.memberSince,
-        isActive: !!u.active && activeMs.length > 0, onHold: onHold.has(id), memberships: ms, activeMs,
+        isActive: !!u.active && activeMs.length > 0, onHold: fz.status === 'frozen', memberships: ms, activeMs,
         first: firstWhyNot ? null : first, firstStart: firstWhyNot ? null : firstStart, firstWhyNot,
         checkins: ci, lastAttendance: last, daysAbsent: last ? diffD(today, last) : null,
         attendedThisWeek: ci.some(d => d >= weekStart), future: fb, futureThisWeek: fb.filter(b => b.date <= weekEnd),
@@ -152,7 +192,7 @@ function createMemberCare(deps) {
         neverAttended: !last && !!earliestStart && diffD(today, earliestStart) <= 30,
       };
     });
-    return { today, hhmm, weekStart, weekEnd, src, members, byId: new Map(members.map(m => [m.userId, m])), transactions: tx?.transactions ?? null };
+    return { today, hhmm, weekStart, weekEnd, src, freeze: freezeInfo, members, byId: new Map(members.map(m => [m.userId, m])), transactions: tx?.transactions ?? null };
   }
 
   // ── eligibility per program (pure on a snapshot) ────────────────────────────
@@ -298,7 +338,7 @@ function createMemberCare(deps) {
     const ts = e => new Date(e.send.at).getTime();
     return policyLib.evaluate({
       program, now: now(), policy: settings.policy,
-      member: { phone: m.phone, phoneShared: m.phoneShared, isActive: m.isActive, onHold: m.onHold },
+      member: { phone: m.phone, phoneShared: m.phoneShared, isActive: m.isActive, freeze: m.freeze },
       state: {
         proactiveOn: st.proactiveOn(), allowed: m.phone ? st.allowed(m.phone) : false, owner: m.phone ? st.owner(m.phone) : 'tomer',
         careOptOut: m.phone ? store.isCareOptedOut(m.phone) : false, pause: m.phone ? store.getPause(m.phone, now()) : null,
@@ -336,10 +376,14 @@ function createMemberCare(deps) {
     const ev = evaluateProgram(id, snap, settings);
     const reasonText = c => policyLib.REASON_HE[c] ?? EXCL_HE[c] ?? c;
     const counts = {}; for (const x of ev.excluded) for (const r of x.reasons) counts[r] = (counts[r] ?? 0) + 1;
+    const active = snap.members.filter(m => m.isActive);
+    const fzCount = s => active.filter(m => m.freeze === s).length;
     return {
+      policyApproval: policyApproval(settings),
+      freeze: { ...snap.freeze, frozen: fzCount('frozen'), notFrozen: fzCount('not_frozen'), unknown: fzCount('unknown') },
       ok: true, program: id, label: PROGRAMS[id].label, enabled: !!settings.programs[id].enabled, blocks: programBlocks(id, settings),
       dataBlocked: ev.dataBlocked, baseline: ev.baseline ?? null, activated: !!settings.programs[id].activatedAt, today: snap.today, sources: snap.src,
-      included: ev.included.map(x => ({ userId: x.m.userId, name: x.m.name, phone: x.m.phone, variant: x.cand.variant, sourceDates: x.cand.sourceDates, decision: x.policy.decision, reasons: x.policy.reasons.map(c => ({ code: c, text: reasonText(c) })), message: x.text })),
+      included: ev.included.map(x => ({ userId: x.m.userId, name: x.m.name, phone: x.m.phone, freeze: x.m.freeze, variant: x.cand.variant, sourceDates: x.cand.sourceDates, decision: x.policy.decision, reasons: x.policy.reasons.map(c => ({ code: c, text: reasonText(c) })), message: x.text })),
       excludedCounts: Object.entries(counts).map(([code, n]) => ({ code, text: reasonText(code), count: n })).sort((a, b) => b.count - a.count),
       excluded: ev.excluded.slice(0, 300).map(x => ({ userId: x.userId, name: x.name, reasons: x.reasons.map(c => ({ code: c, text: reasonText(c) })) })),
       totalMembers: snap.members.filter(m => m.isActive).length,
@@ -536,7 +580,7 @@ function createMemberCare(deps) {
       else if (m.daysAbsent >= 14) next = 'מעקב 14 ימים';
       else if (m.daysAbsent >= 7) next = 'בדיקת 7 ימים';
       return {
-        userId: m.userId, name: m.name, phone: m.phone, membership: m.onHold ? 'בהקפאה' : 'פעיל',
+        userId: m.userId, name: m.name, phone: m.phone, membership: m.freeze === 'frozen' ? 'בהקפאה' : m.freeze === 'unknown' ? 'פעיל (הקפאה לא אומתה)' : 'פעיל', freeze: m.freeze, freezeSource: m.freezeSource,
         lastAttendance: attOk ? m.lastAttendance : null, daysAbsent: attOk ? m.daysAbsent : null, attendanceKnown: attOk && (m.lastAttendance !== null || m.neverAttended),
         neverAttended: m.neverAttended, futureBooking: m.future[0] ?? null,
         lastOutreach: last ? { program: last.program, label: PROGRAMS[last.program].label, at: last.send.at, status: last.status } : null,
@@ -560,6 +604,8 @@ function createMemberCare(deps) {
     const eps = store.listEpisodes({ limit: 100000 });
     return {
       proactiveOn: st.proactiveOn(), settings, policyDefaults: require('../utils/member_care_store').DEFAULT_POLICY,
+      policyApproval: policyApproval(settings),
+      freeze: { sourceConfirmed: settings.freezeSourceConfirmed ?? null, reviews: store.listFreezeReviews(), reviewDays: FREEZE_REVIEW_DAYS },
       programs: PRIORITY.map(id => {
         const mine = eps.filter(e => e.program === id);
         const n = s => mine.filter(e => e.status === s).length;
@@ -593,10 +639,12 @@ function createMemberCare(deps) {
     const phone = st.testPhones()[0];
     if (!phone) return { ok: false, error: 'no_test_phone' };
     const settings = store.getSettings();
-    const blocks = programBlocks(id, settings);
+    // The labelled test message goes only to the route-overridden TEST phone with a synthetic
+    // identity; it is not an activation, so the pending owner approval does not stop it.
+    const blocks = programBlocks(id, settings).filter(b => b.code !== 'policy_unapproved');
     if (blocks.length) return { ok: false, error: 'program_blocked', blocks };
     const today = ilDateString(now());
-    const m = { userId: `test-${phone}`, phone, phoneShared: false, name: 'חבר/ת בדיקה (זהות מדומה)', firstName: 'בדיקה', gender: null, isActive: true, onHold: false, lastAttendance: addD(today, -8) };
+    const m = { userId: `test-${phone}`, phone, phoneShared: false, name: 'חבר/ת בדיקה (זהות מדומה)', firstName: 'בדיקה', gender: null, isActive: true, onHold: false, freeze: 'not_frozen', freezeSource: 'synthetic', lastAttendance: addD(today, -8) };
     const pol = policyFor(id, m, settings);
     if (pol.decision !== 'send') return { ok: false, error: 'policy', reasons: pol.reasons.map(c => ({ code: c, text: policyLib.REASON_HE[c] ?? c })) };
     const variant = id === 'absence14' ? 'standalone' : ['onboarding14', 'month1'].includes(id) ? 'attended' : 'default';
@@ -612,11 +660,37 @@ function createMemberCare(deps) {
     return { ok: status === 'sent', episode: ep, error: status === 'sent' ? undefined : `send_${status}` };
   }
 
+  // ── owner approval of the contact policy; freeze source / per-member review ──
+  /** Approve the policy exactly as shown: the caller must echo the fingerprint it was shown and name the approver. */
+  function approvePolicy({ approved, fingerprint, by } = {}) {
+    if (approved === false) return { ok: true, settings: store.updateSettings({ policyApproval: null }, by || 'staff') };
+    const name = String(by ?? '').trim();
+    if (!name) return { ok: false, error: 'approver_required' };
+    const cur = policyFingerprint(store.getSettings());
+    if (fingerprint !== cur) return { ok: false, error: 'approval_fingerprint_mismatch', fingerprint: cur };
+    return { ok: true, settings: store.updateSettings({ policyApproval: { by: name, at: now().toISOString(), fingerprint: cur } }, name) };
+  }
+  function confirmFreezeSource({ confirmed, by } = {}) {
+    const name = String(by ?? '').trim();
+    if (confirmed === true && !name) return { ok: false, error: 'reviewer_required' };
+    return { ok: true, settings: store.updateSettings({ freezeSourceConfirmed: confirmed === true ? { by: name, at: now().toISOString() } : null }, name || 'staff') };
+  }
+  /** Staff looked at this member in Arbox and state the freeze status. Valid FREEZE_REVIEW_DAYS, then unknown again. */
+  function reviewFreeze(userId, { status, by, note = null } = {}) {
+    const name = String(by ?? '').trim();
+    if (!String(userId ?? '').trim()) return { ok: false, error: 'user_required' };
+    if (status === null || status === 'clear') { store.clearFreezeReview(userId); return { ok: true, review: null }; }
+    if (!['not_frozen', 'frozen'].includes(status)) return { ok: false, error: 'bad_freeze_status' };
+    if (!name) return { ok: false, error: 'reviewer_required' };
+    return { ok: true, review: store.setFreezeReview(userId, { status, by: name, validUntil: addD(ilDateString(now()), FREEZE_REVIEW_DAYS), note: note ? String(note).slice(0, 200) : null }) };
+  }
+
   const replies = require('./member_care_replies')({ store, gateway, cases, logger, now, PROGRAMS, addD, diffD, dmy, wday });
 
   return { PROGRAMS, PRIORITY, EXCL_HE, programBlocks, loadSnapshot, evaluateProgram, preview, run, tick, reconcileOnStartup, resolveUncertain,
     absenceReport, visibility, overview, setProgram, testSend, render,
+    policyApproval, approvePolicy, confirmFreezeSource, reviewFreeze,
     activeConversation: replies.activeConversation, handleReply: replies.handleReply };
 }
 
-module.exports = { createMemberCare, PROGRAMS, PRIORITY };
+module.exports = { createMemberCare, PROGRAMS, PRIORITY, policyFingerprint };

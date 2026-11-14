@@ -20,6 +20,9 @@ const COOLDOWN_EXEMPT   = new Set(['welcome', 'payment_failed', 'birthday', 'exp
 const PAUSE_APPLIES     = new Set(['tuesday', 'absence7', 'absence14', 'onboarding14', 'month1']);
 const RECENT_CONV_EXEMPT = new Set(['welcome', 'birthday']);
 const FREEZE_ALLOWS     = new Set(['birthday']);
+// Absence-related outreach ("we have not seen you") is wrong for a frozen member, so it needs a
+// KNOWN "not frozen". An unknown freeze status blocks these programs — it is never read as "not frozen".
+const FREEZE_MUST_BE_KNOWN = new Set(['tuesday', 'absence7', 'absence14', 'onboarding14', 'month1']);
 
 const REASON_HE = {
   proactive_locked:      'תוכניות יזומות נעולות (TOMER_PROACTIVE_ENABLED)',
@@ -30,6 +33,7 @@ const REASON_HE = {
   care_opt_out:          'ביקש/ה להפסיק הודעות יזומות',
   membership_inactive:   'אין מנוי פעיל',
   on_hold:               'המנוי בהקפאה',
+  freeze_unknown:        'סטטוס ההקפאה לא אומת — הודעות נוכחות וליווי חסומות עד אימות המקור או בדיקת צוות',
   paused:                'השהיה פעילה (חופשה / היעדרות ידועה)',
   human_owns:            'הצוות מנהל את השיחה',
   open_case:             'יש פנייה פתוחה בטיפול הצוות',
@@ -51,7 +55,8 @@ function inSendWindow(now, p) {
 /**
  * @param {object} i
  *   program, now (Date), policy (settings.policy)
- *   member: { phone, phoneShared, isActive, onHold }
+ *   member: { phone, phoneShared, isActive, freeze: 'frozen' | 'not_frozen' | 'unknown' }
+ *           (a missing `freeze` is 'unknown' — fail closed)
  *   state:  { proactiveOn, allowed, owner: 'tomer'|'human'|'opted_out'|…, careOptOut, pause,
  *             openCase, lastConversationAt (ms|null), lastProactiveAt (ms|null), lastAttendanceMsgAt (ms|null) }
  */
@@ -65,7 +70,9 @@ function evaluate({ program, now, policy, member, state }) {
   if (state.owner === 'opted_out') block.push('opted_out');
   if (state.careOptOut) block.push('care_opt_out');
   if (member.isActive === false) block.push('membership_inactive');
-  if (member.onHold && !FREEZE_ALLOWS.has(program)) block.push('on_hold');
+  const freeze = ['frozen', 'not_frozen'].includes(member.freeze) ? member.freeze : 'unknown';
+  if (freeze === 'frozen' && !FREEZE_ALLOWS.has(program)) block.push('on_hold');
+  if (freeze === 'unknown' && FREEZE_MUST_BE_KNOWN.has(program)) block.push('freeze_unknown');
   if (state.pause && PAUSE_APPLIES.has(program)) block.push('paused');
 
   if (state.owner === 'human' || state.owner === 'attribution_review') defer.push('human_owns');
@@ -80,4 +87,4 @@ function evaluate({ program, now, policy, member, state }) {
   return { decision: 'send', reasons: [] };
 }
 
-module.exports = { evaluate, inSendWindow, REASON_HE, ATTENDANCE_FAMILY, COOLDOWN_EXEMPT, PAUSE_APPLIES };
+module.exports = { evaluate, inSendWindow, REASON_HE, ATTENDANCE_FAMILY, COOLDOWN_EXEMPT, PAUSE_APPLIES, FREEZE_MUST_BE_KNOWN };

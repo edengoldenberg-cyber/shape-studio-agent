@@ -156,13 +156,31 @@ function del(port, url) {
 // ── Test ──────────────────────────────────────────────────────────────────────
 
 const LEAD = '972509970055';
+
+// ── Controlled clock ──────────────────────────────────────────────────────────
+// The resolver anchors relative dates ("היום") to the timestamp of the message that
+// carried them, so the harness states that timestamp instead of inheriting the wall
+// clock. The message clock starts at 09:00 Israel time on the NEXT calendar day and
+// advances one minute per message; "היום בשעה 15" therefore always resolves to the
+// explicit instant EXPECTED_AT (tomorrow 15:00 IL), which is in the future at any hour
+// the suite is run. Nothing in this file depends on the time of day of the run.
+const { ilParts, ilDate, addDays } = req('../utils/callback_time.js');
+const _today      = ilParts(new Date());
+const _clockDay   = addDays({ year: _today.year, month: _today.month, day: _today.day }, 1);
+const CLOCK_BASE  = ilDate(_clockDay.year, _clockDay.month, _clockDay.day, 9, 0);
+const EXPECTED_AT = ilDate(_clockDay.year, _clockDay.month, _clockDay.day, 15, 0);
+if (!CLOCK_BASE || !EXPECTED_AT) throw new Error('controlled clock: could not build Israel-time instants');
+let _clockTick = 0;
+const nextMessageAt = () => new Date(CLOCK_BASE.getTime() + (_clockTick++) * 60_000).toISOString();
 let APP_PORT, MOCK_PORT, proc, mock;
 
 try {
   [APP_PORT, MOCK_PORT] = await Promise.all([freePort(), freePort()]);
   [mock, proc] = await Promise.all([startMock(MOCK_PORT), startApp(APP_PORT, MOCK_PORT)]);
 
-  const sim     = text => post(APP_PORT, '/api/whatsapp/simulate', { from: LEAD, name: 'Test', text });
+  // Every simulated message carries an explicit timestamp from the controlled clock
+  // (honoured by /api/whatsapp/simulate in TEST_MODE only).
+  const sim     = text => post(APP_PORT, '/api/whatsapp/simulate', { from: LEAD, name: 'Test', text, timestamp: nextMessageAt() });
   const setQual = q    => post(APP_PORT, `/api/leads/${encodeURIComponent(LEAD)}/set-qual`, q);
   const getLead = ()   => get(APP_PORT, `/api/test/lead/${encodeURIComponent(LEAD)}`).then(r => r?.ok ? r.lead : null);
   const getApts = ()   => get(APP_PORT, '/api/admin/appointments?limit=50').then(r => r?.appointments ?? []);
@@ -205,6 +223,9 @@ try {
     // it is not null. The confirmed name ("שרה") replaces it after name capture.
     truthy('leadName set at creation (WhatsApp display name)', typeof apt.leadName === 'string');
     truthy('scheduledAt populated', apt.scheduledAt != null);
+    test('scheduledAt = explicit expected instant (message day, 15:00 IL)',
+      apt.scheduledAt ? new Date(apt.scheduledAt).toISOString() : null, EXPECTED_AT.toISOString());
+    truthy('scheduledAt is in the future on the real clock', new Date(apt.scheduledAt).getTime() > Date.now());
 
     if (apt.scheduledAt) {
       // Verify parsed time is in Asia/Jerusalem: "היום בשעה 15" → 15:00 IL

@@ -58,6 +58,7 @@ function createArboxMock() {
         if (p === '/v3/reports/bookingsReport' && q.fromDate && q.toDate && (new Date(q.toDate) - new Date(q.fromDate)) / 86400000 > 31) return send(res, 400, { error: { message: { toDate: ['The date range should not exceed 31 days.'] } } });
         if (p === '/v3/reports/bookingsReport') return send(res, 200, { data: state.bookings.filter(b => between(b.date, q.fromDate, q.toDate) && (!q.user_id || String(b.user_id) === String(q.user_id))) });
         if (p === '/v3/reports/bookingCancellationReport') return send(res, 200, { data: state.cancellations.filter(c => between(c.date, q.fromDate, q.toDate)) });
+        if (p === '/v3/reports/membersOnHoldReport' && mode.holdsDown) return send(res, 500, { error: { message: 'report failed' } });
         if (p === '/v3/reports/membersOnHoldReport') return send(res, 200, { data: state.holds });
         if (p === '/v3/membershipTypes') return send(res, 200, { data: state.membershipTypes, extra: { pagination: { next_page_url: null } } });
         if (p === '/v3/reports/transactionsReport') {

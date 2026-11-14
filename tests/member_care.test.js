@@ -175,7 +175,7 @@ const IL = (date, hhmm = '10:05') => new Date(`${date}T${hhmm}:00+02:00`);      
 const MON = '2026-11-16', TUE = '2026-11-17';
 
 /** A fresh isolated world at an Israel date/time: empty stores, empty Arbox stand-in, restarted server. */
-function world(date, hhmm = '10:05') {
+function world(date, hhmm = '10:05', { raw = false } = {}) {
   jest.setSystemTime(IL(date, hhmm));
   for (const f of ['member_care.json', 'service_cases.json', 'leads_persist.json', 'inbox_persist.json', 'tomer_audit.json']) { try { fs.unlinkSync(path.join(DATA_DIR, f)); } catch { /* absent */ } }
   arbox.reset(); mockMembers.clear();
@@ -187,6 +187,13 @@ function world(date, hhmm = '10:05') {
   Object.assign(mockOut, { mgrMode: 'ok', memberMode: 'ok', mgrCalls: 0 }); mockOut.texts.length = 0; mockOut.mgr.length = 0; mockOut.alerts.length = 0;
   process.env.TOMER_MODE = 'all'; delete process.env.TOMER_TEST_ONLY_PHONES; delete process.env.TOMER_TEST_ROUTE_OVERRIDE; process.env.TOMER_MANAGER_PHONE = MANAGER;
   reboot();
+  if (!raw) approveWorld();
+}
+/** The synthetic owner approves the policy as it stands and staff confirm the hold report (test worlds only). */
+function approveWorld() {
+  const a = care.approvePolicy({ approved: true, fingerprint: care.policyApproval().fingerprint, by: 'בעלים (בדיקה)' });
+  const f = care.confirmFreezeSource({ confirmed: true, by: 'צוות (בדיקה)' });
+  if (!a.ok || !f.ok) throw new Error('approveWorld failed');
 }
 function reboot() { restart(); care = app.locals.memberCare; careStore = require('../utils/member_care_store'); }
 const at = (date, hhmm = '10:05') => { jest.setSystemTime(IL(date, hhmm)); gateway.clearCache(); };
@@ -755,15 +762,11 @@ describe('10. Replies continue the conversation', () => {
     expect(q.route).toBe('tomer_answered');
   });
 
-  test('other topics are not swallowed, and old messages are not treated as replies', async () => {
+  test('other topics are not swallowed', async () => {
     const m = await absent();
     const c = await say(m.phone, 'רוצה לבטל את המנוי');
     expect(c.route).toBe('tomer_case_opened');
     expect(cases.list({ phone: m.phone, open: true })[0].category).toBe('membership_cancel');
-    const n = await absent('רונית');
-    at(addIso(MON, 6), '10:30');                                               // 6 days later — outside the reply window
-    const late = await say(n.phone, 'כן');
-    expect(late.route).toBe('tomer_silent');
   });
 
   test('human takeover governs both directions: the reply is held for staff and further proactive messages are deferred', async () => {
@@ -892,5 +895,273 @@ describe('12. Reports and pauses', () => {
     expect(got(m)).toHaveLength(0);
     at(addIso(MON, 3)); await runAll();                                        // the pause ended yesterday; day 10 of the absence
     expect(got(m)).toHaveLength(1);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+describe('13. Late and ambiguous replies — context or ONE clarification, never a blind template', () => {
+  async function absent(first = 'דנה') {
+    world(MON, '09:50');
+    const m = cm({ first }); attend(m, addIso(MON, -7));
+    await enable('absence7');
+    at(MON); await runAll();
+    expect(got(m)).toHaveLength(1);
+    return m;
+  }
+  const UNRELATED = /לא ראינו אותך|שמח לשמוע|אנחנו כאן כשיתאים|אילו ימים ושעות/;
+
+  test('a bare "כן" six days later is not discarded and not guessed: one clarification naming the message; "כן" continues that conversation', async () => {
+    const m = await absent();
+    at(addIso(MON, 6), '10:30');                                               // outside the 5-day reply window
+    const before = got(m).length;
+    const r = await say(m.phone, 'כן');
+    expect(r.route).toBe('tomer_care_reply');
+    expect(got(m)).toHaveLength(before + 1);
+    expect(lastTo(m.phone)).toMatch(/זה בהמשך להודעה ששלחתי לך ב-16\.11\.2026 בנושא החזרה לאימונים\?/);
+    expect(lastTo(m.phone)).not.toMatch(UNRELATED);
+    const ep = ep1('absence7', m);
+    expect(ep.status).toBe('sent');                                            // history kept, nothing closed or dropped
+    expect(ep.conversation).toMatchObject({ awaiting: 'late_confirm', pendingText: 'כן' });
+    expect(ep.conversation.replies.at(-1)).toMatchObject({ text: 'כן', kind: 'clarify_asked', late: true });
+    const c = await say(m.phone, 'כן');                                        // confirms the context
+    expect(c.route).toBe('tomer_care_reply');
+    expect(lastTo(m.phone)).toMatch(/אילו ימים ושעות נוחים לך/);               // the ORIGINAL "כן" is now read against the absence message
+    expect(ep1('absence7', m).conversation).toMatchObject({ outcome: 'schedule', awaiting: 'schedule_pref', pendingText: null });
+    expect(ep1('absence7', m).send.idMessage).toBe(ep.send.idMessage);         // the outreach record is intact
+  });
+
+  test('"לא" to the clarification detaches the old message: no template, no second clarification, nothing assumed', async () => {
+    const m = await absent();
+    at(addIso(MON, 8), '11:00');
+    await say(m.phone, 'כן');
+    expect(lastTo(m.phone)).toMatch(/זה בהמשך להודעה ששלחתי/);
+    const r = await say(m.phone, 'לא');
+    expect(r.route).toBe('tomer_care_reply');
+    expect(lastTo(m.phone)).toMatch(/הבנתי, תודה/);
+    expect(lastTo(m.phone)).not.toMatch(UNRELATED);
+    expect(ep1('absence7', m).conversation).toMatchObject({ detached: 'member_said_unrelated', awaiting: null });
+    expect(cases.list({ phone: m.phone })).toHaveLength(0);
+    const n = got(m).length;
+    const again = await say(m.phone, 'כן');                                    // a later bare word is no longer tied to that message
+    expect(again.viaCare).toBeFalsy();
+    expect(got(m).filter(t => /זה בהמשך להודעה/.test(t))).toHaveLength(1);     // the clarification was asked exactly once
+    expect(got(m).slice(n).join(' ')).not.toMatch(UNRELATED);
+    expect(ep1('absence7', m)).toMatchObject({ status: 'sent' });              // still on record
+  });
+
+  test('a late reply that says what it is about is resolved from context without a clarification', async () => {
+    const m = await absent();
+    at(addIso(MON, 9), '10:30');
+    const r = await say(m.phone, 'אני בחופשה עד 20.12');
+    expect(r.route).toBe('tomer_care_reply');
+    expect(lastTo(m.phone)).toMatch(/לא אכתוב לך עד 20\.12\.2026/);
+    expect(got(m).some(t => /זה בהמשך להודעה/.test(t))).toBe(false);
+    expect(careStore.getPause(m.phone, new Date())).toMatchObject({ reason: 'vacation', until: '2026-12-20', endKnown: true });
+    expect(ep1('absence7', m).conversation.replies.at(-1)).toMatchObject({ kind: 'vacation', late: true });
+  });
+
+  test('a late reply on another topic goes to the general service and is recorded on the episode; a late "תודה" gets no program wording', async () => {
+    const m = await absent();
+    at(addIso(MON, 7), '10:30');
+    const c = await say(m.phone, 'רוצה לבטל את המנוי');
+    expect(c.route).toBe('tomer_case_opened');
+    expect(cases.list({ phone: m.phone, open: true })[0].category).toBe('membership_cancel');
+    expect(ep1('absence7', m).conversation.replies.at(-1)).toMatchObject({ kind: 'other_topic', late: true });
+    const k = await absent('רונית');
+    at(addIso(MON, 7), '10:30');
+    const n = got(k).length;
+    await say(k.phone, 'תודה');
+    expect(got(k).slice(n).join(' ')).not.toMatch(UNRELATED);
+    expect(ep1('absence7', k).conversation.replies.at(-1)).toMatchObject({ text: 'תודה', kind: 'fine', late: true });
+    expect(ep1('absence7', k).status).toBe('sent');
+  });
+
+  test('a reply after the episode was closed for silence (30+ days) is still read against it; beyond the look-back it is a new conversation', async () => {
+    const m = await absent();
+    at(addIso(MON, 33), '10:30'); await runAll();                              // closes the unanswered episode ("no reply")
+    expect(ep1('absence7', m)).toMatchObject({ status: 'closed', conversation: { outcome: 'no_reply' } });
+    const r = await say(m.phone, 'כן');
+    expect(r.route).toBe('tomer_care_reply');
+    expect(lastTo(m.phone)).toMatch(/זה בהמשך להודעה ששלחתי לך ב-16\.11\.2026/);
+    const k = await absent('רונית');
+    at(addIso(MON, 75), '10:30');
+    const far = await say(k.phone, 'כן');
+    expect(far.viaCare).toBeFalsy();
+    expect(got(k).some(t => /זה בהמשך להודעה/.test(t))).toBe(false);
+    expect(ep1('absence7', k).send.idMessage).toBeTruthy();                    // the outreach history itself is never deleted
+  });
+
+  test('inside the window, a bare "כן" while two different messages are open is clarified instead of guessed', async () => {
+    world(MON, '08:50');
+    const m = cm({ first: 'יעל', birthday: '1990-11-16' }); attend(m, addIso(MON, -7));
+    await enable('birthday', 'absence7');
+    at(MON, '09:05'); await runAll();                                          // birthday (priority) — absence waits
+    at(addIso(MON, 3), '10:30'); await runAll();                               // 72h cooldown over; the greeting is still inside its reply window
+    expect(got(m)).toHaveLength(2);
+    const r = await say(m.phone, 'כן');
+    expect(r.route).toBe('tomer_care_reply');
+    expect(lastTo(m.phone)).toMatch(/זה בהמשך להודעה ששלחתי לך ב-19\.11\.2026 בנושא החזרה לאימונים\?/);
+    await say(m.phone, 'כן');
+    expect(lastTo(m.phone)).toMatch(/אילו ימים ושעות נוחים לך/);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+describe('14. Freeze status: unknown is unknown, not "not frozen"', () => {
+  const setup = () => { world(MON, '09:50', { raw: true }); care.approvePolicy({ approved: true, fingerprint: care.policyApproval().fingerprint, by: 'בעלים (בדיקה)' }); };
+
+  test('hold report unconfirmed → every member is "unknown" and absence-related outreach is blocked; birthday is not', async () => {
+    setup();
+    const a = cm({ birthday: '1990-11-16' }); attend(a, addIso(MON, -7));
+    await enable('absence7', 'birthday');
+    at(MON);
+    const pv = (await get('/api/tomer/care/preview/absence7')).body;
+    expect(pv.freeze).toMatchObject({ known: false, reportRead: true, sourceConfirmed: false, unknown: 1, notFrozen: 0, frozen: 0 });
+    expect(await reasons('absence7', a)).toMatchObject({ included: true, decision: 'block', reasons: expect.arrayContaining(['freeze_unknown']) });
+    const r = await runAll();
+    expect(r).toMatchObject({ sent: 1, blocked: 1 });
+    expect(got(a)).toHaveLength(1);
+    expect(got(a)[0]).toMatch(/מזל טוב/);                                      // not absence-related
+    expect(ep1('absence7', a)).toMatchObject({ status: 'blocked', reasons: expect.arrayContaining(['freeze_unknown']) });
+    const rep = (await get('/api/tomer/care/absence-report')).body;
+    expect(rep.rows.find(x => x.userId === String(a.userId))).toMatchObject({ freeze: 'unknown', membership: 'פעיל (הקפאה לא אומתה)' });
+  });
+
+  test('all five attendance / onboarding programs need a known status', () => {
+    const policy = require('../services/contact_policy');
+    const base = { now: IL(TUE), policy: require('../utils/member_care_store').DEFAULT_POLICY, state: { proactiveOn: true, allowed: true, owner: 'tomer' } };
+    const member = f => ({ phone: '972500000001', phoneShared: false, isActive: true, ...(f ? { freeze: f } : {}) });
+    for (const program of ['tuesday', 'absence7', 'absence14', 'onboarding14', 'month1']) {
+      expect(policy.evaluate({ ...base, program, member: member('unknown') })).toMatchObject({ decision: 'block', reasons: ['freeze_unknown'] });
+      expect(policy.evaluate({ ...base, program, member: member(null) })).toMatchObject({ decision: 'block', reasons: ['freeze_unknown'] });      // missing = unknown
+      expect(policy.evaluate({ ...base, program, member: member('frozen') })).toMatchObject({ decision: 'block', reasons: ['on_hold'] });
+      expect(policy.evaluate({ ...base, program, member: member('not_frozen') }).decision).toBe('send');
+    }
+  });
+
+  test('a staff review of ONE member establishes eligibility for a limited time; a review "frozen" blocks; it expires back to unknown', async () => {
+    setup();
+    const a = cm(), b = cm(), c = cm(); for (const m of [a, b, c]) attend(m, addIso(MON, -7));
+    await enable('absence7');
+    expect((await post('/api/tomer/care/freeze-review', { userId: a.userId, status: 'not_frozen' })).body.error).toBe('reviewer_required');
+    expect((await post('/api/tomer/care/freeze-review', { userId: a.userId, status: 'maybe', by: 'עדן' })).body.error).toBe('bad_freeze_status');
+    const ok = await post('/api/tomer/care/freeze-review', { userId: a.userId, status: 'not_frozen', by: 'עדן', note: 'נבדק ב-Arbox' });
+    expect(ok.body.review).toMatchObject({ status: 'not_frozen', by: 'עדן', validUntil: addIso(MON, 14) });
+    await post('/api/tomer/care/freeze-review', { userId: b.userId, status: 'frozen', by: 'עדן' });
+    at(MON);
+    expect(await reasons('absence7', a)).toMatchObject({ decision: 'send' });
+    expect(await reasons('absence7', b)).toMatchObject({ decision: 'block', reasons: expect.arrayContaining(['on_hold']) });
+    expect(await reasons('absence7', c)).toMatchObject({ decision: 'block', reasons: expect.arrayContaining(['freeze_unknown']) });
+    await runAll();
+    expect(mockOut.texts.map(t => t.to)).toEqual([a.phone]);
+    expect(arbox.writes()).toHaveLength(0);                                    // a review is never written to Arbox
+    // expiry: a member reviewed "not frozen" is unknown again after the review's validity
+    const d = cm(); attend(d, addIso(MON, 9));
+    await post('/api/tomer/care/freeze-review', { userId: d.userId, status: 'not_frozen', by: 'עדן' });
+    at(addIso(MON, 16));
+    expect(await reasons('absence7', d)).toMatchObject({ decision: 'block', reasons: expect.arrayContaining(['freeze_unknown']) });
+  });
+
+  test('confirmed source: no row → not frozen, a row → frozen; report unreadable → unknown again (never "not frozen")', async () => {
+    setup();
+    const a = cm(), f = cm(); attend(a, addIso(MON, -7)); attend(f, addIso(MON, -7));
+    arbox.state.holds.push({ user_id: f.userId });
+    await enable('absence7');
+    expect((await post('/api/tomer/care/settings', { freezeSourceConfirmed: true })).body.error).toBe('reviewer_required');
+    expect((await post('/api/tomer/care/settings', { freezeSourceConfirmed: true, by: 'עדן' })).body.overview.freeze.sourceConfirmed).toMatchObject({ by: 'עדן' });
+    at(MON);
+    expect(await reasons('absence7', a)).toMatchObject({ decision: 'send' });
+    expect(await reasons('absence7', f)).toMatchObject({ decision: 'block', reasons: expect.arrayContaining(['on_hold']) });
+    arbox.mode.holdsDown = true; gateway.clearCache();
+    try {
+      expect(await reasons('absence7', a)).toMatchObject({ decision: 'block', reasons: expect.arrayContaining(['freeze_unknown']) });
+      expect(await reasons('absence7', f)).toMatchObject({ decision: 'block', reasons: expect.arrayContaining(['freeze_unknown']) });
+      const r = await runAll();
+      expect(r.sent).toBe(0);
+      expect(mockOut.texts).toHaveLength(0);
+    } finally { arbox.mode.holdsDown = false; }
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+describe('15. Owner approval of the contact policy gates every activation', () => {
+  test('shipped defaults: no program can be enabled or run; approval needs a named approver and the fingerprint that was shown', async () => {
+    world(MON, '09:50', { raw: true });
+    const a = cm(); attend(a, addIso(MON, -7));
+    const ov = (await get('/api/tomer/care/overview')).body;
+    expect(ov.policyApproval).toMatchObject({ approved: false, stale: false, by: null });
+    for (const p of ov.programs) expect(p.blocks.map(b => b.code)).toContain('policy_unapproved');
+    for (const id of careStore.PROGRAM_IDS) expect((await post(`/api/tomer/care/programs/${id}`, { enabled: true, by: 'עדן' })).body).toMatchObject({ ok: false, error: 'program_blocked' });
+    // even a program switched on directly in the file does not run
+    careStore.updateSettings({ programs: { absence7: { enabled: true, activatedAt: new Date().toISOString() } } }, 'test');
+    at(MON);
+    expect(await runAll()).toMatchObject({ ok: true, programs: [], sent: 0 });
+    expect((await care.tick()).sent ?? 0).toBe(0);
+    expect(mockOut.texts).toHaveLength(0);
+    careStore.updateSettings({ programs: { absence7: { enabled: false } } }, 'test');
+
+    const fp = ov.policyApproval.fingerprint;
+    expect((await post('/api/tomer/care/settings', { policyApproved: true, policyFingerprint: fp })).body.error).toBe('approver_required');
+    expect((await post('/api/tomer/care/settings', { policyApproved: true, policyFingerprint: 'deadbeefdeadbeef', approvedBy: 'עדן' })).body.error).toBe('approval_fingerprint_mismatch');
+    // approving while changing a value in the same request needs the fingerprint of the NEW policy
+    expect((await post('/api/tomer/care/settings', { policy: { cooldownHours: 48 }, policyApproved: true, policyFingerprint: fp, approvedBy: 'עדן' })).body.error).toBe('approval_fingerprint_mismatch');
+    const fp2 = (await get('/api/tomer/care/overview')).body.policyApproval.fingerprint;
+    expect(fp2).not.toBe(fp);
+    const ok = (await post('/api/tomer/care/settings', { policyApproved: true, policyFingerprint: fp2, approvedBy: 'עדן' })).body;
+    expect(ok.overview.policyApproval).toMatchObject({ approved: true, by: 'עדן', fingerprint: fp2 });
+    expect((await post('/api/tomer/care/programs/birthday', { enabled: true, by: 'עדן' })).body.ok).toBe(true);
+  });
+
+  test('changing sending hours, the Saturday-birthday rule, a cooldown or a program hour voids the approval and switches programs off', async () => {
+    const changes = [{ policy: { windowEnd: 21 } }, { policy: { birthdaySaturday: 'sunday' } }, { policy: { attendanceCooldownDays: 5 } }];
+    for (const body of changes) {
+      world(MON, '09:50');
+      await enable('birthday');
+      const ov = (await post('/api/tomer/care/settings', body)).body.overview;
+      expect(ov.policyApproval).toMatchObject({ approved: false, stale: true });
+      expect(ov.programs.find(p => p.id === 'birthday')).toMatchObject({ enabled: false });
+      expect((await post('/api/tomer/care/programs/birthday', { enabled: true })).body.error).toBe('program_blocked');
+    }
+    world(MON, '09:50');
+    await enable('birthday');
+    const ov = (await post('/api/tomer/care/programs/birthday', { hour: 12 })).body.overview;
+    expect(ov.policyApproval.approved).toBe(false);
+    expect(ov.programs.find(p => p.id === 'birthday').enabled).toBe(false);
+    // saving the same values again does not void anything
+    world(MON, '09:50');
+    await enable('birthday');
+    expect((await post('/api/tomer/care/settings', { policy: { windowStart: 9, windowEnd: 20 } })).body.overview.policyApproval.approved).toBe(true);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+describe('16. The eligibility preview has no side effects', () => {
+  test('previewing every program writes nothing, sends nothing and only reads Arbox', async () => {
+    world(MON, '09:50');
+    const a = cm({ birthday: '1990-11-16' }); attend(a, addIso(MON, -7));
+    const b = cm(); attend(b, addIso(MON, -14));
+    const mid = ms(cm(), { typeId: T_FIX, start: '2026-08-20', end: addIso(MON, 3) });
+    expect(mid).toBeTruthy();
+    await enable('absence7', 'absence14', 'birthday', 'expiry5', 'tuesday', 'onboarding14', 'month1');
+    at(MON);
+    const snapshot = () => Object.fromEntries(fs.readdirSync(DATA_DIR).sort().map(f => { const st = fs.statSync(path.join(DATA_DIR, f)); return [f, st.isFile() ? fs.readFileSync(path.join(DATA_DIR, f), 'utf8') : 'dir']; }));
+    // Earlier worlds' server instances flush their own debounced history file (2 s) — let that settle first.
+    await new Promise(r => setTimeout(r, 2600));
+    const before = snapshot();
+    const logFrom = arbox.log.length;
+    for (const id of careStore.PROGRAM_IDS) {
+      gateway.clearCache();
+      const pv = (await get(`/api/tomer/care/preview/${id}`)).body;
+      expect(pv.ok).toBe(true);
+    }
+    await get('/api/tomer/care/absence-report'); await get('/api/tomer/care/visibility');
+    expect(snapshot()).toEqual(before);                                        // no file created or changed (episodes, cases, entitlements, inbox …)
+    expect(careStore.listEpisodes({ limit: 1000 })).toHaveLength(0);
+    expect(careStore.listEntitlements()).toHaveLength(0);
+    expect(cases.list({})).toHaveLength(0);
+    expect(mockOut.texts).toHaveLength(0); expect(mockOut.mgr).toHaveLength(0); expect(mockOut.alerts).toHaveLength(0);
+    const calls = arbox.log.slice(logFrom);
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.every(c => c.method === 'GET')).toBe(true);
   });
 });

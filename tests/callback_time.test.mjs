@@ -336,7 +336,9 @@ try {
   // ── 2e. Persistence: leads_persist.json updated ───────────────────────────
   // Flush immediately via test endpoint (periodic save runs every 60s — too slow for tests)
   await post('/api/test/flush', {});
-  const persistPath = path.join(__dirname, '../data/leads_persist.json');
+  // The server under test writes to the ISOLATED data directory. (This check used to read the
+  // repo's data/ folder, so it passed or failed on whatever an unrelated process left there.)
+  const persistPath = path.join(ISOLATED_DATA_DIR, 'leads_persist.json');
   let persisted = false;
   try {
     const raw       = readFileSync(persistPath, 'utf8');

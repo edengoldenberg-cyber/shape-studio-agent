@@ -646,6 +646,7 @@ const CODE_FEATURES = [
   'tomer_panel_v2',       // staff-handled membership requests, one manager alert, complete cases panel
   'tomer_test_only_v1',   // services/tomer_test_mode.js — new flow only for allowlisted phones unless TOMER_MODE=all
   'member_care_v1',       // services/member_care.js — proactive programs (all off by default) + shared contact policy
+  'member_care_gates_v2', // owner approval of the contact policy gates activation; unknown freeze status blocks absence outreach; late replies → context or one clarification
   'strict_callback_time', // utils/callback_time.js — no default hour, no AI date guessing
   'apt_persist_strict',   // appointment_store update/updateBatch throw + roll back on failed write
   'staff_confirm_lifecycle', // confirm / outcome endpoints enforce transitions
@@ -3164,13 +3165,33 @@ if (process.env.TEST_NO_BIND !== 'true') {
       if ((p.windowStart ?? cur.windowStart) >= (p.windowEnd ?? cur.windowEnd)) return { ok: false, error: 'bad_policy' };
       patch.policy = p;                                    // managerDigest is not settable: no digest exists until approved
     }
-    const settings = careStore.updateSettings(patch, _by(req));
-    // A program whose required setting was removed cannot stay enabled.
+    let settings = careStore.updateSettings(patch, _by(req));
+    // Owner approval of the contact policy as it stands AFTER this save. The caller must echo the
+    // fingerprint it was shown and name the approver; any later policy change voids the approval.
+    if ('policyApproved' in b) {
+      const ap = memberCare.approvePolicy({ approved: b.policyApproved === true, fingerprint: b.policyFingerprint, by: String(b.approvedBy ?? '').trim().slice(0, 40) });
+      if (!ap.ok) return ap;
+      settings = ap.settings;
+    }
+    // Staff statement that the Arbox hold report is a reliable source of freeze status.
+    if ('freezeSourceConfirmed' in b) {
+      const fc = memberCare.confirmFreezeSource({ confirmed: b.freezeSourceConfirmed === true, by: String(b.by ?? '').trim().slice(0, 40) });
+      if (!fc.ok) return fc;
+      settings = fc.settings;
+    }
+    // A program whose required setting was removed (or whose policy approval was voided) cannot stay enabled.
     for (const id of careStore.PROGRAM_IDS) if (settings.programs[id].enabled && memberCare.programBlocks(id, settings).length) careStore.updateSettings({ programs: { [id]: { enabled: false } } }, 'system');
     return { overview: memberCare.overview() };
   }));
+  // Staff-reviewed freeze status of ONE member (valid for a limited time; never written to Arbox).
+  app.post('/api/tomer/care/freeze-review', jsonBody, _care(req => {
+    const out = memberCare.reviewFreeze(String(req.body?.userId ?? '').trim(), { status: req.body?.status ?? null, by: String(req.body?.by ?? '').trim().slice(0, 40), note: req.body?.note ?? null });
+    return out.ok ? { review: out.review, overview: memberCare.overview() } : out;
+  }));
   app.post('/api/tomer/care/programs/:id', jsonBody, _care(req => {
     const out = memberCare.setProgram(req.params.id, { enabled: req.body?.enabled, hour: req.body?.hour }, _by(req));
+    // Changing a program's hour changes what the owner approved: programs that are now blocked are switched off.
+    if (out.ok) for (const id of careStore.PROGRAM_IDS) if (out.settings.programs[id].enabled && memberCare.programBlocks(id, out.settings).length) careStore.updateSettings({ programs: { [id]: { enabled: false } } }, 'system');
     return out.ok ? { overview: memberCare.overview() } : out;
   }));
   app.get('/api/tomer/care/preview/:id', _care(req => memberCare.preview(req.params.id)));

@@ -8,6 +8,20 @@
  *
  * One useful question at a time. Nothing is promised that the system cannot do:
  * renewals, guest sessions and anything needing a decision become staff cases.
+ *
+ * LATE AND AMBIGUOUS REPLIES. The reply window (policy.replyWindowDays) only says how long a
+ * bare answer is presumed to belong to the message. It never discards anything:
+ *   • every episode is kept (history is never deleted), and a reply that arrives after the
+ *     window is still read against the most recent outreach to that member (LATE_LOOKBACK_DAYS);
+ *   • a late reply that says what it is about (holiday, injury, hours, "I did train", renewal,
+ *     "stop") is resolved from that context;
+ *   • a late bare "כן" / "לא", or a bare answer while two different outreach messages are
+ *     open, is NOT guessed: Tomer asks ONE clarification that names the message and its date.
+ *     "כן" → the original answer is processed against that message. "לא" → the message is
+ *     detached from the conversation and nothing else is assumed. Anything else → read as a new
+ *     message. The clarification is asked at most once per episode;
+ *   • a late reply this conversation cannot interpret is recorded on the episode and handled
+ *     by the general member service — never by an unrelated proactive template.
  */
 
 const { ilDateString } = require('../utils/callback_time');
@@ -27,6 +41,12 @@ const RE = {
   no:       new RegExp(`^(?:לא|לא תודה|לא כרגע|אין צורך|ממש לא|לא מעוניינ(?:ת)?)(?!${H})`),
   fine:     /הכ[ו]?ל\s+(?:בסדר|טוב|מעולה)|בסדר\s+גמור|אחזור|חוזר(?:ת)?\s+(?:בקרוב|השבוע|בשבוע)|אגיע|מגיע(?:ה)?\s+(?:השבוע|מחר|היום)|מעולה|נהדר|כיף|אוהב(?:ת)?|נהני(?:ת|תי)|מרוצ(?:ה)?|תודה/,
 };
+const LATE_LOOKBACK_DAYS = 60;   // how far back a late reply is still read against the last outreach
+const TOPIC = {
+  welcome: 'ההצטרפות לסטודיו', tuesday: 'קביעת אימון לשבוע', absence7: 'החזרה לאימונים', absence14: 'החזרה לאימונים',
+  birthday: 'יום ההולדת שלך', payment_failed: 'החיוב החודשי', expiry5: 'סיום המנוי וחידושו',
+  onboarding14: 'השבועיים הראשונים שלך אצלנו', month1: 'החודש הראשון ואימוני האורח',
+};
 // Topics that clearly belong to the general member service — the proactive conversation steps aside.
 const FOREIGN = new Set(['membership_cancel', 'membership_freeze', 'billing_dispute', 'refund_request', 'receipt_request', 'class_book', 'class_cancel', 'class_reschedule',
   'class_cancelled_report', 'my_bookings', 'membership_info', 'location', 'staff_request', 'complaint', 'app_problem', 'waitlist', 'availability', 'schedule_query', 'regular_booking']);
@@ -34,14 +54,27 @@ const FOREIGN = new Set(['membership_cancel', 'membership_freeze', 'billing_disp
 module.exports = function createReplies({ store, gateway, cases, logger, now, PROGRAMS, addD, diffD, dmy, wday }) {
   const today = () => ilDateString(now());
 
-  /** The proactive conversation a new message from this phone belongs to (or null). */
-  function activeConversation(phone) {
+  /**
+   * The outreach a new message from this phone may belong to.
+   *   live — inside the reply window, or Tomer is waiting for an answer to his own question
+   *   late — the most recent outreach when nothing is live: sent beyond the window, or closed
+   *          without the member ever answering (still within LATE_LOOKBACK_DAYS)
+   * An episode the member said is unrelated ('detached') is never offered again.
+   */
+  function conversations(phone) {
     const days = store.getSettings().policy.replyWindowDays;
     const t = now().getTime();
-    return store.listEpisodes({ phone, status: 'sent', limit: 50 })
-      .filter(e => e.send?.at && (e.conversation?.awaiting || t - new Date(e.send.at).getTime() <= days * 86400000))
-      .sort((a, b) => String(b.send.at).localeCompare(String(a.send.at)))[0] ?? null;
+    const age = e => t - new Date(e.send.at).getTime();
+    const all = store.listEpisodes({ phone, status: ['sent', 'closed'], limit: 200 })
+      .filter(e => e.send?.at && !e.conversation?.detached)
+      .sort((a, b) => String(b.send.at).localeCompare(String(a.send.at)));
+    const live = all.filter(e => e.conversation?.awaiting || (e.status === 'sent' && age(e) <= days * 86400000));
+    const recent = live.length ? null : all[0] ?? null;
+    const late = recent && age(recent) <= LATE_LOOKBACK_DAYS * 86400000 && (recent.status === 'sent' || !(recent.conversation?.replies ?? []).length) ? recent : null;
+    return { live, late };
   }
+  /** The proactive conversation that is open right now for this phone (or null). */
+  function activeConversation(phone) { return conversations(phone).live[0] ?? null; }
 
   /** "עד 20.12" / "שבועיים" / "עד סוף החודש" → Israel date, or null when the text names no end. */
   function parseUntil(text) {
@@ -65,20 +98,50 @@ module.exports = function createReplies({ store, gateway, cases, logger, now, PR
   }
 
   async function handleReply(ctx, cls, api) {
-    const ep = activeConversation(ctx.phone);
+    const { live, late } = conversations(ctx.phone);
+    const ep = live[0] ?? late;
     if (!ep) return null;
+    const isLate = !live.length;
+    // Two different outreach messages are open at once: a bare answer could belong to either.
+    const twoOpen = live.length > 1 && live.some(e => e.program !== ep.program);
+    return interpret(ctx, cls, api, ep, { isLate, twoOpen, mayClarify: !ep.conversation?.clarifiedAt });
+  }
+
+  async function interpret(ctx, cls, api, ep, { isLate, twoOpen, mayClarify }) {
     const t = ctx.text;
     const program = ep.program;
     const policy = store.getSettings().policy;
     const say = text => api.say(ctx.phone, text, { handler: `care_reply:${program}`, trigger: 'member_reply', name: ctx.name });
     /** Record the reply on the episode. `outcome` closes the conversation unless `awaiting` keeps it open. */
-    const note = (kind, { outcome, awaiting = null, caseId, close = false } = {}) => store.upsertEpisode(ep.key, {
-      ...(close ? { status: 'closed' } : {}), ...(caseId ? { caseId } : {}),
-      conversation: { lastReplyAt: now().toISOString(), awaiting, ...(outcome ? { outcome } : {}), replies: [...(ep.conversation?.replies ?? []), { at: now().toISOString(), text: t.slice(0, 300), kind }].slice(-12) },
-    }, { type: 'reply', detail: kind });
+    const note = (kind, { outcome, awaiting = null, caseId, close = false, extra = {} } = {}) => {
+      const replies = [...(ep.conversation?.replies ?? []), { at: now().toISOString(), text: t.slice(0, 300), kind, ...(isLate ? { late: true } : {}) }].slice(-12);
+      ep.conversation = { ...(ep.conversation ?? {}), replies };          // keep the local copy in step (a clarified reply is noted twice)
+      return store.upsertEpisode(ep.key, {
+        ...(close ? { status: 'closed' } : {}), ...(caseId ? { caseId } : {}),
+        conversation: { lastReplyAt: now().toISOString(), awaiting, ...(outcome ? { outcome } : {}), ...extra, replies },
+      }, { type: isLate ? 'late_reply' : 'reply', detail: kind });
+    };
     /** endKnown = the member named the end date; false = a default length, shown as such in the panel. */
     const pause = (reason, until, endKnown, noteText) => store.setPause(ctx.phone, { reason, until, endKnown, note: noteText ?? t.slice(0, 200), setBy: 'member', userId: ep.userId, name: ep.name });
     const openCase = async (category, summary) => (await api.openCase({ ...ctx, text: `[בתגובה ל"${PROGRAMS[program].label}"] ${t}` }, category, { summary })).case;
+
+    // ── the answer to the ONE clarification of a late / ambiguous reply ───────
+    if (ep.conversation?.awaiting === 'late_confirm') {
+      const original = String(ep.conversation.pendingText ?? '');
+      if (RE.yes.test(t) && !RE.no.test(t) && original) {
+        note('clarify_confirmed', { outcome: ep.conversation?.outcome ?? undefined, extra: { pendingText: null } });
+        // The member confirmed the context: the original answer is now read against this message.
+        return interpret({ ...ctx, text: original }, { category: null }, api, { ...ep, conversation: { ...ep.conversation, awaiting: null, pendingText: null } }, { isLate: false, twoOpen: false, mayClarify: false });
+      }
+      if (RE.no.test(t)) {
+        note('clarify_unrelated', { outcome: ep.conversation?.outcome ?? 'unrelated_reply', extra: { pendingText: null, detached: 'member_said_unrelated' } });
+        await say(`הבנתי, תודה 🙏 אם צריך משהו — אפשר לכתוב לי כאן.`);
+        return api.R('care_reply', { episode: ep.key });
+      }
+      // Neither yes nor no: they wrote what they actually meant. Read it as a new message; no second clarification.
+      note('clarify_superseded', { outcome: ep.conversation?.outcome ?? undefined, extra: { pendingText: null } });
+      return interpret(ctx, cls, api, { ...ep, conversation: { ...ep.conversation, awaiting: null, pendingText: null } }, { isLate, twoOpen: false, mayClarify: false });
+    }
 
     // ── answers to a question Tomer just asked ────────────────────────────────
     if (ep.conversation?.awaiting === 'vacation_until') {
@@ -106,6 +169,21 @@ module.exports = function createReplies({ store, gateway, cases, logger, now, PR
       return api.R('care_reply', { episode: ep.key });
     }
     if (cls.category === 'opt_out') { store.setCareOptOut(ctx.phone, 'member'); note('opt_out', { outcome: 'stop', close: true }); return null; }
+
+    // ── a bare yes / no whose context is not certain → ONE clarification, never a guess ──
+    const saysWhat = RE.injury.test(t) || RE.vacation.test(t) || RE.dispute.test(t) || RE.guest.test(t) || RE.renew.test(t) || RE.paid.test(t)
+      || RE.dislike.test(t) || RE.schedule.test(t) || FOREIGN.has(cls.category);
+    const bare = !saysWhat && (RE.yes.test(t) || RE.no.test(t));
+    if (bare && (isLate || twoOpen)) {
+      if (mayClarify) {
+        note('clarify_asked', { outcome: ep.conversation?.outcome ?? undefined, awaiting: 'late_confirm', extra: { pendingText: t.slice(0, 300), clarifiedAt: now().toISOString() } });
+        await say(`רק כדי לוודא שהבנתי נכון 🙏 זה בהמשך להודעה ששלחתי לך ב-${dmy(ilDateString(new Date(ep.send.at)))} בנושא ${TOPIC[program] ?? PROGRAMS[program].label}?`);
+        return api.R('care_reply', { episode: ep.key, clarification: true });
+      }
+      // Already clarified once for this message: recorded, and left to the general service.
+      note('ambiguous_after_clarification', { outcome: ep.conversation?.outcome ?? 'replied' });
+      return null;
+    }
 
     // ── injury / illness: staff, and no training nudges meanwhile ─────────────
     if (RE.injury.test(t)) {
@@ -210,6 +288,9 @@ module.exports = function createReplies({ store, gateway, cases, logger, now, PR
     }
     if (RE.no.test(t)) { note('no', { outcome: 'declined', close: true }); await say(`אין בעיה 🙏 אנחנו כאן כשיתאים לך.`); return api.R('care_reply', { episode: ep.key }); }
     if (RE.fine.test(t)) {
+      // A late "thanks / all good" is recorded on the message it most likely answers, but Tomer
+      // does not answer it with this program's wording — the general service decides.
+      if (isLate) { note('fine', { outcome: ep.conversation?.outcome ?? 'ok' }); return null; }
       note('fine', { outcome: 'ok', close: true });
       if (program === 'birthday' || program === 'welcome') return api.R('silent', { reason: 'thanks after a greeting', episode: ep.key });
       await say(`שמח לשמוע 💛 אנחנו כאן כשמתאים לך.`);
@@ -220,5 +301,5 @@ module.exports = function createReplies({ store, gateway, cases, logger, now, PR
     return null;
   }
 
-  return { activeConversation, handleReply, parseUntil };
+  return { activeConversation, conversations, handleReply, parseUntil, LATE_LOOKBACK_DAYS };
 };
