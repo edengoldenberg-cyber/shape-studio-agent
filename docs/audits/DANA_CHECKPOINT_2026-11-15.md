@@ -292,3 +292,11 @@ code is deployed (not approved yet). After a future approved deployment: GET /ap
 - Comparison files for the owner: C:/Users/owner/dana-work/review/compare/ (uploaded clip v1 vs v2; DEMO raw captions A vs B; DEMO raw revision before/after; stills; reference analysis JSON).
 - Caption-width alternative B uses a COPY of the safe zone (C:/Users/owner/dana-work/alt/). The working file and the built-in profile are unchanged; nothing was approved for the owner. All owner-like actions in tests were by a TEST actor in local data only.
 - Open owner decisions: deploy the head commit; choose A or B (or other) for caption width; approve a profile; raw clip + consent for the real acceptance.
+
+## DEPLOYED 7166b2b (2026-11-15 20:25 IL), owner-approved
+
+- Deployment 7831b280-fa37-4399-9fe2-361c5f828a4a SUCCESS (previous d226d305 / 02e14ee). HEAD was 7166b2b with no other uploadable change; no webhook in the available log window before deploy.
+- Checks without a session: /health 200; Barak, Tomer and Dana APIs 401; worker API 401 without token; browser → login; startup log 0 error lines, Green API authorized, sync complete; tomer test_only. Publishing / notify switches unset.
+- Worker restarted (session background task, not autostart) with worker.config.production.json: adapter claude, job_adapters_allowed [scripted], face model set. STOP file removed.
+- Not verified by this session (needs login): panels after login, existing project prj_mwhu0wmt8b8ce592 with version 1 still listed, new review page on a phone.
+- Rollback: git checkout 02e14ee && railway up --detach && git checkout dana-phase-1a (data under /data/dana stays; old code ignores new fields).
