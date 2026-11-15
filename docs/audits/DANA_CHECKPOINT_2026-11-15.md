@@ -104,6 +104,6 @@ See `docs/DANA_PHASE_1B_2026-11-15.md`. Claude adapter enabled only in the local
 
 See `docs/DANA_PHASE_1C_2026-11-15.md` (capability matrix, demonstration, remaining requirements) and `docs/DANA_SKILLS_MATRIX.md`.
 Re-run the demonstration: `node scripts/dana_e2e_full.cjs <source.mp4> --exclude a-b,...` (real worker + model; MOCK publisher/notification/metrics).
-Preview the last test project: `set DANA_PREVIEW_DATA=C:\Users\owner\dana-work2e-full` then `node scripts/dana_studio_preview.cjs`.
+Preview the last test project: `set DANA_PREVIEW_DATA=C:/Users/owner/dana-work/e2e-full` then `node scripts/dana_studio_preview.cjs`.
 Still true: not deployed, publishing off by default (`DANA_PUBLISHING_ENABLED`, `DANA_PUBLISHER_MODE=mock` only), notifications mocked, autostart not installed, no real Instagram adapter exists.
 Next: owner-supplied clip as editorial acceptance; then the account/credential/deployment approvals listed in the phase 1C doc.
