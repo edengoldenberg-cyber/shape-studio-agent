@@ -37,11 +37,13 @@ DEFAULT_STYLE = {
     "caption_shadow": "2px 3px 10px rgba(0,0,0,0.95), 0 0 20px rgba(0,0,0,0.75)",
     "backing": True, "backing_css": "background:rgba(0,0,0,0.42);padding:8px 26px 14px;border-radius:18px;",
     "highlight_enabled": True,      # yellow is AVAILABLE; a card is highlighted only when the decisions name words
+    "caption_max_lines": 1,          # a card may be laid out on this many lines before it is split
+    "captions_enabled": True,        # False when the source already carries burned-in captions
     "direction": "rtl",
     "cover_size": 112, "cover_y_px": 960,
 }
 # Keys a job (per-project override) may change. Anything else in a job is ignored.
-STYLE_OVERRIDABLE = {"caption_size", "caption_y_px", "backing", "highlight_enabled", "cover_size", "cover_y_px"}
+STYLE_OVERRIDABLE = {"caption_size", "caption_y_px", "caption_max_lines", "backing", "highlight_enabled", "cover_size", "cover_y_px"}
 DEFAULTS = {
     "style": DEFAULT_STYLE,
     "asr": {"model": "large-v3", "device": "cuda", "compute_type": "float16", "language": "he"},
@@ -52,7 +54,11 @@ DEFAULTS = {
     "segment": {"min_s": 5.0, "max_s": 90.0},
     "cards": {"max_words": 3, "max_chars": 16, "gap_break_s": 0.35, "hold_after_s": 0.40, "merge_max_chars": 24,
               "min_on_screen_s": 0.50, "max_chars_per_s": 17.0},
-    "judgement": {"adapter": "heuristic",
+    # adapter: what this worker uses. job_adapters_allowed: which adapters a JOB may ask for instead (the server
+    # used to send "heuristic" with every upload; a production worker lists only "scripted" here).
+    # on_model_failure: "fail" (clear failure, default) or "fallback_marked" (heuristic edit, marked as having NO content judgement).
+    "judgement": {"adapter": "heuristic", "job_adapters_allowed": ["heuristic", "scripted", "claude"],
+                  "on_model_failure": "fail", "second_pass": True,
                   "claude": {"enabled": False, "model": "claude-sonnet-5-5", "timeout_s": 300, "max_budget_usd": 1.0,
                              "min_s": 12, "max_s": 45}},
     # Words that sound the same in spoken Hebrew. A caption may show either spelling; the choice is a text review item.

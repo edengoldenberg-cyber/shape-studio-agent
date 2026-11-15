@@ -39,7 +39,13 @@ const ARTIFACTS = {            // name → { mime, required }
   'transcript_final.json':  { mime: 'application/json', required: false },
 };
 const SOURCE_EXT       = new Set(['mp4', 'mov', 'm4v', 'webm', 'avi', 'mkv']);
-const STYLE_OVERRIDABLE = { caption_size: 'number', caption_y_px: 'number', backing: 'boolean', highlight_enabled: 'boolean' };
+// Keys a project may override, with the range the worker accepts. Anything else is refused.
+const STYLE_OVERRIDABLE = {
+  caption_size: { type: 'number', min: 40, max: 140 }, caption_y_px: { type: 'number', min: 200, max: 1700 },
+  caption_max_lines: { type: 'number', oneOf: [1, 2] }, highlight_enabled: { type: 'boolean' }, backing: { type: 'boolean' },
+  cover_size: { type: 'number', min: 40, max: 220 }, cover_y_px: { type: 'number', min: 100, max: 1800 },
+};
+const MAX_CAPTION_EDITS = 300, MAX_ZOOM_EDITS = 60, MAX_ACTIVE_RULES = 50;
 const ADAPTERS         = new Set(['heuristic', 'scripted', 'claude']);
 
 const now   = () => new Date().toISOString();
@@ -101,6 +107,49 @@ function getProject(id) {
 }
 function currentVersion(p) { return p.versions.find(v => v.n === p.currentVersion) ?? null; }
 
+/**
+ * A Hebrew file name arrives from the multipart parser as latin1 bytes ("×©×..."). When the
+ * string is pure latin1 and those bytes are valid UTF-8, it is decoded; anything else is left alone.
+ */
+function fixName(name) {
+  const str = String(name ?? '');
+  if (!/[\u0080-\u00ff]/.test(str) || /[^\u0000-\u00ff]/.test(str)) return str;
+  const u = Buffer.from(str, 'latin1').toString('utf8');
+  return u.includes('\ufffd') ? str : u;
+}
+
+/**
+ * The adapter the SERVER asks for. null = no request: the worker's own configuration decides.
+ * Projects created before this rule stored 'heuristic' as a silent default; without the explicit
+ * flag that value is not a request.
+ */
+function projectAdapter(p) {
+  if (p.adapterExplicit) return p.adapter ?? null;
+  return p.adapter && p.adapter !== 'heuristic' ? p.adapter : null;
+}
+
+const num = (x) => typeof x === 'number' && Number.isFinite(x);
+function sanitizeCaptionEdits(list) {
+  if (!Array.isArray(list) || list.length > MAX_CAPTION_EDITS) throw new StudioError(400, 'caption_edits_invalid', 'רשימת תיקוני הכתוביות אינה תקינה');
+  return list.map(e => {
+    if (!e || typeof e !== 'object' || !num(e.source_start_s) || !num(e.source_end_s) || e.source_start_s < 0 || !(e.source_end_s > e.source_start_s) || e.source_end_s > 86400)
+      throw new StudioError(400, 'caption_edits_invalid', 'תיקון כתובית חייב לכלול זמני מקור תקינים');
+    const text = String(e.text ?? '').trim();
+    if (!text || text.length > 80 || /[\r\n]/.test(text)) throw new StudioError(400, 'caption_edits_invalid', 'טקסט הכתובית חייב להיות 1–80 תווים, בלי ירידת שורה');
+    return { source_start_s: Math.round(e.source_start_s * 1000) / 1000, source_end_s: Math.round(e.source_end_s * 1000) / 1000,
+             original: String(e.original ?? '').slice(0, 200), text };
+  });
+}
+function sanitizeZoomEdits(list) {
+  if (!Array.isArray(list) || list.length > MAX_ZOOM_EDITS) throw new StudioError(400, 'zoom_edits_invalid', 'רשימת שינויי הזום אינה תקינה');
+  return list.map(z => {
+    if (!z || typeof z !== 'object' || typeof z.id !== 'string' || !/^[\w@.:-]{1,40}$/.test(z.id) || !['remove', 'set'].includes(z.action))
+      throw new StudioError(400, 'zoom_edits_invalid', 'שינוי זום חייב לכלול מזהה ופעולה (remove | set)');
+    if (z.action === 'set' && !(num(z.scale) && z.scale >= 1.05 && z.scale <= 1.5)) throw new StudioError(400, 'zoom_edits_invalid', 'עוצמת זום חייבת להיות בין 1.05 ל-1.5');
+    return z.action === 'set' ? { id: z.id, action: 'set', scale: Math.round(z.scale * 100) / 100 } : { id: z.id, action: 'remove' };
+  });
+}
+
 function sanitizeOptions(o = {}) {
   const out = {};
   if (o.adapter !== undefined) {
@@ -110,8 +159,11 @@ function sanitizeOptions(o = {}) {
   if (o.style_overrides && typeof o.style_overrides === 'object') {
     out.style_overrides = {};
     for (const [k, v] of Object.entries(o.style_overrides)) {
-      if (!STYLE_OVERRIDABLE[k]) throw new StudioError(400, 'style_override_invalid', `style override not allowed: ${k}`);
-      if (typeof v !== STYLE_OVERRIDABLE[k]) throw new StudioError(400, 'style_override_invalid', `${k} must be ${STYLE_OVERRIDABLE[k]}`);
+      const rule = STYLE_OVERRIDABLE[k];
+      if (!rule) throw new StudioError(400, 'style_override_invalid', `style override not allowed: ${k}`);
+      if (typeof v !== rule.type || (rule.type === 'number' && !Number.isFinite(v))) throw new StudioError(400, 'style_override_invalid', `${k} must be ${rule.type}`);
+      if (rule.oneOf && !rule.oneOf.includes(v)) throw new StudioError(400, 'style_override_invalid', `${k} must be one of ${rule.oneOf.join(' | ')}`);
+      if (rule.min != null && (v < rule.min || v > rule.max)) throw new StudioError(400, 'style_override_invalid', `${k} must be between ${rule.min} and ${rule.max}`);
       out.style_overrides[k] = v;
     }
   }
@@ -128,6 +180,8 @@ function sanitizeOptions(o = {}) {
     if (o.test_inject !== 'unverified_price_and_paraphrased_cover') throw new StudioError(400, 'test_inject_invalid', 'unknown test injection');
     out.test_inject = o.test_inject;
   }
+  if (o.caption_edits !== undefined) out.caption_edits = sanitizeCaptionEdits(o.caption_edits);
+  if (o.zoom_edits !== undefined) out.zoom_edits = sanitizeZoomEdits(o.zoom_edits);
   if (o.exclude_ranges !== undefined) {
     const r = o.exclude_ranges;
     if (!Array.isArray(r) || r.length > 30 || !r.every(x => Array.isArray(x) && x.length === 2 && x.every(Number.isFinite) && x[0] < x[1]))
@@ -139,6 +193,7 @@ function sanitizeOptions(o = {}) {
 
 /** Register an uploaded file. Same bytes as an existing source → no second copy, no second project. */
 async function registerUpload({ tmpPath, originalName, options, actor = 'owner' }) {
+  originalName = fixName(originalName);
   const ext = (String(originalName || '').match(/\.([a-z0-9]+)$/i)?.[1] || '').toLowerCase();
   if (!SOURCE_EXT.has(ext)) { fs.rmSync(tmpPath, { force: true }); throw new StudioError(400, 'format_unsupported', `פורמט לא נתמך: .${ext || '?'}`); }
   const bytes = fs.statSync(tmpPath).size;
@@ -158,8 +213,8 @@ async function registerUpload({ tmpPath, originalName, options, actor = 'owner' 
   if (!fs.existsSync(dest)) fs.renameSync(tmpPath, dest); else fs.rmSync(tmpPath, { force: true });
   const project = {
     id: newId('prj'), title: String(originalName).replace(/\.[^.]+$/, '').slice(0, 120), createdAt: now(),
-    source, status: 'editing', adapter: opts.adapter ?? 'heuristic', styleOverrides: opts.style_overrides ?? {},
-    excludeRanges: opts.exclude_ranges ?? [],
+    source, status: 'editing', adapter: opts.adapter ?? null, adapterExplicit: opts.adapter !== undefined,   // null → the worker's configuration decides
+    styleOverrides: opts.style_overrides ?? {}, excludeRanges: opts.exclude_ranges ?? [], captionEdits: [], zoomEdits: [],
     versions: [], currentVersion: 0,
     consent: { status: 'unknown', note: null, by: null, at: null },   // publication consent of the people in the footage
     rights: { music: 'none' },                                         // phase 1A: no music
@@ -177,14 +232,21 @@ function enqueueEdit(project, options, actor) {
   const open = Object.values(s.jobs).find(j => j.projectId === project.id && ['queued', 'leased'].includes(j.status));
   if (open) throw new StudioError(409, 'job_in_progress', 'כבר יש עריכה פעילה לפרויקט הזה');
   const n = (project.versions.at(-1)?.n ?? 0) + 1;
+  const adapter = options.adapter ?? projectAdapter(project);
+  const rules = activeRules(), profile = require('./dana_references').defaultProfile();
   const job = {
     id: newId('job'), projectId: project.id, version: n, type: 'edit', status: 'queued',
     attempts: 0, maxAttempts: MAX_ATTEMPTS, lease: null, notBefore: null,
     stage: 'queued', note: 'ממתין לעובד העריכה', error: null, uploaded: {},
-    options: { adapter: options.adapter ?? project.adapter, style_overrides: { ...project.styleOverrides, ...(options.style_overrides ?? {}) },
+    options: { ...(adapter ? { adapter } : {}),                       // no key → the worker decides (its config is authoritative)
+               style_overrides: { ...project.styleOverrides, ...(options.style_overrides ?? {}) },
                ...(options.decisions ? { decisions: options.decisions } : {}), ...(options.change_request ? { change_request: options.change_request } : {}),
                ...(options.previous ? { previous: options.previous } : {}), ...(options.test_inject ? { test_inject: options.test_inject } : {}),
-               ...((project.excludeRanges ?? []).length ? { exclude_ranges: project.excludeRanges } : {}) },
+               ...((project.excludeRanges ?? []).length ? { exclude_ranges: project.excludeRanges } : {}),
+               // the owner's standing corrections travel with every later job of the project
+               ...((project.captionEdits ?? []).length ? { caption_edits: project.captionEdits } : {}),
+               ...((project.zoomEdits ?? []).length ? { zoom_edits: project.zoomEdits } : {}),
+               ...(rules.length ? { rules } : {}), ...(profile ? { profile } : {}) },
     createdAt: now(), updatedAt: now(),
   };
   s.jobs[job.id] = job;
@@ -193,7 +255,7 @@ function enqueueEdit(project, options, actor) {
     changeRequest: options.change_request ?? null });
   project.currentVersion = n;
   project.status = 'editing';
-  hist(project, actor, 'edit_queued', { jobId: job.id, version: n, adapter: job.options.adapter });
+  hist(project, actor, 'edit_queued', { jobId: job.id, version: n, adapter: job.options.adapter ?? 'worker_default' });
   return job;
 }
 
@@ -323,6 +385,9 @@ function complete(jobId, token, body) {
   if (pkg.source?.sha256 !== p.source.sha256) throw new StudioError(422, 'package_invalid', 'the package was built from a different source file');
   const brand = require('../utils/dana_brand').get();
   v.package = pkg; v.artifacts = { ...j.uploaded };
+  // An automatic transcript is not an exact quote: a caption draft may not call it one unless the owner verified the text.
+  if (pkg.caption?.text && pkg.transcript?.status !== 'owner_corrected')
+    pkg.caption.text = String(pkg.caption.text).replace(/ציטוט מדויק מהסרטון/g, 'תמלול אוטומטי מהסרטון — לא אומת');
   v.caption = { text: String(pkg.caption?.text ?? ''), cta: pkg.caption?.cta ?? brand.cta_default.value ?? null, isDraft: true };
   v.destination = { platform: 'instagram', format: 'reel', account: brand.instagram_account.value ?? null };
   v.scheduledAt = require('./dana_publisher').proposeTime();
@@ -377,6 +442,21 @@ function unresolved(v) {
 }
 function approvalValid(v) { return !!v?.approval && v.approval.fingerprint === fingerprint(v); }
 
+const JUDGEMENT_EXCEPTION = 'content_judgement_missing';
+/** How the content decisions of a package were made. Old packages have no judgement_mode; their adapter tells. */
+function judgementMode(pkg) {
+  if (!pkg) return null;
+  if (pkg.judgement_mode) return pkg.judgement_mode;
+  return pkg.adapter === 'heuristic' ? 'fallback_heuristic' : pkg.adapter === 'claude' ? 'model' : pkg.adapter === 'scripted' ? 'scripted' : null;
+}
+/** A technical edit whose message, segments, cover and review were NOT judged: an automatic rule chose them. */
+function judgementMissing(v) {
+  const pkg = v?.package;
+  if (!pkg) return false;
+  return judgementMode(pkg) === 'fallback_heuristic' || pkg.plan?.content_judgement === 'none';
+}
+const judgementExcepted = (v) => (v?.exceptions ?? []).some(e => e.id === JUDGEMENT_EXCEPTION);
+
 function reviewable(projectId) {
   const p = getProject(projectId), v = currentVersion(p);
   if (!v || !v.package || !['ready_for_review', 'approved'].includes(v.status)) throw new StudioError(409, 'not_reviewable', 'אין חבילה מוכנה לבדיקה בגרסה הנוכחית');
@@ -413,7 +493,8 @@ function editPackage(projectId, body, actor = 'owner') {
 /** An explicit, recorded human exception for one failed check / blocking issue. Never implicit. */
 function recordException(projectId, { id, reason, by }, actor = 'owner') {
   const { p, v } = reviewable(projectId);
-  if (!unresolved(v).some(u => u.id === id)) throw new StudioError(400, 'exception_not_applicable', 'אין בעיה פתוחה עם המזהה הזה');
+  const applies = id === JUDGEMENT_EXCEPTION ? judgementMissing(v) && !judgementExcepted(v) : unresolved(v).some(u => u.id === id);
+  if (!applies) throw new StudioError(400, 'exception_not_applicable', 'אין בעיה פתוחה עם המזהה הזה');
   if (!reason || String(reason).trim().length < 10) throw new StudioError(400, 'exception_reason_required', 'נדרש נימוק כתוב (לפחות 10 תווים)');
   if (!by || !String(by).trim()) throw new StudioError(400, 'exception_by_required', 'נדרש שם המאשר/ת');
   v.exceptions.push({ id, reason: String(reason).trim().slice(0, 1000), by: String(by).trim().slice(0, 80), at: now() });
@@ -447,6 +528,8 @@ function approve(projectId, { fingerprint: shown, by }, actor = 'owner') {
   const { p, v } = reviewable(projectId);
   const fp = fingerprint(v);
   if (!shown || shown !== fp) throw new StudioError(409, 'fingerprint_mismatch', 'החבילה השתנתה מאז שהוצגה — יש לרענן ולאשר את הגרסה הנוכחית', { fingerprint: fp });
+  if (judgementMissing(v) && !judgementExcepted(v))
+    throw new StudioError(409, JUDGEMENT_EXCEPTION, 'זו עריכה טכנית בלבד: שיפוט התוכן (מסר, קטעים, קאבר, ביקורת) לא רץ. אפשר להפיק גרסה מתוקנת, או לתעד חריגה מפורשת.');
   const open = unresolved(v);
   if (open.length) throw new StudioError(409, 'unresolved_issues', 'יש בעיות פתוחות שדורשות תיקון או חריגה מתועדת', { unresolved: open });
   v.approval = { fingerprint: fp, by: String(by || 'owner').slice(0, 80), at: now() };
@@ -465,10 +548,16 @@ function requestChanges(projectId, body, actor = 'owner') {
                                  adapter: body.decisions ? undefined : body.adapter });
   dropApproval(p, v, actor, 'changes_requested');
   hist(p, actor, 'changes_requested', { version: v.n, note, overrides: opts.style_overrides ?? null, hasDecisions: !!opts.decisions });
+  return queueChange(p, v, opts, note, actor);
+}
+
+/** Turn a change (note / style / decisions / stored edits) into the next version's job, or park it when nothing can act on it. */
+function queueChange(p, v, opts, note, actor, { hasEdits = false } = {}) {
   if (opts.style_overrides) p.styleOverrides = { ...p.styleOverrides, ...opts.style_overrides };
-  const adapter = opts.adapter ?? p.adapter;
-  if (!opts.decisions && adapter === 'claude' && v.package) {
-    opts.adapter = 'claude';
+  const adapter = opts.adapter ?? projectAdapter(p);
+  // No explicit adapter (the worker's model path decides) or an explicit model adapter: send the request and the previous result.
+  if (!opts.decisions && (adapter === 'claude' || adapter == null) && v.package) {
+    if (adapter === 'claude') opts.adapter = 'claude';
     opts.previous = { segment: v.package.segment, cards: v.package.cards.map(c => ({ text: c.text, highlight: c.highlight ?? [] })),
       cover: v.package.cover, caption: { text: v.caption?.text ?? v.package.caption.text, cta: v.caption?.cta ?? null } };
     p.pendingChange = null;
@@ -476,15 +565,15 @@ function requestChanges(projectId, body, actor = 'owner') {
     save();
     return view(p);
   }
-  // A free-text note needs judgement. Rules cannot act on it, so nothing is re-rendered blindly.
-  if (!opts.style_overrides && !opts.decisions && adapter === 'heuristic') {
+  // A free-text note needs judgement. With an EXPLICITLY rule-based project nothing can act on it, so nothing is re-rendered blindly.
+  if (!opts.style_overrides && !opts.decisions && !hasEdits && adapter === 'heuristic') {
     v.status = 'changes_requested'; p.status = 'changes_requested'; v.changeNote = note;
     p.pendingChange = { note, at: now(), needs: 'operator_decisions' };
     save();
     return view(p);
   }
   // keep the previous decisions when only the style changes (same words, same cut)
-  if (!opts.decisions && v.package && adapter !== 'claude') {
+  if (!opts.decisions && v.package && adapter !== 'claude' && adapter != null) {
     opts.decisions = { segment: { in_s: v.package.segment.in_s, out_s: v.package.segment.out_s, reason: v.package.segment.reason },
       cards: v.package.cards.map(c => ({ text: c.text, highlight: c.highlight ?? [] })), cover: v.package.cover,
       caption: { text: v.caption?.text ?? v.package.caption.text, cta: v.caption?.cta ?? null } };
@@ -497,6 +586,74 @@ function requestChanges(projectId, body, actor = 'owner') {
   save();
   return view(p);
 }
+
+/**
+ * "הפק גרסה מתוקנת": the owner's caption corrections, style choices, zoom changes and an optional
+ * note become the next version. Corrections are stored on the project (original text kept beside
+ * the correction) and travel with every later job. The approval of the current version is dropped.
+ * A note is either for this project only (change_request) or a standing rule for every project.
+ */
+function revise(projectId, body = {}, actor = 'owner') {
+  const p = getProject(projectId), v = currentVersion(p);
+  if (!v || v.status === 'editing') throw new StudioError(409, 'not_reviewable', 'העריכה עדיין רצה');
+  const by = String(body.by || '').trim().slice(0, 80);
+  if (!by) throw new StudioError(400, 'by_required', 'נדרש שם מי שמבקש/ת את התיקון');
+  const edits = body.caption_edits !== undefined ? sanitizeCaptionEdits(body.caption_edits) : [];
+  const zooms = body.zoom_edits !== undefined ? sanitizeZoomEdits(body.zoom_edits) : [];
+  const style = sanitizeOptions({ style_overrides: body.style_overrides && Object.keys(body.style_overrides).length ? body.style_overrides : undefined }).style_overrides;
+  const note = String(body.note || '').trim().slice(0, 2000);
+  if (note && !['project', 'permanent'].includes(body.note_scope))
+    throw new StudioError(400, 'note_scope_required', 'יש לבחור: "תיקון לפרויקט הזה" או "כלל קבוע"');
+  if (!edits.length && !zooms.length && !style && !note) throw new StudioError(400, 'nothing_to_revise', 'לא סומן שום תיקון');
+  const open = Object.values(state().jobs).find(j => j.projectId === p.id && ['queued', 'leased'].includes(j.status));
+  if (open) throw new StudioError(409, 'job_in_progress', 'כבר יש עריכה פעילה לפרויקט הזה');
+
+  const at = now();
+  p.captionEdits = p.captionEdits ?? []; p.captionEditHistory = p.captionEditHistory ?? []; p.zoomEdits = p.zoomEdits ?? [];
+  const same = (a, e) => Math.abs(a.source_start_s - e.source_start_s) < 0.02 && Math.abs(a.source_end_s - e.source_end_s) < 0.02;
+  for (const e of edits) {
+    const i = p.captionEdits.findIndex(x => same(x, e));
+    const original = i >= 0 ? p.captionEdits[i].original : e.original;        // the transcript's own text, never an earlier correction
+    if (i >= 0) { p.captionEditHistory.push({ ...p.captionEdits[i], replacedAt: at }); p.captionEdits.splice(i, 1); }
+    if (e.text === original) continue;                                         // back to the transcript: the correction is withdrawn
+    if (p.captionEdits.length >= MAX_CAPTION_EDITS) throw new StudioError(400, 'caption_edits_invalid', 'יותר מדי תיקוני כתוביות בפרויקט');
+    p.captionEdits.push({ id: `ce_${Math.round(e.source_start_s * 1000)}_${Math.round(e.source_end_s * 1000)}`, ...e, original, by, at });
+  }
+  p.captionEdits.sort((a, b2) => a.source_start_s - b2.source_start_s);
+  for (const z of zooms) { p.zoomEdits = p.zoomEdits.filter(x => x.id !== z.id); p.zoomEdits.push({ ...z, by, at }); }
+
+  let rule = null;
+  if (note && body.note_scope === 'permanent') rule = addRule({ text: note, by, projectId: p.id });
+  const opts = { ...(style ? { style_overrides: style } : {}), ...(note && body.note_scope === 'project' ? { change_request: note } : {}) };
+  dropApproval(p, v, actor, 'revision_requested');
+  hist(p, actor, 'revision_requested', { version: v.n, by, captionEdits: edits.length, zoomEdits: zooms.length, style: style ?? null,
+    note: note || null, noteScope: note ? body.note_scope : null, ruleId: rule?.id ?? null });
+  return queueChange(p, v, opts, note, actor, { hasEdits: edits.length > 0 || zooms.length > 0 || !!rule });
+}
+
+// ── Standing rules: feedback the owner marked as "כלל קבוע" — global, with history ──
+const rulesFile = () => path.join(dir(), 'rules.json');
+function rulesState() { try { return JSON.parse(fs.readFileSync(rulesFile(), 'utf8')); } catch (e) { if (e.code !== 'ENOENT') throw new Error(`dana rules are unreadable (${e.message})`); return { rules: [] }; } }
+function saveRules(r) { fs.mkdirSync(dir(), { recursive: true }); const tmp = rulesFile() + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(r, null, 1), 'utf8'); fs.renameSync(tmp, rulesFile()); }
+const listRules = () => rulesState().rules;
+const activeRules = () => listRules().filter(r => r.status === 'active').map(r => ({ id: r.id, text: r.text }));
+function addRule({ text, by, projectId = null }) {
+  const t = String(text || '').trim().slice(0, 500);
+  if (t.length < 3) throw new StudioError(400, 'rule_invalid', 'כלל קבוע חייב לכלול טקסט');
+  if (!by || !String(by).trim()) throw new StudioError(400, 'by_required', 'נדרש שם מי שמאשר/ת את הכלל');
+  const r = rulesState();
+  if (r.rules.filter(x => x.status === 'active').length >= MAX_ACTIVE_RULES) throw new StudioError(400, 'rules_full', `יש כבר ${MAX_ACTIVE_RULES} כללים קבועים פעילים — יש להסיר כלל לפני הוספת חדש`);
+  const rule = { id: newId('rule'), text: t, status: 'active', by: String(by).trim().slice(0, 80), at: now(), projectId, retiredBy: null, retiredAt: null };
+  r.rules.push(rule); saveRules(r); event('rule_added', { ruleId: rule.id, by: rule.by, projectId });
+  return rule;
+}
+function retireRule(id, by) {
+  const r = rulesState(), rule = r.rules.find(x => x.id === id);
+  if (!rule) throw new StudioError(404, 'rule_not_found', 'הכלל לא נמצא');
+  if (rule.status === 'active') { rule.status = 'retired'; rule.retiredBy = String(by || 'owner').slice(0, 80); rule.retiredAt = now(); saveRules(r); event('rule_retired', { ruleId: id, by: rule.retiredBy }); }
+  return r.rules;
+}
+
 function homophonesOf(pkg) {
   const out = {};
   for (const i of pkg.issues ?? []) if (i.code === 'caption_differs_from_asr' && i.heard && i.shown) out[i.heard] = i.shown;
@@ -526,7 +683,7 @@ function retry(projectId, actor = 'owner') {
   const p = getProject(projectId), v = currentVersion(p);
   if (!v || !['failed', 'waiting'].includes(v.status)) throw new StudioError(409, 'not_retryable', 'אין עריכה שנכשלה לנסות שוב');
   const prev = state().jobs[v.jobId];
-  enqueueEdit(p, { adapter: prev?.options.adapter, style_overrides: prev?.options.style_overrides, decisions: prev?.options.decisions,
+  enqueueEdit(p, { adapter: prev?.options.adapter ?? undefined, style_overrides: prev?.options.style_overrides, decisions: prev?.options.decisions,
                    change_request: prev?.options.change_request }, actor);
   save();
   return view(p);
@@ -537,9 +694,11 @@ function view(p) {
   const s = state(), v = currentVersion(p), job = v ? s.jobs[v.jobId] : null;
   const publisher = require('./dana_publisher');
   return {
-    id: p.id, title: p.title, status: p.status, createdAt: p.createdAt, currentVersion: p.currentVersion,
-    source: { sha256: p.source.sha256, bytes: p.source.bytes, originalName: p.source.originalName, ext: p.source.ext },
+    id: p.id, title: fixName(p.title), status: p.status, createdAt: p.createdAt, currentVersion: p.currentVersion,
+    source: { sha256: p.source.sha256, bytes: p.source.bytes, originalName: fixName(p.source.originalName), ext: p.source.ext },
     consent: p.consent, rights: p.rights, pendingChange: p.pendingChange ?? null,
+    adapter: projectAdapter(p),                                    // null = the worker's configuration decides
+    captionEdits: p.captionEdits ?? [], zoomEdits: p.zoomEdits ?? [], styleOverrides: p.styleOverrides ?? {},
     job: job ? { id: job.id, status: job.status, stage: job.stage, note: job.note, attempts: job.attempts, maxAttempts: job.maxAttempts,
                  error: job.error ? { code: job.error.code, message: job.error.message, retryable: job.error.retryable } : null,
                  totalSeconds: job.totalSeconds ?? null } : null,
@@ -549,14 +708,20 @@ function view(p) {
       caption: v.caption, destination: v.destination, scheduledAt: v.scheduledAt,
       scheduledLocal: require('./dana_publisher').toLocal(v.scheduledAt), scheduleProposed: !!v.scheduleProposed, timezone: 'Asia/Jerusalem',
       exceptions: v.exceptions, unresolved: unresolved(v),
+      contentJudgement: v.package ? { mode: judgementMode(v.package), missing: judgementMissing(v), excepted: judgementExcepted(v), exceptionId: JUDGEMENT_EXCEPTION } : null,
       package: v.package ? { duration: v.package.duration, segment: v.package.segment, adapter: v.package.adapter, spokenText: v.package.spoken_text,
         cards: v.package.cards, cover: v.package.cover, checks: v.package.checks, issues: v.package.issues, style: v.package.style,
         considered: v.package.considered ?? [], revisionNote: v.package.revision_note ?? '', spelling: v.package.spelling ?? [],
         usage: v.package.judgement_usage ?? null, bundle: v.package.instruction_bundle ?? null, editorial: v.package.editorial ?? null,
-        timings: v.package.timings_s, totalSeconds: v.package.total_s, pipelineVersion: v.package.pipeline_version } : null,
+        timings: v.package.timings_s, totalSeconds: v.package.total_s, pipelineVersion: v.package.pipeline_version,
+        // present only when the worker sent them; never invented here
+        plan: v.package.plan ?? null, judgementMode: judgementMode(v.package), zooms: v.package.zooms ?? null, transcript: v.package.transcript ?? null,
+        rulesUsed: v.package.rules_used ?? null, captionStatus: v.package.caption?.status ?? null } : null,
       hasVideo: !!v.artifacts['final.mp4'], hasCover: !!v.artifacts['cover.jpg'],
     } : null,
-    versions: p.versions.map(x => ({ n: x.n, status: x.status, createdAt: x.createdAt, approved: !!x.approval, changeRequest: x.changeRequest ?? null })),
+    versions: p.versions.map(x => ({ n: x.n, status: x.status, createdAt: x.createdAt, approved: !!x.approval, changeRequest: x.changeRequest ?? null,
+      hasVideo: !!x.artifacts?.['final.mp4'], hasCover: !!x.artifacts?.['cover.jpg'], duration: x.package?.duration ?? null,
+      judgementMode: judgementMode(x.package), profile: x.package?.rules_used?.profile ?? null })),
     publication: { ...publisher.gate(p), record: p.publication },
     history: p.history.slice(-60),
   };
@@ -573,5 +738,6 @@ function reconcileOnStartup() { state(); return recover('server_restart'); }
 module.exports = {
   StudioError, ARTIFACTS, registerUpload, getProject, currentVersion, view, list, workerStatus, workerHello, heartbeat, lease, leasedJob,
   progress, acceptArtifact, complete, fail, recover, reconcileOnStartup, fingerprint, unresolved, approvalValid, editPackage, recordException,
-  approve, confirmReview, requestChanges, reject, setConsent, retry, sourcePath, artifactPath, dir, save, state, hist, _resetForTests,
+  approve, confirmReview, requestChanges, revise, reject, setConsent, retry, sourcePath, artifactPath, dir, save, state, hist, _resetForTests,
+  listRules, activeRules, addRule, retireRule, fixName, projectAdapter, judgementMode, judgementMissing, STYLE_OVERRIDABLE,
 };

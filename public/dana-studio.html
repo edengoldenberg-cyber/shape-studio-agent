@@ -62,6 +62,26 @@
       <div class="bar hidden" id="upbar"><i></i></div>
     </div>
     <div class="card"><h2>פרויקטים</h2><ul class="plain" id="projects"><li class="mute">טוען…</li></ul></div>
+    <div class="card"><h2>חשבון יעד ופרופיל עריכה</h2>
+      <div class="row"><span class="grow">חשבון האינסטגרם ליעד הפרסום: <b id="acctnow">—</b></span><button id="acctset">עדכון</button></div>
+      <div class="small mute" style="margin-top:8px">פרופיל עריכה מאושר: <span id="profnow">—</span></div>
+      <p class="small mute">פרופיל מאשרים מתוך חבילה שנערכה לפיו ("התוכנית של דנה" ← "לפי אילו כללים נערך").</p></div>
+    <div class="card"><h2>כללים קבועים</h2><ul class="plain small" id="rules"><li class="mute">טוען…</li></ul>
+      <p class="small mute">כללים שאישרת נשלחים עם כל עריכה, בכל הפרויקטים.</p></div>
+    <div class="card"><h2>רפרנסים לעריכה</h2>
+      <p class="small warn">רפרנס נשמר עם ההערה שלך וממתין לניתוח — ניתוח רפרנסים עדיין לא פעיל, ואין עדיין פרופיל שנגזר מרפרנס.</p>
+      <ul class="plain small" id="refs"><li class="mute">טוען…</li></ul>
+      <details class="small"><summary>הוספת רפרנס</summary>
+        <label for="ref_title">שם</label><input type="text" id="ref_title" maxlength="120">
+        <label for="ref_source_url">קישור (או קובץ למטה)</label><input type="text" id="ref_source_url" inputmode="url" placeholder="https://…" dir="ltr">
+        <label for="ref_file">קובץ (וידאו או תמונה)</label><input type="file" id="ref_file" accept="video/*,image/*">
+        <label for="ref_origin">מקור — מי יצר / איפה נמצא</label><input type="text" id="ref_origin" maxlength="200">
+        <label for="ref_usage_permission">הרשאת שימוש</label><select id="ref_usage_permission"><option value="unknown">לא ידועה</option><option value="inspiration_only">להשראה בלבד</option><option value="own">חומר שלי</option><option value="licensed">ברישיון</option></select>
+        <label for="ref_content_type">סוג התוכן</label><input type="text" id="ref_content_type" maxlength="120">
+        <label for="ref_fits_message">לאיזה מסר הוא מתאים</label><input type="text" id="ref_fits_message" maxlength="300">
+        <label for="ref_owner_note">מה אהבתי בו</label><textarea id="ref_owner_note" style="min-height:70px" maxlength="2000"></textarea>
+        <button id="refadd" style="margin-top:10px">שמירת הרפרנס</button>
+        <p class="small mute">רפרנס משמש ללמידה בלבד. תוכן, מוזיקה ונכסים ממנו לא מועתקים לעריכה בלי הרשאה.</p></details></div>
     <div class="card"><h2>הגדרות מותג חסרות</h2><ul class="plain small" id="brand"></ul>
       <p class="small mute">פרטים חסרים לא חוסמים עריכה. דנה לא ממציאה אותם — הם מסומנים כחסרים עד שתגדיר/י.</p></div>
   </section>

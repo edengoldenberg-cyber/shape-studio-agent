@@ -1,0 +1,31 @@
+{
+  "_comment": "Copy to references/editing/examples/<short-name>.json. Write null for what is not known and list it under `unknown`. Never guess. No media in this repository.",
+  "id": null,
+  "title": null,
+  "source": {
+    "file": null,
+    "url": null,
+    "origin": null,
+    "usage_permission": "unknown",
+    "permission_evidence": null
+  },
+  "content_type": null,
+  "fits_message": [],
+  "owner_note": null,
+  "take": {
+    "pace":     { "observation": null, "example_times_s": [], "rule": null, "measured_by": null },
+    "opening":  { "observation": null, "example_times_s": [], "rule": null, "measured_by": null },
+    "cuts":     { "observation": null, "example_times_s": [], "rule": null, "measured_by": null },
+    "captions": { "observation": null, "example_times_s": [], "rule": null, "measured_by": null },
+    "emphasis": { "observation": null, "example_times_s": [], "rule": null, "measured_by": null },
+    "zooms":    { "observation": null, "example_times_s": [], "rule": null, "measured_by": null },
+    "sound":    { "observation": null, "example_times_s": [], "rule": null, "measured_by": null },
+    "cover":    { "observation": null, "example_times_s": [], "rule": null, "measured_by": null }
+  },
+  "do_not_imitate": [],
+  "hypotheses": [],
+  "unknown": [],
+  "status": "awaiting_analysis",
+  "decided_by": null,
+  "decided_at": null
+}

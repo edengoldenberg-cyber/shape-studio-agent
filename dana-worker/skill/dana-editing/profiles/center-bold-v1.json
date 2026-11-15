@@ -1,0 +1,29 @@
+{
+  "id": "center-bold-v1",
+  "version": "1",
+  "status": "unapproved",
+  "_about": "Built-in profile for the owner's stated test style (2026-11-15): Heebo Bold, large and prominent, horizontally centred, centre area of the frame, not hiding the face. The words of that sentence are the owner's; every NUMBER below is a working value chosen to implement it and is not approved until the owner approves this profile.",
+  "params": {
+    "font_family": "Heebo",
+    "font_weight": 800,
+    "caption_size": 96,
+    "caption_y_px": 1040,
+    "caption_max_lines": 2,
+    "backing": false,
+    "highlight_enabled": true,
+    "max_words_per_line": 3,
+    "max_chars_per_line": 12,
+    "min_on_screen_s": 0.5,
+    "max_chars_per_s": 17.0,
+    "face_margin_px": 30,
+    "zoom_scale_light": 1.08,
+    "zoom_scale_medium": 1.15,
+    "zoom_scale_strong": 1.25,
+    "zoom_scale_max": 1.5,
+    "zoom_ease_frames": 8,
+    "zoom_min_start_s": 2.0,
+    "zoom_min_gap_s": 4.0,
+    "zoom_min_hold_s": 1.2,
+    "zoom_face_margin": 0.04
+  }
+}

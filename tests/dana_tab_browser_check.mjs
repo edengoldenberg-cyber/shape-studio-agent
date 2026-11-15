@@ -13,7 +13,7 @@ import { spawn, spawnSync } from 'child_process';
 import { createServer }     from 'http';
 import { createRequire }    from 'module';
 import { fileURLToPath }    from 'url';
-import { existsSync, writeFileSync, mkdtempSync, rmSync, cpSync, mkdirSync } from 'fs';
+import { existsSync, writeFileSync, readFileSync, mkdtempSync, rmSync, cpSync, mkdirSync } from 'fs';
 import { tmpdir }           from 'os';
 import path                 from 'path';
 
@@ -23,6 +23,7 @@ const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const arg = n => { const i = process.argv.indexOf(n); return i >= 0 ? process.argv[i + 1] : null; };
 const seed = arg('--seed'), shots = arg('--shots');
 
+const WORKER_TOKEN = 'test-worker-token-not-a-secret-0123';
 let pass = 0, fail = 0;
 const check = (label, cond, detail = '') => { if (cond) { pass++; console.log(`  ✓ ${label}`); } else { fail++; console.error(`  ✗ ${label}${detail ? '  →  ' + detail : ''}`); } };
 
@@ -38,7 +39,30 @@ let mock, ws;
 
 try {
   const seeded = !!(seed && existsSync(path.join(seed, 'dana')));
-  if (seeded) cpSync(path.join(seed, 'dana'), path.join(dataDir, 'dana'), { recursive: true });
+  let oldId = null; const NEW_ID = 'prj_newstylepackage01';
+  if (seeded) {
+    cpSync(path.join(seed, 'dana'), path.join(dataDir, 'dana'), { recursive: true });
+    // Second project: the same local test package, re-labelled with the fields the NEW worker sends
+    // (plan, zooms, transcript doubts, per-card source times, rules used). The original stays as the "old package".
+    const sf = path.join(dataDir, 'dana', 'studio.json'), st = JSON.parse(readFileSync(sf, 'utf8'));
+    const old = Object.values(st.projects)[0]; oldId = old.id;
+    const np = JSON.parse(JSON.stringify(old));
+    np.id = NEW_ID; np.title = 'חבילה בפורמט החדש'; np.createdAt = new Date(Date.parse(old.createdAt) + 1000).toISOString();
+    np.publication = null; np.status = 'ready_for_review'; np.captionEdits = []; np.zoomEdits = [];
+    const v = np.versions.find(x => x.n === np.currentVersion); v.approval = null; v.status = 'ready_for_review';
+    const k = v.package, seg = k.segment;
+    k.judgement_mode = 'model';
+    k.cards = k.cards.map(c => ({ ...c, source_start_s: +(seg.in_s + c.start).toFixed(3), source_end_s: +(seg.in_s + c.start + c.dur).toFixed(3) }));
+    k.plan = { message: 'מסר לבדיקה', hook: 'פתיחה לבדיקה', rationale: 'נימוק לבדיקה', content_judgement: 'model', brief: ['שורת תדריך'],
+      segments: [{ n: 1, source_in_s: seg.in_s, source_out_s: seg.out_s, tl_in_s: 0, tl_out_s: k.duration, role: 'hook', why: 'קטע בדיקה' }] };
+    k.zooms = [{ id: 'z@152.0', source_t_s: 152.0, tl_t_s: 2.0, scale: 1.15, ease_s: 0.4, hold_until_s: k.duration, reason: 'משפט מפתח (בדיקה)', evidence: 'rms +3dB' }];
+    k.transcript = { status: 'auto_unverified', corrections_applied: [],
+      doubts: [{ card: 2, tl_start_s: k.cards[1].start, tl_end_s: k.cards[1].start + k.cards[1].dur, source_start_s: k.cards[1].source_start_s, source_end_s: k.cards[1].source_end_s, word: 'בדיקה', kind: 'low_confidence', note: 'prob 0.5' }] };
+    k.rules_used = { skill: { name: 'dana-editing', version: '1.0.0', sha256: 'a'.repeat(64) }, profile: { id: 'center-bold-v1', version: '1', sha256: 'b'.repeat(64) }, standing_rules: [], references: [] };
+    st.projects[NEW_ID] = np;
+    writeFileSync(sf, JSON.stringify(st));
+    cpSync(path.join(dataDir, 'dana', 'projects', old.id), path.join(dataDir, 'dana', 'projects', NEW_ID), { recursive: true });
+  }
   const [appPort, mockPort, dbgPort] = [await freePort(), await freePort(), await freePort()];
   mock = createServer((req, res) => { req.resume(); req.on('end', () => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(req.url.includes('/arbox') ? { data: [] } : { idMessage: 'MOCK' })); }); });
   await new Promise(r => mock.listen(mockPort, '127.0.0.1', r));
@@ -46,7 +70,7 @@ try {
     cwd: root, stdio: ['ignore', 'ignore', 'pipe'],
     env: isolatedChildEnv(dataDir, { PORT: String(appPort), TEST_MODE: 'true', LOG_SILENT: 'true', LOG_TO_FILE: 'false',
       GREEN_API_URL: `127.0.0.1:${mockPort}`, GREEN_API_ID_INSTANCE: '9990001', GREEN_API_TOKEN_INSTANCE: 'mock',
-      ARBOX_BASE_URL: `http://127.0.0.1:${mockPort}/arbox`, ARBOX_API_KEY: 'mock-arbox', DANA_WORKER_TOKEN: 'test-token-not-a-secret' }),
+      ARBOX_BASE_URL: `http://127.0.0.1:${mockPort}/arbox`, ARBOX_API_KEY: 'mock-arbox', DANA_WORKER_TOKEN: WORKER_TOKEN }),
   });
   children.push(server);
   let serverErr = ''; server.stderr.on('data', d => { serverErr += d.toString(); });
@@ -98,15 +122,31 @@ try {
 
     if (seeded) {
       check('projects are listed', await until(`${D}.querySelectorAll('#projects .proj').length > 0`));
-      await evalJs(`${D}.querySelector('#projects .proj').click()`);
+      await evalJs(`${D}.querySelector('#projects .proj[data-id="${oldId}"]').click()`);
       check('project opens: processing history and review package', await until(`!${D}.getElementById('detail').classList.contains('hidden') && !!${D}.querySelector('#detail video')`));
       check('review video has a source and the cover is shown', await evalJs(`!!${D}.querySelector('#detail video').getAttribute('src') && !!${D}.querySelector('#detail img.cover')`));
       check('video is playable (metadata loads through the panel)', await until(`${D}.querySelector('#detail video').readyState >= 1 && ${D}.querySelector('#detail video').duration > 1`, 20000));
       check('approval actions are visible inside the frame', await evalJs(`(() => { const a = ${D}.getElementById('actions'); if (a.classList.contains('hidden')) return false; const r = a.getBoundingClientRect(); return r.bottom <= ${F}.clientHeight + 1 && r.height > 40 && !!a.querySelector('[data-act="approve"]'); })()`));
       check('approval bar is on screen without scrolling the panel', await evalJs(`(() => { const f = ${F}.getBoundingClientRect(), a = ${D}.getElementById('actions').getBoundingClientRect(); return f.top + a.bottom <= window.visualViewport.height + 1; })()`), await evalJs(`JSON.stringify([${F}.getBoundingClientRect().top, ${D}.getElementById('actions').getBoundingClientRect().bottom, window.visualViewport.height])`));
       await shot(`${vp.name}-2-package`);
+      check('old package (no new fields) still renders: captions editor, style, revise — and no plan / zoom sections', await evalJs(`!!${D}.getElementById('captions') && !!${D}.getElementById('style') && !!${D}.getElementById('revise') && !${D}.getElementById('plan') && !${D}.getElementById('zooms')`));
+      check('automatic transcript is not called an exact quote', await evalJs(`!/ציטוט מדויק\\)/.test(${D}.getElementById('detail').innerText) && /תמלול אוטומטי — לא אומת/.test(${D}.getElementById('captions').innerText)`));
       await evalJs(`${D}.getElementById('back').click()`);
       check('back returns to upload + project list', await until(`!${D}.getElementById('list').classList.contains('hidden')`));
+      check('list page: standing rules, references (analysis marked not active), destination account', await until(`!!${D}.getElementById('rules') && /ניתוח רפרנסים עדיין לא פעיל/.test(${D}.getElementById('list').innerText) && !!${D}.getElementById('acctset') && !!${D}.getElementById('refadd')`));
+
+      // ── the NEW-format package ──
+      await evalJs(`${D}.querySelector('#projects .proj[data-id="${NEW_ID}"]').click()`);
+      check('new package: plan with message, segment map and rules used', await until(`!!${D}.getElementById('plan') && /מסר לבדיקה/.test(${D}.getElementById('plan').innerText) && /center-bold-v1/.test(${D}.getElementById('plan').innerText) && ${D}.querySelectorAll('#plan [data-play]').length === 1`));
+      check('captions editor: one field per card, the doubt is marked on its card', await evalJs(`(() => { const d = ${D}; const n = d.querySelectorAll('#captions input[data-card]').length; const li = d.querySelector('#captions input[data-card="2"]').closest('li'); return n > 5 && [...d.querySelectorAll('#captions input[data-card]')].every(i => !i.disabled) && /ודאות נמוכה/.test(li.innerText) && d.querySelectorAll('#captions .pill.warn').length === 2; })()`));
+      check('tapping a card seeks the review video to it', await evalJs(`(async () => { const d = ${D}, v = d.getElementById('mainvid'); d.querySelector('#captions input[data-card="3"]').closest('li').querySelector('[data-play]').click(); await new Promise(r => setTimeout(r, 400)); const t0 = Number(d.querySelector('#captions input[data-card="3"]').closest('li').querySelector('[data-play]').dataset.play.split(',')[0]); const ok = Math.abs(v.currentTime - t0) < 1.5; v.pause(); return ok; })()`));
+      check('style preview is drawn over a real frame', await until(`(() => { const c = ${D}.getElementById('pv'); const px = c.getContext('2d').getImageData(0, 0, c.width, c.height).data; let lit = 0; for (let i = 0; i < px.length; i += 400) if (px[i] + px[i + 1] + px[i + 2] > 60) lit++; return lit > 50; })()`));
+      check('zooms are listed with time, strength and reason', await evalJs(`/משפט מפתח/.test(${D}.getElementById('zooms').innerText) && !!${D}.querySelector('#zooms select[data-zoom="z@152.0"]')`));
+      check('versions section and the single revise action exist', await evalJs(`!!${D}.getElementById('versions') && !!${D}.querySelector('#revise [data-do="revise"]')`));
+      check('no horizontal overflow inside the studio with every section open', await evalJs(`${D}.documentElement.scrollWidth <= ${F}.clientWidth + 1`), await evalJs(`${D}.documentElement.scrollWidth + ' > ' + ${F}.clientWidth`));
+      await shot(`${vp.name}-4-new-package`);
+      await evalJs(`${D}.getElementById('back').click()`);
+      await until(`!${D}.getElementById('list').classList.contains('hidden')`);
     }
 
     await evalJs(`document.querySelector('.dana-switch-btn[data-dana-view="tools"]').click()`);
@@ -118,6 +158,32 @@ try {
     check('switching back shows the studio again without reloading it', await evalJs(`!document.getElementById('dana-view-studio').hidden && !!${D}.getElementById('pick')`));
     await evalJs(`document.querySelector('.tab-btn[data-tab="barak"]').click()`);
     check('other tabs still switch (Barak)', await evalJs(`document.getElementById('tab-barak').classList.contains('active') && !document.getElementById('tab-dana').classList.contains('active')`));
+  }
+  if (seeded) {
+    // ── "הפק גרסה מתוקנת" end to end: the page → the server → the job the worker would receive ──
+    console.log('\n── revise flow');
+    await evalJs(`document.querySelector('.tab-btn[data-tab="dana"]').click()`);
+    await until(`${D} && !!${D}.querySelector('#projects .proj[data-id="${NEW_ID}"]')`);
+    await evalJs(`${D}.querySelector('#projects .proj[data-id="${NEW_ID}"]').click()`);
+    await until(`${D}.getElementById('list').classList.contains('hidden') && !${D}.getElementById('detail').classList.contains('hidden') && !!${D}.querySelector('#captions input[data-card="2"]')`);   // the project is loaded, not the previous DOM
+    const original = await evalJs(`${D}.querySelector('#captions input[data-card="2"]').value`);
+    await evalJs(`(() => { const d = ${D}, w = ${F}.contentWindow; w.prompt = () => 'בודק אוטומטי'; w.confirm = () => true;
+      const set = (el, val) => { el.value = val; el.dispatchEvent(new w.Event('input', { bubbles: true })); };
+      set(d.querySelector('#captions input[data-card="2"]'), 'כתובית מתוקנת');
+      set(d.getElementById('st_size'), '110');
+      const z = d.querySelector('#zooms select[data-zoom="z@152.0"]'); z.value = 'remove'; z.dispatchEvent(new w.Event('input', { bubbles: true }));
+      set(d.getElementById('rvnote'), 'הערת בדיקה לפרויקט');
+      const r = d.querySelector('input[name="rvscope"][value="project"]'); r.checked = true; r.dispatchEvent(new w.Event('input', { bubbles: true })); })()`);
+    check('the summary lists what will go into the next version', await evalJs(`/1 תיקוני כתוביות/.test(${D}.getElementById('rvsum').textContent) && /שינוי סגנון/.test(${D}.getElementById('rvsum').textContent) && /1 שינויי זום/.test(${D}.getElementById('rvsum').textContent)`), await evalJs(`${D}.getElementById('rvsum').textContent`));
+    await evalJs(`${D}.querySelector('#revise [data-do="revise"]').click()`);
+    const api = async (u, o) => (await fetch(`http://127.0.0.1:${appPort}${u}`, o)).json().catch(() => ({}));
+    const queued = await waitFor(async () => { const p = (await api(`/api/dana/studio/projects/${NEW_ID}`)).project; return p && p.currentVersion === 2 && p.status === 'editing' ? p : null; }, { timeoutMs: 10000, intervalMs: 200 });
+    check('pressing it queues version 2 and keeps version 1', !!queued && queued.versions.length === 2 && queued.versions[0].hasVideo === true, JSON.stringify(queued?.versions));
+    check('the page shows the new version in the queue', await until(`/ממתין בתור|בעריכה/.test(${D}.getElementById('detail').innerText)`));
+    const W = { method: 'POST', headers: { Authorization: `Bearer ${WORKER_TOKEN}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ workerId: 'check', pipelineVersion: 't' }) };
+    const leased = await api('/api/dana/worker/lease', W), o = leased.job?.options ?? {};
+    check('the job carries the caption correction with its source time and original text', o.caption_edits?.length === 1 && o.caption_edits[0].text === 'כתובית מתוקנת' && o.caption_edits[0].original === original && o.caption_edits[0].source_end_s > o.caption_edits[0].source_start_s, JSON.stringify(o.caption_edits));
+    check('the job carries the style change, the zoom removal and the project note; no adapter is forced', o.style_overrides?.caption_size === 110 && o.zoom_edits?.[0]?.id === 'z@152.0' && o.zoom_edits[0].action === 'remove' && o.change_request === 'הערת בדיקה לפרויקט' && (o.adapter === undefined || o.adapter === 'claude'), JSON.stringify({ s: o.style_overrides, z: o.zoom_edits, c: o.change_request, a: o.adapter }));
   }
   check('no JavaScript errors in the page', pageErrors.length === 0, pageErrors.slice(0, 3).join(' | '));
 } catch (e) {

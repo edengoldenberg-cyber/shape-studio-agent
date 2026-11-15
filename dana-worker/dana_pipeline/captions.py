@@ -164,6 +164,7 @@ def card_html(text, highlight, style):
     for h in sorted(set(highlight or []), key=len, reverse=True):
         esc = html.escape(h)
         out = out.replace(esc, f'<span class="hl">{esc}</span>', 1)
+    out = out.replace("\n", "<br>")                 # layout only: the line break is ours, never content
     if style["backing"]:
         out = f'<span style="display:inline-block;{style["backing_css"]}">{out}</span>'
     return out
@@ -223,6 +224,8 @@ def composite(cfg, base, voice, cards, png_dir, out, dur):
         t0, t1 = c["start"], round(c["start"] + c["dur"], 4)
         parts.append(f"[{prev}][{idx + 2}:v]overlay=format=auto:enable='between(t,{t0},{t1})'[v{idx + 1}]")
         prev = f"v{idx + 1}"
+    if not parts:                                    # no caption layer (the source already carries captions)
+        parts, prev = ["[0:v]null[v0]"], "v0"
     script = Path(out).with_suffix(".filter.txt")
     script.write_text(";\n".join(parts), encoding="utf-8")
     cmd = [tool(cfg, "ffmpeg"), "-y", "-v", "error", "-i", base, "-i", voice, *inputs,
@@ -235,3 +238,12 @@ def composite(cfg, base, voice, cards, png_dir, out, dur):
     run(cmd, "render_failed", timeout=cfg["timeouts"]["ffmpeg_s"])
     script.unlink(missing_ok=True)
     return out
+
+
+def two_lines(text):
+    """The same words on two balanced lines (layout only). None when the card has a single word."""
+    w = text.split()
+    if len(w) < 2:
+        return None
+    best = min(range(1, len(w)), key=lambda k: abs(len(" ".join(w[:k])) - len(" ".join(w[k:]))))
+    return " ".join(w[:best]) + "\n" + " ".join(w[best:])

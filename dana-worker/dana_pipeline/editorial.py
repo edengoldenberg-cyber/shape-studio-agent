@@ -245,6 +245,14 @@ def model_review(cfg, job_dir, dec, res, previous, tag, work):
                                             ensure_ascii=False, indent=1) + "\n</publication_text>",
         ("<previous_findings>\n" + json.dumps([{k: f[k] for k in ("id", "asset", "card", "problem", "correction")} for f in previous],
                                                ensure_ascii=False, indent=1) + "\n</previous_findings>") if previous else "",
+        ("<notes>\nThe SOURCE file already carries its own burned-in captions. This edit added NO caption layer: the cards above are data "
+         "only (text and times) and are not drawn on the picture. Do not report differences between the burned captions you see in the "
+         "frames and the cards, and do not ask to cover, move or restyle the burned captions: they are part of the source and cannot be "
+         "changed. The cover has no text layer by design; any text you see on it is the source's own caption.\n</notes>")
+        if not res.get("captions_added", True) else "",
+        ("<zooms>\n" + json.dumps([{k: z.get(k) for k in ("tl_t_s", "hold_until_s", "scale", "reason")} for z in res.get("zooms") or []],
+                                   ensure_ascii=False) + "\nEach zoom eases in at tl_t_s and holds until hold_until_s, then cuts back to the wide "
+         "frame. You see stills only; judge framing in the stills, not the feel of the motion.\n</zooms>") if res.get("zooms") else "",
         f"Still frames follow, in order, taken at {', '.join(str(s['t']) + ' s' for s in shots)}; the last image is the cover.",
     ])
     content = [{"type": "text", "text": text}] + [{"type": "image", "path": s["path"]} for s in shots] + [{"type": "image", "path": cover_small}]

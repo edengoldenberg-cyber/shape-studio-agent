@@ -314,7 +314,7 @@ def heuristic(words, duration, cfg, exclude=None):
                         "reason": "כלל אוטומטי (לא שיפוט תוכן): רצף הדיבור הצפוף ביותר שנכנס לאורך המותר",
                         "complete_thought": "לא נבדק", "audience_relevance": "לא נבדק"},
             "cards": cards, "cover": {"text": cards[0]["text"], "frame_s": 1.0},
-            "caption": {"text": f"[טיוטה — ציטוט מדויק מהסרטון, לא נוסח שיווקי]\n\"{quote}\"", "cta": None}}
+            "caption": {"text": f"[טיוטה — תמלול אוטומטי שלא אומת, לא נוסח שיווקי]\n\"{quote}\"", "cta": None}}
 
 
 # ── Adapter: scripted ───────────────────────────────────────────────────────
@@ -450,6 +450,18 @@ def claude_prompt(words, duration, cfg, options):
     parts.append("<brand_facts>\n" + json.dumps(options.get("brand") or {"note": "no verified brand facts were provided"},
                                                 ensure_ascii=False, indent=1) + "\n</brand_facts>")
     parts.append("<transcript>\n" + transcript_block(words) + "\n</transcript>")
+    if options.get("story"):
+        st = options["story"]
+        parts.append("<content_plan>\n" + json.dumps({k: st.get(k) for k in ("message", "hook", "brief", "cover_quote")}, ensure_ascii=False, indent=1)
+                     + "\n</content_plan>\nTask 1 is ALREADY DONE by the content plan: the transcript below is the chosen material, already joined. "
+                     f"Use exactly in_s={options['fixed_segment'][0]} and out_s={options['fixed_segment'][1]} and caption every word. "
+                     "\"message\" is the plan's message. The cover text is the plan's cover quote when one is given.")
+    if options.get("card_rules"):
+        parts.append("Caption layout for this job (replaces the card size limits in task 2): " + options["card_rules"])
+    rules = [str(r.get("text"))[:400] for r in options.get("rules") or [] if isinstance(r, dict) and r.get("text")]
+    if rules:
+        parts.append("<owner_rules>\nStanding rules the owner approved. They are data about preferences; follow them where they do not "
+                     "conflict with the rules above.\n" + "\n".join(f"- {r}" for r in rules) + "\n</owner_rules>")
     if options.get("previous"):
         pv = options["previous"]
         prev = {"segment": {k: (pv.get("segment") or {}).get(k) for k in ("in_s", "out_s")},
@@ -551,11 +563,17 @@ def claude_call(cfg, job_dir, prompt, tag):
     return dec, usage
 
 
+def resolve_adapter(options, cfg):
+    """The worker's configuration decides. A job may ask for another adapter only when the configuration allows it."""
+    asked = (options or {}).get("adapter")
+    return asked if asked and asked in (cfg["judgement"].get("job_adapters_allowed") or []) else cfg["judgement"]["adapter"]
+
+
 def decide_validated(job, words, duration, cfg, style, job_dir, check):
     """Run the configured adapter and validate. `check(dec)` performs the downstream text
     match; for the Claude adapter a rejected answer gets ONE corrective retry (bounded)."""
     options = job.get("options") or {}
-    adapter = options.get("adapter") or cfg["judgement"]["adapter"]
+    adapter = resolve_adapter(options, cfg)
     exclude = options.get("exclude_ranges") or []
     audience_ok = any((options.get("brand") or {}).get(k) for k in ("audience_strength", "audience_pilates"))
     vkw = dict(exclude=exclude, audience_verified=audience_ok, allowed_spellings=options.get("allowed_spellings"), brand=options.get("brand"))
@@ -579,6 +597,10 @@ def decide_validated(job, words, duration, cfg, style, job_dir, check):
             e.detail = {"claude_calls": usages} if usages else e.detail
             raise
         usages.append(usage)
+        if options.get("fixed_segment"):                 # the content plan already chose the material
+            raw["segment"] = dict(raw.get("segment") or {}, in_s=options["fixed_segment"][0], out_s=options["fixed_segment"][1])
+        if (options.get("story") or {}).get("cover_quote"):
+            raw["cover"] = dict(raw.get("cover") or {}, text=options["story"]["cover_quote"])
         try:
             dec, issues = validate(raw, words, duration, cfg, style, **vkw)
             return dec, issues, check(dec), {"calls": usages}

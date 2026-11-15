@@ -56,8 +56,8 @@ async function finish(l, sourceSha, opts) {
   const status = (opts?.failed?.length || opts?.blockers?.length) ? 'review_required' : 'success';
   return W(request(app).post(`/api/dana/worker/jobs/${l.job.id}/complete`)).set('X-Lease-Token', l.leaseToken).send({ status });
 }
-async function ready(opts) {
-  const up = await upload(Buffer.concat([VIDEO, crypto.randomBytes(16)]), `clip-${crypto.randomBytes(3).toString('hex')}.mp4`); const l = (await lease()).body;
+async function ready(opts, uploadOptions) {
+  const up = await upload(Buffer.concat([VIDEO, crypto.randomBytes(16)]), `clip-${crypto.randomBytes(3).toString('hex')}.mp4`, uploadOptions); const l = (await lease()).body;
   expect((await finish(l, up.body.project.source.sha256, opts)).status).toBe(200);
   return up.body.project.id;
 }
@@ -278,7 +278,7 @@ describe('review package: one approval bound to the exact version', () => {
   });
 
   test('request changes: a new version is a new package and never inherits approval', async () => {
-    const id = await ready(); const A = `/api/dana/studio/projects/${id}`;
+    const id = await ready(undefined, { adapter: 'heuristic' }); const A = `/api/dana/studio/projects/${id}`;   // EXPLICITLY rule-based
     await request(app).post(A + '/approve').send({ fingerprint: (await get(id)).version.fingerprint, by: 'Eden' });
     // free-text note with the rule-based adapter: recorded, not re-rendered blindly
     let r = await request(app).post(A + '/request-changes').send({ note: 'לקצר את הפתיחה' });

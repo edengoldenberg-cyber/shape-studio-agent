@@ -138,7 +138,8 @@ def run_pipeline(cfg, cfg_path, job_dir, source, on_stage):
     return state, result
 
 
-STAGE_HE = {"source": "בודק את קובץ המקור", "transcribe_source": "מתמלל", "judgement": "בוחר קטע וכתוביות",
+STAGE_HE = {"transcribe_check": "האזנה שנייה לבדיקת התמלול", "assemble": "מחבר את החלקים שנבחרו", "measure_picture": "מודד מיקום פנים לכתוביות ולזומים",
+            "source": "בודק את קובץ המקור", "transcribe_source": "מתמלל", "judgement": "בוחר קטע וכתוביות",
             "plan": "דנה מתכננת: מסר, קטע ותדריך עריכה", "review": "דנה בודקת את התוצר", "revise": "העורך מתקן לפי הערות דנה",
             "match_cards": "מתאים כתוביות לדיבור", "align": "מיישר כתוביות למילים באודיו הסופי", "render_base": "חותך ומנרמל אודיו", "render_cards": "מרנדר כרטיסי כתוביות",
             "composite": "מרכיב כתוביות", "verify": "בודק סנכרון מול האודיו הסופי", "checks": "מריץ בדיקות", "cover": "מכין קאבר"}

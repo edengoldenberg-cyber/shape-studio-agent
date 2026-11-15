@@ -20,6 +20,7 @@ const multer  = require('multer');
 const studio    = require('../services/dana_studio');
 const publisher = require('../services/dana_publisher');
 const brand     = require('../utils/dana_brand');
+const refs      = require('../services/dana_references');
 
 const json = express.json({ limit: '300kb' });
 const wrap = fn => (req, res) => new Promise(resolve => resolve(fn(req, res))).catch(err => {   // sync throws too
@@ -97,7 +98,8 @@ const upload = (req, res, next) => multer({
 });
 
 panelRouter.get('/status', wrap((_req, res) => res.json({ ok: true, worker: studio.workerStatus(), publishingEnabled: publisher.enabled(),
-  notifications: require('../services/dana_notify').realEnabled() ? 'real' : 'mock', maxUploadMb: maxUploadMb(), brandMissing: brand.missing() })));
+  notifications: require('../services/dana_notify').realEnabled() ? 'real' : 'mock', maxUploadMb: maxUploadMb(), brandMissing: brand.missing(),
+  instagramAccount: brand.get().instagram_account.value ?? null, defaultProfile: refs.defaultProfile(), styleLimits: studio.STYLE_OVERRIDABLE })));
 // ── Notification: configuration check and ONE explicit test (real mode only) ──
 panelRouter.get('/notify/status', wrap((_req, res) => res.json({ ok: true, notify: require('../services/dana_notify').status() })));
 panelRouter.post('/notify/test', json, wrap(async (req, res) => res.json({ ok: true, ...(await require('../services/dana_notify').sendTest(req.body ?? {})) })));
@@ -133,6 +135,8 @@ panelRouter.post('/projects/:id/exceptions',      ...act(studio.recordException)
 panelRouter.post('/projects/:id/review-confirm',  ...act(studio.confirmReview));
 panelRouter.post('/projects/:id/approve',         ...act(studio.approve));
 panelRouter.post('/projects/:id/request-changes', ...act(studio.requestChanges));
+/** "הפק גרסה מתוקנת": caption corrections + style + zoom changes + an optional note (project-only or standing rule) → the next version. */
+panelRouter.post('/projects/:id/revise',          ...act(studio.revise));
 panelRouter.post('/projects/:id/reject',          ...act(studio.reject));
 panelRouter.post('/projects/:id/consent',         ...act(studio.setConsent));
 panelRouter.post('/projects/:id/retry',           ...act((id) => studio.retry(id)));
@@ -173,5 +177,42 @@ panelRouter.get('/publisher/status', wrap(async (req, res) => {
 
 panelRouter.get('/brand', wrap((_req, res) => res.json({ ok: true, brand: brand.get() })));
 panelRouter.put('/brand/:field', json, wrap((req, res) => res.json({ ok: true, brand: brand.set(req.params.field, req.body?.value, req.body?.by) })));
+
+// ── Standing rules (feedback the owner marked "כלל קבוע") ─────────────────────
+panelRouter.get('/rules', wrap((_req, res) => res.json({ ok: true, rules: studio.listRules() })));
+panelRouter.post('/rules/:id/retire', json, wrap((req, res) => res.json({ ok: true, rules: studio.retireRule(req.params.id, req.body?.by) })));
+
+// ── Editing references and the approved profile ───────────────────────────────
+// A reference is stored with the owner's note and waits. Analysing it and proposing a profile is NOT implemented.
+const REF_MIME = { mp4: 'video/mp4', mov: 'video/quicktime', m4v: 'video/x-m4v', webm: 'video/webm', mkv: 'video/x-matroska',
+                   jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp' };
+const refUpload = (req, res, next) => multer({
+  storage: multer.diskStorage({ destination: (_r, _f, cb) => cb(null, tmpDir()), filename: (_r, _f, cb) => cb(null, `ref_${crypto.randomBytes(8).toString('hex')}`) }),
+  limits: { fileSize: Math.min(maxUploadMb(), 500) * 1024 * 1024, files: 1 },
+}).single('file')(req, res, err => {
+  if (err) return res.status(err.code === 'LIMIT_FILE_SIZE' ? 413 : 400).json({ ok: false, error: err.code ?? 'upload_failed',
+    message: err.code === 'LIMIT_FILE_SIZE' ? 'קובץ הרפרנס גדול מהמותר (500MB)' : err.message });
+  next();
+});
+const refsOut = () => ({ ok: true, references: refs.list(), analysis: { active: false, note: 'ניתוח רפרנסים עדיין לא פעיל' } });
+panelRouter.get('/references', wrap((_req, res) => res.json(refsOut())));
+panelRouter.post('/references', refUpload, wrap((req, res) => {
+  const b = req.body ?? {};
+  const ref = refs.add({ title: b.title, source_url: b.source_url, origin: b.origin, usage_permission: b.usage_permission, content_type: b.content_type,
+    fits_message: b.fits_message, owner_note: b.owner_note, by: b.by, fixName: studio.fixName,
+    file: req.file ? { tmpPath: req.file.path, originalName: req.file.originalname } : null });
+  res.status(201).json({ ...refsOut(), reference: ref });
+}));
+panelRouter.delete('/references/:id', wrap((req, res) => { refs.remove(req.params.id); res.json(refsOut()); }));
+panelRouter.get('/references/:id/file', wrap((req, res) => { const f = refs.filePath(req.params.id); sendRange(req, res, f.path, REF_MIME[f.ext] ?? 'application/octet-stream'); }));
+
+panelRouter.get('/profiles', wrap((_req, res) => res.json({ ok: true, profiles: refs.profiles(), default: refs.defaultProfile() })));
+/** Approve the profile that a finished version was actually edited with as the default for future projects. */
+panelRouter.post('/profiles/:id/approve', json, wrap((req, res) => {
+  const p = studio.getProject(String(req.body?.projectId ?? '')), v = req.body?.version ? p.versions.find(x => x.n === Number(req.body.version)) : studio.currentVersion(p);
+  if (!v?.package) throw new studio.StudioError(409, 'not_reviewable', 'אין חבילה בגרסה הזו');
+  res.json({ ok: true, profiles: refs.approveProfile(req.params.id, { package: v.package, projectId: p.id, versionN: v.n, by: req.body?.by }), default: refs.defaultProfile() });
+}));
+panelRouter.post('/profiles/clear-default', json, wrap((_req, res) => res.json({ ok: true, profiles: refs.clearDefaultProfile(), default: null })));
 
 module.exports = { workerRouter, panelRouter, sendRange };
