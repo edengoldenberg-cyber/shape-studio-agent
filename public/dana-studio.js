@@ -5,7 +5,7 @@
   const API = '/api/dana/studio';
   const csrf = () => { const m = /(?:^|;\s*)ss_csrf=([^;]+)/.exec(document.cookie); return m ? decodeURIComponent(m[1]) : null; };
   const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-  const fmt = iso => iso ? new Date(iso).toLocaleString('he-IL', { dateStyle: 'short', timeStyle: 'short' }) : '—';
+  const fmt = iso => iso ? new Date(iso).toLocaleString('he-IL', { dateStyle: 'short', timeStyle: 'short', timeZone: 'Asia/Jerusalem' }) : '—';
   let current = null, timer = null, me = '';
   try { me = localStorage.getItem('dana_reviewer') || ''; } catch { /* private mode */ }
 
@@ -109,7 +109,8 @@
         <label for="cap">הקפשן המדויק שיפורסם</label><textarea id="cap">${esc(v.caption.text)}</textarea>
         <label for="cta">קריאה לפעולה (CTA)</label><input type="text" id="cta" value="${esc(v.caption.cta || '')}" placeholder="לא הוגדר — לא יפורסם CTA">
         <label for="acct">חשבון יעד · ${esc(v.destination.platform)} / ${esc(v.destination.format)}</label><input type="text" id="acct" value="${esc(v.destination.account || '')}" placeholder="חשבון היעד לא הוגדר">
-        <label for="when">מועד פרסום</label><input type="datetime-local" id="when" value="${v.scheduledAt ? new Date(new Date(v.scheduledAt) - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16) : ''}">
+        <label for="when">מועד פרסום ${v.scheduleProposed ? 'מוצע' : ''} — שעון ישראל</label><input type="datetime-local" id="when" value="${esc(v.scheduledLocal || '')}">
+        ${v.scheduleProposed ? '<div class="small mute">ברירת מחדל טכנית (מחר ב-12:00, לא לפני פרסום אחר) — לא המלצת תזמון. אפשר לשנות.</div>' : ''}
         <button data-do="save" style="margin-top:10px">שמירת שינויים</button>
         <p class="small mute">שינוי בקפשן, ב-CTA, ביעד או במועד מבטל אישור קיים.</p></div>`);
 
@@ -148,16 +149,45 @@
       <div class="row" style="margin-top:10px"><span class="grow">מוזיקה</span><span class="pill ok">ללא מוזיקה</span></div>
       <p class="small mute">אפשר להכין ולאשר חבילה לפני שתועדה הסכמה, אבל פרסום חסום עד שהיא מתועדת.</p></div>`);
 
-    h.push(`<div class="card"><h2>פרסום</h2><div class="pill ${p.publication.allowed ? 'ok' : 'bad'}">${p.publication.allowed ? 'מותר' : 'חסום'}</div>
-      <ul class="plain small">${p.publication.blocked.map(b => `<li>${esc(b.message)}</li>`).join('')}</ul>
-      <p class="small mute">בשלב הזה אין חיבור לאינסטגרם ושום דבר לא מתפרסם.</p></div>`);
+    const ed = pkg && pkg.editorial;
+    if (ed) {
+      const last = ed.cycles[ed.cycles.length - 1];
+      h.push(`<div class="card"><h2>העבודה של דנה</h2>
+        <div class="row"><span class="pill ${ed.status === 'ready_for_owner_review' ? 'ok' : 'warn'}">${ed.status === 'ready_for_owner_review' ? 'מוכן לבדיקה שלך' : 'נעצר עם נושאים פתוחים'}</span>
+          <span class="pill mute">${ed.revisions} סבבי תיקון</span>${ed.test_injection ? '<span class="pill bad">כולל פגם בדיקה מוזרק</span>' : ''}</div>
+        ${ed.test_injection ? `<div class="small bad">${esc(ed.test_injection.label)}</div>` : ''}
+        <label>מטרת התוכן</label><div>${esc(ed.objective || '—')}</div>
+        <details class="small"><summary>תדריך העריכה</summary><ul class="plain">${ed.brief.map(b => `<li>${esc(b)}</li>`).join('') || '<li>—</li>'}</ul>
+          <div class="mute">עובדות מאומתות ששימשו: ${esc(ed.verified_facts.join(' · ') || '—')}</div><div class="mute">חסר ולכן הושמט: ${esc(ed.missing_information.join(' · ') || '—')}</div></details>
+        <details class="small"><summary>קריטריוני קבלה (${last ? ed.criteria.filter(c => c.met).length : 0}/${ed.criteria.length} מתקיימים)</summary><ul class="plain">${ed.criteria.map(c =>
+          `<li><span class="pill ${c.met === true ? 'ok' : c.met === false ? 'bad' : 'mute'}">${c.met === true ? 'כן' : c.met === false ? 'לא' : '?'}</span> ${esc(c.criterion)} <span class="mute">(${esc({ check: 'בדיקה', skill: 'כלי סקיל', reviewer: 'ביקורת דנה' }[c.decided_by])})</span></li>`).join('')}</ul></details>
+        <details class="small"><summary>סבבי ביקורת ותיקון</summary>${ed.cycles.map(c => `<div style="margin-top:8px"><b>סבב ${c.cycle}</b>${c.reused_render ? ' · רק טקסטים השתנו' : ''}
+          <ul class="plain">${c.findings.map(f => `<li><span class="pill ${f.severity === 'blocking' ? 'bad' : 'warn'}">${f.severity === 'blocking' ? 'חוסם' : 'המלצה'}</span> ${esc(f.problem)}<div class="mute">→ ${esc(f.correction)}</div></li>`).join('') || '<li class="ok">אין ממצאים</li>'}</ul>
+          ${c.verification_of_previous.length ? `<div class="mute">אימות תיקוני הסבב הקודם: ${c.verification_of_previous.filter(x => x.status === 'fixed').length}/${c.verification_of_previous.length} תוקנו</div>` : ''}</div>`).join('')}</details>
+        <p class="small mute">הביקורת של דנה קוראת טקסט ורואה פריימים בודדים. היא לא שומעת את האודיו ולא צופה בתנועה. קבלה פנימית שלה פירושה "מוכן לבדיקה שלך" — לא אישור פרסום.</p>
+        <a class="small" href="${base}/editorial" target="_blank" rel="noopener">הפלט המלא (JSON)</a></div>`);
+    }
+    const pub = p.publication.record;
+    const PS = { scheduled: ['מתוזמן', 'info'], processing: ['בתהליך', 'info'], published: ['פורסם', 'ok'], failed: ['נכשל', 'bad'], uncertain: ['לא ודאי', 'warn'], cancelled: ['בוטל', 'mute'] };
+    h.push(`<div class="card"><h2>פרסום</h2>
+      ${pub ? `<div class="row"><span class="pill ${PS[pub.state][1]}">${PS[pub.state][0]}</span>${pub.mode === 'mock' ? '<span class="pill bad">MOCK — לא פרסום אמיתי</span>' : ''}<span class="small mute">${fmt(pub.scheduledAt)} שעון ישראל</span></div>
+        ${pub.permalink ? `<div class="small">קישור: <code>${esc(pub.permalink)}</code> · מזהה <code>${esc(pub.mediaId)}</code>${pub.verification ? ` · קפשן תואם: ${pub.verification.captionMatches === true ? 'כן' : pub.verification.captionMatches === false ? 'לא' : '—'}` : ''}</div>` : ''}
+        ${pub.error ? `<div class="small bad">${esc(pub.error)}</div>` : ''}
+        ${pub.metrics.length ? `<ul class="plain small">${pub.metrics.map(m => `<li><span class="pill bad">${esc(m.source)}</span> אחרי ${m.offsetHours} שעות: ${Object.entries(m.values).map(([k, x]) => `${esc(k)} ${esc(x)}`).join(' · ')}</li>`).join('')}</ul>` : ''}
+        ${pub.state === 'scheduled' ? '<button data-do="pubcancel" class="danger" style="margin-top:8px">ביטול הפרסום המתוזמן</button>' : ''}`
+      : `<div class="pill ${p.publication.allowed ? 'ok' : 'bad'}">${p.publication.allowed ? 'מותר לתזמן' : 'חסום'}</div>
+        <ul class="plain small">${p.publication.blocked.map(b => `<li>${esc(b.message)}</li>`).join('')}</ul>
+        ${p.publication.allowed ? '<button data-do="pubschedule" class="primary" style="margin-top:8px">תזמון הפרסום (MOCK)</button>' : ''}`}
+      ${p.publication.paused ? '<div class="pill warn" style="margin-top:8px">כל הפרסומים מושהים</div>' : ''}
+      <p class="small mute">אין חיבור לאינסטגרם. במצב בדיקה קיים רק ספק דמה מקומי; שום דבר לא מתפרסם בפועל.</p></div>`);
 
     if (v && v.approval) h.push(`<div class="card"><h2 class="${v.approvalValid ? 'ok' : 'bad'}">${v.approvalValid ? 'אושר' : 'האישור אינו תקף (התוכן השתנה)'}</h2>
       <div class="small mute">${esc(v.approval.by)} · ${fmt(v.approval.at)} · טביעת גרסה <code>${esc(v.approval.fingerprint.slice(0, 16))}…</code></div></div>`);
 
     const H = { uploaded: 'הועלה', duplicate_upload: 'העלאה כפולה זוהתה', edit_queued: 'עריכה נכנסה לתור', job_leased: 'העובד התחיל', job_released: 'עריכה הוחזרה לתור',
       job_failed: 'עריכה נכשלה', package_ready: 'חבילה מוכנה', package_edited: 'החבילה נערכה', approval_invalidated: 'האישור בוטל', approved: 'אושר',
-      changes_requested: 'התבקשו שינויים', rejected: 'נדחה', consent_recorded: 'הסכמה תועדה', exception_recorded: 'חריגה תועדה', review_confirmed: 'פריטי הבדיקה אושרו' };
+      changes_requested: 'התבקשו שינויים', rejected: 'נדחה', consent_recorded: 'הסכמה תועדה', exception_recorded: 'חריגה תועדה', review_confirmed: 'פריטי הבדיקה אושרו', publication_scheduled: 'פרסום תוזמן', publication_processing: 'פרסום בתהליך',
+      publication_published: 'פורסם (אומת)', publication_failed: 'פרסום נכשל', publication_uncertain: 'פרסום לא ודאי', publication_cancelled: 'פרסום בוטל', metrics_collected: 'נתונים נאספו' };
     h.push(`<div class="card"><details><summary><b>היסטוריה וגרסאות</b></summary>
       <div class="small">${p.versions.map(x => `גרסה ${x.n}: ${(STATUS[x.status] || [x.status])[0]}${x.changeRequest ? ' — "' + esc(x.changeRequest) + '"' : ''}`).join('<br>')}</div>
       <ul class="plain small">${p.history.slice().reverse().map(e => `<li>${fmt(e.at)} · ${esc(e.actor)} · <b>${esc(H[e.action] || e.action)}</b>${e.detail && (e.detail.note || e.detail.reason || e.detail.code) ? ' — ' + esc(e.detail.note || e.detail.reason || e.detail.code) : ''}</li>`).join('')}</ul></details></div>`);
@@ -192,8 +222,10 @@
   $('#detail').onclick = e => {
     const t = e.target;
     if (t.dataset.do === 'save') return act('/package', { caption: $('#cap').value, cta: $('#cta').value, account: $('#acct').value,
-      scheduledAt: $('#when').value ? new Date($('#when').value).toISOString() : null }, 'נשמר. אם היה אישור — הוא בוטל ויש לאשר מחדש.', 'PATCH');
+      scheduledLocal: $('#when').value || null }, 'נשמר. אם היה אישור — הוא בוטל ויש לאשר מחדש.', 'PATCH');
     if (t.dataset.do === 'retry') return act('/retry', {}, 'העריכה חזרה לתור.');
+    if (t.dataset.do === 'pubschedule') return act('/publish', {}, 'הפרסום תוזמן (MOCK).');
+    if (t.dataset.do === 'pubcancel') return act('/publish/cancel', {}, 'הפרסום המתוזמן בוטל.');
     if (t.dataset.play) {
       const [t0, t1] = t.dataset.play.split(',').map(Number), vid = $('#detail video');
       vid.scrollIntoView({ block: 'center' });
@@ -224,10 +256,10 @@
       if (!confirm(`לאשר את גרסה ${v.n} בדיוק כפי שהיא מוצגת?\nסרטון, קאבר, קפשן, יעד ומועד.`)) return;
       return act('/approve', { fingerprint: v.fingerprint, by }, 'החבילה אושרה. האישור תקף לגרסה הזו בלבד.'); }
     if (a === 'changes') { const note = prompt('מה לשנות?'); if (!note) return; return act('/request-changes', { note }, 'בקשת השינוי נשמרה.'); }
-    if (a === 'reschedule') { const cur = $('#when') && $('#when').value; const val = prompt('מועד חדש (YYYY-MM-DD HH:MM):', cur ? cur.replace('T', ' ') : '');
-      if (!val) return; const d = new Date(val.replace(' ', 'T')); if (isNaN(d)) return notice('תאריך לא תקין', 'bad');
+    if (a === 'reschedule') { const cur = $('#when') && $('#when').value; const val = prompt('מועד חדש בשעון ישראל (YYYY-MM-DD HH:MM):', cur ? cur.replace('T', ' ') : '');
+      if (!val) return; const loc = val.trim().replace(' ', 'T'); if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(loc)) return notice('תאריך לא תקין', 'bad');
       const keep = v.approvalValid && confirm('התוכן כבר אושר. להשאיר אותו מאושר עם המועד החדש?');
-      return act('/reschedule', { scheduledAt: d.toISOString(), keepApproval: keep, by: keep ? who() : undefined }, 'המועד עודכן.'); }
+      return act('/reschedule', { scheduledLocal: loc, keepApproval: keep, by: keep ? who() : undefined }, 'המועד עודכן.'); }
     if (a === 'reject') { const reason = prompt('סיבת הדחייה:'); if (reason === null) return; return act('/reject', { reason }, 'החבילה נדחתה.'); }
   };
 

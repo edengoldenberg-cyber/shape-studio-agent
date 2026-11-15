@@ -49,6 +49,13 @@ DECISIONS_SCHEMA = {
                                "properties": {"heard": {"type": "string"}, "shown": {"type": "string"},
                                               "context": {"type": "string"}}}},
         "revision_note": {"type": "string"},
+        "objective": {"type": "string"},
+        "brief": {"type": "array", "maxItems": 8, "items": {"type": "string"}},
+        "facts_used": {"type": "array", "maxItems": 10, "items": {"type": "string"}},
+        "missing_info": {"type": "array", "maxItems": 10, "items": {"type": "string"}},
+        "addressed": {"type": "array", "maxItems": 30,
+                      "items": {"type": "object", "additionalProperties": False, "required": ["id", "action"],
+                                "properties": {"id": {"type": "string"}, "action": {"type": "string"}}}},
     },
 }
 EXTRA_KEYS = {"adapter", "notes", "_usage", "homophones", "considered", "alternatives"}   # legacy / operator-supplied keys
@@ -67,6 +74,21 @@ def canon(word, groups=None):
         if w in g:
             return g[0]
     return w
+
+
+FINALS = str.maketrans("ךםןףץ", "כמנפצ")
+
+
+def skeleton(text):
+    """Letters that carry the pronunciation-independent identity of Hebrew text: no spaces or
+    punctuation, final letters normalised, the vowel letters י/ו dropped except at the very
+    start, and a trailing א dropped. Two spellings with the same skeleton differ only in
+    orthography ("האמונים"/"האימונים", "איך שהוא"/"איכשהו"); "ושעה"/"והשעה" do NOT match."""
+    t = strip(text).replace(" ", "").translate(FINALS)
+    if not t:
+        return ""
+    body = t[0] + "".join(ch for ch in t[1:] if ch not in "יו")
+    return body[:-1] if len(body) > 2 and body.endswith("א") else body
 
 
 # kept for callers that only need punctuation-insensitive comparison
@@ -124,7 +146,7 @@ def snap_segment(seg, words, duration, fps, cfg):
     return round(in_s, 3), round(out_s, 3), notes
 
 
-def validate(dec, words, duration, cfg, style, exclude=None, audience_verified=False):
+def validate(dec, words, duration, cfg, style, exclude=None, audience_verified=False, allowed_spellings=None, brand=None):
     """Return (clean decisions, issues). Raises PipelineError(judgement_invalid)."""
     if not isinstance(dec, dict):
         raise PipelineError("judgement_invalid", "decisions must be an object")
@@ -170,9 +192,10 @@ def validate(dec, words, duration, cfg, style, exclude=None, audience_verified=F
         heard, shown = strip(_plain(sp.get("heard"), "spelling.heard", 30)), strip(_plain(sp.get("shown"), "spelling.shown", 30))
         if heard == shown:
             continue
-        if not any(heard in g and shown in g for g in groups):
-            raise PipelineError("judgement_invalid", f"spelling '{heard}'→'{shown}' is not a known homophone pair; "
-                                                     "captions may differ from the audio only between listed homophones")
+        offered = any(strip(a) == heard and strip(b) == shown for a, b in allowed_spellings or [])
+        if not any(heard in g and shown in g for g in groups) and not (offered and skeleton(heard) == skeleton(shown)):
+            raise PipelineError("judgement_invalid", f"spelling '{heard}'→'{shown}' is neither a listed homophone pair nor an "
+                                                     "orthographic variant that the second transcription actually wrote")
         clean_spelling.append({"heard": heard, "shown": shown, "reason": str(sp.get("context") or sp.get("reason") or "")[:300]})
 
     seg_words = [w for w in words if w["end"] > in_s + 0.05 and w["start"] < out_s - 0.05]
@@ -214,8 +237,27 @@ def validate(dec, words, duration, cfg, style, exclude=None, audience_verified=F
              "cards": cards, "cover": {"text": cover_text, "frame_s": round(frame_s, 3)},
              "caption": {"text": cap_text, "cta": cta, "is_draft": True},
              "spelling": clean_spelling, "revision_note": str(dec.get("revision_note") or "")[:500],
+             "plan": plan_fields(dec, brand, issues),
+             "addressed": [{"id": str(a.get("id"))[:40], "action": str(a.get("action") or "")[:300]}
+                           for a in (dec.get("addressed") or []) if isinstance(a, dict)],
              "adapter": dec.get("adapter") or "scripted"}
     return clean, issues
+
+
+def plan_fields(dec, brand, issues):
+    """Objective, edit brief, facts used and missing information. A "fact" is kept only when it
+    is literally one of the verified brand values — the plan cannot introduce a business fact."""
+    verified = [str(v) for k, v in (brand or {}).items() if k != "not_defined" and isinstance(v, (str, int, float))]
+    facts, dropped = [], []
+    for f in dec.get("facts_used") or []:
+        f = str(f)[:200]
+        (facts if any(v and v in f for v in verified) else dropped).append(f)
+    if dropped:
+        issues.append(issue("plan_fact_not_verified", "info", "עובדות שהתוכנית ציינה ואינן בהגדרות המותג המאומתות הושמטו: " + "; ".join(dropped)))
+    return {"objective": str(dec.get("objective") or "")[:300],
+            "brief": [str(b)[:300] for b in (dec.get("brief") or [])[:8]],
+            "facts_used": facts,
+            "missing_info": [str(m)[:200] for m in (dec.get("missing_info") or [])[:10]] or list((brand or {}).get("not_defined") or [])}
 
 
 # ── Adapter: heuristic ──────────────────────────────────────────────────────
@@ -323,7 +365,17 @@ THE TASK
 5. A short editorial note for the owner, in Hebrew, one sentence each: "message" (what the speaker
    says in this excerpt), "stands_alone" (why a stranger understands it without the rest of the
    recording). "audience" is null unless <brand_facts> defines an audience; never guess one.
-6. If <owner_change_request> is present, produce a revised version that addresses it, keep
+6. The plan: "objective" (what this video is for, one sentence, in Hebrew — e.g. building trust through a
+   trainee's own words; never a performance promise), "brief" (up to 8 short instructions for the edit that
+   follow from the content: where it opens, what the cover must show, what the caption must and must not
+   say), "facts_used" (verified brand facts the caption relies on, quoted exactly from <brand_facts>),
+   "missing_info" (what is not defined and therefore left out).
+7. If <review_findings> is present, this is a revision. Each finding has an id, the affected card / asset,
+   the problem and the requested correction. Apply every finding you can within the rules, change nothing
+   else, and list each one in "addressed" with its id and what you did (or why the rules forbid it).
+   A spelling listed under "allowed spellings" may be applied through "spelling"; card texts then use
+   the chosen form.
+8. If <owner_change_request> is present, produce a revised version that addresses it, keep
    everything it does not ask to change, and say what changed in "revision_note". A request that
    would require inventing words, facts or prices cannot be met: keep to the rules and say so.
 
@@ -351,7 +403,7 @@ def claude_command(cfg, system_prompt_file, schema_json):
     """The exact command. No tools, no MCP servers, no skills, no session, no settings, no CLAUDE.md."""
     c = cfg["judgement"]["claude"]
     exe = (cfg.get("paths") or {}).get("claude_exe") or "claude"
-    return [exe, "-p", "--output-format", "json",
+    return [exe, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
             "--model", str(c["model"]),
             "--tools", "",                       # no tool is available to the model
             "--strict-mcp-config",               # no MCP servers (none are configured)
@@ -393,44 +445,69 @@ def claude_prompt(words, duration, cfg, options):
     if options.get("previous"):
         pv = options["previous"]
         prev = {"segment": {k: (pv.get("segment") or {}).get(k) for k in ("in_s", "out_s")},
-                "cards": pv.get("cards"), "cover": pv.get("cover"), "caption": pv.get("caption")}
+                "cards": [{"n": n, "text": c.get("text"), "highlight": c.get("highlight") or []} for n, c in enumerate(pv.get("cards") or [], 1)],
+                "cover": pv.get("cover"), "caption": {k: (pv.get("caption") or {}).get(k) for k in ("text", "cta")}}
         parts.append("<previous_version>\n" + json.dumps(prev, ensure_ascii=False) + "\n</previous_version>")
+    if options.get("allowed_spellings"):
+        parts.append("Allowed spellings (the second transcription of the same audio wrote these forms; same speech, "
+                     "different orthography): " + "; ".join(f"'{a}' may be written '{b}'" for a, b in options["allowed_spellings"]))
+    if options.get("review_findings"):
+        parts.append("<review_findings>\n" + json.dumps(options["review_findings"], ensure_ascii=False, indent=1) + "\n</review_findings>")
     if options.get("change_request"):
         parts.append("<owner_change_request>\n" + str(options["change_request"])[:2000] + "\n</owner_change_request>")
     return "\n\n".join(parts)
 
 
-def claude_call(cfg, job_dir, prompt, tag):
+def claude_json(cfg, job_dir, system_text, content, schema, tag):
+    """ONE tool-free Claude call. `content` is a list of blocks: {"type": "text", "text": …} or
+    {"type": "image", "path": <jpeg>}. Returns (structured_output, usage). The same bounded
+    command is used for planning, revising and reviewing."""
+    import base64
     c = cfg["judgement"]["claude"]
-    bundle, bundle_info = load_bundle()
     job_dir = Path(job_dir)
-    sp = job_dir / "claude_system_prompt.txt"
-    sp.write_text(CLAUDE_SYSTEM + "\n\n# GUIDANCE (reviewed bundle from the installed Instagram skills)\n\n" + bundle, encoding="utf-8")
-    (job_dir / f"claude_prompt_{tag}.txt").write_text(prompt, encoding="utf-8")
+    sp = job_dir / f"claude_system_{tag}.txt"
+    sp.write_text(system_text, encoding="utf-8")
+    blocks = []
+    for blk in content:
+        if blk["type"] == "image":
+            blocks.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                                       "data": base64.b64encode(Path(blk["path"]).read_bytes()).decode("ascii")}})
+        else:
+            blocks.append({"type": "text", "text": blk["text"]})
+    (job_dir / f"claude_prompt_{tag}.txt").write_text(
+        "\n\n".join(b["text"] if b["type"] == "text" else f"[image: {b['path']}]" for b in content), encoding="utf-8")
+    stdin = (json.dumps({"type": "user", "message": {"role": "user", "content": blocks}}) + "\n").encode("utf-8")
     cwd = job_dir / "claude_cwd"                 # an empty folder: no project files, no CLAUDE.md
     cwd.mkdir(exist_ok=True)
-    cmd = claude_command(cfg, sp, json.dumps(DECISIONS_SCHEMA))
+    cmd = claude_command(cfg, sp, json.dumps(schema))
     t0 = time.time()
     try:
-        r = subprocess.run(cmd, input=prompt.encode("utf-8"), capture_output=True, timeout=int(c["timeout_s"]), cwd=str(cwd))
+        r = subprocess.run(cmd, input=stdin, capture_output=True, timeout=int(c["timeout_s"]), cwd=str(cwd))
     except subprocess.TimeoutExpired:
         raise PipelineError("judgement_timeout", f"Claude did not answer within {c['timeout_s']}s", True)
     except OSError as e:
         raise PipelineError("judgement_unavailable", f"cannot start the Claude CLI: {e}")
     elapsed = round(time.time() - t0, 1)
     out = r.stdout.decode("utf-8", errors="replace")
-    (job_dir / f"claude_response_{tag}.json").write_text(out, encoding="utf-8")
-    try:
-        env = json.loads(out)
-    except ValueError:
-        raise PipelineError("judgement_failed", f"claude exited {r.returncode} without JSON", True,
+    (job_dir / f"claude_response_{tag}.jsonl").write_text(out, encoding="utf-8")
+    env = None
+    for line in out.splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(e, dict) and e.get("type") == "result":
+            env = e
+    if env is None:
+        raise PipelineError("judgement_failed", f"claude exited {r.returncode} without a result", True,
                             detail=(r.stderr or b"").decode("utf-8", errors="replace")[-800:])
     usage = {"call": tag, "elapsed_s": elapsed, "exit_code": r.returncode, "model_requested": c["model"],
              "models_used": sorted((env.get("modelUsage") or {}).keys()), "cost_usd_reported": env.get("total_cost_usd"),
              "duration_api_ms": env.get("duration_api_ms"), "num_turns": env.get("num_turns"),
              "usage": {k: (env.get("usage") or {}).get(k) for k in ("input_tokens", "output_tokens",
                        "cache_creation_input_tokens", "cache_read_input_tokens")},
-             "subtype": env.get("subtype"), "is_error": env.get("is_error"), "bundle": bundle_info,
+             "subtype": env.get("subtype"), "is_error": env.get("is_error"), "stop_reason": env.get("stop_reason"),
+             "images": sum(1 for b in content if b["type"] == "image"),
              # How the call was authenticated and what the cost figure means, as the CLI reports it.
              # api_key_source None = the logged-in Claude account (no API key in the environment);
              # cost_basis "list" = a list-price calculation by the CLI, not an invoice line.
@@ -439,19 +516,28 @@ def claude_call(cfg, job_dir, prompt, tag):
              "provider": sorted({str(v.get("provider")) for v in (env.get("modelUsage") or {}).values()}),
              "api_key_in_env": bool(__import__("os").environ.get("ANTHROPIC_API_KEY")),
              "budget_cap_usd": c["max_budget_usd"], "timeout_s": c["timeout_s"]}
-    if r.returncode != 0 or env.get("is_error"):
-        e = PipelineError("judgement_failed", f"claude reported an error ({env.get('subtype') or r.returncode}): "
+    if r.returncode != 0 or env.get("is_error") or env.get("stop_reason") == "refusal":
+        e = PipelineError("judgement_failed", f"claude reported an error ({env.get('stop_reason') or env.get('subtype') or r.returncode}): "
                           f"{str(env.get('result'))[:300]}", env.get("subtype") != "error_max_budget_usd")
         e.usage = usage
         raise e
-    dec = env.get("structured_output")
-    if dec is None:
+    data = env.get("structured_output")
+    if data is None:
         try:
-            dec = json.loads(env.get("result") or "")
+            data = json.loads(env.get("result") or "")
         except ValueError:
             e = PipelineError("judgement_invalid", "Claude did not return a JSON object", True)
             e.usage = usage
             raise e
+    return data, usage
+
+
+def claude_call(cfg, job_dir, prompt, tag):
+    """Planner / editor call: system rules + the reviewed instruction bundle, transcript as data."""
+    bundle, bundle_info = load_bundle()
+    system = CLAUDE_SYSTEM + "\n\n# GUIDANCE (reviewed bundle from the installed Instagram skills)\n\n" + bundle
+    dec, usage = claude_json(cfg, job_dir, system, [{"type": "text", "text": prompt}], DECISIONS_SCHEMA, tag)
+    usage["bundle"], usage["role"] = bundle_info, "planner" if "<review_findings>" not in prompt and "<owner_change_request>" not in prompt else "editor"
     dec.pop("homophones", None)
     dec["adapter"] = "claude"
     return dec, usage
@@ -464,11 +550,13 @@ def decide_validated(job, words, duration, cfg, style, job_dir, check):
     adapter = options.get("adapter") or cfg["judgement"]["adapter"]
     exclude = options.get("exclude_ranges") or []
     audience_ok = any((options.get("brand") or {}).get(k) for k in ("audience_strength", "audience_pilates"))
+    vkw = dict(exclude=exclude, audience_verified=audience_ok, allowed_spellings=options.get("allowed_spellings"), brand=options.get("brand"))
+    tag = str(options.get("_tag") or "plan")
     if adapter not in ("heuristic", "scripted", "claude"):
         raise PipelineError("judgement_invalid", f"unknown adapter '{adapter}'")
     if adapter != "claude":
         raw = scripted(Path(job_dir) / "decisions.json") if adapter == "scripted" else heuristic(words, duration, cfg, exclude)
-        dec, issues = validate(raw, words, duration, cfg, style, exclude, audience_ok)
+        dec, issues = validate(raw, words, duration, cfg, style, **vkw)
         return dec, issues, check(dec), None
     c = cfg["judgement"]["claude"]
     if not c.get("enabled"):
@@ -476,7 +564,7 @@ def decide_validated(job, words, duration, cfg, style, job_dir, check):
     prompt, usages, feedback = claude_prompt(words, duration, cfg, options), [], None
     for attempt in (1, 2):
         try:
-            raw, usage = claude_call(cfg, job_dir, prompt if not feedback else prompt + feedback, f"a{attempt}")
+            raw, usage = claude_call(cfg, job_dir, prompt if not feedback else prompt + feedback, f"{tag}_a{attempt}")
         except PipelineError as e:
             if getattr(e, "usage", None):
                 usages.append(e.usage)
@@ -484,7 +572,7 @@ def decide_validated(job, words, duration, cfg, style, job_dir, check):
             raise
         usages.append(usage)
         try:
-            dec, issues = validate(raw, words, duration, cfg, style, exclude, audience_ok)
+            dec, issues = validate(raw, words, duration, cfg, style, **vkw)
             return dec, issues, check(dec), {"calls": usages}
         except PipelineError as e:
             if attempt == 2 or e.code not in ("judgement_invalid", "caption_text_mismatch"):

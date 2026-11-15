@@ -58,6 +58,8 @@ DEFAULTS = {
     # Words that sound the same in spoken Hebrew. A caption may show either spelling; the choice is a text review item.
     "language": {"homophone_groups": [["אם", "עם"], ["אל", "על"], ["את", "עת"], ["לא", "לו"], ["כל", "קול"]]},
     "alignment": {"vad_min_silence_ms": 100, "agree_ms": 80, "lead_fail_ms": 120},
+    # Dana's plan → edit → review loop: at most this many automatic revisions, inside a total budget.
+    "editorial": {"max_cycles": 3, "max_total_cost_usd": 2.0, "max_total_s": 1500},
     "timeouts": {"ffmpeg_s": 1800, "chrome_s": 60},
 }
 REQUIRED_PATHS = ["work_root", "chrome", "caption_renderer", "font_dir", "safe_zone"]

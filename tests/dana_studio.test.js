@@ -19,6 +19,7 @@ function boot({ keepData = false } = {}) {
   process.env.DANA_WORKER_TOKEN = TOKEN;
   process.env.DANA_RETRY_DELAY_SECONDS = '0';
   delete process.env.DANA_PUBLISHING_ENABLED; delete process.env.DANA_NOTIFY_REAL;
+  process.env.DANA_PUBLISHER_MODE = 'mock';            // the only mode that exists; publishing itself stays off unless a test turns it on
   jest.resetModules();
   studio = require('../services/dana_studio'); publisher = require('../services/dana_publisher'); notify = require('../services/dana_notify');
   const { workerRouter, panelRouter } = require('../routes/dana_studio_routes');
@@ -329,7 +330,8 @@ describe('publication seam (no live publishing)', () => {
     const id = await ready();
     const r = await request(app).post(`/api/dana/studio/projects/${id}/publish`).send({});
     expect(r.status).toBe(409);
-    expect(r.body.blocked.map(b => b.code).sort()).toEqual(['consent_missing', 'destination_missing', 'not_approved', 'publishing_disabled', 'schedule_missing']);
+    expect(r.body.blocked.map(b => b.code).sort()).toEqual(['consent_missing', 'destination_missing', 'not_approved', 'publishing_disabled']);
+    expect((await get(id)).version).toMatchObject({ scheduleProposed: true, timezone: 'Asia/Jerusalem' });      // a concrete proposed time is always present
     const ok = await approved();
     expect((await request(app).post(`/api/dana/studio/projects/${ok}/publish`).send({})).body.blocked.map(b => b.code)).toEqual(['publishing_disabled']);
   });

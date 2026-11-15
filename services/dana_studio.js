@@ -34,6 +34,7 @@ const ARTIFACTS = {            // name → { mime, required }
   'package.json':           { mime: 'application/json', required: true  },
   'checks.json':            { mime: 'application/json', required: true  },
   'captions.json':          { mime: 'application/json', required: true  },
+  'editorial.json':         { mime: 'application/json', required: false },
   'transcript_source.json': { mime: 'application/json', required: false },
   'transcript_final.json':  { mime: 'application/json', required: false },
 };
@@ -122,6 +123,11 @@ function sanitizeOptions(o = {}) {
     out.decisions = d; out.adapter = 'scripted';
   }
   if (o.change_request) out.change_request = String(o.change_request).slice(0, 2000);
+  if (o.test_inject !== undefined) {
+    // Engineering verification only: a labelled defect is injected so the review → revise loop can be observed.
+    if (o.test_inject !== 'unverified_price_and_paraphrased_cover') throw new StudioError(400, 'test_inject_invalid', 'unknown test injection');
+    out.test_inject = o.test_inject;
+  }
   if (o.exclude_ranges !== undefined) {
     const r = o.exclude_ranges;
     if (!Array.isArray(r) || r.length > 30 || !r.every(x => Array.isArray(x) && x.length === 2 && x.every(Number.isFinite) && x[0] < x[1]))
@@ -177,7 +183,7 @@ function enqueueEdit(project, options, actor) {
     stage: 'queued', note: 'ממתין לעובד העריכה', error: null, uploaded: {},
     options: { adapter: options.adapter ?? project.adapter, style_overrides: { ...project.styleOverrides, ...(options.style_overrides ?? {}) },
                ...(options.decisions ? { decisions: options.decisions } : {}), ...(options.change_request ? { change_request: options.change_request } : {}),
-               ...(options.previous ? { previous: options.previous } : {}),
+               ...(options.previous ? { previous: options.previous } : {}), ...(options.test_inject ? { test_inject: options.test_inject } : {}),
                ...((project.excludeRanges ?? []).length ? { exclude_ranges: project.excludeRanges } : {}) },
     createdAt: now(), updatedAt: now(),
   };
@@ -319,6 +325,8 @@ function complete(jobId, token, body) {
   v.package = pkg; v.artifacts = { ...j.uploaded };
   v.caption = { text: String(pkg.caption?.text ?? ''), cta: pkg.caption?.cta ?? brand.cta_default.value ?? null, isDraft: true };
   v.destination = { platform: 'instagram', format: 'reel', account: brand.instagram_account.value ?? null };
+  v.scheduledAt = require('./dana_publisher').proposeTime();
+  v.scheduleProposed = true;                       // a neutral default, not a timing recommendation
   v.status = 'ready_for_review';
   j.status = body.status === 'success' ? 'succeeded' : 'review_required';
   j.lease = null; j.stage = 'done'; j.note = 'החבילה מוכנה לבדיקה'; j.updatedAt = now(); j.totalSeconds = pkg.total_s ?? null;
@@ -386,9 +394,16 @@ function editPackage(projectId, body, actor = 'owner') {
   if (body.caption !== undefined) { v.caption.text = String(body.caption).slice(0, 2200); v.caption.isDraft = false; }
   if (body.cta !== undefined) v.caption.cta = body.cta ? String(body.cta).slice(0, 200) : null;
   if (body.account !== undefined) v.destination.account = body.account ? String(body.account).replace(/^@/, '').slice(0, 60) : null;
+  if (body.scheduledLocal !== undefined) {         // wall-clock time in Israel, "YYYY-MM-DDTHH:MM"
+    const d = body.scheduledLocal ? require('./dana_publisher').fromLocal(body.scheduledLocal) : null;
+    if (body.scheduledLocal && !d) throw new StudioError(400, 'schedule_invalid', 'תאריך לא תקין');
+    body = { ...body, scheduledAt: d ? d.toISOString() : null };
+  }
   if (body.scheduledAt !== undefined) {
     if (body.scheduledAt && Number.isNaN(Date.parse(body.scheduledAt))) throw new StudioError(400, 'schedule_invalid', 'תאריך לא תקין');
-    v.scheduledAt = body.scheduledAt ? new Date(body.scheduledAt).toISOString() : null;
+    const next = body.scheduledAt ? new Date(body.scheduledAt).toISOString() : null;
+    if (next !== v.scheduledAt) v.scheduleProposed = false;
+    v.scheduledAt = next;
   }
   if (fingerprint(v) !== before) { hist(p, actor, 'package_edited', { version: v.n, fields: Object.keys(body) }); dropApproval(p, v, actor, 'content_changed'); }
   save();
@@ -532,11 +547,12 @@ function view(p) {
       n: v.n, status: v.status, createdAt: v.createdAt, changeRequest: v.changeRequest ?? null,
       fingerprint: fingerprint(v), approval: v.approval, approvalValid: approvalValid(v),
       caption: v.caption, destination: v.destination, scheduledAt: v.scheduledAt,
+      scheduledLocal: require('./dana_publisher').toLocal(v.scheduledAt), scheduleProposed: !!v.scheduleProposed, timezone: 'Asia/Jerusalem',
       exceptions: v.exceptions, unresolved: unresolved(v),
       package: v.package ? { duration: v.package.duration, segment: v.package.segment, adapter: v.package.adapter, spokenText: v.package.spoken_text,
         cards: v.package.cards, cover: v.package.cover, checks: v.package.checks, issues: v.package.issues, style: v.package.style,
         considered: v.package.considered ?? [], revisionNote: v.package.revision_note ?? '', spelling: v.package.spelling ?? [],
-        usage: v.package.judgement_usage ?? null, bundle: v.package.instruction_bundle ?? null,
+        usage: v.package.judgement_usage ?? null, bundle: v.package.instruction_bundle ?? null, editorial: v.package.editorial ?? null,
         timings: v.package.timings_s, totalSeconds: v.package.total_s, pipelineVersion: v.package.pipeline_version } : null,
       hasVideo: !!v.artifacts['final.mp4'], hasCover: !!v.artifacts['cover.jpg'],
     } : null,

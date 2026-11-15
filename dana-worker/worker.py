@@ -36,7 +36,7 @@ from dana_pipeline.core import (FAILURE, REVIEW_REQUIRED, STATE_BY_EXIT, SUCCESS
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{4,80}$")
 SAFE_EXT = {"mp4", "mov", "m4v", "webm", "avi", "mkv"}
-UPLOAD_ORDER = ["package.json", "checks.json", "captions.json", "transcript_source.json", "transcript_final.json",
+UPLOAD_ORDER = ["package.json", "checks.json", "captions.json", "editorial.json", "transcript_source.json", "transcript_final.json",
                 "cover.jpg", "final.mp4"]
 TRANSFER_ATTEMPTS = 3
 
@@ -139,6 +139,7 @@ def run_pipeline(cfg, cfg_path, job_dir, source, on_stage):
 
 
 STAGE_HE = {"source": "בודק את קובץ המקור", "transcribe_source": "מתמלל", "judgement": "בוחר קטע וכתוביות",
+            "plan": "דנה מתכננת: מסר, קטע ותדריך עריכה", "review": "דנה בודקת את התוצר", "revise": "העורך מתקן לפי הערות דנה",
             "match_cards": "מתאים כתוביות לדיבור", "align": "מיישר כתוביות למילים באודיו הסופי", "render_base": "חותך ומנרמל אודיו", "render_cards": "מרנדר כרטיסי כתוביות",
             "composite": "מרכיב כתוביות", "verify": "בודק סנכרון מול האודיו הסופי", "checks": "מריץ בדיקות", "cover": "מכין קאבר"}
 

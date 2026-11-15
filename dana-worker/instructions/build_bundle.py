@@ -26,7 +26,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SKILLS = Path.home() / ".claude" / "skills"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # (skill, heading, keep-only regex or None)
 SECTIONS = [
@@ -107,8 +107,10 @@ def build():
               + "\n\n".join(chunks) + "\n")
     sources["local_rules"] = {"path": "dana-worker/instructions/local_rules.md",
                               "sha256": hashlib.sha256((HERE / "local_rules.md").read_bytes().replace(b"\r\n", b"\n")).hexdigest()}
+    # Skill scripts the worker is allowed to RUN (measurements only). Pinned by hash: a changed script is not run.
+    tools = {rel: hashlib.sha256((SKILLS / rel).read_bytes()).hexdigest() for rel in ("ig-caption/caption.py", "ig-human/detect.py")}
     manifest = {"version": VERSION, "built": date.today().isoformat(), "bundle_sha256": hashlib.sha256(bundle.encode("utf-8")).hexdigest(),
-                "sections": [[s, h] for s, h, _ in SECTIONS], "sources": sources}
+                "sections": [[s, h] for s, h, _ in SECTIONS], "sources": sources, "tools": tools}
     return bundle, manifest
 
 

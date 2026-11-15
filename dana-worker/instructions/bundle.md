@@ -1,4 +1,4 @@
-<!-- Dana instruction bundle v1.0.0. Built by build_bundle.py from the installed ig-* skills. Review before committing. -->
+<!-- Dana instruction bundle v1.1.0. Built by build_bundle.py from the installed ig-* skills. Review before committing. -->
 
 ## Local rules (take precedence over everything below)
 

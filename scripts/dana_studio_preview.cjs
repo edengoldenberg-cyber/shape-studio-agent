@@ -19,12 +19,14 @@ const fs      = require('fs');
 const os      = require('os');
 const path    = require('path');
 
-function start({ lan = process.argv.includes('--lan'), port = Number(process.env.PORT) || 3100, dataDir } = {}) {
+function start({ lan = process.argv.includes('--lan'), port = Number(process.env.PORT) || 3100, dataDir, mockPublish = envMock() } = {}) {
   dataDir = dataDir || process.env.DANA_PREVIEW_DATA || 'C:/Users/owner/dana-work/preview-data';
   fs.mkdirSync(dataDir, { recursive: true });
   process.env.DATA_DIR = dataDir;
   process.env.LOG_TO_FILE = 'false';
-  delete process.env.DANA_PUBLISHING_ENABLED;          // never on in a preview
+  // Publishing stays off. `mockPublish` (dry-run tests only) turns on the MOCK publisher against a local stand-in API.
+  if (mockPublish) { process.env.DANA_PUBLISHING_ENABLED = 'true'; process.env.DANA_PUBLISHER_MODE = 'mock'; process.env.DANA_PUBLISH_API_BASE = mockPublish.base; process.env.DANA_PUBLISH_API_TOKEN = mockPublish.token; }
+  else { delete process.env.DANA_PUBLISHING_ENABLED; delete process.env.DANA_PUBLISHER_MODE; }
   delete process.env.DANA_NOTIFY_REAL;                 // notifications are always mocked here
   if (!process.env.DANA_WORKER_TOKEN) process.env.DANA_WORKER_TOKEN = crypto.randomBytes(24).toString('hex');
   fs.writeFileSync(path.join(dataDir, 'worker.token'), process.env.DANA_WORKER_TOKEN, { mode: 0o600 });
@@ -46,11 +48,13 @@ function start({ lan = process.argv.includes('--lan'), port = Number(process.env
       const ips = lan ? Object.values(os.networkInterfaces()).flat().filter(i => i.family === 'IPv4' && !i.internal).map(i => i.address) : [];
       console.log(`Dana studio preview: http://127.0.0.1:${port}/dana-studio.html`);
       for (const ip of ips) console.log(`  from a phone on the same Wi-Fi: http://${ip}:${port}/dana-studio.html (login required)`);
-      console.log(`data: ${dataDir}   publishing: OFF   notifications: MOCK`);
+      console.log(`data: ${dataDir}   publishing: ${mockPublish ? 'MOCK publisher → ' + mockPublish.base : 'OFF'}   notifications: MOCK`);
       resolve({ server, port, dataDir, token: process.env.DANA_WORKER_TOKEN });
     });
   });
 }
+
+function envMock() { return process.env.DANA_MOCK_PUBLISH_BASE ? { base: process.env.DANA_MOCK_PUBLISH_BASE, token: process.env.DANA_MOCK_PUBLISH_TOKEN || 'mock-token' } : null; }
 
 module.exports = { start };
 if (require.main === module) start();

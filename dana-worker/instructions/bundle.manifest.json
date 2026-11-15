@@ -1,7 +1,7 @@
 {
- "version": "1.0.0",
+ "version": "1.1.0",
  "built": "2026-11-15",
- "bundle_sha256": "bf64ca4c7f9f0ec7dbc47c0d2075b3573eefdb551bd13c1bebed65f80b7d7ff5",
+ "bundle_sha256": "11155bcd07ddc5425f929dbbd3cad5ac067f7a139354bad9ae9f03158af06ed3",
  "sections": [
   [
    "ig-repurpose",
@@ -53,5 +53,9 @@
    "path": "dana-worker/instructions/local_rules.md",
    "sha256": "7e3d49abd94f4f4521e40e1d95e015215cd63e138611dbdcf7a72cf721b09a6a"
   }
+ },
+ "tools": {
+  "ig-caption/caption.py": "5de10d9df4a6617dfb7c83a7650054fd93f34463893d08e74f719452411d24c1",
+  "ig-human/detect.py": "7d6269568f9755dc34e4de5691b70894428601b1d97b6ee08cb6e41a9f87b83e"
  }
 }

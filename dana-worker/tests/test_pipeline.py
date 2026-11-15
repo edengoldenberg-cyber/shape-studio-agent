@@ -461,5 +461,109 @@ class TextAndAcoustic(unittest.TestCase):
         self.assertEqual(checks.check_boundary(SRC, 1.2, 8.2)["status"], "fail")
 
 
+class Editorial(unittest.TestCase):
+    """Dana's review → revise loop: structured findings, verification by re-measurement, limits."""
+
+    def res(self, issues=(), odiffs=(), comfort=()):
+        return {"issues": [dict(code=c, severity="blocker", message=c) for c in issues], "odiffs": list(odiffs), "comfort_rows": list(comfort)}
+
+    def dec(self, caption="מתאמנת מספרת", cover="שינה לי את החיים"):
+        d, _ = judgement.validate({**DEC, "caption": {"text": caption, "cta": None}, "cover": {"text": cover}}, SRC, 10.0, CFG, STYLE)
+        return d
+
+    def test_findings_carry_asset_problem_correction_evidence_and_severity(self):
+        from dana_pipeline import editorial
+        res = self.res(issues=["unverified_number", "cover_text_not_a_quotation"],
+                       odiffs=[{"card": 4, "kind": "asr_variance", "shown": "האמונים", "heard": "האימונים", "t0": 3.0},
+                               {"card": 2, "kind": "asr_variance", "shown": "ושעה", "heard": "והשעה", "t0": 1.0}],
+                       comfort=[{"i": 3, "text": "שלי", "why": "על המסך 0.24s", "t0": 5.0}])
+        f = editorial.deterministic_findings(CFG, self.dec("רק 99 ₪"), res, {})
+        by = {x["key"]: x for x in f}
+        self.assertEqual(sorted(by), ["comfort:שלי", "issue:cover_not_quote", "issue:unverified_number", "ortho:האמונים>האימונים"])
+        for x in f:
+            for k in ("id", "asset", "problem", "correction", "evidence", "severity", "fix"):
+                self.assertTrue(x[k], k)
+        self.assertEqual((by["issue:unverified_number"]["severity"], by["issue:unverified_number"]["fix"]), ("blocking", "caption"))
+        self.assertEqual((by["comfort:שלי"]["severity"], by["comfort:שלי"]["card"]), ("advisory", 3))
+        # a difference in CONTENT between the transcriptions is not an orthography finding: it stays with the owner
+        self.assertNotIn("ortho:ושעה>והשעה", by)
+        self.assertEqual(editorial.allowed_spellings(res), [("האמונים", "האימונים")])
+
+    def test_orthography_rule(self):
+        k = judgement.skeleton
+        self.assertEqual(k("האמונים"), k("האימונים"))
+        self.assertEqual(k("איך שהוא"), k("איכשהו"))
+        for a, b in (("ושעה", "והשעה"), ("אם", "עם"), ("מאפשר", "מאפשר לי"), ("חזקה", "חזק")):
+            self.assertNotEqual(k(a), k(b), (a, b))
+
+    def test_a_spelling_must_be_one_the_second_transcription_actually_wrote(self):
+        seg = {"in_s": 0.9, "out_s": 8.2, "message": "m", "stands_alone": "s"}
+        base = {**DEC, "segment": seg, "spelling": [{"heard": "החיים", "shown": "החים", "context": "x"}]}
+        with self.assertRaises(PipelineError):
+            judgement.validate(base, SRC, 10.0, CFG, STYLE)                                   # not offered
+        dec, _ = judgement.validate(base, SRC, 10.0, CFG, STYLE, allowed_spellings=[("החיים", "החים")])
+        self.assertEqual(dec["spelling"][0]["shown"], "החים")
+        with self.assertRaises(PipelineError):                                                # offered, but not the same letters
+            judgement.validate({**base, "spelling": [{"heard": "החיים", "shown": "המוות", "context": "x"}]}, SRC, 10.0, CFG, STYLE,
+                               allowed_spellings=[("החיים", "המוות")])
+
+    def test_verification_is_by_re_measurement_for_checks_and_by_the_reviewer_otherwise(self):
+        from dana_pipeline import editorial
+        before = editorial.deterministic_findings(CFG, self.dec("רק 99 ₪"), self.res(issues=["unverified_number", "cover_text_not_a_quotation"]), {})
+        rv = editorial.F("reviewer:r0:0", "reviewer", "caption", "p", "c", "e", "blocking", "caption")
+        after = editorial.deterministic_findings(CFG, self.dec(), self.res(issues=["cover_text_not_a_quotation"]), {})
+        v = editorial.verify(before + [rv], after, {"previous": [{"id": rv["id"], "status": "fixed", "evidence": "הקפשן החדש"}]},
+                             [{"id": before[0]["id"], "action": "הוסר המחיר"}])
+        st = {x["problem"][:20]: (x["status"], x["verified_by"]) for x in v}
+        self.assertEqual(sorted(x["status"] for x in v), ["fixed", "fixed", "not_fixed"])
+        self.assertEqual([x for x in v if x["id"] == before[0]["id"]][0]["editor_said"], "הוסר המחיר")
+        self.assertEqual([x for x in v if x["id"] == rv["id"]][0]["verified_by"], "reviewer on the new result")
+        # the editor SAYING it fixed something does not make it fixed
+        v2 = editorial.verify(before, before, None, [{"id": b["id"], "action": "תוקן"} for b in before])
+        self.assertTrue(all(x["status"] == "not_fixed" for x in v2))
+
+    def test_model_cannot_decide_deterministic_criteria_or_restate_failed_checks(self):
+        from dana_pipeline import editorial
+        res = self.res(issues=["unverified_number"])
+        det = editorial.deterministic_findings(CFG, self.dec("רק 99 ₪"), res, {})
+        review = {"criteria": [{"id": "A2", "met": True, "note": "נראה בסדר"}, {"id": "A7", "met": True, "note": "מובן"}]}
+        table = {r["id"]: r for r in editorial.criteria_table(self.dec("רק 99 ₪"), res, det, {}, review)}
+        self.assertEqual((table["A2"]["decided_by"], table["A2"]["met"]), ("check", False))     # the model's "met" is ignored
+        self.assertEqual((table["A7"]["decided_by"], table["A7"]["met"]), ("reviewer", True))
+        self.assertIsNone(table["A4"]["met"])                                                  # skill tool did not run: unknown, not "passed"
+        for text in ("בדיקת sync_lead נכשלה בכרטיס 15", "הכרטיס על המסך 0.20s", "נקרא ב-30 תווים/ש", "energy_gate"):
+            self.assertIsNotNone(editorial.MEASURED.search(text), text)
+        self.assertIsNone(editorial.MEASURED.search("הקפשן מבטיח תוצאות שלא נאמרו"))
+
+    def test_injection_is_labelled_and_caught_by_the_checks(self):
+        from dana_pipeline import editorial
+        raw, info = editorial.inject(runner.as_raw(self.dec()), "unverified_price_and_paraphrased_cover")
+        self.assertIn("TEST INJECTION", info["label"])
+        dec, issues = judgement.validate(raw, SRC, 10.0, CFG, STYLE)
+        self.assertEqual({i["code"] for i in issues} & {"unverified_number", "cover_text_not_a_quotation"}, {"unverified_number", "cover_text_not_a_quotation"})
+        with self.assertRaises(PipelineError):
+            editorial.inject(raw, "something_else")
+
+    def test_plan_keeps_only_verified_facts_and_lists_what_is_missing(self):
+        brand = {"studio_name": "Shape Studio", "location": "פרדס חנה", "not_defined": ["CTA", "הצעה נוכחית"]}
+        raw = {**DEC, "objective": "בניית אמון", "brief": ["לפתוח במשפט הראשון"], "facts_used": ["studio_name: Shape Studio", "מחיר: 60 ₪"]}
+        dec, issues = judgement.validate(raw, SRC, 10.0, CFG, STYLE, brand=brand)
+        self.assertEqual(dec["plan"]["facts_used"], ["studio_name: Shape Studio"])
+        self.assertEqual(dec["plan"]["missing_info"], ["CTA", "הצעה נוכחית"])
+        self.assertIn("plan_fact_not_verified", [i["code"] for i in issues])
+
+    def test_limits_and_perception_are_explicit(self):
+        from dana_pipeline import editorial
+        self.assertEqual((CFG["editorial"]["max_cycles"], CFG["editorial"]["max_total_cost_usd"]), (3, 2.0))
+        self.assertTrue(any("לשמוע" in c for c in editorial.PERCEPTION["cannot"]))
+        self.assertNotRegex(editorial.REVIEW_SYSTEM.lower(), r"\bscore the\b|readiness")
+        ids = [i for i, _, _ in editorial.ACCEPTANCE]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_pinned_skill_tools_are_listed_in_the_manifest(self):
+        man = json.loads((ROOT / "instructions" / "bundle.manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(sorted(man["tools"]), ["ig-caption/caption.py", "ig-human/detect.py"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

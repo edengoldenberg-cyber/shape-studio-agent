@@ -121,6 +121,7 @@ const media = (name) => wrap((req, res) => {
 panelRouter.get('/projects/:id/versions/:n/video',  media('final.mp4'));
 panelRouter.get('/projects/:id/versions/:n/cover',  media('cover.jpg'));
 panelRouter.get('/projects/:id/versions/:n/checks', media('checks.json'));
+panelRouter.get('/projects/:id/versions/:n/editorial', media('editorial.json'));
 
 const act = fn => [json, wrap((req, res) => res.json({ ok: true, project: fn(req.params.id, req.body ?? {}) }))];
 panelRouter.patch('/projects/:id/package',        ...act(studio.editPackage));
@@ -134,13 +135,24 @@ panelRouter.post('/projects/:id/retry',           ...act((id) => studio.retry(id
 /** RESCHEDULE: a new time for content that is already approved is a re-approval of the same content. */
 panelRouter.post('/projects/:id/reschedule', json, wrap((req, res) => {
   const p = studio.getProject(req.params.id), v = studio.currentVersion(p), was = studio.approvalValid(v);
-  studio.editPackage(p.id, { scheduledAt: req.body?.scheduledAt ?? null });
+  studio.editPackage(p.id, req.body?.scheduledLocal !== undefined ? { scheduledLocal: req.body.scheduledLocal } : { scheduledAt: req.body?.scheduledAt ?? null });
   if (was && req.body?.keepApproval === true) studio.approve(p.id, { fingerprint: studio.fingerprint(v), by: req.body?.by });
   res.json({ ok: true, project: studio.view(p) });
 }));
 /** The seam only: scheduling a publication is refused while any gate is closed. Nothing is ever posted here. */
 panelRouter.post('/projects/:id/publish', json, wrap((req, res) => { const p = studio.getProject(req.params.id); publisher.createPublication(p); res.json({ ok: true, project: studio.view(p) }); }));
 panelRouter.post('/projects/:id/publish/cancel', json, wrap((req, res) => { const p = studio.getProject(req.params.id); publisher.cancel(p); res.json({ ok: true, project: studio.view(p) }); }));
+
+// ── Calendar, global pause, publication recovery (dry-run: MOCK publisher only) ──
+panelRouter.get('/calendar', wrap((_req, res) => res.json({ ok: true, timezone: publisher.TZ, paused: publisher.paused(), mode: publisher.enabled() ? publisher.mode() : null, items: publisher.calendar() })));
+panelRouter.post('/settings/pause', json, wrap((req, res) => res.json({ ok: true, settings: publisher.setPaused(req.body?.paused === true) })));
+panelRouter.post('/projects/:id/publish/resume', json, wrap((req, res) => { const p = studio.getProject(req.params.id); publisher.resume(p); res.json({ ok: true, project: studio.view(p) }); }));
+panelRouter.post('/projects/:id/publish/reconcile', json, wrap(async (req, res) => { const p = studio.getProject(req.params.id); await publisher.reconcile(p, publisher.configuredPublisher()); res.json({ ok: true, project: studio.view(p) }); }));
+/** One scheduler pass. Exists only with the MOCK publisher; refuses otherwise. `now` lets a dry run reach a scheduled time. */
+panelRouter.post('/publisher/tick', json, wrap(async (req, res) => {
+  const now = req.body?.now ? Date.parse(req.body.now) : Date.now();
+  res.json({ ok: true, mock: true, report: await publisher.tick(publisher.configuredPublisher(), { now }) });
+}));
 
 panelRouter.get('/brand', wrap((_req, res) => res.json({ ok: true, brand: brand.get() })));
 panelRouter.put('/brand/:field', json, wrap((req, res) => res.json({ ok: true, brand: brand.set(req.params.field, req.body?.value, req.body?.by) })));
