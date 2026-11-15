@@ -234,3 +234,10 @@ code is deployed (not approved yet). After a future approved deployment: GET /ap
 - Still off: publishing switches, real notifications, worker token. No media uploaded, nothing published.
 - Rollback if needed: `git checkout 8a81337 && railway up --detach && git checkout dana-phase-1a`.
 - Never run `railway config migrate` (the CLI suggests it on every command).
+
+## Probe result after deploy (2026-11-15) — stored token value is wrong
+
+- Owner: Barak/Tomer panels load. Probe: enabled false, ready false, credentialsConfigured true, probeError auth_expired "Invalid application ID (code 190)".
+- Shape check (value never printed): DANA_IG_ACCESS_TOKEN is 80 chars, contains spaces, "|", the words railway/clipboard/variable/skip-deploys/dana_ig, does not start with EAA → the clipboard held the COMMAND text, not the token. The real token was never stored. Publishing switches, worker token, notify vars: all unset.
+- Adapter header (Authorization: Bearer) is NOT yet proven or disproven; the error is explained by the value alone ("|" = app-token form).
+- Needed: owner re-stores the token (paste command first, do not press Enter, copy token, then Enter), shape check again, then ONE restart (railway redeploy) needs approval because --skip-deploys does not reach the running process. Proposed code fix, not deployed: reject a token with whitespace before any call; label code 190 "token invalid or expired", not "expired".
