@@ -58,7 +58,10 @@ try {
     k.zooms = [{ id: 'z@152.0', source_t_s: 152.0, tl_t_s: 2.0, scale: 1.15, ease_s: 0.4, hold_until_s: k.duration, reason: 'משפט מפתח (בדיקה)', evidence: 'rms +3dB' }];
     k.transcript = { status: 'auto_unverified', corrections_applied: [],
       doubts: [{ card: 2, tl_start_s: k.cards[1].start, tl_end_s: k.cards[1].start + k.cards[1].dur, source_start_s: k.cards[1].source_start_s, source_end_s: k.cards[1].source_end_s, word: 'בדיקה', kind: 'low_confidence', note: 'prob 0.5' }] };
-    k.rules_used = { skill: { name: 'dana-editing', version: '1.0.0', sha256: 'a'.repeat(64) }, profile: { id: 'center-bold-v1', version: '1', sha256: 'b'.repeat(64) }, standing_rules: [], references: [] };
+    k.rules_used = { skill: { name: 'dana-editing', version: '1.0.0', sha256: 'a'.repeat(64) }, profile: { id: 'center-bold-v1', version: '1', sha256: 'b'.repeat(64) }, standing_rules: [{ id: 'rule_abc', version: 2 }], references: [] };
+    k.revision_mode = 'locked_to_previous_plan';
+    k.quality = { technical: { passed: 14, failed: 1, warned: 2, failed_ids: ['caption_text'] }, content_review: { met: 12, total: 14, not_met: [{ id: 'A9', note: 'אין טקסט קאבר' }], basis: 'תמלול ופריימים בודדים בלבד' },
+                  owner_needed: { listening_doubts: 5, review_items: 1, human_checks: ['listening', 'framing', 'meaning'] }, not_verified: ['תחושת התנועה של הזום'] };
     st.projects[NEW_ID] = np;
     writeFileSync(sf, JSON.stringify(st));
     cpSync(path.join(dataDir, 'dana', 'projects', old.id), path.join(dataDir, 'dana', 'projects', NEW_ID), { recursive: true });
@@ -133,11 +136,17 @@ try {
       check('automatic transcript is not called an exact quote', await evalJs(`!/ציטוט מדויק\\)/.test(${D}.getElementById('detail').innerText) && /תמלול אוטומטי — לא אומת/.test(${D}.getElementById('captions').innerText)`));
       await evalJs(`${D}.getElementById('back').click()`);
       check('back returns to upload + project list', await until(`!${D}.getElementById('list').classList.contains('hidden')`));
-      check('list page: standing rules, references (analysis marked not active), destination account', await until(`!!${D}.getElementById('rules') && /ניתוח רפרנסים עדיין לא פעיל/.test(${D}.getElementById('list').innerText) && !!${D}.getElementById('acctset') && !!${D}.getElementById('refadd')`));
+      check('list page: standing rules, references (a file is analysed by the worker; links are not fetched), destination account', await until(`!!${D}.getElementById('rules') && /דנה לא מורידה קישורים/.test(${D}.getElementById('list').innerText) && !/עדיין לא פעיל/.test(${D}.getElementById('list').innerText) && !!${D}.getElementById('acctset') && !!${D}.getElementById('refadd')`));
 
       // ── the NEW-format package ──
       await evalJs(`${D}.querySelector('#projects .proj[data-id="${NEW_ID}"]').click()`);
       check('new package: plan with message, segment map and rules used', await until(`!!${D}.getElementById('plan') && /מסר לבדיקה/.test(${D}.getElementById('plan').innerText) && /center-bold-v1/.test(${D}.getElementById('plan').innerText) && ${D}.querySelectorAll('#plan [data-play]').length === 1`));
+      check('quality is three separate blocks plus what was not verified — and no "N/14" headline anywhere', await evalJs(`(() => { const d = ${D}, q = d.getElementById('quality'); if (!q) return false; const t = n => d.getElementById(n)?.innerText || '';
+        return /בדיקות טכניות \\(אוטומטיות\\)/.test(t('q-technical')) && /14 עברו/.test(t('q-technical')) && /caption_text/.test(t('q-technical'))
+          && /הערכת תוכן \\(מודל, על תמלול ופריימים בודדים\\)/.test(t('q-content')) && /A9/.test(t('q-content'))
+          && /דורש צפייה או האזנה שלך/.test(t('q-owner')) && /5/.test(t('q-owner')) && /לא נבדק/.test(t('q-notverified')) && /תחושת התנועה/.test(t('q-notverified'))
+          && !/\\d+\\/14/.test(d.getElementById('detail').innerText) && !/קריטריוני קבלה \\(/.test(d.getElementById('detail').innerText); })()`));
+      check('the revision mode and the standing rules used (id + version) are shown in plain words', await evalJs(`/נעול לתוכנית של הגרסה הקודמת — רק מה שביקשת השתנה/.test(${D}.getElementById('revmode')?.innerText || '') && /rule_abc/.test(${D}.getElementById('plan').innerText) && /גרסה 2/.test(${D}.getElementById('plan').innerText)`));
       check('captions editor: one field per card, the doubt is marked on its card', await evalJs(`(() => { const d = ${D}; const n = d.querySelectorAll('#captions input[data-card]').length; const li = d.querySelector('#captions input[data-card="2"]').closest('li'); return n > 5 && [...d.querySelectorAll('#captions input[data-card]')].every(i => !i.disabled) && /ודאות נמוכה/.test(li.innerText) && d.querySelectorAll('#captions .pill.warn').length === 2; })()`));
       check('tapping a card seeks the review video to it', await evalJs(`(async () => { const d = ${D}, v = d.getElementById('mainvid'); d.querySelector('#captions input[data-card="3"]').closest('li').querySelector('[data-play]').click(); await new Promise(r => setTimeout(r, 400)); const t0 = Number(d.querySelector('#captions input[data-card="3"]').closest('li').querySelector('[data-play]').dataset.play.split(',')[0]); const ok = Math.abs(v.currentTime - t0) < 1.5; v.pause(); return ok; })()`));
       check('style preview is drawn over a real frame', await until(`(() => { const c = ${D}.getElementById('pv'); const px = c.getContext('2d').getImageData(0, 0, c.width, c.height).data; let lit = 0; for (let i = 0; i < px.length; i += 400) if (px[i] + px[i + 1] + px[i + 2] > 60) lit++; return lit > 50; })()`));
@@ -184,6 +193,42 @@ try {
     const leased = await api('/api/dana/worker/lease', W), o = leased.job?.options ?? {};
     check('the job carries the caption correction with its source time and original text', o.caption_edits?.length === 1 && o.caption_edits[0].text === 'כתובית מתוקנת' && o.caption_edits[0].original === original && o.caption_edits[0].source_end_s > o.caption_edits[0].source_start_s, JSON.stringify(o.caption_edits));
     check('the job carries the style change, the zoom removal and the project note; no adapter is forced', o.style_overrides?.caption_size === 110 && o.zoom_edits?.[0]?.id === 'z@152.0' && o.zoom_edits[0].action === 'remove' && o.change_request === 'הערת בדיקה לפרויקט' && (o.adapter === undefined || o.adapter === 'claude'), JSON.stringify({ s: o.style_overrides, z: o.zoom_edits, c: o.change_request, a: o.adapter }));
+  }
+  {
+    // ── Reference: owner uploads a file + note → the worker analyses → the page shows it → the owner approves ──
+    console.log('\n── reference analysis flow');
+    const base = `http://127.0.0.1:${appPort}`, WH = { Authorization: `Bearer ${WORKER_TOKEN}`, 'Content-Type': 'application/json' };
+    const fd = new FormData();
+    fd.append('title', 'רפרנס לבדיקה'); fd.append('by', 'בודק אוטומטי'); fd.append('owner_note', 'אהבתי את הפתיחה'); fd.append('usage_permission', 'inspiration_only');
+    fd.append('file', new Blob([Buffer.alloc(4000, 7)], { type: 'video/mp4' }), 'ref.mp4');
+    const added = await (await fetch(`${base}/api/dana/studio/references`, { method: 'POST', body: fd })).json();
+    const rid = added.reference?.id;
+    check('a reference with a file waits for the worker', added.reference?.status === 'awaiting_analysis', JSON.stringify(added).slice(0, 200));
+    const lr = await (await fetch(`${base}/api/dana/worker/references/lease`, { method: 'POST', headers: WH, body: JSON.stringify({ workerId: 'check' }) })).json();
+    const file = await fetch(`${base}/api/dana/worker/references/${rid}/file`, { headers: { ...WH, 'X-Lease-Token': lr.leaseToken } });
+    check('the worker leases it and downloads the file with the lease', lr.reference?.id === rid && file.status === 200 && (await file.arrayBuffer()).byteLength === 4000);
+    const analysis = { summary: 'פתיחה ישירה וכתוביות גדולות', basis_note: 'מדידות קוד ופריימים בודדים; בלי האזנה', measured: { duration_s: 12.5, cuts_s: [3.2], avg_shot_s: 6.2, words_per_s: 2.4, face_scale_changes: [{ t_s: 3.2, ratio: 1.2 }], notes: [] },
+      aspects: [{ aspect: 'opening', observation: 'נפתח על המשפט המרכזי', example_times_s: [0.0, 1.5], rule: 'לפתוח על המשפט החזק', basis: 'measured' },
+                { aspect: 'sound', observation: 'ייתכן שיש מוזיקה', example_times_s: [], rule: '', basis: 'hypothesis' }],
+      do_not_imitate: ['הלוגו של החשבון'], hypotheses: ['הקצב לפי מוזיקה'], proposed_profile: { params: { caption_size: 104, caption_max_lines: 1, backing: false }, rules: ['לפתוח על המשפט החזק'] } };
+    const posted = await (await fetch(`${base}/api/dana/worker/references/${rid}/analysis`, { method: 'POST', headers: { ...WH, 'X-Lease-Token': lr.leaseToken }, body: JSON.stringify({ status: 'analysed', analysis }) })).json();
+    check('the analysis is accepted', posted.status === 'analysed', JSON.stringify(posted));
+    await evalJs(`document.querySelector('.tab-btn[data-tab="dana"]').click()`);
+    await evalJs(`(() => { const d = ${D}; if (d.getElementById('list').classList.contains('hidden')) d.getElementById('back').click(); })()`);
+    const card = `${D}.querySelector('#refs li[data-refid="${rid}"]')`;
+    await evalJs(`${F}.contentWindow.location.reload()`);
+    check('the page shows the analysis: note, summary, basis labels, example times, what not to imitate, hypotheses', await until(`(() => { const c = ${card}; if (!c) return false; const t = c.innerText;
+      return /נותח — מחכה להחלטה שלך/.test(t) && /אהבתי את הפתיחה/.test(t) && /פתיחה ישירה וכתוביות גדולות/.test(t) && /נמדד/.test(t) && /השערה/.test(t) && /לא לחקות/.test(t) && /הלוגו של החשבון/.test(t)
+        && /מדידות קוד ופריימים בודדים/.test(t) && c.querySelectorAll('[data-refplay][data-t="1.5"]').length === 1 && !!c.querySelector('input[data-pk="caption_size"]') && !!c.querySelector('[data-refapprove]') && !!c.querySelector('[data-refreject]'); })()`, 15000));
+    await evalJs(`${card}.querySelector('[data-refplay][data-t="1.5"]').click()`);
+    check('tapping an example time opens the reference player on that reference', await evalJs(`(() => { const v = ${D}.getElementById('refvid'); return !v.classList.contains('hidden') && v.dataset.ref === '${rid}' && v.getAttribute('src').endsWith('/references/${rid}/file'); })()`));
+    check('nothing is approved or default before the owner decides', (await (await fetch(`${base}/api/dana/studio/profiles`)).json()).profiles.every(p => p.source_reference !== rid));
+    await evalJs(`(() => { const w = ${F}.contentWindow, c = ${card}; w.prompt = () => 'בודק אוטומטי'; w.confirm = () => true;
+      const i = c.querySelector('input[data-pk="caption_size"]'); i.value = '110'; c.querySelector('[data-refdefault]').checked = true; c.querySelector('[data-refapprove]').click(); })()`);
+    const prof = await waitFor(async () => { const j = await (await fetch(`${base}/api/dana/studio/profiles`)).json(); return j.default?.source_reference === rid ? j : null; }, { timeoutMs: 8000, intervalMs: 200 });
+    check('approving with an adjusted number creates version 1 of the reference profile and makes it the default', !!prof && prof.default.id === `ref-${rid}` && prof.default.version === 1 && prof.default.params.caption_size === 110 && prof.default.params.caption_max_lines === 1 && prof.default.rules.length === 1, JSON.stringify(prof?.default));
+    check('the page shows the approved profile on the reference and as the default', await until(`/פרופיל אושר/.test(${card}?.innerText || '') && /ref-${rid}/.test(${D}.getElementById('profnow').textContent)`, 8000));
+    await shot('reference-analysed');
   }
   check('no JavaScript errors in the page', pageErrors.length === 0, pageErrors.slice(0, 3).join(' | '));
 } catch (e) {

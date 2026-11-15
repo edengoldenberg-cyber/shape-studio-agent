@@ -17,6 +17,7 @@
   const newDraft = () => ({ captions: {}, style: {}, zooms: {}, note: '', scope: '' });
   const isNum = x => typeof x === 'number' && isFinite(x);
   const tfmt = t => isNum(t) ? t.toFixed(1) + 's' : '—';
+  const REVMODE = { locked_to_previous_plan: 'נעול לתוכנית של הגרסה הקודמת — רק מה שביקשת השתנה', replanned: 'תוכנן מחדש לפי ההערה שלך' };
   try { me = localStorage.getItem('dana_reviewer') || ''; } catch { /* private mode */ }
 
   async function api(path, { method = 'GET', body } = {}) {
@@ -66,10 +67,23 @@
   // ── Standing rules ("כלל קבוע") ─────────────────────────────────────────────
   async function loadRules() {
     const { rules } = await api('/rules'), active = rules.filter(r => r.status === 'active');
-    $('#rules').innerHTML = active.length ? active.map(r => `<li><div class="row"><span class="grow">${esc(r.text)}</span><button data-rule="${esc(r.id)}" class="danger">הסר כלל</button></div>
-      <div class="small mute">${esc(r.by)} · ${fmt(r.at)}</div></li>`).join('') : '<li class="mute">אין כללים קבועים. כלל נוצר כשמסמנים הערה כ"כלל קבוע" בהפקת גרסה מתוקנת.</li>';
+    $('#rules').innerHTML = active.length ? active.map(r => { const src = r.source || {}; return `<li data-ruleid="${esc(r.id)}"><div class="row"><span class="grow">${esc(r.text)}</span><span class="pill mute">גרסה ${esc(r.version ?? 1)}</span></div>
+      <div class="small mute">מקור: ${src.project_title ? `פרויקט "${esc(src.project_title)}"${src.version_n ? ' · גרסה ' + esc(src.version_n) : ''}` : src.project_id ? 'פרויקט ' + esc(src.project_id) : 'לא נרשם'} · ${esc(src.by ?? r.by ?? '')} · ${fmt(src.at ?? r.at)}${(r.history || []).length > 1 ? ` · נוסח ${r.history.length} פעמים` : ''}</div>
+      <div class="row" style="margin-top:6px"><button data-ruleedit="${esc(r.id)}">עריכת הנוסח</button><button data-rule="${esc(r.id)}" class="danger">הסר כלל</button></div></li>`; }).join('')
+      : '<li class="mute">אין כללים קבועים. כלל נוצר כשמסמנים הערה כ"כלל קבוע" בהפקת גרסה מתוקנת.</li>';
+    rulesNow = active;
   }
+  let rulesNow = [];
   $('#rules').onclick = async e => {
+    const eid = e.target.dataset.ruleedit;
+    if (eid) {
+      const cur = rulesNow.find(r => r.id === eid); if (!cur) return;
+      const text = prompt('נוסח חדש לכלל (ייווצר כגרסה חדשה של אותו כלל; הנוסח הקודם נשמר בהיסטוריה):', cur.text);
+      if (text == null || text.trim() === cur.text) return;
+      const by = who(); if (!by) return;
+      try { await api(`/rules/${eid}`, { method: 'POST', body: { text: text.trim(), by } }); await loadRules(); notice('הכלל עודכן לגרסה חדשה.', 'ok'); } catch (err) { notice(err.message, 'bad'); }
+      return;
+    }
     const id = e.target.dataset.rule; if (!id) return;
     if (!confirm('להסיר את הכלל? הוא לא יישלח יותר לעריכות הבאות (הרישום נשמר).')) return;
     const by = who(); if (!by) return;
@@ -79,15 +93,86 @@
   // ── References ──────────────────────────────────────────────────────────────
   const PERM = { unknown: 'הרשאה לא ידועה', own: 'חומר שלי', licensed: 'ברישיון', inspiration_only: 'להשראה בלבד' };
   async function loadRefs() {
-    const { references } = await api('/references');
-    $('#refs').innerHTML = references.length ? references.map(r => `<li><div class="row"><b class="grow">${esc(r.title)}</b><span class="pill warn">ממתין לניתוח</span></div>
-      <div class="small mute">${r.source_url ? `<a href="${esc(r.source_url)}" target="_blank" rel="noopener noreferrer">קישור</a>` : ''}${r.file ? `קובץ: ${esc(r.file.name)} (${(r.file.bytes / 1048576).toFixed(1)}MB)` : ''} · ${esc(PERM[r.usage_permission] || r.usage_permission)}${r.origin ? ' · מקור: ' + esc(r.origin) : ''}</div>
+    const { references, worker } = await api('/references');
+    refsNow = references;
+    const RS = { awaiting_analysis: [worker && worker.online ? 'ממתין לעובד העריכה' : 'ממתין לעובד העריכה (לא מחובר)', 'warn'], analysing: ['בניתוח', 'info'], analysed: ['נותח — מחכה להחלטה שלך', 'info'],
+      analysis_failed: ['הניתוח נכשל', 'bad'], link_only: ['קישור בלבד — אין מה לנתח', 'mute'], approved: ['פרופיל אושר', 'ok'], rejected: ['ההצעה נדחתה', 'mute'] };
+    const BASIS = { measured: ['נמדד', 'ok'], seen_in_stills: ['נראה בפריימים', 'info'], hypothesis: ['השערה', 'warn'] };
+    const ASPECT = { pace: 'קצב', opening: 'פתיחה', cuts: 'חיתוכים', captions: 'כתוביות', emphasis: 'הדגשות', zooms: 'זומים', sound: 'סאונד', cover: 'קאבר' };
+    const isVideo = r => r.file && /^(mp4|mov|m4v|webm|mkv)$/.test(r.file.ext);
+    const times = (r, list) => (list || []).filter(isNum).map(t => isVideo(r) ? `<button data-refplay="${esc(r.id)}" data-t="${t}" style="min-height:32px;padding:4px 10px">▶ ${tfmt(t)}</button>` : `<span class="pill mute">${tfmt(t)}</span>`).join(' ');
+    $('#refs').innerHTML = references.length ? references.map(r => {
+      const a = r.analysis, m = a && a.measured, pp = r.proposed_profile, st = RS[r.status] || [r.status, 'mute'];
+      return `<li data-refid="${esc(r.id)}"><div class="row"><b class="grow">${esc(r.title)}</b><span class="pill ${st[1]}">${st[0]}</span></div>
+      <div class="small mute">${r.source_url ? `<a href="${esc(r.source_url)}" target="_blank" rel="noopener noreferrer">קישור</a> ` : ''}${r.file ? `קובץ: ${esc(r.file.name)} (${(r.file.bytes / 1048576).toFixed(1)}MB)` : ''} · ${esc(PERM[r.usage_permission] || r.usage_permission)}${r.origin ? ' · מקור: ' + esc(r.origin) : ''}</div>
       ${r.content_type || r.fits_message ? `<div class="small">${esc([r.content_type, r.fits_message].filter(Boolean).join(' · '))}</div>` : ''}
-      ${r.owner_note ? `<div class="quote">${esc(r.owner_note)}</div>` : ''}
-      <button data-refdel="${esc(r.id)}" class="danger" style="margin-top:6px">מחיקה</button></li>`).join('') : '<li class="mute">עדיין לא נוסף רפרנס.</li>';
+      ${r.owner_note ? `<label>מה אהבת בו</label><div class="quote">${esc(r.owner_note)}</div>` : ''}
+      ${r.status === 'link_only' ? '<div class="small warn">דנה לא יכולה להוריד קישורים. כדי שהרפרנס ינותח צריך להעלות את קובץ הווידאו עצמו (רפרנס חדש עם קובץ).</div>' : ''}
+      ${r.status === 'analysis_failed' && r.analysisError ? `<div class="small bad">${esc(r.analysisError.message)} <span class="mute">(${esc(r.analysisError.code)} · ${r.attempts} ניסיונות)</span></div>` : ''}
+      ${a ? `<div class="refan">
+        ${a.summary ? `<label>סיכום הניתוח</label><div>${esc(a.summary)}</div>` : ''}
+        ${a.basis_note ? `<div class="small mute">על מה הניתוח מבוסס: ${esc(a.basis_note)}</div>` : ''}
+        ${m ? `<details><summary>מדידות</summary><ul class="plain">
+          ${isNum(m.duration_s) ? `<li>אורך: ${tfmt(m.duration_s)}</li>` : ''}${isNum(m.avg_shot_s) ? `<li>אורך שוט ממוצע: ${tfmt(m.avg_shot_s)}</li>` : ''}${isNum(m.words_per_s) ? `<li>מילים בשנייה: ${m.words_per_s}</li>` : ''}
+          ${(m.cuts_s || []).length ? `<li>חיתוכים (${m.cuts_s.length}): ${times(r, m.cuts_s)}</li>` : ''}
+          ${(m.face_scale_changes || []).length ? `<li>שינויי גודל פנים (זום/חיתוך): ${m.face_scale_changes.map(x => `${times(r, [x.t_s])} ×${esc(x.ratio)}`).join(' ')}</li>` : ''}
+          ${(m.notes || []).map(n => `<li class="mute">${esc(n)}</li>`).join('')}</ul></details>` : ''}
+        ${(a.aspects || []).length ? `<label>מה לקחת ממנו</label><ul class="plain">${a.aspects.map(x => { const b = BASIS[x.basis] || [x.basis || '—', 'mute']; return `<li><div class="row"><b>${esc(ASPECT[x.aspect] || x.aspect)}</b><span class="pill ${b[1]}">${esc(b[0])}</span></div>
+          <div>${esc(x.observation || '')}</div>${x.rule ? `<div class="mute">כלל מעשי: ${esc(x.rule)}</div>` : ''}${(x.example_times_s || []).length ? `<div style="margin-top:4px">${times(r, x.example_times_s)}</div>` : ''}</li>`; }).join('')}</ul>` : ''}
+        ${(a.do_not_imitate || []).length ? `<label>לא לחקות</label><ul class="plain">${a.do_not_imitate.map(x => `<li>${esc(x)}</li>`).join('')}</ul>` : ''}
+        ${(a.hypotheses || []).length ? `<label>השערות (לא נמדדו)</label><ul class="plain">${a.hypotheses.map(x => `<li>${esc(x)}</li>`).join('')}</ul>` : ''}
+        ${pp && pp.params ? `<label>הצעת פרופיל — ${r.profile ? `אושרה בגרסה ${esc(r.profile.version)}${r.profile.default ? ' (ברירת מחדל)' : ''}; אפשר לאשר גרסה חדשה` : 'ממתינה לאישור שלך'}</label>
+          <div class="refparams">${Object.entries(pp.params).map(([k, val]) => typeof val === 'boolean'
+            ? `<label style="display:flex;gap:8px;align-items:center;color:var(--ink)"><input type="checkbox" data-pk="${esc(k)}" data-pt="boolean" ${val ? 'checked' : ''} style="width:20px;height:20px"> <code>${esc(k)}</code></label>`
+            : `<div class="row"><code class="grow">${esc(k)}</code><input type="text" data-pk="${esc(k)}" data-pt="${typeof val}" value="${esc(val)}" ${typeof val === 'number' ? 'inputmode="decimal" dir="ltr"' : ''} style="width:120px"></div>`).join('')}</div>
+          ${(pp.rules || []).length ? `<div class="small">כללים שיישלחו עם הפרופיל:<ul class="plain">${pp.rules.map(x => `<li>${esc(x)}</li>`).join('')}</ul></div>` : ''}
+          <label style="display:flex;gap:8px;align-items:center;color:var(--ink);font-size:15px"><input type="checkbox" data-refdefault style="width:20px;height:20px"> ברירת מחדל לפרויקטים הבאים</label>
+          <div class="row" style="margin-top:6px"><button class="primary" data-refapprove="${esc(r.id)}">אשר כפרופיל</button><button data-refreject="${esc(r.id)}" class="danger">דחה</button></div>
+          ${r.decision && r.decision.action === 'rejected' ? `<div class="small mute">נדחה על ידי ${esc(r.decision.by)} · ${fmt(r.decision.at)}${r.decision.reason ? ' · ' + esc(r.decision.reason) : ''}</div>` : ''}` : '<div class="small mute">הניתוח לא כלל הצעת פרופיל.</div>'}</div>` : ''}
+      <div class="row" style="margin-top:6px">${isVideo(r) ? `<button data-refplay="${esc(r.id)}" data-t="0">▶ צפייה ברפרנס</button>` : ''}
+        ${r.file && r.status !== 'analysing' && r.status !== 'awaiting_analysis' ? `<button data-refagain="${esc(r.id)}">נתח שוב</button>` : ''}<button data-refdel="${esc(r.id)}" class="danger">מחיקה</button></div></li>`; }).join('') : '<li class="mute">עדיין לא נוסף רפרנס.</li>';
+    clearTimeout(refTimer);
+    if (references.some(r => ['awaiting_analysis', 'analysing'].includes(r.status)) && !$('#list').classList.contains('hidden')) refTimer = setTimeout(() => loadRefs().catch(() => {}), 6000);
   }
+  let refsNow = [], refTimer = null;
   $('#refs').onclick = async e => {
-    const id = e.target.dataset.refdel; if (!id) return;
+    const t = e.target, d = t.dataset;
+    if (d.refplay) {                                             // seek the reference itself to the example time
+      const v = $('#refvid'), src = `${API}/references/${d.refplay}/file`;
+      if (v.dataset.ref !== d.refplay) { v.src = src; v.dataset.ref = d.refplay; }
+      v.classList.remove('hidden');
+      const go = () => { try { v.currentTime = Number(d.t) || 0; } catch { /* not seekable yet */ } v.play().catch(() => {}); };
+      if (v.readyState >= 1) go(); else v.addEventListener('loadedmetadata', go, { once: true });
+      v.scrollIntoView({ block: 'nearest' });
+      return;
+    }
+    if (d.refapprove) {
+      const li = t.closest('li'), ref = refsNow.find(r => r.id === d.refapprove); if (!ref) return;
+      const params = {};
+      for (const inp of li.querySelectorAll('[data-pk]')) {
+        const k = inp.dataset.pk, orig = ref.proposed_profile.params[k];
+        const val = inp.dataset.pt === 'boolean' ? inp.checked : inp.dataset.pt === 'number' ? Number(inp.value) : inp.value;
+        if (inp.dataset.pt === 'number' && !isFinite(val)) return notice(`ערך לא תקין בשדה ${k}`, 'warn');
+        if (val !== orig) params[k] = val;
+      }
+      const make_default = !!li.querySelector('[data-refdefault]')?.checked;
+      const by = who(); if (!by) return;
+      if (!confirm(make_default ? 'לאשר את הפרופיל ולהפוך אותו לברירת המחדל של כל העריכות הבאות?' : 'לאשר את הפרופיל (בלי להפוך אותו לברירת מחדל)?')) return;
+      try { await api(`/references/${d.refapprove}/approve-profile`, { method: 'POST', body: { by, make_default, ...(Object.keys(params).length ? { params } : {}) } });
+        await loadRefs(); await loadList().catch(() => {}); notice(make_default ? 'הפרופיל אושר ונקבע כברירת מחדל.' : 'הפרופיל אושר. הוא לא ברירת מחדל.', 'ok'); } catch (err) { notice(err.message, 'bad'); }
+      return;
+    }
+    if (d.refreject) {
+      const reason = prompt('למה ההצעה נדחית? (לא חובה)'); if (reason === null) return;
+      const by = who(); if (!by) return;
+      try { await api(`/references/${d.refreject}/reject-profile`, { method: 'POST', body: { by, reason } }); await loadRefs(); notice('ההצעה נדחתה. שום דבר לא השתנה בברירת המחדל.', 'ok'); } catch (err) { notice(err.message, 'bad'); }
+      return;
+    }
+    if (d.refagain) {
+      try { await api(`/references/${d.refagain}/reanalyse`, { method: 'POST', body: {} }); await loadRefs(); notice('הרפרנס חזר לתור הניתוח.', 'ok'); } catch (err) { notice(err.message, 'bad'); }
+      return;
+    }
+    const id = d.refdel; if (!id) return;
     if (!confirm('למחוק את הרפרנס?')) return;
     try { await api('/references/' + id, { method: 'DELETE' }); await loadRefs(); } catch (err) { notice(err.message, 'bad'); }
   };
@@ -106,7 +191,7 @@
       if (!r.ok) throw new Error(j.message || j.error || 'ההוספה נכשלה');
       for (const k of ['title', 'source_url', 'origin', 'content_type', 'fits_message', 'owner_note']) $('#ref_' + k).value = '';
       $('#ref_file').value = '';
-      await loadRefs(); notice('הרפרנס נשמר. הוא ממתין — ניתוח רפרנסים עדיין לא פעיל.', 'ok');
+      await loadRefs(); notice(f ? 'הרפרנס נשמר וממתין לעובד העריכה לניתוח.' : 'הקישור נשמר לתיעוד. כדי לנתח צריך להעלות את הקובץ עצמו — דנה לא מורידה קישורים.', f ? 'ok' : 'warn');
     } catch (err) { notice(err.message, 'bad'); } finally { $('#refadd').disabled = false; }
   };
   $('#acctset').onclick = async () => {
@@ -162,6 +247,25 @@
     if (pkg) {
       const cj = v.contentJudgement || {};
       const JM = { model: 'שיקול תוכן של המודל', fallback_heuristic: 'כלל אוטומטי — לא שיפוט תוכן', scripted: 'החלטות שהוזנו ידנית' };
+      // ── Quality: three separate things, never one score ──
+      const q = pkg.quality;
+      if (q) {
+        const t = q.technical || {}, cr = q.content_review || {}, on = q.owner_needed || {};
+        const HC = { listening: 'האזנה לסרטון', framing: 'פריים ותנועה', meaning: 'משמעות הדברים' };
+        h.push(`<div class="card" id="quality"><h2>מצב הבדיקות</h2>
+          <p class="small mute">שלושה דברים שונים. אף אחד מהם אינו ציון איכות כולל, והם לא מחליפים צפייה והאזנה שלך.</p>
+          <div class="qblock" id="q-technical"><h3>בדיקות טכניות (אוטומטיות)</h3>
+            <div class="row"><span class="pill ok">${esc(t.passed ?? '—')} עברו</span>${t.failed ? `<span class="pill bad">${esc(t.failed)} נכשלו</span>` : ''}${t.warned ? `<span class="pill warn">${esc(t.warned)} אזהרות</span>` : ''}</div>
+            ${(t.failed_ids || []).length ? `<div class="small">נכשלו: ${t.failed_ids.map(x => `<code>${esc(x)}</code>`).join(' · ')}</div>` : ''}</div>
+          <div class="qblock" id="q-content"><h3>הערכת תוכן (מודל, על תמלול ופריימים בודדים)</h3>
+            ${isNum(cr.total) ? `<div class="small">${esc(cr.met)} מתוך ${esc(cr.total)} סעיפים שהמודל בדק סומנו כמתקיימים.</div>` : '<div class="small mute">לא רצה הערכת תוכן בגרסה הזו.</div>'}
+            ${(cr.not_met || []).length ? `<ul class="plain small">${cr.not_met.map(x => `<li><span class="pill warn">${esc(x.id)}</span> ${esc(x.note || '')}</li>`).join('')}</ul>` : ''}
+            <div class="small mute">${esc(cr.basis || 'המודל קרא טקסט וראה פריימים בודדים. הוא לא שמע את האודיו ולא צפה בתנועה.')}</div></div>
+          <div class="qblock" id="q-owner"><h3>דורש צפייה או האזנה שלך</h3>
+            <ul class="plain small"><li>מילים בספק להאזנה: <b>${esc(on.listening_doubts ?? 0)}</b></li><li>פריטים פתוחים לבדיקה: <b>${esc(on.review_items ?? 0)}</b></li>
+              ${(on.human_checks || []).map(x => `<li>${esc(HC[x] || x)} — רק את/ה יכול/ה לבדוק</li>`).join('')}</ul></div>
+          ${(q.not_verified || []).length ? `<div class="qblock" id="q-notverified"><h3>לא נבדק</h3><ul class="plain small">${q.not_verified.map(x => `<li>${esc(x)}</li>`).join('')}</ul></div>` : ''}</div>`);
+      }
       if (cj.missing) h.push(`<div class="card" id="nojudge" style="border-color:var(--bad)"><h2 class="bad">עריכה טכנית בלבד — שיפוט התוכן לא רץ</h2>
         <p>המסר, בחירת הקטעים, הקאבר והביקורת בגרסה הזו <b>לא</b> נבחרו בשיקול תוכן: כלל אוטומטי בחר אותם. החיתוך, הכתוביות והבדיקות הטכניות כן רצו.</p>
         <p class="small mute">אי אפשר לאשר את החבילה כמו שהיא. אפשר להפיק גרסה מתוקנת, או לתעד חריגה מפורשת אם בדקת את התוכן בעצמך.</p>
@@ -171,6 +275,7 @@
       if (pkg.plan) {
         const pl = pkg.plan, ru = pkg.rulesUsed;
         h.push(`<div class="card" id="plan"><h2>התוכנית של דנה</h2>
+          ${REVMODE[pkg.revisionMode] ? `<div class="pill info" id="revmode">${REVMODE[pkg.revisionMode]}</div>` : ''}
           ${pkg.revisionNote ? `<div class="pill info">מה השתנה בגרסה הזו</div><div class="quote">${esc(pkg.revisionNote)}</div>` : ''}
           <label>המסר</label><div>${esc(pl.message || '—')}</div>
           <label>הפתיחה</label><div>${esc(pl.hook || '—')}</div>
@@ -184,7 +289,8 @@
             <li>סקיל עריכה: ${ru.skill ? `${esc(ru.skill.name)} · גרסה ${esc(ru.skill.version)} · <code>${esc(String(ru.skill.sha256 || '').slice(0, 12))}</code>` : '—'}</li>
             <li>פרופיל: ${ru.profile ? `${esc(ru.profile.id)} · גרסה ${esc(ru.profile.version)} · <code>${esc(String(ru.profile.sha256 || '').slice(0, 12))}</code>` : '—'}
               ${ru.profile ? `<button data-do="profile" data-pid="${esc(ru.profile.id)}" style="margin-top:6px">אישור הפרופיל הזה כברירת מחדל לפרויקטים הבאים</button>` : ''}</li>
-            <li>כללים קבועים: ${(ru.standing_rules || []).length || 'אין'}</li><li>רפרנסים: ${(ru.references || []).length || 'אין'}</li></ul></details>` : ''}
+            <li>כללים קבועים: ${(ru.standing_rules || []).length ? ru.standing_rules.map(x => typeof x === 'object' && x ? `<code>${esc(x.id)}</code> גרסה ${esc(x.version ?? '—')}` : `<code>${esc(x)}</code>`).join(' · ') : 'אין'}</li>
+            <li>רפרנסים: ${(ru.references || []).length ? ru.references.map(x => `<code>${esc(typeof x === 'object' && x ? x.id : x)}</code>`).join(' · ') : ru.profile && ru.profile.source_reference ? `<code>${esc(ru.profile.source_reference)}</code> (דרך הפרופיל)` : 'אין'}</li></ul></details>` : ''}
           ${pkg.usage ? `<div class="small mute" style="margin-top:6px">${pkg.usage.calls.length} קריאות למודל · ${pkg.usage.calls.reduce((t, c) => t + (c.elapsed_s || 0), 0).toFixed(0)}s · עלות מדווחת $${pkg.usage.calls.reduce((t, c) => t + (c.cost_usd_reported || 0), 0).toFixed(3)}</div>` : ''}</div>`);
       } else if (pkg.segment.reason) h.push(`<div class="card"><h2>מה נבחר ולמה</h2>
         ${pkg.revisionNote ? `<div class="pill info">מה השתנה בגרסה הזו</div><div class="quote">${esc(pkg.revisionNote)}</div>` : ''}
@@ -308,13 +414,13 @@
     if (ed) {
       const last = ed.cycles[ed.cycles.length - 1];
       h.push(`<div class="card"><h2>העבודה של דנה</h2>
-        <div class="row"><span class="pill ${ed.status === 'ready_for_owner_review' ? 'ok' : 'warn'}">${ed.status === 'ready_for_owner_review' ? 'מוכן לבדיקה שלך' : 'נעצר עם נושאים פתוחים'}</span>
+        <div class="row"><span class="pill ${ed.status === 'ready_for_owner_review' ? 'info' : 'warn'}">${ed.status === 'ready_for_owner_review' ? 'הביקורת הפנימית הסתיימה — ממתין לבדיקה שלך' : 'נעצר עם נושאים פתוחים'}</span>
           <span class="pill mute">${ed.revisions} סבבי תיקון</span>${ed.test_injection ? '<span class="pill bad">כולל פגם בדיקה מוזרק</span>' : ''}</div>
         ${ed.test_injection ? `<div class="small bad">${esc(ed.test_injection.label)}</div>` : ''}
         <label>מטרת התוכן</label><div>${esc(ed.objective || '—')}</div>
         <details class="small"><summary>תדריך העריכה</summary><ul class="plain">${ed.brief.map(b => `<li>${esc(b)}</li>`).join('') || '<li>—</li>'}</ul>
           <div class="mute">עובדות מאומתות ששימשו: ${esc(ed.verified_facts.join(' · ') || '—')}</div><div class="mute">חסר ולכן הושמט: ${esc(ed.missing_information.join(' · ') || '—')}</div></details>
-        <details class="small"><summary>קריטריוני קבלה (${last ? ed.criteria.filter(c => c.met).length : 0}/${ed.criteria.length} מתקיימים)</summary><ul class="plain">${ed.criteria.map(c =>
+        <details class="small"><summary>פירוט סעיפי הביקורת הפנימית (אינו ציון איכות)</summary><ul class="plain">${ed.criteria.map(c =>
           `<li><span class="pill ${c.met === true ? 'ok' : c.met === false ? 'bad' : 'mute'}">${c.met === true ? 'כן' : c.met === false ? 'לא' : '?'}</span> ${esc(c.criterion)} <span class="mute">(${esc({ check: 'בדיקה', skill: 'כלי סקיל', reviewer: 'ביקורת דנה' }[c.decided_by])})</span></li>`).join('')}</ul></details>
         <details class="small"><summary>סבבי ביקורת ותיקון</summary>${ed.cycles.map(c => `<div style="margin-top:8px"><b>סבב ${c.cycle}</b>${c.reused_render ? ' · רק טקסטים השתנו' : ''}
           <ul class="plain">${c.findings.map(f => `<li><span class="pill ${f.severity === 'blocking' ? 'bad' : 'warn'}">${f.severity === 'blocking' ? 'חוסם' : 'המלצה'}</span> ${esc(f.problem)}<div class="mute">→ ${esc(f.correction)}</div></li>`).join('') || '<li class="ok">אין ממצאים</li>'}</ul>
@@ -347,6 +453,7 @@
     if (p.versions.length) h.push(`<div class="card" id="versions"><h2>גרסאות</h2>
       <ul class="plain">${p.versions.map(x => `<li><div class="row"><b>גרסה ${x.n}</b>${pill(x.status)}${x.n === p.currentVersion ? '<span class="pill info">נוכחית</span>' : ''}${x.approved ? '<span class="pill ok">מאושרת</span>' : ''}
         ${x.hasVideo && x.n !== p.currentVersion ? `<button data-cmp="${x.n}" style="margin-inline-start:auto">▶ צפייה להשוואה</button>` : ''}</div>
+        ${REVMODE[x.revisionMode] ? `<div class="small info">${REVMODE[x.revisionMode]}</div>` : ''}
         <div class="small mute">${fmt(x.createdAt)}${x.duration ? ' · ' + x.duration + 's' : ''}${x.judgementMode ? ' · ' + esc({ model: 'שיקול תוכן', fallback_heuristic: 'טכני בלבד', scripted: 'החלטות ידניות' }[x.judgementMode] || x.judgementMode) : ''}${x.profile ? ' · פרופיל ' + esc(x.profile.id) : ''}${x.changeRequest ? ' · "' + esc(x.changeRequest) + '"' : ''}</div></li>`).join('')}</ul>
       <div id="cmpbox" class="hidden"><label id="cmplabel"></label><video id="cmp" controls playsinline preload="metadata"></video>
         <p class="small mute">גרסה קודמת מוצגת להשוואה בלבד. האישור והפרסום חלים רק על הגרסה הנוכחית.</p></div></div>`);

@@ -161,12 +161,13 @@ describe('feedback scope: this project vs a standing rule', () => {
     await request(app).post(`/api/dana/studio/projects/${a.id}/revise`).send({ by: 'Eden', note: 'בלי אימוג׳י בכתוביות', note_scope: 'permanent' });
     const la = await lease();
     expect(la.job.projectId).toBe(a.id);
-    expect(la.job.options.rules).toEqual([{ id: expect.stringMatching(/^rule_/), text: 'בלי אימוג׳י בכתוביות' }]);
-    expect(la.job.options.change_request).toBeUndefined();
+    expect(la.job.options.rules).toEqual([{ id: expect.stringMatching(/^rule_/), text: 'בלי אימוג׳י בכתוביות', version: 1 }]);
+    expect(la.job.options.change_request).toBe('בלי אימוג׳י בכתוביות');       // the owner wrote a note: this revision acts on it too
     await finish(la, (await get(a.id)).source.sha256);
     const rules = (await request(app).get('/api/dana/studio/rules')).body.rules;
     expect(rules).toHaveLength(1);
-    expect(rules[0]).toMatchObject({ status: 'active', by: 'Eden', projectId: a.id });
+    expect(rules[0]).toMatchObject({ status: 'active', by: 'Eden', projectId: a.id, version: 1,
+      source: { project_id: a.id, project_title: expect.any(String), version_n: 1, by: 'Eden', at: expect.any(String) } });
     // another project, a project-only note: the rule travels, the note stays local
     await request(app).post(`/api/dana/studio/projects/${b.id}/revise`).send({ by: 'Eden', note: 'רק כאן: לקצר', note_scope: 'project' });
     const lb = await lease();
@@ -256,7 +257,7 @@ describe('Hebrew file names', () => {
 
 describe('references and the approved profile', () => {
   const R = '/api/dana/studio/references';
-  test('add (link or file) with the owner note, list, serve, delete — always "awaiting analysis"', async () => {
+  test('add (link or file) with the owner note, list, serve, delete — a file waits for the worker, a link alone cannot be analysed', async () => {
     expect((await request(app).post(R).field('title', 'x').field('by', 'Eden')).body.error).toBe('reference_source_required');
     expect((await request(app).post(R).field('source_url', 'https://example.com/r').field('by', 'Eden')).body.error).toBe('reference_title_required');
     expect((await request(app).post(R).field('title', 'x').field('source_url', 'javascript:alert(1)').field('by', 'Eden')).body.error).toBe('reference_url_invalid');
@@ -264,11 +265,11 @@ describe('references and the approved profile', () => {
     const a = await request(app).post(R).field('title', 'ריל עם פתיחה חזקה').field('source_url', 'https://example.com/reel/1').field('origin', 'חשבון אחר')
       .field('usage_permission', 'inspiration_only').field('content_type', 'עדות מתאמנת').field('fits_message', 'התגברות על חשש').field('owner_note', 'אהבתי את הקצב בפתיחה').field('by', 'Eden');
     expect(a.status).toBe(201);
-    expect(a.body.reference).toMatchObject({ status: 'awaiting_analysis', analysis: null, proposed_profile: null, usage_permission: 'inspiration_only', owner_note: 'אהבתי את הקצב בפתיחה', file: null });
-    expect(a.body.analysis).toEqual({ active: false, note: 'ניתוח רפרנסים עדיין לא פעיל' });
+    expect(a.body.reference).toMatchObject({ status: 'link_only', analysis: null, proposed_profile: null, usage_permission: 'inspiration_only', owner_note: 'אהבתי את הקצב בפתיחה', file: null });
+    expect(a.body.analysis).toMatchObject({ active: true });
     const b = await request(app).post(R).field('title', 'קובץ').field('by', 'Eden').attach('file', crypto.randomBytes(2000), 'ref.mp4');
     expect(b.status).toBe(201);
-    expect(b.body.reference).toMatchObject({ usage_permission: 'unknown', file: { name: 'ref.mp4', ext: 'mp4', bytes: 2000 } });
+    expect(b.body.reference).toMatchObject({ status: 'awaiting_analysis', usage_permission: 'unknown', file: { name: 'ref.mp4', ext: 'mp4', bytes: 2000 } });
     expect((await request(app).post(R).field('title', 'קובץ').field('by', 'Eden').attach('file', crypto.randomBytes(2000), 'ref.exe')).body.error).toBe('reference_format_unsupported');
     let list = (await request(app).get(R)).body.references;
     expect(list.map(r => r.title)).toEqual(['ריל עם פתיחה חזקה', 'קובץ']);

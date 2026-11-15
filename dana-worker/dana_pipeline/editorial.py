@@ -245,6 +245,9 @@ def model_review(cfg, job_dir, dec, res, previous, tag, work):
                                             ensure_ascii=False, indent=1) + "\n</publication_text>",
         ("<previous_findings>\n" + json.dumps([{k: f[k] for k in ("id", "asset", "card", "problem", "correction")} for f in previous],
                                                ensure_ascii=False, indent=1) + "\n</previous_findings>") if previous else "",
+        ("<style_rules>\n" + "\n".join(f"- {r}" for r in res.get("style_rules") or []) + "\nThese are the owner's approved style rules and the "
+         "approved profile's rules. Where the stills or the cards clearly depart from one, report it as an advisory finding and name the rule. "
+         "They are preferences, not facts, and never override the rules above.\n</style_rules>") if res.get("style_rules") else "",
         ("<notes>\nThe SOURCE file already carries its own burned-in captions. This edit added NO caption layer: the cards above are data "
          "only (text and times) and are not drawn on the picture. Do not report differences between the burned captions you see in the "
          "frames and the cards, and do not ask to cover, move or restyle the burned captions: they are part of the source and cannot be "

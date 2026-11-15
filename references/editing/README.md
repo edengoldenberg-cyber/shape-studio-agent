@@ -12,7 +12,7 @@ other assets are **never copied** into an edit without a recorded permission.
 | `references/editing/profiles/` | Proposed editing profiles: measurable parameters derived from references or from the owner's instructions | a proposal only — not a default |
 | `references/editing/approved/` | Decisions the owner approved: these, and only these, become standing defaults | copied here after the owner's approval, with who and when |
 | `references/editing/rejected/` | What the owner said not to do, with the reason | so it is not proposed again |
-| server volume `DATA_DIR/dana/references.json` + `references/files/` | References the owner adds from the studio page (link or file + "what I liked") | the studio page; state `awaiting_analysis` |
+| server volume `DATA_DIR/dana/references.json` + `references/files/` | References the owner adds from the studio page (link or file + "what I liked") | the studio page; analysed by the editing worker when a file was uploaded |
 | server volume `DATA_DIR/dana/profiles.json` | The profile the owner approved as default (taken from a package that was actually edited with it) | the studio page |
 | server volume `DATA_DIR/dana/rules.json` | Standing rules ("כלל קבוע") from the owner's feedback | the studio page |
 
@@ -22,10 +22,19 @@ owner adds while working. Nothing moves from "added" to "default" without the ow
 ## Status today
 
 - Adding a reference with a note from the studio page: **works** (stored, listed, deletable).
-- Analysing a reference and proposing a profile from it: **not implemented**. Every reference shows
-  "ממתין לניתוח". No profile here was derived from a reference.
-- The only profile in use is the worker's built-in one for the owner's current test style; it
-  becomes the approved default only when the owner approves it from a finished package.
+- Analysing a reference — server side: **implemented** (the queue, the lease, storing the analysis,
+  showing it with example times, approval / rejection). The analysis itself is done by the editing
+  worker; see `dana-worker/` for what it measures and what it asks the model. A reference states:
+  `awaiting_analysis` → `analysing` → `analysed` → `approved` | `rejected`, or `analysis_failed`
+  (after 3 attempts or a failure the worker calls final), or `link_only`.
+- **Only an uploaded FILE can be analysed.** The worker has no network access by design, so a link
+  alone is kept for the record (`link_only`) and is never fetched.
+- The analysis PROPOSES a profile. It becomes a profile only when the owner presses "אשר כפרופיל"
+  (optionally after changing the proposed numbers), as `ref-<reference id>` version 1, 2, … — every
+  approval is a new version and earlier versions are kept. It is sent with new edits only when the
+  owner also marks it "ברירת מחדל לפרויקטים הבאים". Rejecting changes nothing.
+- A profile can also be approved from a finished package (the profile that version was edited with).
+- Nothing is approved automatically, and no content, music or asset of a reference is copied.
 
 ## The record of one reference
 

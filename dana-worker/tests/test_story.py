@@ -220,5 +220,84 @@ class Adapter(unittest.TestCase):
         self.assertRegex(story.profile_info(prof)["sha256"], r"^[0-9a-f]{64}$")
 
 
+class OwnerCorrections(unittest.TestCase):
+    def test_owner_words_replace_the_machine_hearing_inside_the_span_only(self):
+        w, _ = story.apply_caption_edits([dict(x) for x in W], [{"source_start_s": W[17]["start"], "source_end_s": W[17]["end"], "text": "תומכת"}])
+        groups = story.owner_groups(w, 0.0)
+        self.assertEqual(len(groups), 1)
+        heard = [dict(x) for x in W]
+        heard[17] = dict(heard[17], word="עומכת", probability=0.5)
+        heard[16] = dict(heard[16], end=W[17]["start"] + 0.02)          # a neighbour that touches the span stays
+        out, notes = story.keep_owner_corrections(heard, groups)
+        self.assertEqual([x["word"] for x in out], TEXT.split())
+        self.assertTrue(out[17].get("owner"))
+        self.assertEqual(out[17]["probability"], 1.0)
+        self.assertEqual((notes[0]["heard"], notes[0]["owner"]), ("עומכת", "תומכת"))
+        out, notes = story.keep_owner_corrections([dict(x) for x in W], groups)
+        self.assertEqual(notes, [])                                     # the machine agreed: nothing to report
+
+
+class LockedRevision(unittest.TestCase):
+    def prev(self):
+        pl = story.validate_story(raw(zooms=[{"at_s": W[12]["start"], "strength": "medium", "release_s": W[15]["end"], "reason": "key"}]), W, DUR, CFG, PROFILE)
+        s = pl["segments"][0]
+        cards, t = [], 0
+        ws = TEXT.split()[4:22]
+        for k in range(0, len(ws), 3):
+            grp = W[4 + k:4 + k + 3]
+            cards.append({"text": " ".join(x["word"] for x in grp), "highlight": [], "source_start_s": grp[0]["start"], "source_end_s": grp[-1]["end"]})
+        z = dict(pl["zooms"][0], evidence="e")
+        return {"plan": {"content_judgement": "model", "message": "m", "hook": "h", "brief": ["b"],
+                         "segments": [{k: s[k] for k in ("n", "source_in_s", "source_out_s", "tl_in_s", "tl_out_s", "role", "why")}]},
+                "zooms": [z], "cards": cards, "cover": {"text": "נעלמו החששות", "frame_s": 3.3}, "caption": {"text": "קפשן", "cta": None}}, pl
+
+    def test_previous_plan_is_rebuilt_exactly(self):
+        prev, pl = self.prev()
+        again = story.plan_from_previous(prev, W, CFG, PROFILE)
+        self.assertEqual([(s["source_in_s"], s["source_out_s"]) for s in again["segments"]], [(s["source_in_s"], s["source_out_s"]) for s in pl["segments"]])
+        self.assertEqual([(z["id"], z["tl_t_s"], z["hold_until_s"], z["scale"]) for z in again["zooms"]],
+                         [(z["id"], z["tl_t_s"], z["hold_until_s"], z["scale"]) for z in pl["zooms"]])
+        self.assertEqual(again["message"], "m")
+        self.assertTrue(again["kept_from_previous"])
+
+    def test_only_the_corrected_card_changes(self):
+        prev, _ = self.prev()
+        c = prev["cards"][2]
+        dec = story.decisions_from_previous(prev, [{"source_start_s": c["source_start_s"], "source_end_s": c["source_end_s"], "text": "טקסט מתוקן"}])
+        self.assertEqual(dec["cards"][2]["text"], "טקסט מתוקן")
+        self.assertEqual([x["text"] for i, x in enumerate(dec["cards"]) if i != 2], [x["text"] for i, x in enumerate(prev["cards"]) if i != 2])
+        self.assertEqual((dec["caption"]["text"], dec["cover"]["text"]), ("קפשן", "נעלמו החששות"))
+
+    def test_a_plan_that_cannot_be_reproduced_is_refused(self):
+        prev, _ = self.prev()
+        prev["plan"]["segments"][0].update(source_in_s=500.0, source_out_s=520.0)      # a part that is not in this transcript
+        with self.assertRaises(PipelineError):
+            story.plan_from_previous(prev, W, CFG, PROFILE)
+        with self.assertRaises(PipelineError):
+            story.plan_from_previous({"plan": {"content_judgement": "none", "segments": []}}, W, CFG, PROFILE)
+
+
+class Reference(unittest.TestCase):
+    def test_proposal_is_clamped_labelled_and_never_invents_times(self):
+        from dana_pipeline import reference
+        rawr = {"summary": "s", "content_type": "c", "fits_message": "f", "do_not_imitate": ["x"], "hypotheses": ["h"], "rules": ["r"] * 20,
+                "aspects": [{"aspect": "sound", "observation": "music", "example_times_s": [1, 999], "rule": "r", "basis": "measured"},
+                            {"aspect": "captions", "observation": "big", "example_times_s": [2.5], "rule": "r", "basis": "seen_in_stills"},
+                            {"aspect": "nonsense", "observation": "x", "example_times_s": [], "rule": "", "basis": "measured"}],
+                "proposed_params": {"caption_size": 900, "caption_max_lines": 1, "backing": True, "font_family": "Comic", "zoom_scale_light": 1.0}}
+        out = reference.validate(rawr, {"duration_s": 20.0}, PROFILE["params"])
+        self.assertEqual([a["aspect"] for a in out["aspects"]], ["sound", "captions"])
+        self.assertEqual(out["aspects"][0]["basis"], "hypothesis")              # nothing about sound is measured or heard
+        self.assertEqual(out["aspects"][0]["example_times_s"], [1.0])           # a time outside the video is dropped
+        p = out["proposed_profile"]["params"]
+        self.assertEqual((p["caption_size"], p["caption_max_lines"], p["backing"], p["zoom_scale_light"]), (130, 1, True, 1.03))
+        self.assertNotIn("font_family", p)
+        self.assertEqual(len(out["proposed_profile"]["rules"]), 8)
+
+    def test_approved_profile_carries_its_rules_and_reference(self):
+        p = story.resolve_profile({"profile": {"id": "ref-r1", "version": 2, "params": {"caption_size": 110}, "rules": ["שורה אחת", 5], "source_reference": "r1"}}, PROFILE)
+        self.assertEqual((p["rules"], p["source_reference"], p["version"]), (["שורה אחת"], "r1", "2"))
+
+
 if __name__ == "__main__":
     unittest.main()

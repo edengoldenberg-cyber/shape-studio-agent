@@ -39,6 +39,8 @@
   .small { font-size:13px; } .hidden { display:none !important; }
   details summary { cursor:pointer; padding:6px 0; }
   code { font-size:12px; overflow-wrap:anywhere; }
+  .qblock { border-top:1px solid var(--line); padding:10px 0 4px; } .qblock h3 { font-size:14px; margin:0 0 6px; }
+  .refan { border-top:1px solid var(--line); margin-top:8px; padding-top:4px; } .refparams .row { margin:4px 0; }
   .embed header a { display:none; }                       /* inside the panel tab the panel is already around it */
   .embed body { background:transparent; }
 </style>
@@ -65,16 +67,17 @@
     <div class="card"><h2>חשבון יעד ופרופיל עריכה</h2>
       <div class="row"><span class="grow">חשבון האינסטגרם ליעד הפרסום: <b id="acctnow">—</b></span><button id="acctset">עדכון</button></div>
       <div class="small mute" style="margin-top:8px">פרופיל עריכה מאושר: <span id="profnow">—</span></div>
-      <p class="small mute">פרופיל מאשרים מתוך חבילה שנערכה לפיו ("התוכנית של דנה" ← "לפי אילו כללים נערך").</p></div>
+      <p class="small mute">פרופיל מאשרים מתוך חבילה שנערכה לפיו ("התוכנית של דנה" ← "לפי אילו כללים נערך"), או מתוך הצעה שדנה גזרה מרפרנס (למטה). שום פרופיל לא מאושר אוטומטית.</p></div>
     <div class="card"><h2>כללים קבועים</h2><ul class="plain small" id="rules"><li class="mute">טוען…</li></ul>
-      <p class="small mute">כללים שאישרת נשלחים עם כל עריכה, בכל הפרויקטים.</p></div>
+      <p class="small mute">כללים שאישרת נשלחים עם כל עריכה, בכל הפרויקטים, עם מספר הגרסה שלהם. הערה שסומנה "תיקון לפרויקט הזה" לא הופכת לכלל.</p></div>
     <div class="card"><h2>רפרנסים לעריכה</h2>
-      <p class="small warn">רפרנס נשמר עם ההערה שלך וממתין לניתוח — ניתוח רפרנסים עדיין לא פעיל, ואין עדיין פרופיל שנגזר מרפרנס.</p>
+      <p class="small mute">מעלים קובץ וידאו עם הערה מה אהבת בו. עובד העריכה מנתח אותו ומציע פרופיל; רק אישור שלך הופך הצעה לפרופיל. דנה לא מורידה קישורים — קישור בלי קובץ נשמר לתיעוד בלבד.</p>
+      <video id="refvid" class="hidden" controls playsinline preload="metadata" style="max-height:46vh;margin-bottom:8px"></video>
       <ul class="plain small" id="refs"><li class="mute">טוען…</li></ul>
       <details class="small"><summary>הוספת רפרנס</summary>
         <label for="ref_title">שם</label><input type="text" id="ref_title" maxlength="120">
         <label for="ref_source_url">קישור (או קובץ למטה)</label><input type="text" id="ref_source_url" inputmode="url" placeholder="https://…" dir="ltr">
-        <label for="ref_file">קובץ (וידאו או תמונה)</label><input type="file" id="ref_file" accept="video/*,image/*">
+        <label for="ref_file">קובץ וידאו (נדרש לניתוח)</label><input type="file" id="ref_file" accept="video/*,image/*">
         <label for="ref_origin">מקור — מי יצר / איפה נמצא</label><input type="text" id="ref_origin" maxlength="200">
         <label for="ref_usage_permission">הרשאת שימוש</label><select id="ref_usage_permission"><option value="unknown">לא ידועה</option><option value="inspiration_only">להשראה בלבד</option><option value="own">חומר שלי</option><option value="licensed">ברישיון</option></select>
         <label for="ref_content_type">סוג התוכן</label><input type="text" id="ref_content_type" maxlength="120">

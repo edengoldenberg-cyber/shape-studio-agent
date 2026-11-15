@@ -83,6 +83,13 @@ workerRouter.put('/jobs/:id/artifacts/:name', wrap(async (req, res) => {
 }));
 workerRouter.post('/jobs/:id/complete', json, wrap((req, res) => { studio.complete(req.params.id, leaseOf(req), req.body ?? {}); res.json({ ok: true }); }));
 workerRouter.post('/jobs/:id/fail',     json, wrap((req, res) => res.json({ ok: true, ...studio.fail(req.params.id, leaseOf(req), req.body ?? {}) })));
+// Reference analysis: the worker leases a reference FILE the owner uploaded, analyses it locally and posts the result.
+workerRouter.post('/references/lease', json, wrap((req, res) => { const l = refs.leaseNext(req.body ?? {}); return l ? res.json(l) : res.status(204).end(); }));
+workerRouter.get('/references/:id/file', wrap((req, res) => {
+  const f = refs.leasedFile(req.params.id, leaseOf(req));
+  sendRange(req, res, f.path, 'application/octet-stream', { 'X-Content-SHA256': f.sha256 });
+}));
+workerRouter.post('/references/:id/analysis', json, wrap((req, res) => { const r = refs.submitAnalysis(req.params.id, leaseOf(req), req.body ?? {}); res.json({ ok: true, status: r.status }); }));
 workerRouter.use((_req, res) => res.status(404).json({ ok: false, error: 'not_found' }));
 
 // ── Panel API ─────────────────────────────────────────────────────────────────
@@ -181,9 +188,11 @@ panelRouter.put('/brand/:field', json, wrap((req, res) => res.json({ ok: true, b
 // ── Standing rules (feedback the owner marked "כלל קבוע") ─────────────────────
 panelRouter.get('/rules', wrap((_req, res) => res.json({ ok: true, rules: studio.listRules() })));
 panelRouter.post('/rules/:id/retire', json, wrap((req, res) => res.json({ ok: true, rules: studio.retireRule(req.params.id, req.body?.by) })));
+/** Reword a standing rule: a new version of the same rule (the earlier wording stays in its history). */
+panelRouter.post('/rules/:id', json, wrap((req, res) => res.json({ ok: true, rules: studio.editRule(req.params.id, req.body ?? {}) })));
 
 // ── Editing references and the approved profile ───────────────────────────────
-// A reference is stored with the owner's note and waits. Analysing it and proposing a profile is NOT implemented.
+// A reference FILE is analysed by the editing worker (it cannot fetch links). The analysis proposes a profile; only the owner approves one.
 const REF_MIME = { mp4: 'video/mp4', mov: 'video/quicktime', m4v: 'video/x-m4v', webm: 'video/webm', mkv: 'video/x-matroska',
                    jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp' };
 const refUpload = (req, res, next) => multer({
@@ -194,7 +203,8 @@ const refUpload = (req, res, next) => multer({
     message: err.code === 'LIMIT_FILE_SIZE' ? 'קובץ הרפרנס גדול מהמותר (500MB)' : err.message });
   next();
 });
-const refsOut = () => ({ ok: true, references: refs.list(), analysis: { active: false, note: 'ניתוח רפרנסים עדיין לא פעיל' } });
+const refsOut = () => ({ ok: true, references: refs.list(), default: refs.defaultProfile(), worker: studio.workerStatus(),
+  analysis: { active: true, note: 'הניתוח נעשה במחשב העריכה, על קובץ שהועלה בלבד. דנה לא מורידה קישורים.' } });
 panelRouter.get('/references', wrap((_req, res) => res.json(refsOut())));
 panelRouter.post('/references', refUpload, wrap((req, res) => {
   const b = req.body ?? {};
@@ -204,6 +214,13 @@ panelRouter.post('/references', refUpload, wrap((req, res) => {
   res.status(201).json({ ...refsOut(), reference: ref });
 }));
 panelRouter.delete('/references/:id', wrap((req, res) => { refs.remove(req.params.id); res.json(refsOut()); }));
+panelRouter.post('/references/:id/reanalyse', json, wrap((req, res) => { const reference = refs.reanalyse(req.params.id); res.json({ ...refsOut(), reference }); }));
+/** The owner approves the profile Dana proposed from this reference (optionally with adjusted numbers). Never automatic. */
+panelRouter.post('/references/:id/approve-profile', json, wrap((req, res) => {
+  const out = refs.approveReferenceProfile(req.params.id, { by: req.body?.by, make_default: req.body?.make_default === true, params: req.body?.params });
+  res.json({ ...refsOut(), reference: out.reference, profile: out.profile });
+}));
+panelRouter.post('/references/:id/reject-profile', json, wrap((req, res) => { const reference = refs.rejectReferenceProfile(req.params.id, req.body ?? {}); res.json({ ...refsOut(), reference }); }));
 panelRouter.get('/references/:id/file', wrap((req, res) => { const f = refs.filePath(req.params.id); sendRange(req, res, f.path, REF_MIME[f.ext] ?? 'application/octet-stream'); }));
 
 panelRouter.get('/profiles', wrap((_req, res) => res.json({ ok: true, profiles: refs.profiles(), default: refs.defaultProfile() })));

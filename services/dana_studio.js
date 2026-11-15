@@ -551,6 +551,41 @@ function requestChanges(projectId, body, actor = 'owner') {
   return queueChange(p, v, opts, note, actor);
 }
 
+/**
+ * Everything the worker needs to keep what the owner did NOT ask to change: the previous version's
+ * cut, cards (with times), cover, caption, content plan, zooms and style — as data. Without a note
+ * from the owner the worker locks the revision to this plan.
+ */
+const PREVIOUS_MAX_BYTES = 200 * 1024;
+function previousOf(v) {
+  const pk = v.package;
+  const prev = {
+    segment: pk.segment,
+    cards: (pk.cards ?? []).map(c => ({ i: c.i, text: c.text, lines: c.lines, highlight: c.highlight ?? [], start: c.start, dur: c.dur,
+                                         source_start_s: c.source_start_s, source_end_s: c.source_end_s })),
+    cover: pk.cover, caption: { text: v.caption?.text ?? pk.caption.text, cta: v.caption?.cta ?? null },
+    plan: pk.plan ?? null, zooms: pk.zooms ?? null, judgement_mode: judgementMode(pk), style: pk.style ?? null,
+    // kept for workers that read the short form
+    ...(pk.plan?.content_judgement === 'model' ? { story_plan: {
+      message: pk.plan.message, hook: pk.plan.hook,
+      segments: (pk.plan.segments ?? []).map(x => ({ in_s: x.source_in_s, out_s: x.source_out_s, role: x.role })),
+      zooms: (pk.zooms ?? []).map(z => ({ at_s: z.source_t_s, strength: z.strength, reason: z.reason })),
+      cover_quote: pk.cover?.text ?? '' } } : {}),
+  };
+  const size = () => Buffer.byteLength(JSON.stringify(prev));
+  if (size() > PREVIOUS_MAX_BYTES && prev.plan) {
+    // long free text goes first; segments, zooms and cards are never dropped
+    const { segments, message, hook, content_judgement, reordered } = prev.plan;
+    for (const k of ['skill_text', 'basis', 'burned_in_text', 'zooms_not_used', 'left_out', 'brief', 'rationale']) {
+      if (size() <= PREVIOUS_MAX_BYTES) break;
+      if (k in prev.plan) { prev.plan = { ...prev.plan }; delete prev.plan[k]; }
+    }
+    if (size() > PREVIOUS_MAX_BYTES) prev.plan = { segments, message: String(message ?? '').slice(0, 300), hook: String(hook ?? '').slice(0, 200), content_judgement, reordered };
+  }
+  if (size() > PREVIOUS_MAX_BYTES) throw new StudioError(400, 'previous_too_large', 'הגרסה הקודמת גדולה מדי לשליחה כבסיס לתיקון');
+  return prev;
+}
+
 /** Turn a change (note / style / decisions / stored edits) into the next version's job, or park it when nothing can act on it. */
 function queueChange(p, v, opts, note, actor, { hasEdits = false } = {}) {
   if (opts.style_overrides) p.styleOverrides = { ...p.styleOverrides, ...opts.style_overrides };
@@ -558,14 +593,7 @@ function queueChange(p, v, opts, note, actor, { hasEdits = false } = {}) {
   // No explicit adapter (the worker's model path decides) or an explicit model adapter: send the request and the previous result.
   if (!opts.decisions && (adapter === 'claude' || adapter == null) && v.package) {
     if (adapter === 'claude') opts.adapter = 'claude';
-    opts.previous = { segment: v.package.segment, cards: v.package.cards.map(c => ({ text: c.text, highlight: c.highlight ?? [] })),
-      cover: v.package.cover, caption: { text: v.caption?.text ?? v.package.caption.text, cta: v.caption?.cta ?? null },
-      // the content plan of the version being revised, so a revision keeps what the owner did not ask to change
-      ...(v.package.plan?.content_judgement === 'model' ? { story_plan: {
-        message: v.package.plan.message, hook: v.package.plan.hook,
-        segments: (v.package.plan.segments ?? []).map(x => ({ in_s: x.source_in_s, out_s: x.source_out_s, role: x.role })),
-        zooms: (v.package.zooms ?? []).map(z => ({ at_s: z.source_t_s, strength: z.strength, reason: z.reason })),
-        cover_quote: v.package.cover?.text ?? '' } } : {}) };
+    opts.previous = previousOf(v);
     p.pendingChange = null;
     enqueueEdit(p, opts, actor);
     save();
@@ -629,8 +657,10 @@ function revise(projectId, body = {}, actor = 'owner') {
   for (const z of zooms) { p.zoomEdits = p.zoomEdits.filter(x => x.id !== z.id); p.zoomEdits.push({ ...z, by, at }); }
 
   let rule = null;
-  if (note && body.note_scope === 'permanent') rule = addRule({ text: note, by, projectId: p.id });
-  const opts = { ...(style ? { style_overrides: style } : {}), ...(note && body.note_scope === 'project' ? { change_request: note } : {}) };
+  if (note && body.note_scope === 'permanent') rule = addRule({ text: note, by, projectId: p.id, projectTitle: fixName(p.title), versionN: v.n });
+  // change_request exists ONLY when the owner wrote a note (either scope). Without it the worker locks the revision to the previous plan.
+  // A project-scope note is sent to this job and never becomes a rule; a permanent one is both a rule and this job's request.
+  const opts = { ...(style ? { style_overrides: style } : {}), ...(note ? { change_request: note } : {}) };
   dropApproval(p, v, actor, 'revision_requested');
   hist(p, actor, 'revision_requested', { version: v.n, by, captionEdits: edits.length, zoomEdits: zooms.length, style: style ?? null,
     note: note || null, noteScope: note ? body.note_scope : null, ruleId: rule?.id ?? null });
@@ -641,23 +671,47 @@ function revise(projectId, body = {}, actor = 'owner') {
 const rulesFile = () => path.join(dir(), 'rules.json');
 function rulesState() { try { return JSON.parse(fs.readFileSync(rulesFile(), 'utf8')); } catch (e) { if (e.code !== 'ENOENT') throw new Error(`dana rules are unreadable (${e.message})`); return { rules: [] }; } }
 function saveRules(r) { fs.mkdirSync(dir(), { recursive: true }); const tmp = rulesFile() + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(r, null, 1), 'utf8'); fs.renameSync(tmp, rulesFile()); }
-const listRules = () => rulesState().rules;
-const activeRules = () => listRules().filter(r => r.status === 'active').map(r => ({ id: r.id, text: r.text }));
-function addRule({ text, by, projectId = null }) {
+/** Rules written before versions existed are read as version 1 with the source they recorded. */
+const normRule = r => ({ ...r, version: r.version ?? 1, history: r.history ?? [],
+  source: r.source ?? { project_id: r.projectId ?? null, project_title: null, version_n: null, by: r.by ?? null, at: r.at ?? null } });
+const listRules = () => rulesState().rules.map(normRule);
+/** What travels with every job: the active rules only, each with the version that is in force. */
+const activeRules = () => listRules().filter(r => r.status === 'active').map(r => ({ id: r.id, text: r.text, version: r.version }));
+function addRule({ text, by, projectId = null, projectTitle = null, versionN = null }) {
   const t = String(text || '').trim().slice(0, 500);
   if (t.length < 3) throw new StudioError(400, 'rule_invalid', 'כלל קבוע חייב לכלול טקסט');
   if (!by || !String(by).trim()) throw new StudioError(400, 'by_required', 'נדרש שם מי שמאשר/ת את הכלל');
   const r = rulesState();
   if (r.rules.filter(x => x.status === 'active').length >= MAX_ACTIVE_RULES) throw new StudioError(400, 'rules_full', `יש כבר ${MAX_ACTIVE_RULES} כללים קבועים פעילים — יש להסיר כלל לפני הוספת חדש`);
-  const rule = { id: newId('rule'), text: t, status: 'active', by: String(by).trim().slice(0, 80), at: now(), projectId, retiredBy: null, retiredAt: null };
+  const who = String(by).trim().slice(0, 80), at = now();
+  const rule = { id: newId('rule'), text: t, version: 1, status: 'active', by: who, at, projectId,
+                 source: { project_id: projectId, project_title: projectTitle ? String(projectTitle).slice(0, 200) : null, version_n: versionN, by: who, at },
+                 history: [{ version: 1, text: t, by: who, at, action: 'created' }], retiredBy: null, retiredAt: null };
   r.rules.push(rule); saveRules(r); event('rule_added', { ruleId: rule.id, by: rule.by, projectId });
   return rule;
+}
+/** The owner rewords a standing rule: a new version of the same rule; the earlier wording stays in its history. */
+function editRule(id, { text, by } = {}) {
+  const t = String(text || '').trim().slice(0, 500), who = String(by || '').trim().slice(0, 80);
+  if (t.length < 3) throw new StudioError(400, 'rule_invalid', 'כלל קבוע חייב לכלול טקסט');
+  if (!who) throw new StudioError(400, 'by_required', 'נדרש שם מי שמעדכן/ת את הכלל');
+  const r = rulesState(), i = r.rules.findIndex(x => x.id === id);
+  if (i < 0) throw new StudioError(404, 'rule_not_found', 'הכלל לא נמצא');
+  const rule = normRule(r.rules[i]);
+  if (rule.status !== 'active') throw new StudioError(409, 'rule_retired', 'הכלל הוסר — אי אפשר לערוך אותו');
+  if (t !== rule.text) {
+    if (!rule.history.length) rule.history.push({ version: rule.version, text: rule.text, by: rule.by ?? null, at: rule.at ?? null, action: 'created' });
+    rule.version += 1; rule.text = t;
+    rule.history.push({ version: rule.version, text: t, by: who, at: now(), action: 'edited' });
+    r.rules[i] = rule; saveRules(r); event('rule_edited', { ruleId: id, by: who, version: rule.version });
+  }
+  return r.rules.map(normRule);
 }
 function retireRule(id, by) {
   const r = rulesState(), rule = r.rules.find(x => x.id === id);
   if (!rule) throw new StudioError(404, 'rule_not_found', 'הכלל לא נמצא');
   if (rule.status === 'active') { rule.status = 'retired'; rule.retiredBy = String(by || 'owner').slice(0, 80); rule.retiredAt = now(); saveRules(r); event('rule_retired', { ruleId: id, by: rule.retiredBy }); }
-  return r.rules;
+  return r.rules.map(normRule);
 }
 
 function homophonesOf(pkg) {
@@ -690,7 +744,7 @@ function retry(projectId, actor = 'owner') {
   if (!v || !['failed', 'waiting'].includes(v.status)) throw new StudioError(409, 'not_retryable', 'אין עריכה שנכשלה לנסות שוב');
   const prev = state().jobs[v.jobId];
   enqueueEdit(p, { adapter: prev?.options.adapter ?? undefined, style_overrides: prev?.options.style_overrides, decisions: prev?.options.decisions,
-                   change_request: prev?.options.change_request }, actor);
+                   change_request: prev?.options.change_request, previous: prev?.options.previous }, actor);   // a retried revision keeps its basis
   save();
   return view(p);
 }
@@ -722,12 +776,13 @@ function view(p) {
         timings: v.package.timings_s, totalSeconds: v.package.total_s, pipelineVersion: v.package.pipeline_version,
         // present only when the worker sent them; never invented here
         plan: v.package.plan ?? null, judgementMode: judgementMode(v.package), zooms: v.package.zooms ?? null, transcript: v.package.transcript ?? null,
-        rulesUsed: v.package.rules_used ?? null, captionStatus: v.package.caption?.status ?? null } : null,
+        rulesUsed: v.package.rules_used ?? null, captionStatus: v.package.caption?.status ?? null,
+        quality: v.package.quality ?? null, revisionMode: v.package.revision_mode ?? null } : null,
       hasVideo: !!v.artifacts['final.mp4'], hasCover: !!v.artifacts['cover.jpg'],
     } : null,
     versions: p.versions.map(x => ({ n: x.n, status: x.status, createdAt: x.createdAt, approved: !!x.approval, changeRequest: x.changeRequest ?? null,
       hasVideo: !!x.artifacts?.['final.mp4'], hasCover: !!x.artifacts?.['cover.jpg'], duration: x.package?.duration ?? null,
-      judgementMode: judgementMode(x.package), profile: x.package?.rules_used?.profile ?? null })),
+      judgementMode: judgementMode(x.package), profile: x.package?.rules_used?.profile ?? null, revisionMode: x.package?.revision_mode ?? null })),
     publication: { ...publisher.gate(p), record: p.publication },
     history: p.history.slice(-60),
   };
@@ -745,5 +800,5 @@ module.exports = {
   StudioError, ARTIFACTS, registerUpload, getProject, currentVersion, view, list, workerStatus, workerHello, heartbeat, lease, leasedJob,
   progress, acceptArtifact, complete, fail, recover, reconcileOnStartup, fingerprint, unresolved, approvalValid, editPackage, recordException,
   approve, confirmReview, requestChanges, revise, reject, setConsent, retry, sourcePath, artifactPath, dir, save, state, hist, _resetForTests,
-  listRules, activeRules, addRule, retireRule, fixName, projectAdapter, judgementMode, judgementMissing, STYLE_OVERRIDABLE,
+  listRules, activeRules, addRule, editRule, retireRule, previousOf, fixName, projectAdapter, judgementMode, judgementMissing, STYLE_OVERRIDABLE,
 };

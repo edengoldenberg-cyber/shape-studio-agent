@@ -284,3 +284,11 @@ code is deployed (not approved yet). After a future approved deployment: GET /ap
 - Open owner decisions: deploy; safe-zone width for centre captions; approve profile; consent; raw clip for a full acceptance.
 - Local end-to-end through the server (scripts/dana_e2e_revise.cjs, raw clip uploaded as "ראיון מתאמנת.mp4", data C:/Users/owner/dana-work/e2e-phase2): v1 = model plan, 2 parts, 2 zooms, accepted with 0 revisions; revise (TEST actor: caption edit, size 104, one zoom removed, project note) → v2 with all three applied, v1 still playable. It caught and fixed a real bug (profile + owner style collided). Final tests: python 72, Jest 450, mjs 373/0, Barak panel 33/0, Dana tab 72/0.
 - Known limits: a revision re-runs the content plan; the previous plan is now sent with it (server change, unit-tested, NOT re-run end to end). An owner caption correction is not yet substituted into the final-audio text check. Reference analysis not implemented. Phone screenshots of the new review page with real data were not captured faithfully (headless window minimum width); the CDP check covers phone size.
+
+## Completion round (2026-11-15) — reference analysis, standing rules, locked revisions, owner corrections, quality groups
+
+- Read the addendum in docs/DANA_PHASE_2_2026-11-15.md. NOT deployed; production still 02e14ee / d226d305; worker STOPPED (STOP file).
+- Local proof: scripts/dana_e2e_phase3.cjs 22/22 (data C:/Users/owner/dana-work/e2e-phase3, log in review/compare). Tests: python 78, Jest 466, mjs 373/0, Barak panel 33/0, Dana tab 84/0.
+- Comparison files for the owner: C:/Users/owner/dana-work/review/compare/ (uploaded clip v1 vs v2; DEMO raw captions A vs B; DEMO raw revision before/after; stills; reference analysis JSON).
+- Caption-width alternative B uses a COPY of the safe zone (C:/Users/owner/dana-work/alt/). The working file and the built-in profile are unchanged; nothing was approved for the owner. All owner-like actions in tests were by a TEST actor in local data only.
+- Open owner decisions: deploy the head commit; choose A or B (or other) for caption width; approve a profile; raw clip + consent for the real acceptance.

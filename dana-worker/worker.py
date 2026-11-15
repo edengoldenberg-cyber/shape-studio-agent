@@ -214,6 +214,49 @@ def handle(api, cfg, cfg_path, leased):
         stop.set()
 
 
+def handle_reference(api, cfg, cfg_path, leased):
+    """Analyse one reference video the owner added (style only). The result is a PROPOSAL stored on the server."""
+    ref, lease = leased["reference"], leased["leaseToken"]
+    rid = str(ref.get("id") or "")
+    h = {"X-Lease-Token": lease}
+    if not SAFE_ID.match(rid) or ref.get("ext") not in SAFE_EXT or not re.fullmatch(r"[0-9a-f]{64}", ref.get("sha256", "")):
+        api.call("POST", f"/api/dana/worker/references/{rid}/analysis", {"status": "failed", "error": {"code": "reference_invalid", "message": "reference fields failed validation on the worker"}}, h)
+        return
+    root = Path(cfg["paths"]["work_root"])
+    ref_dir = root / "references" / rid
+    if ref_dir.exists():
+        shutil.rmtree(ref_dir)
+    ref_dir.mkdir(parents=True)
+    (ref_dir / "reference.json").write_text(json.dumps({k: ref.get(k) for k in ("id", "title", "owner_note", "content_type", "fits_message", "usage_permission", "origin")},
+                                                       ensure_ascii=False), encoding="utf-8")
+    src = ref_dir / f"source.{ref['ext']}"
+    try:
+        digest = hashlib.sha256()
+        with api._req("GET", f"/api/dana/worker/references/{rid}/file", headers=h, timeout=120) as r, open(src, "wb") as f:
+            for chunk in iter(lambda: r.read(1 << 20), b""):
+                f.write(chunk)
+                digest.update(chunk)
+        if digest.hexdigest() != ref["sha256"]:
+            raise PipelineError("reference_transfer_failed", "the downloaded reference does not match its hash", True)
+        proc = subprocess.run([sys.executable, "-X", "utf8", "-m", "dana_pipeline.reference", "--config", str(cfg_path), "--ref-dir", str(ref_dir),
+                               "--source", str(src)], cwd=str(HERE), capture_output=True, timeout=1800)
+        out = ref_dir / "analysis.json"
+        if proc.returncode == 0 and out.is_file():
+            code, body = api.call("POST", f"/api/dana/worker/references/{rid}/analysis",
+                                  {"status": "analysed", "analysis": json.loads(out.read_text(encoding="utf-8"))}, h)
+            log(f"reference {rid}: analysed → HTTP {code}")
+            return
+        err = json.loads((ref_dir / "error.json").read_text(encoding="utf-8")) if (ref_dir / "error.json").is_file() else \
+            {"code": "reference_analysis_failed", "message": f"analysis exited {proc.returncode}"}
+        raise PipelineError(err["code"], err["message"])
+    except (PipelineError, urllib.error.URLError, OSError, subprocess.TimeoutExpired) as e:
+        code_, msg = (e.code, e.message) if isinstance(e, PipelineError) else ("reference_analysis_failed", str(e)[:300])
+        log(f"reference {rid}: {code_}: {msg}")
+        api.call("POST", f"/api/dana/worker/references/{rid}/analysis", {"status": "failed", "error": {"code": code_, "message": msg}}, h)
+    finally:
+        src.unlink(missing_ok=True)                 # the reference file itself is not kept on the editing machine
+
+
 def main():
     utf8_stdout()
     ap = argparse.ArgumentParser()
@@ -251,6 +294,12 @@ def main():
                 continue
             if code not in (200, 204):
                 log(f"lease: HTTP {code} {body}")
+            # no edit is waiting: is there a reference the owner added for analysis? (404 = an older server; ignored)
+            rcode, rbody = api.call("POST", "/api/dana/worker/references/lease", {"workerId": api.worker_id})
+            if rcode == 200 and rbody and rbody.get("reference"):
+                log(f"reference {rbody['reference'].get('id')} leased for analysis")
+                handle_reference(api, cfg, a.config, rbody)
+                continue
         except (urllib.error.URLError, OSError) as e:
             log(f"server unreachable: {e}")        # keep polling; the server shows the worker as offline
         if a.once:

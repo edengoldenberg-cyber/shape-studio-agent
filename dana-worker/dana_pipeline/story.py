@@ -40,7 +40,7 @@ def load_skill():
 
 
 def profile_info(profile):
-    body = json.dumps(profile.get("params") or {}, ensure_ascii=False, sort_keys=True)
+    body = json.dumps([profile.get("params") or {}, profile.get("rules") or []], ensure_ascii=False, sort_keys=True)
     return {"id": profile.get("id"), "version": profile.get("version"), "status": profile.get("status") or "unapproved",
             "sha256": hashlib.sha256(body.encode("utf-8")).hexdigest()}
 
@@ -53,7 +53,10 @@ def resolve_profile(options, default_profile):
         for k, v in p["params"].items():
             if k in merged and isinstance(v, type(merged[k])) or (k in merged and isinstance(merged[k], (int, float)) and isinstance(v, (int, float))):
                 merged[k] = v
-        return {"id": str(p["id"])[:60], "version": str(p.get("version") or "1")[:20], "status": "owner_approved", "params": merged}
+        return {"id": str(p["id"])[:60], "version": str(p.get("version") or "1")[:20], "status": "owner_approved", "params": merged,
+                # style rules that came with the approved profile (from an analysed reference); data for the planner and reviewer
+                "rules": [str(r)[:240] for r in (p.get("rules") or [])[:8] if isinstance(r, str) and r.strip()],
+                "source_reference": str(p["source_reference"])[:80] if p.get("source_reference") else None}
     return dict(default_profile, status=default_profile.get("status") or "unapproved")
 
 
@@ -80,7 +83,8 @@ def apply_caption_edits(words, edits, key_start="start", key_end="end"):
         new, t = [], t0
         for tok in toks:
             d = (t1 - t0) * len(tok) / total
-            new.append(dict(out[first], word=tok, **{key_start: round(t, 3), key_end: round(t + d, 3)}, probability=1.0, owner=True))
+            new.append(dict(out[first], word=tok, **{key_start: round(t, 3), key_end: round(t + d, 3)}, probability=1.0, owner=True,
+                            owner_edit=len(applied)))
             t += d
         applied.append({"id": str(e.get("id") or "")[:40], "source_start_s": a, "source_end_s": b,
                         "original": " ".join(w["word"] for w in out[first:last + 1]), "text": text})
@@ -608,3 +612,96 @@ def low_confidence(words, threshold):
     return [{"word_index": i, "word": w["word"], "source_start_s": w["start"], "source_end_s": w["end"], "kind": "low_confidence",
              "note": f"ודאות זיהוי {w.get('probability', 1):.2f} (סף {threshold})"}
             for i, w in enumerate(words) if w.get("probability", 1) < threshold and not w.get("owner")]
+
+
+# ── The owner's corrections outrank a second machine hearing ───────────────────────────────────────
+def owner_groups(words, offset=0.0):
+    """Corrected spans on a timeline: [{t0, t1, tokens}] (times minus `offset`)."""
+    groups = {}
+    for w in words:
+        if w.get("owner"):
+            g = groups.setdefault(w.get("owner_edit", id(w)), {"t0": w["start"] - offset, "t1": w["end"] - offset, "tokens": []})
+            g["t0"], g["t1"] = min(g["t0"], w["start"] - offset), max(g["t1"], w["end"] - offset)
+            g["tokens"].append(w["word"])
+    return sorted(groups.values(), key=lambda g: g["t0"])
+
+
+def keep_owner_corrections(heard, groups):
+    """A re-transcription writes what the machine hears. Inside a span the owner corrected by ear, the owner's
+    words stand: they replace the machine's words there. Returns (words, notes) - a note for every span where
+    the machine heard something else (shown as information, never reopened as an unresolved warning)."""
+    out, notes = list(heard), []
+    for g in groups:
+        # a heard word belongs to the corrected span when most of it lies inside the span (a neighbour that merely touches it stays)
+        idx = [i for i, w in enumerate(out) if not w.get("owner")
+               and min(w["end"], g["t1"]) - max(w["start"], g["t0"]) >= 0.5 * max(w["end"] - w["start"], 0.02)]
+        idx = list(range(idx[0], idx[-1] + 1)) if idx else []
+        heard_text = " ".join(out[i]["word"] for i in idx)
+        t0, t1 = (out[idx[0]]["start"], out[idx[-1]]["end"]) if idx else (max(0.0, g["t0"]), g["t1"])
+        total, t, new = sum(len(x) for x in g["tokens"]) or 1, t0, []
+        for tok in g["tokens"]:
+            d = (t1 - t0) * len(tok) / total
+            new.append({"word": tok, "start": round(t, 3), "end": round(t + d, 3), "probability": 1.0, "owner": True})
+            t += d
+        if idx:
+            out[idx[0]:idx[-1] + 1] = new
+        else:
+            pos = next((i for i, w in enumerate(out) if w["start"] > t0), len(out))
+            out[pos:pos] = new
+        if " ".join(_norm(x) for x in heard_text.split()) != " ".join(_norm(x) for x in g["tokens"]):
+            notes.append({"t0": round(t0, 2), "owner": " ".join(g["tokens"]), "heard": heard_text or "(לא נשמעה מילה)"})
+    return out, notes
+
+
+def plan_from_previous(prev, words, cfg, profile):
+    """The content plan of the version being revised, rebuilt exactly from its package (no model call):
+    same parts, same zooms, same cover. Used when the owner asked only for caption / style / zoom changes.
+    Raises PipelineError(story_invalid) when the previous plan cannot be reproduced on this transcript."""
+    pp = prev.get("plan") or {}
+    if pp.get("content_judgement") != "model" or not pp.get("segments"):
+        raise PipelineError("story_invalid", "the previous version has no model plan to keep")
+    raw = {"segments": [{"in_s": s["source_in_s"] + 0.13, "out_s": s["source_out_s"] - 0.23, "role": s.get("role"), "why": s.get("why")}
+                        for s in pp["segments"]], "zooms": [], "cover": {}, "transcript_doubts": []}
+    pl = validate_story(raw, words, max(w["end"] for w in words) + 1.0, cfg, profile)
+    for a, b in zip(pl["segments"], pp["segments"]):
+        if abs(a["source_in_s"] - b["source_in_s"]) > 0.06 or abs(a["source_out_s"] - b["source_out_s"]) > 0.06:
+            raise PipelineError("story_invalid", "the previous parts could not be reproduced exactly")
+    if len(pl["segments"]) != len(pp["segments"]):
+        raise PipelineError("story_invalid", "the previous parts could not be reproduced exactly")
+    zooms = []
+    for z in prev.get("zooms") or []:
+        seg = next((s for s in pl["segments"] if s["source_in_s"] - 0.05 <= z["source_t_s"] <= s["source_out_s"] + 0.05), None)
+        if seg is None:
+            continue
+        tl = round(seg["tl_in_s"] + z["source_t_s"] - seg["source_in_s"], 3)
+        zooms.append({"id": z["id"], "source_t_s": z["source_t_s"], "tl_t_s": tl, "scale": z["scale"], "strength": z.get("strength"),
+                      "ease_s": z["ease_s"], "hold_until_s": round(min(tl + (z["hold_until_s"] - z["tl_t_s"]), seg["tl_out_s"]), 3),
+                      "reason": z.get("reason") or "", "evidence": z.get("evidence") or ""})
+    pl.update(message=str(pp.get("message") or ""), hook=str(pp.get("hook") or ""), rationale=str(pp.get("rationale") or ""),
+              brief=list(pp.get("brief") or []), left_out=list(pp.get("left_out") or []), zooms=zooms,
+              zooms_dropped=list(pp.get("zooms_not_used") or []), burned_in_text=pp.get("burned_in_text") or {"present": False, "examples": []},
+              cover={"quote": str((prev.get("cover") or {}).get("text") or ""), "quote_is_exact": True, "tl_s": None, "why": str(pp.get("cover_why") or "")},
+              revision_note="", kept_from_previous=True)
+    return pl
+
+
+def decisions_from_previous(prev, edits):
+    """The previous cards, cover and caption as decisions. Only a card the owner corrected changes its text."""
+    cards = []
+    for c in prev.get("cards") or []:
+        text, hl = c["text"], list(c.get("highlight") or [])
+        for e in edits or []:
+            try:
+                mid = (float(c["source_start_s"]) + float(c["source_end_s"])) / 2
+                if float(e["source_start_s"]) - 0.05 <= mid <= float(e["source_end_s"]) + 0.05:
+                    text = " ".join(str(e["text"]).split())
+                    hl = [h for h in hl if h in text]
+            except (KeyError, TypeError, ValueError):
+                continue
+        cards.append({"text": text, "highlight": hl})
+    pp = prev.get("plan") or {}
+    cover = prev.get("cover") or {}
+    return {"segment": {"in_s": 0.0, "out_s": 0.0, "message": pp.get("message") or "", "stands_alone": ""},
+            "cards": cards, "cover": {"text": cover.get("text") or "", "frame_s": cover.get("frame_s")},
+            "caption": {"text": (prev.get("caption") or {}).get("text") or "", "cta": (prev.get("caption") or {}).get("cta")},
+            "objective": "", "brief": list(pp.get("brief") or []), "facts_used": [], "missing_info": []}
