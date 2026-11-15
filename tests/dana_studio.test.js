@@ -467,3 +467,28 @@ describe('Claude adapter jobs: data only, automatic revision', () => {
     expect(p.history.map(h => h.action)).toEqual(expect.arrayContaining(['approved', 'approval_invalidated', 'changes_requested']));
   });
 });
+
+describe("Dana's editorial acceptance is not approval", () => {
+  test('a package Dana accepted still cannot be approved or published while a failed check is open', async () => {
+    const up = await upload(Buffer.concat([VIDEO, crypto.randomBytes(16)]), 'e.mp4'); const l = (await lease()).body;
+    const items = [{ id: 'timing:23', kind: 'timing', card: 23, t0: 20, t1: 23, text: 'זה מה שאני', original: 'בדיקת הסנכרון הנעולה: drift +4280ms', verdict: 'confirmed', explanation: '', ask: '' }];
+    const pkg = { ...pkgFor(up.body.project.source.sha256, { failed: ['sync_lead'] }), review_items: items,
+      editorial: { status: 'ready_for_owner_review', stop_reason: 'accepted', revisions: 2, cycles: [], criteria: [], brief: [], verified_facts: [], missing_information: [] } };
+    const files = { 'final.mp4': crypto.randomBytes(3000), 'cover.jpg': crypto.randomBytes(500), 'package.json': Buffer.from(JSON.stringify(pkg)), 'checks.json': Buffer.from('{}'),
+      'captions.json': Buffer.from('[]'), 'editorial.json': Buffer.from(JSON.stringify({ status: 'ready_for_owner_review' })) };
+    for (const [name, buf] of Object.entries(files))
+      expect((await W(request(app).put(`/api/dana/worker/jobs/${l.job.id}/artifacts/${name}`)).set('X-Lease-Token', l.leaseToken).set('X-Content-SHA256', sha(buf)).set('Content-Type', 'application/octet-stream').send(buf)).status).toBe(200);
+    await W(request(app).post(`/api/dana/worker/jobs/${l.job.id}/complete`)).set('X-Lease-Token', l.leaseToken).send({ status: 'review_required' });
+    const id = up.body.project.id, A = `/api/dana/studio/projects/${id}`;
+    let p = await get(id);
+    expect(p.version.package.editorial.status).toBe('ready_for_owner_review');
+    expect(p.version.approval).toBeNull();                                                   // Dana's acceptance created no approval
+    expect(p.version.package.checks.find(c => c.id === 'sync_lead').status).toBe('fail');
+    expect(p.version.unresolved.map(u => [u.id, u.verdict])).toEqual([['timing:23', 'confirmed']]);
+    const a = await request(app).post(A + '/approve').send({ fingerprint: p.version.fingerprint, by: 'Eden' });
+    expect(a.status).toBe(409); expect(a.body.error).toBe('unresolved_issues');
+    process.env.DANA_PUBLISHING_ENABLED = 'true';
+    expect((await request(app).post(A + '/publish').send({})).body.blocked.map(b => b.code)).toEqual(expect.arrayContaining(['not_approved', 'consent_missing']));
+    expect((await request(app).get(A + '/versions/1/editorial')).status).toBe(200);
+  });
+});

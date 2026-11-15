@@ -376,6 +376,8 @@ def pipeline(j):
                      "reused_render": res["reused_render"], "skill_tools": tools,
                      "criteria": editorial.criteria_table(dec, res, det, tools, review), "findings": findings,
                      "reviewer_frames_s": (review or {}).get("frames_s"), "review_error": review_error,
+                     # restated automatic checks are not sent to the editor; they stay in the owner's review list
+                     "reviewer_findings_not_forwarded": (review or {}).get("dropped_as_already_measured") or [],
                      "verification_of_previous": verification, "editor_addressed": dec.get("addressed") or [],
                      "sent_to_editor": [f["id"] for f in actionable] if use_model else [],
                      "cost_usd_reported_so_far": cost, "seconds_so_far": secs}
@@ -431,6 +433,7 @@ def pipeline(j):
                                  "original": f["problem"], "verdict": "needs_decision",
                                  "explanation": f"תיקון מבוקש: {f['correction']}. ראיה: {f['evidence']}",
                                  "ask": "נדרשת החלטה שלך" if f["fix"] == "owner" else "לא תוקן אוטומטית בתוך מגבלת הסבבים"})
+    checks.assert_nothing_hidden(records, res["sync"], issues, review_items)
     cost, secs = spent()
     accepted = stop == "accepted"
     ed = {"perception": editorial.PERCEPTION, "acceptance_criteria": [{"id": i, "criterion": t, "decided_by": w} for i, t, w in editorial.ACCEPTANCE],

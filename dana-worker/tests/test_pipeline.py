@@ -180,6 +180,18 @@ class Judgement(unittest.TestCase):
         self.assertEqual(dec["segment"]["in_s"], 1.2)
         self.assertTrue(any("checked on the audio level" in i["message"] for i in issues))
 
+    def test_out_point_next_to_a_word_with_no_gap_or_inside_a_pause_stamp_is_resolved_not_rejected(self):
+        tight = words(("שלום", 1.0, 1.4), ("לכולם", 1.4, 1.9), ("אני", 1.9, 2.3), ("כאן", 2.3, 2.9), ("היום", 2.9, 7.5), ("וזה", 7.5, 9.2), ("טוב", 9.2, 9.6))
+        seg = {"in_s": 0.9, "out_s": 7.2, "message": "m", "stands_alone": "s"}
+        cards = [{"text": "שלום לכולם"}, {"text": "אני כאן היום"}]
+        dec, _ = judgement.validate({**DEC, "segment": seg, "cards": cards, "cover": {"text": "אני כאן"}}, tight, 12.0, CFG, STYLE)
+        self.assertEqual(dec["segment"]["out_s"], 7.52)          # 'היום' kept whole; cut right where it ends (frame-snapped)
+        # 7.7 is inside the stamp of 'וזה' (7.5–9.2, a word after a pause): the segment ends in the pause, before it
+        dec, issues = judgement.validate({**DEC, "segment": {**seg, "out_s": 7.7}, "cards": cards, "cover": {"text": "אני כאן"}}, tight, 12.0, CFG, STYLE)
+        self.assertLessEqual(dec["segment"]["out_s"], 7.68)
+        self.assertGreaterEqual(dec["segment"]["out_s"], 7.5)
+        self.assertTrue(any("not included" in i["message"] for i in issues))
+
     def test_prices_and_paraphrased_covers_are_flagged(self):
         dec, issues = judgement.validate({**DEC, "cover": {"text": "החיים שלי השתנו"},
                                           "caption": {"text": "בואו לנסות, 2 אימונים ב-60 ₪", "cta": None}}, SRC, 10.0, CFG, STYLE)
@@ -531,9 +543,40 @@ class Editorial(unittest.TestCase):
         self.assertEqual((table["A2"]["decided_by"], table["A2"]["met"]), ("check", False))     # the model's "met" is ignored
         self.assertEqual((table["A7"]["decided_by"], table["A7"]["met"]), ("reviewer", True))
         self.assertIsNone(table["A4"]["met"])                                                  # skill tool did not run: unknown, not "passed"
-        for text in ("בדיקת sync_lead נכשלה בכרטיס 15", "הכרטיס על המסך 0.20s", "נקרא ב-30 תווים/ש", "energy_gate"):
+        for text in ("בדיקת sync_lead נכשלה בכרטיס 15", "נקרא ב-30 תווים/ש", "energy_gate"):
             self.assertIsNotNone(editorial.MEASURED.search(text), text)
         self.assertIsNone(editorial.MEASURED.search("הקפשן מבטיח תוצאות שלא נאמרו"))
+        # a content finding that merely mentions screen time is NOT suppressed
+        self.assertIsNone(editorial.MEASURED.search('כרטיסים 23-24 מציגים מילים שאינן בתמלול האודיו הסופי (כרטיס 23 על המסך כ-2 שניות)'))
+
+    def test_suppressing_a_redundant_request_never_hides_a_failure(self):
+        """The reviewer may not restate a failed check to the editor — but the failure itself must
+        remain a failed record AND an open review item, or the pipeline refuses to produce a package."""
+        cards = [{"i": 1, "start": 0.0, "dur": 1.0, "plain": "שלום לכולם"}, {"i": 2, "start": 5.0, "dur": 1.0, "plain": "זה מה שאני"}]
+        sync = {"lead_fail": [2], "not_found": [], "tail_fail": [], "suspicious_words": [],
+                "cards": [{"i": 1, "status": "ok", "drift_ms": 0, "tail_ms": 20}, {"i": 2, "status": "fail", "drift_ms": 4280, "tail_ms": 20}]}
+        text = checks.text_check([{"card": 2, "kind": "not_heard", "shown": "זה מה שאני", "heard": "", "t0": None, "t1": None}])
+        al = checks.rec("alignment_reference", "pass", "", cards=[], rows=[{"i": 2, "lead_ms": 10}])
+        records = checks.sync_records({**sync, "tail_unknown": [], "lead_warn": [], "lead_ms": None, "tail_ms": None}) + [al, text]
+        adj = [{"card": 2, "original": "drift +4280ms", "verdict": "confirmed", "reason": "r"}]
+        items = checks.review_items(records, [], cards, sync, adj, 10.0)
+        kinds = sorted((i["kind"], i["card"], i["verdict"]) for i in items)
+        self.assertEqual(kinds, [("text", 2, "needs_listening"), ("timing", 2, "confirmed")])     # the timing failure is NOT folded away
+        self.assertEqual({r["id"]: r["status"] for r in records}["sync_lead"], "fail")
+        checks.assert_nothing_hidden(records, sync, [], items)                                     # complete → fine
+        with self.assertRaises(PipelineError) as e:
+            checks.assert_nothing_hidden(records, sync, [], [i for i in items if i["card"] != 2])
+        self.assertEqual(e.exception.code, "review_items_incomplete")
+        with self.assertRaises(PipelineError):
+            checks.assert_nothing_hidden(records, sync, [judgement.issue("unverified_number", "blocker", "x")], items)
+        # only a pure spelling variance with a small locked drift is shown once, as the text item
+        text2 = checks.text_check([{"card": 2, "kind": "asr_variance", "shown": "איך שהוא", "heard": "איכשהו", "t0": 5.0, "t1": 5.5}])
+        sync2 = dict(sync, lead_fail=[], not_found=[2], cards=[sync["cards"][0], {"i": 2, "status": "not_found", "drift_ms": None, "tail_ms": 20}])
+        items2 = checks.review_items(checks.sync_records({**sync2, "tail_unknown": [], "lead_warn": [], "lead_ms": None, "tail_ms": None}) + [al, text2],
+                                     [], cards, sync2, [{"card": 2, "original": "NOT_FOUND", "verdict": "confirmed", "reason": "r"}], 10.0)
+        self.assertEqual([(i["kind"], i["card"]) for i in items2], [("text", 2)])
+        self.assertIn("NOT_FOUND", items2[0]["explanation"])                                       # the locked result is quoted inside it
+        checks.assert_nothing_hidden([], sync2, [], items2)
 
     def test_injection_is_labelled_and_caught_by_the_checks(self):
         from dana_pipeline import editorial

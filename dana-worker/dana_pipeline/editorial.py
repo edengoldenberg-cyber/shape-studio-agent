@@ -48,6 +48,7 @@ ACCEPTANCE = [
     ("A7", "הקטע מובן למי שלא ראה את שאר ההקלטה", "reviewer"),
     ("A8", "הקפשן אומר רק מה שנאמר בסרטון או עובדות מאומתות, ואינו מבטיח תוצאות", "reviewer"),
     ("A9", "הציטוט בקאבר מייצג את המסר של הקטע", "reviewer"),
+    ("A14", "הקפשן והקאבר אינם נוקבים בשמו של אדם פרטי (גם אם השם נשמע בהקלטה)", "reviewer"),
     ("A10", "ההדגשה הצהובה סלקטיבית ונמצאת על המילים שנושאות את המסר", "reviewer"),
     ("A11", "בפריימים שנבדקו הכתובית קריאה ואינה מסתירה את הפנים", "reviewer"),
     ("A12", "כתיב: הבדלי איות בלבד בין שני התמלולים הוכרעו לפי ההקשר", "check"),
@@ -117,7 +118,7 @@ a valid answer.
 
 
 # Reviewer findings that only restate a mandatory automatic check are not passed on.
-MEASURED = re.compile(r"sync_|alignment_reference|energy_gate|cards_in_motion|reading_comfort|תווים/ש|על המסך (רק )?\d")
+MEASURED = re.compile(r"sync_|alignment_reference|energy_gate|cards_in_motion|reading_comfort|תווים/ש")
 
 
 # ── tools from the installed skills (measurements only; pinned by hash) ─────

@@ -539,11 +539,14 @@ def review_items(records, issues, cards, sync, adjudications, dur):
     al_rows = {r["i"]: r for r in ((al or {}).get("data") or {}).get("rows") or []}
     al_bad = set(((al or {}).get("data") or {}).get("cards") or [])
     text_rec = status.get("caption_text")
-    diff_cards = {t["card"] for t in (text_rec["data"]["items"] if text_rec else []) if t["kind"] != "homophone"}
+    diff_cards = {t["card"] for t in (text_rec["data"]["items"] if text_rec else []) if t["kind"] == "asr_variance"}
     folded = {}
     for i in sorted(set(sync["lead_fail"] + sync["not_found"] + sync["tail_fail"])):
         a = adj.get(i)
-        if i in diff_cards and i in al_rows and i not in al_bad and not (a and a["verdict"] == "suspected_false_positive"):
+        lk0 = next(r for r in sync["cards"] if r["i"] == i)
+        small = lk0["status"] == "not_found" or (lk0["drift_ms"] is not None and abs(lk0["drift_ms"]) < 1000)
+        if (i in diff_cards and i in al_rows and i not in al_bad and small and i not in sync["tail_fail"]
+                and not (a and a["verdict"] == "suspected_false_positive")):
             lk = next(r for r in sync["cards"] if r["i"] == i)
             what = "NOT_FOUND" if lk["status"] == "not_found" else f"drift {lk['drift_ms']}ms" if lk["status"] == "fail" else f"tail {lk['tail_ms']}ms"
             folded[i] = (f" בדיקת הסנכרון הנעולה דיווחה {what} לכרטיס הזה, כי היא מחפשת את האיות שבכתובית; "
@@ -587,6 +590,23 @@ def review_items(records, issues, cards, sync, adjudications, dur):
             items.append({"id": f"content:{i['code']}", "kind": "content", "card": None, "t0": None, "t1": None, "text": None,
                           "original": i["message"], "verdict": "needs_decision", "explanation": "", "ask": "נדרשת החלטה שלך"})
     return items
+
+
+def assert_nothing_hidden(records, sync, issues, items):
+    """Fail closed: every failed check, every card the locked sync check failed and every blocking
+    issue must be represented in the owner's review list. Suppressing a redundant revision request
+    must never make a failure disappear."""
+    cards = {i["card"] for i in items if i.get("card")}
+    ids = {i["id"] for i in items}
+    missing = [f"card {c}" for c in sorted(set(sync["lead_fail"] + sync["not_found"] + sync["tail_fail"])) if c not in cards]
+    missing += [f"word '{w['word']}' (card {w['card']})" for w in sync["suspicious_words"] if w["card"] not in cards]
+    covered = {"sync_lead", "sync_not_found", "sync_tail", "energy_gate", "caption_text"}
+    missing += [r["id"] for r in records if r["status"] == "fail" and r["id"] not in covered and f"check:{r['id']}" not in ids]
+    missing += [i["code"] for i in issues if i["severity"] == "blocker" and f"content:{i['code']}" not in ids]
+    text = next((r for r in records if r["id"] == "caption_text"), None)
+    missing += [f"text difference on card {t['card']}" for t in ((text or {}).get("data") or {}).get("items") or [] if t["card"] not in cards]
+    if missing:
+        raise PipelineError("review_items_incomplete", "failed checks are missing from the review list: " + ", ".join(missing))
 
 
 HUMAN_CHECKS = [

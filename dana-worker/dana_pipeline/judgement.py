@@ -126,12 +126,17 @@ def snap_segment(seg, words, duration, fps, cfg):
     for i, w in enumerate(words):
         if w["start"] < out_s < w["end"]:
             nxt = words[i + 1]["start"] if i + 1 < len(words) else duration
-            new = min(w["end"] + 0.15, duration)
-            if new > nxt - 0.02:
-                new = (w["end"] + nxt) / 2
-            if new <= w["end"]:
-                raise PipelineError("judgement_invalid", f"out_s {out_s} cuts the word '{w['word']}' and cannot be extended")
-            notes.append(f"out_s moved {out_s:.2f}→{new:.2f} so '{w['word']}' is whole")
+            stretched = w["end"] - w["start"] > max(0.60, 0.20 * len(strip(w["word"])))    # far longer than the word can take
+            if stretched and out_s - w["start"] <= 0.5:
+                # The stamp of a word after a pause begins where the previous word ended; the cut was
+                # placed in that pause, before the word is spoken. End the segment there, before the word.
+                new = min(w["start"] + 0.15, out_s)
+                notes.append(f"out_s {out_s:.2f}→{new:.2f}: the segment ends in the pause before '{w['word']}' (not included)")
+            else:
+                new = min(w["end"] + 0.15, duration)
+                if new > nxt - 0.02:
+                    new = max(w["end"], (w["end"] + nxt) / 2)        # no room after the word: cut exactly where it ends
+                notes.append(f"out_s moved {out_s:.2f}→{new:.2f} so '{w['word']}' is whole")
             out_s = new
         if w["start"] < in_s < w["end"]:
             notes.append(f"in_s {in_s:.2f} is inside the stamp of '{w['word']}' "
@@ -362,6 +367,9 @@ THE TASK
    - No prices, offers, numbers, results, schedules, guarantees or medical claims.
    - If no approved call to action is given, "cta" is null. Do not invent one.
    - No brand voice is defined: write plainly.
+   - Do not name the speaker or any other person in the caption or on the cover, even if a name is heard in
+     the recording. Naming a private person needs their consent, which is not yours to assume: write
+     "מתאמנת" / "מתאמן" / "מדריכה" instead.
 5. A short editorial note for the owner, in Hebrew, one sentence each: "message" (what the speaker
    says in this excerpt), "stands_alone" (why a stranger understands it without the rest of the
    recording). "audience" is null unless <brand_facts> defines an audience; never guess one.
