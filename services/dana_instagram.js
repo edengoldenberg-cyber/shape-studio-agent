@@ -37,10 +37,10 @@ const RUPLOAD = 'https://rupload.facebook.com';
 const REEL_METRICS = ['views', 'reach', 'likes', 'comments', 'saved', 'shares', 'total_interactions', 'ig_reels_avg_watch_time', 'ig_reels_video_view_total_time'];
 const REQUIRED = ['DANA_IG_LOGIN', 'DANA_IG_API_VERSION', 'DANA_IG_USER_ID', 'DANA_IG_ACCESS_TOKEN'];
 
-function config(env = process.env) {
+function config(env = process.env, { requireLive = true } = {}) {
   const missing = REQUIRED.filter(k => !env[k]);
   const problems = [];
-  if (env.DANA_INSTAGRAM_LIVE !== 'true') problems.push('DANA_INSTAGRAM_LIVE is not "true"');
+  if (requireLive && env.DANA_INSTAGRAM_LIVE !== 'true') problems.push('DANA_INSTAGRAM_LIVE is not "true"');
   if (missing.length) problems.push('missing: ' + missing.join(', '));
   if (env.DANA_IG_LOGIN && !HOSTS[env.DANA_IG_LOGIN]) problems.push('DANA_IG_LOGIN must be facebook or instagram');
   if (env.DANA_IG_API_VERSION && !/^v\d{2}\.\d$/.test(env.DANA_IG_API_VERSION)) problems.push('DANA_IG_API_VERSION must look like v24.0');
@@ -51,7 +51,7 @@ function config(env = process.env) {
 /** What is configured — names and shapes only, never a value of a secret. */
 function status(env = process.env) {
   const c = config(env);
-  return { ready: c.ok, problems: c.problems, login: c.login ?? null, apiVersion: c.version ?? null, userIdConfigured: !!c.userId,
+  return { ready: c.ok, problems: c.problems, credentialsConfigured: config(env, { requireLive: false }).ok, login: c.login ?? null, apiVersion: c.version ?? null, userIdConfigured: !!c.userId,
            tokenConfigured: !!env.DANA_IG_ACCESS_TOKEN, coverMode: c.coverMode, verifiedAgainstRealAccount: false };
 }
 
@@ -62,8 +62,11 @@ class InstagramPublisher {
    * @param files  (projectId, version, name) → absolute path of a stored artifact
    * @param publicUrl  optional (projectId, version, name) → short-lived signed URL (only when the login flow needs a URL)
    */
-  constructor({ env = process.env, files, publicUrl = null, base = null, uploadBase = null, timeoutMs = Number(env.DANA_PUBLISH_TIMEOUT_MS) || 30000, fetchImpl = fetch } = {}) {
-    const c = config(env);
+  constructor({ env = process.env, files, publicUrl = null, base = null, uploadBase = null, timeoutMs = Number(env.DANA_PUBLISH_TIMEOUT_MS) || 30000, fetchImpl = fetch, readOnly = false } = {}) {
+    // readOnly: a connection check that may run while every publishing switch is still off. It can only
+    // issue the two GET requests of whoAmI() and publishingLimit(); every write method refuses.
+    const c = config(env, { requireLive: !readOnly });
+    this.readOnly = readOnly;
     if (!c.ok) throw Object.assign(new Error('Instagram publisher is not configured: ' + c.problems.join('; ')), { code: 'publisher_not_configured' });
     Object.assign(this, { c, token: env.DANA_IG_ACCESS_TOKEN, files, publicUrl, timeoutMs, fetch: fetchImpl,
       base: `${base ?? HOSTS[c.login]}/${c.version}`, uploadBase: `${uploadBase ?? RUPLOAD}/ig-api-upload/${c.version}` });
@@ -108,6 +111,7 @@ class InstagramPublisher {
   }
 
   async createContainer(x) {
+    if (this.readOnly) throw Object.assign(new Error('read-only connection check: nothing may be created'), { code: 'read_only' });
     const video = this.files(x.projectId, x.version, 'final.mp4');
     const params = { media_type: 'REELS', caption: x.caption, share_to_feed: true };
     if (this.c.coverMode === 'signed_url' && this.publicUrl) params.cover_url = this.publicUrl(x.projectId, x.version, 'cover.jpg');
@@ -135,6 +139,7 @@ class InstagramPublisher {
     return j.status_code;
   }
   async publish(containerId) {
+    if (this.readOnly) throw Object.assign(new Error('read-only connection check: nothing may be published'), { code: 'read_only' });
     const j = await this.call('POST', `${this.base}/${this.c.userId}/media_publish`, { params: { creation_id: containerId } });
     return { mediaId: String(j.id) };
   }

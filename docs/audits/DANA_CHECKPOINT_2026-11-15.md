@@ -197,3 +197,20 @@ NEXT (step 7, owner only, in their OWN terminal — not in this chat): store fou
 DANA_IG_USER_ID=17841401323322547, DANA_IG_ACCESS_TOKEN=<the Page token>. Do NOT set or change
 DANA_PUBLISHER_MODE, DANA_INSTAGRAM_LIVE, DANA_PUBLISHING_ENABLED. The variables are inert until Dana's
 code is deployed (not approved yet). After a future approved deployment: GET /api/dana/studio/publisher/status?probe=1.
+
+## Credentials stored; deployment proposal handed to the owner (2026-11-15)
+
+- Owner stored in Railway with --skip-deploys: DANA_IG_LOGIN, DANA_IG_API_VERSION, DANA_IG_USER_ID,
+  DANA_IG_ACCESS_TOKEN. Clipboard cleared. Latest deployment still a773838f-7263-4450-9747-bcc5833226ec
+  (= commit 8a81337). Publishing switches untouched (unset). The token was never shown in chat.
+- Code change after that: the read-only connection check (GET /api/dana/studio/publisher/status?probe=1)
+  now works with every publishing switch off (readOnly client: account + quota GETs only; write methods refuse).
+- Deployment is PROPOSED, NOT APPROVED. Candidate = head of dana-phase-1a (see git log; code commit is the
+  one titled "read-only connection check with publishing switches off").
+- If approved, step A: (1) owner sets DANA_WORKER_TOKEN with --skip-deploys (optional for the probe-only
+  check), (2) `railway up --detach` from the repo root, (3) verify /api/version deployment id, /health,
+  401 without session, Barak/Tomer panels, (4) logged-in GET /api/dana/studio/publisher/status?probe=1
+  → expect enabled:false, instagram.ready:false, credentialsConfigured:true, account.username
+  pilates_barre_power, matchesConfiguredId true, limit.total 100.
+- Rollback: `git checkout 8a81337 && railway up --detach`, then `git checkout dana-phase-1a`.
+- Reminder: data access of the token expires 2027-02-13; remind late January 2027.

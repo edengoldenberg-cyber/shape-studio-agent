@@ -202,6 +202,21 @@ describe('contract: one Reel through the documented flow', () => {
     expect(ig.scrub(`bad token ${TOKEN} access_token=abc123`, TOKEN)).toBe('bad token [token] access_token=[token]');
   });
 
+  test('connection check with every publishing switch OFF: two GETs, and it cannot write', async () => {
+    boot({ DANA_INSTAGRAM_LIVE: '', DANA_PUBLISHING_ENABLED: '', DANA_PUBLISHER_MODE: '' });
+    expect(ig.status()).toMatchObject({ ready: false, credentialsConfigured: true });
+    expect(() => new ig.InstagramPublisher({ files: () => null })).toThrow(/not configured/);          // the publisher itself stays unavailable
+    const p = new ig.InstagramPublisher({ files: () => null, readOnly: true, base: `http://127.0.0.1:${fake.port}` });
+    expect(await p.whoAmI()).toMatchObject({ username: 'shape.test', matchesConfiguredId: true });
+    expect(await p.publishingLimit()).toEqual({ used: 2, total: 50 });
+    await expect(p.createContainer({ projectId: 'x', version: 1, caption: 'c' })).rejects.toMatchObject({ code: 'read_only' });
+    await expect(p.publish('1')).rejects.toMatchObject({ code: 'read_only' });
+    expect(fake.st.seen.every(r => r.method === 'GET')).toBe(true);
+    const st = (await request(app).get('/api/dana/studio/publisher/status')).body;
+    expect(st).toMatchObject({ enabled: false, instagram: { ready: false, credentialsConfigured: true, tokenConfigured: true } });
+    expect(JSON.stringify(st)).not.toContain(TOKEN);
+  });
+
   test('the scheduler does not start under test, in mock mode, or when publishing is off', () => {
     expect(publisher.startScheduler()).toBe(false);
   });

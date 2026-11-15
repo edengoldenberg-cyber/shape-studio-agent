@@ -162,8 +162,10 @@ panelRouter.post('/publisher/tick', json, wrap(async (req, res) => {
 panelRouter.get('/publisher/status', wrap(async (req, res) => {
   const ig = require('../services/dana_instagram');
   const out = { ok: true, enabled: publisher.enabled(), mode: publisher.mode(), paused: publisher.paused(), instagram: ig.status() };
-  if (req.query.probe === '1' && publisher.mode() === 'instagram' && ig.status().ready) {
-    const p = new ig.InstagramPublisher({ files: () => null });
+  // The probe is two GET requests (account, quota). It works with every publishing switch off, so the
+  // connection can be checked right after a deployment and long before anything may be published.
+  if (req.query.probe === '1' && ig.status().credentialsConfigured) {
+    const p = new ig.InstagramPublisher({ files: () => null, readOnly: true });
     try { out.account = await p.whoAmI(); out.limit = await p.publishingLimit(); } catch (e) { out.probeError = { code: e.code, message: e.message }; }
   }
   res.json(out);
