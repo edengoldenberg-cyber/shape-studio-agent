@@ -11,96 +11,117 @@ import math
 from pathlib import Path
 
 from .core import PipelineError, run, tool
-from .judgement import norm
+import difflib
 
-STRETCHED = 0.60                 # a first word longer than this spans a pause (Whisper artefact)
-ONSET_DB, ONSET_HOLD = -28.0, 0.06
+from .judgement import canon, strip
 
 
-def match_cards(cards, words, homophones=None):
-    """Match each card's words to transcript words, in order, by text.
+def match_cards(cards, words, groups=None):
+    """Match each card's words to transcript words, in order, by text. Words of one
+    homophone group match each other (spelling is a separate, textual review item).
     Returns (spans, skipped). Raises when a card cannot be found — never guesses."""
     pos, spans, skipped = 0, [], []
     for n, c in enumerate(cards, 1):
-        want = [norm(t, homophones) for t in c["text"].split()]
-        want = [t for t in want if t]
+        want = [t for t in (canon(t, groups) for t in c["text"].split()) if t]
         if not want:
             raise PipelineError("judgement_invalid", f"card {n} has no words")
         start = pos
-        while pos < len(words) and norm(words[pos]["word"], homophones) != want[0]:
+        while pos < len(words) and canon(words[pos]["word"], groups) != want[0]:
             pos += 1
         got = words[pos:pos + len(want)]
-        if [norm(w["word"], homophones) for w in got] != want:
+        if [canon(w["word"], groups) for w in got] != want:
             heard = " ".join(w["word"] for w in words[start:start + 6])
             raise PipelineError("caption_text_mismatch",
                                 f"card {n} '{c['text']}' is not in the audio at this point (heard: {heard})",
                                 detail={"card": n, "text": c["text"], "heard": heard})
-        skipped += words[start:pos]
+        skipped.append({"before_card": n, "words": words[start:pos]}) if pos > start else None
         spans.append(got)
         pos += len(want)
-    skipped += words[pos:]
+    if pos < len(words):
+        skipped.append({"before_card": None, "words": words[pos:]})
     return spans, skipped
 
 
-def envelope_onset(wav, t0, t1):
-    """First time in [t0, t1] after which the level stays above ONSET_DB."""
-    import numpy as np
-    import soundfile as sf
-    x, sr = sf.read(str(wav))
-    if x.ndim > 1:
-        x = x.mean(axis=1)
-    win, need, db = int(0.01 * sr), int(ONSET_HOLD / 0.01), []
-    for i in range(int(t0 * sr), int(t1 * sr), win):
-        seg = x[i:i + win]
-        if len(seg) == 0:
-            break
-        db.append(20 * np.log10(np.sqrt((seg ** 2).mean()) + 1e-9))
-    # The stamp of a stretched word starts in the tail of the previous word. Find the
-    # pause first (level below the threshold), then the first sustained sound after it.
-    quiet = next((k for k in range(len(db) - need) if all(v <= ONSET_DB for v in db[k:k + need])), None)
-    if quiet is None:
-        return None                       # no pause inside the stamp: keep the stamped start
-    for k in range(quiet, len(db) - need):
-        if all(v > ONSET_DB for v in db[k:k + need]):
-            return round(t0 + k * 0.01, 3)
-    return None
+def align_cards(cards, heard, groups=None):
+    """Map every card to the words heard in the FINAL audio.
+
+    The cards were already proven to be the exact words of the source transcript
+    (match_cards). A second transcription of the cut audio can write the same speech
+    differently ("איך שהוא" / "איכשהו"), so this mapping is a sequence alignment, not an
+    equality test. Every difference is returned in `diffs` and becomes a TEXT review item;
+    it is never hidden and never treated as a timing matter.
+    Returns (spans, diffs). Raises when the audio clearly says something else."""
+    toks = [(n, t) for n, c in enumerate(cards) for t in c["text"].split() if canon(t, groups)]
+    a, b = [canon(t, groups) for _, t in toks], [canon(w["word"], groups) for w in heard]
+    sm = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
+    if sm.ratio() < 0.75:
+        raise PipelineError("caption_text_mismatch", f"the final audio does not match the captions (similarity {sm.ratio():.2f})")
+    idx, diffs = {n: [] for n in range(len(cards))}, []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                n, shown = toks[i1 + k]
+                idx[n].append(j1 + k)
+                if strip(shown) != strip(heard[j1 + k]["word"]):
+                    diffs.append({"card": n + 1, "shown": strip(shown), "heard": strip(heard[j1 + k]["word"]), "kind": "homophone",
+                                  "t0": heard[j1 + k]["start"], "t1": heard[j1 + k]["end"]})
+        elif tag == "replace":
+            for k in range(i1, i2):
+                idx[toks[k][0]].append(j1 + min(j2 - j1 - 1, (k - i1) * (j2 - j1) // (i2 - i1)))
+            diffs.append({"card": toks[i1][0] + 1, "shown": " ".join(strip(t) for _, t in toks[i1:i2]),
+                          "heard": " ".join(strip(w["word"]) for w in heard[j1:j2]), "kind": "asr_variance",
+                          "t0": heard[j1]["start"], "t1": heard[j2 - 1]["end"]})
+        elif tag == "delete":
+            diffs.append({"card": toks[i1][0] + 1, "shown": " ".join(strip(t) for _, t in toks[i1:i2]), "heard": "",
+                          "kind": "not_heard", "t0": None, "t1": None})
+        else:
+            n = toks[min(i1, len(toks) - 1)][0]
+            diffs.append({"card": n + 1, "shown": "", "heard": " ".join(strip(w["word"]) for w in heard[j1:j2]),
+                          "kind": "extra_heard", "t0": heard[j1]["start"], "t1": heard[j2 - 1]["end"]})
+    spans = []
+    for n in range(len(cards)):
+        if idx[n]:
+            spans.append(heard[min(idx[n]):max(idx[n]) + 1])
+        else:                                   # nothing heard for this card: place it between its neighbours
+            before = max((max(v) for m, v in idx.items() if m < n and v), default=None)
+            after = min((min(v) for m, v in idx.items() if m > n and v), default=None)
+            t0 = heard[before]["end"] if before is not None else 0.0
+            t1 = heard[after]["start"] if after is not None else t0 + 0.5
+            spans.append([{"word": "", "start": t0, "end": max(t1, t0 + 0.2), "probability": 0.0, "synthetic": True}])
+    return spans, diffs
 
 
-def time_cards(cards, spans, fps, hold_after, total_dur, wav=None):
-    """Card times on the timeline. A card starts on the frame of its first word, ends
-    no earlier than its last word (tail >= 0), never shares a frame with the next card,
-    and does not stay up through a pause."""
+def time_cards(cards, spans, fps, hold_after, total_dur, align=None):
+    """Card times on the timeline. A card starts on the frame of its first word's reference
+    onset (align.Alignment; the Whisper start when no alignment is given), ends no earlier
+    than its last word (tail >= 0), never shares a frame with the next card, and does not
+    stay up through a pause."""
     frame = 1.0 / fps
     fl = lambda t: round(math.floor(round(t / frame, 6)) * frame, 3)
     ce = lambda t: round(math.ceil(round(t / frame, 6)) * frame, 3)
-    starts, notes = [], []
-    for n, got in enumerate(spans, 1):
-        first, s = got[0], got[0]["start"]
-        if wav is not None and first["end"] - first["start"] > STRETCHED:
-            on = envelope_onset(wav, max(first["start"], 0), first["end"])
-            if on is not None:
-                notes.append(f"card {n}: first word stamped {first['start']:.2f}-{first['end']:.2f}, "
-                             f"audible onset {on:.2f} — card starts at the onset")
-                s = on
-        starts.append(max(s, 0.0))
+    refs = []
+    for got in spans:
+        refs.append(align.onset(got[0]) if align is not None else
+                    {"t": got[0]["start"], "uncertainty_s": 0.05, "method": "whisper", "evidence": {}})
+    starts = [max(r["t"], 0.0) for r in refs]
     out, prev_end = [], 0.0
     for n, (c, got) in enumerate(zip(cards, spans)):
         last_end = got[-1]["end"]
         start = 0.0 if n == 0 and starts[n] < frame else fl(starts[n])
         start = max(start, prev_end)
-        end = ce(last_end + 0.001)
+        end = ce(last_end + 0.002)
         if n + 1 < len(cards):
             end = max(end, min(fl(starts[n + 1]), ce(last_end + hold_after)))
         else:
-            end = min(ce(last_end + hold_after), fl(total_dur))
-            end = max(end, min(ce(last_end + 0.001), fl(total_dur)))
+            end = max(min(ce(last_end + hold_after), fl(total_dur)), min(ce(last_end + 0.002), fl(total_dur)))
         if end <= start:
             end = round(start + frame, 3)
         out.append({"i": n + 1, "start": start, "dur": round(end - start - 0.001, 3),
                     "plain": c["text"], "highlight": c.get("highlight") or [],
-                    "first_word_audio_s": round(starts[n], 3), "last_word_end_audio_s": round(last_end, 3)})
+                    "first_word_audio_s": round(starts[n], 3), "last_word_end_audio_s": round(last_end, 3),
+                    "onset": refs[n]})
         prev_end = end
-    return out, notes
+    return out
 
 
 def card_html(text, highlight, style):
@@ -178,4 +199,5 @@ def composite(cfg, base, voice, cards, png_dir, out, dur):
            "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv",
            "-movflags", "+faststart", out]
     run(cmd, "render_failed", timeout=cfg["timeouts"]["ffmpeg_s"])
+    script.unlink(missing_ok=True)
     return out

@@ -95,6 +95,13 @@
     if (pkg) {
       h.push(`<div class="card"><h2>הסרטון הסופי</h2><video controls playsinline preload="metadata" poster="${base}/cover" src="${base}/video"></video>
         <div class="small mute" style="margin-top:6px">${pkg.duration}s · מקור ${pkg.segment.in_s}–${pkg.segment.out_s}s · בחירה: ${esc(pkg.adapter)} · נערך ב-${Math.round(pkg.totalSeconds)}s</div></div>`);
+      if (pkg.segment.reason) h.push(`<div class="card"><h2>למה הקטע הזה</h2>
+        ${pkg.revisionNote ? `<div class="pill info">מה השתנה בגרסה הזו</div><div class="quote">${esc(pkg.revisionNote)}</div>` : ''}
+        <div>${esc(pkg.segment.reason)}</div>
+        ${pkg.segment.complete_thought ? `<label>המחשבה השלמה</label><div>${esc(pkg.segment.complete_thought)}</div>` : ''}
+        ${pkg.segment.audience_relevance ? `<label>למה זה חשוב לקהל</label><div>${esc(pkg.segment.audience_relevance)}</div>` : ''}
+        ${pkg.considered.length ? `<details class="small"><summary>חלופות שנשקלו (${pkg.considered.length})</summary><ul class="plain">${pkg.considered.map(c => `<li>${c.in_s}–${c.out_s}s: ${esc(c.why_not)}</li>`).join('')}</ul></details>` : ''}
+        ${pkg.usage ? `<div class="small mute" style="margin-top:6px">נבחר על ידי ${esc(pkg.usage.calls.map(c => c.models_used.join('+') || c.model_requested).join(', '))} · ${pkg.usage.calls.length} קריאות · ${pkg.usage.calls.reduce((t, c) => t + (c.elapsed_s || 0), 0).toFixed(0)}s · עלות מדווחת $${pkg.usage.calls.reduce((t, c) => t + (c.cost_usd_reported || 0), 0).toFixed(3)}</div>` : ''}</div>`);
       h.push(`<div class="card"><h2>קאבר</h2><img class="cover" alt="קאבר" src="${base}/cover"><div class="small mute" style="margin-top:6px">טקסט: ${esc(pkg.cover.text || '— ללא —')}</div></div>`);
 
       h.push(`<div class="card"><h2>קפשן ו-CTA</h2>
@@ -109,11 +116,21 @@
       h.push(`<div class="card"><h2>מה נאמר בסרטון (ציטוט מדויק)</h2><div class="quote">${esc(pkg.spokenText)}</div></div>`);
 
       const open = v.unresolved;
-      h.push(`<div class="card"><h2>${open.length ? `<span class="bad">${open.length} בעיות פתוחות חוסמות אישור</span>` : '<span class="ok">אין בעיות חוסמות</span>'}</h2>
-        <ul class="plain">${open.map(u => `<li><b>${esc(u.id)}</b><div>${esc(u.summary)}</div>
-          <button data-ex="${esc(u.id)}" style="margin-top:6px">תיעוד חריגה (אני מאשר/ת למרות הכשל)</button></li>`).join('') || '<li class="mute">—</li>'}</ul>
-        ${v.exceptions.length ? `<details><summary>חריגות שתועדו (${v.exceptions.length})</summary><ul class="plain small">${v.exceptions.map(e => `<li><b>${esc(e.id)}</b> · ${esc(e.by)} · ${fmt(e.at)}<div class="quote">${esc(e.reason)}</div></li>`).join('')}</ul></details>` : ''}
-        <p class="small mute">כשל בבדיקה נשאר כשל. אפשר לתקן בעריכה חוזרת, או לתעד חריגה מנומקת — היא נשמרת בהיסטוריה.</p></div>`);
+      const KIND = { timing: 'תזמון', text: 'איות', acoustic: 'שמיעה', technical: 'טכני', content: 'תוכן' };
+      const VERD = { suspected_false_positive: ['כנראה אזעקת שווא', 'info'], confirmed: ['כשל מאומת', 'bad'], needs_reading: ['לקרוא', 'warn'],
+        needs_listening: ['להאזין', 'warn'], needs_decision: ['להחליט', 'warn'] };
+      h.push(`<div class="card" id="review"><h2>${open.length ? `<span class="bad">לבדיקה שלך: ${open.length} פריטים</span>` : '<span class="ok">אין פריטים פתוחים לבדיקה</span>'}</h2>
+        <ul class="plain">${open.map(u => { const vd = VERD[u.verdict] || ['לבדוק', 'warn']; return `<li>
+          <div class="row"><span class="pill mute">${esc(KIND[u.kind] || 'בדיקה')}</span><span class="pill ${vd[1]}">${vd[0]}</span>
+            ${u.t0 != null ? `<button data-play="${u.t0},${u.t1}" style="margin-inline-start:auto">▶ ${u.t0}s</button>` : ''}</div>
+          <div><b>${esc(u.ask || '')}</b>${u.text ? ` <span class="mute">"${esc(u.text)}"</span>` : ''}</div>
+          <div class="small">${esc(u.original || u.summary || '')}</div>
+          ${u.explanation ? `<details class="small mute"><summary>ראיות</summary>${esc(u.explanation)}</details>` : ''}</li>`; }).join('') || '<li class="mute">—</li>'}</ul>
+        ${open.length ? `<label style="display:flex;gap:8px;align-items:center;color:var(--ink);font-size:15px"><input type="checkbox" id="watched" style="width:22px;height:22px"> צפיתי והקשבתי לכל הקטעים</label>
+          <input type="text" id="rnote" placeholder="הערה (לא חובה)" style="margin-top:8px">
+          <button class="primary" data-do="confirm" style="margin-top:8px;width:100%">אישור כל הפריטים יחד</button>` : ''}
+        ${v.exceptions.length ? `<details><summary>פריטים שאושרו (${v.exceptions.length})</summary><ul class="plain small">${v.exceptions.map(e => `<li><b>${esc(e.id)}</b> · ${esc(e.by)} · ${fmt(e.at)}<div>${esc(e.original || '')}</div><div class="quote">${esc(e.reason)}</div></li>`).join('')}</ul></details>` : ''}
+        <p class="small mute">התוצאה המקורית של כל בדיקה נשמרת כמו שהיא. אישור אחד מכסה את כל הפריטים המוצגים, ונרשם בהיסטוריה. אפשר גם לבקש שינויים במקום לאשר.</p></div>`);
 
       h.push(`<div class="card"><details ${open.length ? '' : 'open'}><summary><b>בדיקות (${pkg.checks.length})</b></summary><ul class="plain small">${pkg.checks.map(c => {
         const [t, cl] = CHECK[c.status] || [c.status, 'mute']; return `<li><span class="pill ${cl}">${t}</span> <b>${esc(c.id)}</b><div>${esc(c.summary)}</div></li>`; }).join('')}</ul>
@@ -140,7 +157,7 @@
 
     const H = { uploaded: 'הועלה', duplicate_upload: 'העלאה כפולה זוהתה', edit_queued: 'עריכה נכנסה לתור', job_leased: 'העובד התחיל', job_released: 'עריכה הוחזרה לתור',
       job_failed: 'עריכה נכשלה', package_ready: 'חבילה מוכנה', package_edited: 'החבילה נערכה', approval_invalidated: 'האישור בוטל', approved: 'אושר',
-      changes_requested: 'התבקשו שינויים', rejected: 'נדחה', consent_recorded: 'הסכמה תועדה', exception_recorded: 'חריגה תועדה' };
+      changes_requested: 'התבקשו שינויים', rejected: 'נדחה', consent_recorded: 'הסכמה תועדה', exception_recorded: 'חריגה תועדה', review_confirmed: 'פריטי הבדיקה אושרו' };
     h.push(`<div class="card"><details><summary><b>היסטוריה וגרסאות</b></summary>
       <div class="small">${p.versions.map(x => `גרסה ${x.n}: ${(STATUS[x.status] || [x.status])[0]}${x.changeRequest ? ' — "' + esc(x.changeRequest) + '"' : ''}`).join('<br>')}</div>
       <ul class="plain small">${p.history.slice().reverse().map(e => `<li>${fmt(e.at)} · ${esc(e.actor)} · <b>${esc(H[e.action] || e.action)}</b>${e.detail && (e.detail.note || e.detail.reason || e.detail.code) ? ' — ' + esc(e.detail.note || e.detail.reason || e.detail.code) : ''}</li>`).join('')}</ul></details></div>`);
@@ -177,6 +194,18 @@
     if (t.dataset.do === 'save') return act('/package', { caption: $('#cap').value, cta: $('#cta').value, account: $('#acct').value,
       scheduledAt: $('#when').value ? new Date($('#when').value).toISOString() : null }, 'נשמר. אם היה אישור — הוא בוטל ויש לאשר מחדש.', 'PATCH');
     if (t.dataset.do === 'retry') return act('/retry', {}, 'העריכה חזרה לתור.');
+    if (t.dataset.play) {
+      const [t0, t1] = t.dataset.play.split(',').map(Number), vid = $('#detail video');
+      vid.scrollIntoView({ block: 'center' });
+      const stop = () => { if (vid.currentTime >= t1) { vid.pause(); vid.removeEventListener('timeupdate', stop); } };
+      vid.addEventListener('timeupdate', stop); vid.currentTime = t0; vid.play();
+      return;
+    }
+    if (t.dataset.do === 'confirm') {
+      if (!$('#watched').checked) return notice('יש לסמן שצפית והקשבת לקטעים.', 'warn');
+      const by = who(); if (!by) return;
+      return act('/review-confirm', { ids: current.version.unresolved.map(u => u.id), by, note: $('#rnote').value, watched: true }, 'כל הפריטים אושרו יחד ונרשמו.');
+    }
     if (t.dataset.ex) {
       const reason = prompt(`חריגה עבור "${t.dataset.ex}"\nלמה לאשר למרות שהבדיקה נכשלה? (לפחות 10 תווים — נשמר בהיסטוריה)`);
       if (reason === null) return; const by = who(); if (!by) return;

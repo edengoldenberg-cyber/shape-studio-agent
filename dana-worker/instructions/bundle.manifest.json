@@ -1,0 +1,57 @@
+{
+ "version": "1.0.0",
+ "built": "2026-11-15",
+ "bundle_sha256": "bf64ca4c7f9f0ec7dbc47c0d2075b3573eefdb551bd13c1bebed65f80b7d7ff5",
+ "sections": [
+  [
+   "ig-repurpose",
+   "## Extract, do not summarise"
+  ],
+  [
+   "ig-repurpose",
+   "## Then build the week"
+  ],
+  [
+   "ig-reel",
+   "## The shape"
+  ],
+  [
+   "ig-reel",
+   "## On-screen text is a separate script"
+  ],
+  [
+   "ig-reel",
+   "## Rules that make the difference"
+  ],
+  [
+   "ig-caption",
+   "## First, decide which job this caption has"
+  ],
+  [
+   "ig-caption",
+   "## The shape"
+  ],
+  [
+   "ig-caption",
+   "## Rules"
+  ]
+ ],
+ "sources": {
+  "ig-repurpose": {
+   "path": "~/.claude/skills/ig-repurpose/SKILL.md",
+   "sha256": "6d031de341ae215b2c2c5fca64d5770b1c94b87b59a6d7b88b50607052830c49"
+  },
+  "ig-reel": {
+   "path": "~/.claude/skills/ig-reel/SKILL.md",
+   "sha256": "c3547fa49d809a9d56f3118b1c294d596c7d3bbefe27385c8920ab38abceceee"
+  },
+  "ig-caption": {
+   "path": "~/.claude/skills/ig-caption/SKILL.md",
+   "sha256": "ff94232715c9aad89ec564959226ee536eaffe4d2ef646aea711f577bbab0733"
+  },
+  "local_rules": {
+   "path": "dana-worker/instructions/local_rules.md",
+   "sha256": "7e3d49abd94f4f4521e40e1d95e015215cd63e138611dbdcf7a72cf721b09a6a"
+  }
+ }
+}

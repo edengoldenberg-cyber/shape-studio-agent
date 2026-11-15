@@ -15,7 +15,7 @@ import wave
 from pathlib import Path
 
 from .core import PipelineError, probe, run, sha256_file, tool
-from .judgement import norm as _norm_h
+from .judgement import canon, strip
 
 BIDI = re.compile(r"[‎‏‪-‮⁦-⁩]")
 PUNCT_RE = re.compile(r'[.,?!;:…"\'׳]')
@@ -107,12 +107,15 @@ def _rms_db(samples, sr, t0, t1):
     return 20 * np.log10(rms / 32768.0) if rms > 0 else -100.0
 
 
-def verify_sync(cfg, cards, heard, wav16k, homophones=None):
-    """Structured result for lead drift, tail, NOT_FOUND and the energy gate."""
+def verify_sync(cfg, cards, heard, wav16k, groups=None):
+    """Structured result for lead drift, tail, NOT_FOUND and the energy gate (locked rules).
+    Words are compared in canonical form: which homophone spelling a caption shows is a
+    TEXT question (see text_check) and must not show up as a timing failure."""
     import numpy as np
     s = cfg["sync"]
-    hom = homophones or {}
-    ws = [dict(w, word=hom.get(clean(w["word"]), clean(w["word"]))) for w in heard if clean(w["word"])]
+    ws = [dict(w, word=canon(w["word"], groups)) for w in heard if clean(w["word"])]
+    shown = {c["i"]: c["plain"] for c in cards}
+    cards = [dict(c, plain=" ".join(canon(t, groups) or t for t in c["plain"].split())) for c in cards]
     WARN, FAIL, SUSP, FB = s["drift_warn_s"], s["drift_fail_s"], 0.500, 0.300
     rows = []
     for c in cards:
@@ -141,7 +144,7 @@ def verify_sync(cfg, cards, heard, wav16k, homophones=None):
             status = "fail" if abs(drift) >= ef else "warn" if abs(drift) >= ew else "ok"
         le = _find_last_end(ws, exp_last, t, dur)
         tail_ms = int(round((end - le) * 1000)) if le is not None else None
-        rows.append({"i": c["i"], "plain": c["plain"], "card_t": t, "card_end": end, "whisper_t": wt,
+        rows.append({"i": c["i"], "plain": shown[c["i"]], "card_t": t, "card_end": end, "whisper_t": wt,
                      "drift_ms": drift_ms, "lead_ms": (-drift_ms if drift_ms is not None else None),
                      "status": status, "whisper_last_end": le, "tail_ms": tail_ms,
                      "tail_status": "unknown" if tail_ms is None else "fail" if tail_ms < 0 else "ok",
@@ -296,14 +299,20 @@ def cards_in_motion(cfg, final, base, png_dir, cards, fps):
         luma = 0.299 * im[:, :, 0] + 0.587 * im[:, :, 1] + 0.114 * im[:, :, 2]   # ffmpeg converts the RGB card with BT.601
         layers[c["i"]] = (im[:, :, 3] / 255.0, luma)   # ffmpeg's gray output is full range, like the PNG
     shown, blank, double, unknown = {c["i"]: [] for c in cards}, 0, [], []
+    when = {c["i"]: (c["start"], c["start"] + c["dur"]) for c in cards}
     for f in range(n):
         a, b = fin[f].astype(float), bas[f].astype(float)
         errs = {i: np.abs(a - (b * (1 - al) + gr * al)).mean() for i, (al, gr) in layers.items()}
         best = min(errs, key=errs.get)
-        if np.abs(a - b).mean() <= errs[best]:
+        none_err = np.abs(a - b).mean()
+        if none_err <= errs[best]:
             blank += 1
             continue
-        if errs[best] > 6.0:
+        twins = [i for i in errs if abs(errs[i] - errs[best]) < 1e-6]
+        if len(twins) > 1:                        # the same words on two cards: pick the one scheduled now
+            t = f / fps
+            best = min(twins, key=lambda i: 0.0 if when[i][0] - 0.04 <= t < when[i][1] + 0.04 else min(abs(t - when[i][0]), abs(t - when[i][1])))
+        if errs[best] > max(6.0, 0.35 * none_err):
             near = sorted(errs, key=errs.get)[:4]
             pair = min(((i, j, np.abs(a - ((b * (1 - layers[i][0]) + layers[i][1] * layers[i][0])
                                            * (1 - layers[j][0]) + layers[j][1] * layers[j][0])).mean())
@@ -428,6 +437,156 @@ def level_db(wav, t0, t1):
         x = x.mean(axis=1)
     seg = x[int(t0 * sr):int(t1 * sr)]
     return round(float(20 * np.log10(np.sqrt((seg ** 2).mean()) + 1e-9)), 1) if len(seg) else None
+
+
+# ── Text: which spelling is shown (separate from timing and from acoustic confidence) ──
+def text_check(diffs):
+    """Differences between the captions and a fresh transcription of the FINAL audio
+    (captions.align_cards). The captions are the exact words of the source transcript; a
+    difference is either a homophone spelling choice or the transcriber writing the same
+    speech another way. Both need a reader/listener — neither is a timing matter."""
+    items = [dict(d) for d in diffs]
+    hom = [i for i in items if i["kind"] == "homophone"]
+    other = [i for i in items if i["kind"] != "homophone"]
+    parts = []
+    if hom:
+        parts.append("בחירת איות בין מילים שנשמעות זהה: " + ", ".join(f"#{i['card']} מוצג '{i['shown']}' (התמלול כתב '{i['heard']}')" for i in hom))
+    if other:
+        parts.append("התמלול של הקובץ הסופי שונה מהכתובית: " + ", ".join(f"#{i['card']} מוצג '{i['shown'] or '—'}' / נשמע '{i['heard'] or '—'}'" for i in other))
+    return rec("caption_text", "review" if items else "pass",
+               " · ".join(parts) if items else "כל מילות הכתוביות זהות לתמלול האודיו הסופי", items=items)
+
+
+# ── Alignment to the final spoken words, and adjudication of the locked sync result ──
+def alignment_check(cfg, cards, spans, align):
+    """Card start against the reference onset of its first word (Whisper interval + VAD +
+    envelope), with the uncertainty of that reference. This is a separate measurement:
+    it never replaces or edits the locked sync records."""
+    a = cfg["alignment"]
+    rows, late, early_end, uncertain = [], [], [], []
+    for c, sp in zip(cards, spans):
+        ref = align.onset(sp[0])
+        lead_ms = round((c["start"] - ref["t"]) * 1000)
+        tail_ms = round((c["start"] + c["dur"] - sp[-1]["end"]) * 1000)
+        rows.append({"i": c["i"], "card_t": c["start"], "ref_onset": ref["t"], "uncertainty_ms": round(ref["uncertainty_s"] * 1000),
+                     "method": ref["method"], "lead_ms": lead_ms, "tail_ms": tail_ms, "evidence": ref["evidence"]})
+        if abs(lead_ms) >= a["lead_fail_ms"]:
+            late.append(c["i"])
+        if tail_ms < -1:
+            early_end.append(c["i"])
+        if ref["uncertainty_s"] * 1000 > a["agree_ms"]:
+            uncertain.append(c["i"])
+    bad = sorted(set(late + early_end))
+    n_vad = sum(1 for r in rows if r["method"].startswith("vad"))
+    return rec("alignment_reference", "fail" if bad else "warn" if uncertain else "pass",
+               (f"כרטיסים שאינם מיושרים למילה הנאמרת: {bad}" if bad else
+                f"יישור תקין, אך אי-ודאות גבוהה (מעל {a['agree_ms']}ms) בכרטיסים {uncertain}" if uncertain else
+                f"כל {len(rows)} הכרטיסים מיושרים לתחילת המילה הנאמרת (בתוך {a['lead_fail_ms']}ms)")
+               + f" · {n_vad} כרטיסים אחרי הפסקה נמדדו ב-VAD ובמעטפת העוצמה",
+               cards=bad, uncertain=uncertain, rows=rows,
+               method="Whisper word interval + Silero VAD speech onset + level envelope; uncertainty = |VAD − envelope|")
+
+
+def adjudicate_sync(cfg, sync, alignment):
+    """For every card the locked sync check failed, state — with evidence — whether the
+    failure is explained by a Whisper stamp that absorbed a pause. The locked result is
+    NOT changed; this is a separate record for the reviewer."""
+    a = cfg["alignment"]
+    by_i = {r["i"]: r for r in alignment["data"]["rows"]}
+    locked = {r["i"]: r for r in sync["cards"]}
+    out = []
+    for i in sorted(set(sync["lead_fail"] + sync["not_found"])):
+        r, lk = by_i.get(i), locked[i]
+        original = "NOT_FOUND" if lk["status"] == "not_found" else f"drift {lk['drift_ms']:+d}ms"
+        if r is None:
+            out.append({"card": i, "original": original, "verdict": "confirmed", "reason": "אין מדידת יישור לכרטיס הזה"})
+            continue
+        ev = r["evidence"]
+        two_methods = r["method"] == "vad+envelope" and r["uncertainty_ms"] <= a["agree_ms"]
+        inside = ev.get("whisper_start") is not None and ev["whisper_start"] - 0.05 <= r["ref_onset"] <= ev["whisper_end"]
+        aligned = abs(r["lead_ms"]) < a["lead_fail_ms"]
+        if two_methods and inside and aligned:
+            verdict = "suspected_false_positive"
+            reason = (f"חותמת Whisper למילה הראשונה היא {ev['whisper_start']:.2f}–{ev['whisper_end']:.2f}s ({ev['whisper_word_s']:.2f}s למילה אחת) "
+                      f"וכוללת {ev['silence_inside_stamp_s']:.2f}s של שקט. שתי מדידות בלתי תלויות מוצאות שהדיבור מתחיל ב-"
+                      f"{ev['vad_onset']:.2f}s (VAD) וב-{ev['envelope_onset']:.2f}s (מעטפת), הפרש {r['uncertainty_ms']}ms. "
+                      f"הכרטיס מופיע ב-{r['card_t']:.2f}s, {abs(r['lead_ms'])}ms מתחילת הדיבור הנמדדת.")
+        else:
+            verdict = "confirmed"
+            why = []
+            if not two_methods: why.append("אין שתי מדידות מסכימות של תחילת הדיבור")
+            if not inside: why.append("תחילת הדיבור הנמדדת מחוץ לחותמת המילה")
+            if not aligned: why.append(f"הכרטיס רחוק {abs(r['lead_ms'])}ms מתחילת הדיבור הנמדדת")
+            reason = "הכשל לא מוסבר במדידות: " + "; ".join(why)
+        out.append({"card": i, "original": original, "verdict": verdict, "reason": reason,
+                    "evidence": {"locked_whisper_t": lk["whisper_t"], "locked_drift_ms": lk["drift_ms"], "card_t": r["card_t"],
+                                 "ref_onset": r["ref_onset"], "uncertainty_ms": r["uncertainty_ms"], "method": r["method"], **ev}})
+    return out
+
+
+def review_items(records, issues, cards, sync, adjudications, dur):
+    """ONE list of everything the owner has to look at, each with a playable excerpt."""
+    by_card = {c["i"]: c for c in cards}
+    adj = {a["card"]: a for a in adjudications}
+
+    def excerpt(i):
+        c = by_card[i]
+        return {"t0": round(max(0.0, c["start"] - 1.2), 2), "t1": round(min(dur, c["start"] + c["dur"] + 0.8), 2), "text": c["plain"]}
+
+    items = []
+    status = {r["id"]: r for r in records}
+    al = status.get("alignment_reference")
+    al_rows = {r["i"]: r for r in ((al or {}).get("data") or {}).get("rows") or []}
+    al_bad = set(((al or {}).get("data") or {}).get("cards") or [])
+    text_rec = status.get("caption_text")
+    diff_cards = {t["card"] for t in (text_rec["data"]["items"] if text_rec else []) if t["kind"] != "homophone"}
+    folded = {}
+    for i in sorted(set(sync["lead_fail"] + sync["not_found"] + sync["tail_fail"])):
+        a = adj.get(i)
+        if i in diff_cards and i in al_rows and i not in al_bad and not (a and a["verdict"] == "suspected_false_positive"):
+            lk = next(r for r in sync["cards"] if r["i"] == i)
+            what = "NOT_FOUND" if lk["status"] == "not_found" else f"drift {lk['drift_ms']}ms" if lk["status"] == "fail" else f"tail {lk['tail_ms']}ms"
+            folded[i] = (f" בדיקת הסנכרון הנעולה דיווחה {what} לכרטיס הזה, כי היא מחפשת את האיות שבכתובית; "
+                         f"ביחס למילה שנשמעה בפועל הכרטיס מופיע {abs(al_rows[i]['lead_ms'])}ms מתחילתה.")
+            continue
+        locked = next(r for r in sync["cards"] if r["i"] == i)
+        orig = a["original"] if a else f"tail {locked['tail_ms']}ms"
+        items.append({"id": f"timing:{i}", "kind": "timing", "card": i, **excerpt(i),
+                      "original": f"בדיקת הסנכרון הנעולה: {orig}",
+                      "verdict": a["verdict"] if a else "confirmed", "explanation": a["reason"] if a else "הכרטיס נעלם לפני סוף המילה",
+                      "ask": "האם הכתובית מופיעה יחד עם המילה?"})
+    text = status.get("caption_text")
+    for t in (text["data"]["items"] if text and text["status"] == "review" else []):
+        if t["kind"] == "homophone":
+            items.append({"id": f"text:{t['card']}:{t['shown']}", "kind": "text", "card": t["card"], **excerpt(t["card"]),
+                          "original": f"מוצג '{t['shown']}', התמלול כתב '{t['heard']}' (נשמעות זהה)",
+                          "verdict": "needs_reading", "explanation": "בחירת איות לפי ההקשר — לא עניין של תזמון או של איכות אודיו",
+                          "ask": f"האם '{t['shown']}' היא המילה הנכונה במשפט?"})
+        else:
+            items.append({"id": f"text:{t['card']}:{t['kind']}", "kind": "text", "card": t["card"], **excerpt(t["card"]),
+                          "original": f"בכתובית '{t['shown'] or '—'}', תמלול חוזר של הקובץ הסופי כתב '{t['heard'] or '—'}'",
+                          "verdict": "needs_listening",
+                          "explanation": "הכתובית זהה לתמלול המקור. תמלול שני של אותו אודיו כתב אחרת — צריך לשמוע מה נאמר בפועל."
+                                         + folded.get(t["card"], ""),
+                          "ask": "האם הכתובית תואמת את מה שנאמר?"})
+    text_words = {(t["card"], w) for t in (text["data"]["items"] if text else []) for w in (t["shown"] or "").split()}
+    for w in sync["suspicious_words"]:
+        if (w["card"], strip(w["word"])) in text_words:
+            continue                                   # low confidence caused by the homophone itself; listed once, as text
+        items.append({"id": f"acoustic:{w['card']}:{strip(w['word'])}", "kind": "acoustic", "card": w["card"], **excerpt(w["card"]),
+                      "original": f"ודאות אקוסטית נמוכה למילה '{w['word']}' ({'; '.join(w['reasons'])})",
+                      "verdict": "needs_listening", "explanation": "התמלול לא בטוח שהמילה נאמרה — זו בדיקת שמיעה, לא בדיקת איות",
+                      "ask": f"האם שומעים את המילה '{w['word']}'?"})
+    covered = {"sync_lead", "sync_not_found", "sync_tail", "energy_gate", "caption_text"}
+    for r in records:
+        if r["status"] == "fail" and r["id"] not in covered:
+            items.append({"id": f"check:{r['id']}", "kind": "technical", "card": None, "t0": None, "t1": None, "text": None,
+                          "original": r["summary"], "verdict": "confirmed", "explanation": "בדיקה טכנית שנכשלה", "ask": "לתקן בעריכה חוזרת"})
+    for i in issues:
+        if i["severity"] == "blocker":
+            items.append({"id": f"content:{i['code']}", "kind": "content", "card": None, "t0": None, "t1": None, "text": None,
+                          "original": i["message"], "verdict": "needs_decision", "explanation": "", "ask": "נדרשת החלטה שלך"})
+    return items
 
 
 HUMAN_CHECKS = [

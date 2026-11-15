@@ -53,7 +53,11 @@ DEFAULTS = {
     "cards": {"max_words": 3, "max_chars": 16, "gap_break_s": 0.35, "hold_after_s": 0.40,
               "min_on_screen_s": 0.50, "max_chars_per_s": 17.0},
     "judgement": {"adapter": "heuristic",
-                  "claude": {"enabled": False, "model": "sonnet", "timeout_s": 180, "max_budget_usd": 0.5}},
+                  "claude": {"enabled": False, "model": "claude-sonnet-5-5", "timeout_s": 300, "max_budget_usd": 1.0,
+                             "min_s": 12, "max_s": 45}},
+    # Words that sound the same in spoken Hebrew. A caption may show either spelling; the choice is a text review item.
+    "language": {"homophone_groups": [["אם", "עם"], ["אל", "על"], ["את", "עת"], ["לא", "לו"], ["כל", "קול"]]},
+    "alignment": {"vad_min_silence_ms": 100, "agree_ms": 80, "lead_fail_ms": 120},
     "timeouts": {"ffmpeg_s": 1800, "chrome_s": 60},
 }
 REQUIRED_PATHS = ["work_root", "chrome", "caption_renderer", "font_dir", "safe_zone"]
@@ -103,6 +107,17 @@ def load_config(path):
                             "(restore the backup in dana-worker/vendor or re-pin deliberately)")
     if cfg["judgement"]["adapter"] not in ("heuristic", "scripted", "claude"):
         problems.append("judgement.adapter must be heuristic | scripted | claude")
+    cl = cfg["judgement"]["claude"]
+    if cl.get("enabled"):
+        exe = paths.get("claude_exe")
+        if not exe or not Path(exe).is_file():
+            problems.append("judgement.claude.enabled needs paths.claude_exe (the Claude CLI executable)")
+        if not str(cl.get("model") or "").startswith("claude-"):
+            problems.append("judgement.claude.model must be an explicit model id (claude-…), not an alias")
+        if not (0 < float(cl.get("max_budget_usd") or 0) <= 5):
+            problems.append("judgement.claude.max_budget_usd must be between 0 and 5")
+        if not (30 <= int(cl.get("timeout_s") or 0) <= 900):
+            problems.append("judgement.claude.timeout_s must be between 30 and 900")
     if problems:
         raise PipelineError("config_invalid", "; ".join(problems))
     Path(paths["work_root"]).mkdir(parents=True, exist_ok=True)

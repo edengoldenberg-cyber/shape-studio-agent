@@ -95,3 +95,7 @@ Acceptance criteria: report section G.
 ## UPDATE 2026-11-15 — phase 1A implemented
 
 Branch `dana-phase-1a`. Status, evidence, preview commands and next steps: `docs/DANA_PHASE_1A_2026-11-15.md`. Not deployed; publishing and real notifications off.
+
+## UPDATE 2026-11-15 — phase 1B (bounded Claude adapter, alignment, one review section)
+
+See `docs/DANA_PHASE_1B_2026-11-15.md`. Claude adapter enabled only in the local worker.config.json (not committed). CLAUDE.md section I has the scoped Dana-worker exception. Auto-start prepared, not installed. Still not deployed; publishing off.

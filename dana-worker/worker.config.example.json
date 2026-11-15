@@ -14,7 +14,17 @@
     "cuda_dll_dirs": [
       "C:/Users/owner/AppData/Local/Programs/Python/Python310/Lib/site-packages/nvidia/cublas/bin",
       "C:/Users/owner/AppData/Local/Programs/Python/Python310/Lib/site-packages/nvidia/cudnn/bin"
-    ]
+    ],
+    "claude_exe": "C:/Users/owner/AppData/Roaming/npm/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
   },
-  "judgement": { "adapter": "heuristic", "claude": { "enabled": false } }
+  "judgement": {
+    "adapter": "heuristic",
+    "claude": {
+      "enabled": false,
+      "model": "claude-sonnet-5-5",
+      "timeout_s": 300,
+      "max_budget_usd": 1.0
+    }
+  },
+  "_claude": "The Claude adapter is used only for jobs that ask for it (adapter=claude) and only when enabled=true here. Model id, timeout and spending cap are explicit."
 }

@@ -139,7 +139,7 @@ def run_pipeline(cfg, cfg_path, job_dir, source, on_stage):
 
 
 STAGE_HE = {"source": "בודק את קובץ המקור", "transcribe_source": "מתמלל", "judgement": "בוחר קטע וכתוביות",
-            "match_cards": "מתאים כתוביות לדיבור", "render_base": "חותך ומנרמל אודיו", "render_cards": "מרנדר כרטיסי כתוביות",
+            "match_cards": "מתאים כתוביות לדיבור", "align": "מיישר כתוביות למילים באודיו הסופי", "render_base": "חותך ומנרמל אודיו", "render_cards": "מרנדר כרטיסי כתוביות",
             "composite": "מרכיב כתוביות", "verify": "בודק סנכרון מול האודיו הסופי", "checks": "מריץ בדיקות", "cover": "מכין קאבר"}
 
 
@@ -227,13 +227,20 @@ def main():
     if len(token) < 24:
         log(f"missing worker token: set the {cfg.get('token_env') or 'DANA_WORKER_TOKEN'} environment variable")
         return 1
+    if (Path(cfg["paths"]["work_root"]) / "STOP").exists():
+        log("STOP file present — worker does not start (delete the file to allow it)")
+        return 0
     api = Api(cfg["server_url"], token, cfg.get("worker_id") or "worker")
     code, body = api.call("POST", "/api/dana/worker/hello", {"workerId": api.worker_id, "pipelineVersion": PIPELINE_VERSION})
     if code != 200:
         log(f"server refused the worker: HTTP {code} {body}")
         return 1
     log(f"worker {api.worker_id} online, pipeline {PIPELINE_VERSION}, server {cfg['server_url']}")
+    stop_file = Path(cfg["paths"]["work_root"]) / "STOP"
     while True:
+        if stop_file.exists():                      # kill switch: finish nothing new, exit cleanly
+            log(f"STOP file present ({stop_file}) — worker exits")
+            return 0
         try:
             code, body = api.call("POST", "/api/dana/worker/lease", {"workerId": api.worker_id, "pipelineVersion": PIPELINE_VERSION})
             if code == 200 and body and body.get("job"):

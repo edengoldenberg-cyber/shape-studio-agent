@@ -125,6 +125,7 @@ panelRouter.get('/projects/:id/versions/:n/checks', media('checks.json'));
 const act = fn => [json, wrap((req, res) => res.json({ ok: true, project: fn(req.params.id, req.body ?? {}) }))];
 panelRouter.patch('/projects/:id/package',        ...act(studio.editPackage));
 panelRouter.post('/projects/:id/exceptions',      ...act(studio.recordException));
+panelRouter.post('/projects/:id/review-confirm',  ...act(studio.confirmReview));
 panelRouter.post('/projects/:id/approve',         ...act(studio.approve));
 panelRouter.post('/projects/:id/request-changes', ...act(studio.requestChanges));
 panelRouter.post('/projects/:id/reject',          ...act(studio.reject));

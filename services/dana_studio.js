@@ -122,6 +122,12 @@ function sanitizeOptions(o = {}) {
     out.decisions = d; out.adapter = 'scripted';
   }
   if (o.change_request) out.change_request = String(o.change_request).slice(0, 2000);
+  if (o.exclude_ranges !== undefined) {
+    const r = o.exclude_ranges;
+    if (!Array.isArray(r) || r.length > 30 || !r.every(x => Array.isArray(x) && x.length === 2 && x.every(Number.isFinite) && x[0] < x[1]))
+      throw new StudioError(400, 'exclude_ranges_invalid', 'exclude_ranges must be a list of [start, end] seconds');
+    out.exclude_ranges = r;
+  }
   return out;
 }
 
@@ -147,6 +153,7 @@ async function registerUpload({ tmpPath, originalName, options, actor = 'owner' 
   const project = {
     id: newId('prj'), title: String(originalName).replace(/\.[^.]+$/, '').slice(0, 120), createdAt: now(),
     source, status: 'editing', adapter: opts.adapter ?? 'heuristic', styleOverrides: opts.style_overrides ?? {},
+    excludeRanges: opts.exclude_ranges ?? [],
     versions: [], currentVersion: 0,
     consent: { status: 'unknown', note: null, by: null, at: null },   // publication consent of the people in the footage
     rights: { music: 'none' },                                         // phase 1A: no music
@@ -169,7 +176,9 @@ function enqueueEdit(project, options, actor) {
     attempts: 0, maxAttempts: MAX_ATTEMPTS, lease: null, notBefore: null,
     stage: 'queued', note: 'ממתין לעובד העריכה', error: null, uploaded: {},
     options: { adapter: options.adapter ?? project.adapter, style_overrides: { ...project.styleOverrides, ...(options.style_overrides ?? {}) },
-               ...(options.decisions ? { decisions: options.decisions } : {}), ...(options.change_request ? { change_request: options.change_request } : {}) },
+               ...(options.decisions ? { decisions: options.decisions } : {}), ...(options.change_request ? { change_request: options.change_request } : {}),
+               ...(options.previous ? { previous: options.previous } : {}),
+               ...((project.excludeRanges ?? []).length ? { exclude_ranges: project.excludeRanges } : {}) },
     createdAt: now(), updatedAt: now(),
   };
   s.jobs[job.id] = job;
@@ -252,7 +261,14 @@ function lease(info) {
   save();
   // The job is DECLARATIVE: what to edit and with which options. No commands.
   return { leaseToken: j.lease.token, job: { id: j.id, projectId: j.projectId, version: j.version, attempt: j.attempts,
-           source: { sha256: p.source.sha256, ext: p.source.ext, bytes: p.source.bytes }, options: j.options } };
+           source: { sha256: p.source.sha256, ext: p.source.ext, bytes: p.source.bytes }, options: { ...j.options, brand: brandFacts() } } };
+}
+
+function brandFacts() {
+  const b = require('../utils/dana_brand').get(), out = {};
+  for (const [k, v] of Object.entries(b)) if (v.status === 'set' && k !== 'instagram_account') out[k] = v.value;
+  out.not_defined = Object.entries(b).filter(([, v]) => v.status === 'missing').map(([, v]) => v.label);
+  return out;
 }
 
 function leasedJob(jobId, token) {
@@ -344,6 +360,8 @@ function fingerprint(v) {
 function unresolved(v) {
   if (!v?.package) return [];
   const excepted = new Set(v.exceptions.map(e => e.id));
+  if (Array.isArray(v.package.review_items))
+    return v.package.review_items.filter(r => !excepted.has(r.id)).map(r => ({ ...r, summary: r.original }));
   const items = [];
   for (const c of v.package.checks ?? []) if (c.status === 'fail' && !excepted.has(c.id)) items.push({ id: c.id, kind: 'check', summary: c.summary });
   for (const i of v.package.issues ?? []) if (i.severity === 'blocker' && !excepted.has(i.code)) items.push({ id: i.code, kind: 'issue', summary: i.message });
@@ -389,6 +407,27 @@ function recordException(projectId, { id, reason, by }, actor = 'owner') {
   return view(p);
 }
 
+/**
+ * ONE confirmation for everything in the review section. The owner confirms exactly the
+ * items that were shown (ids must match the current open list), after watching the
+ * excerpts. Each item keeps its original result and its adjudication in the record.
+ */
+function confirmReview(projectId, { ids, by, note, watched }, actor = 'owner') {
+  const { p, v } = reviewable(projectId);
+  const open = unresolved(v);
+  if (!open.length) throw new StudioError(409, 'nothing_to_review', 'אין פריטים פתוחים לבדיקה');
+  const want = open.map(o => o.id).sort(), got = Array.isArray(ids) ? [...new Set(ids.map(String))].sort() : [];
+  if (JSON.stringify(want) !== JSON.stringify(got)) throw new StudioError(409, 'review_list_changed', 'רשימת הפריטים השתנתה — יש לרענן ולבדוק שוב', { ids: want });
+  if (watched !== true) throw new StudioError(400, 'review_not_watched', 'יש לאשר שצפית והקשבת לקטעים');
+  if (!by || !String(by).trim()) throw new StudioError(400, 'exception_by_required', 'נדרש שם המאשר/ת');
+  const at = now(), reason = String(note || '').trim().slice(0, 1000) || 'נבדק בצפייה ובהאזנה לקטעים שהוצגו';
+  for (const o of open) v.exceptions.push({ id: o.id, kind: o.kind ?? null, original: o.original ?? o.summary, verdict: o.verdict ?? null,
+    reason, by: String(by).trim().slice(0, 80), at, confirmedTogether: want.length });
+  hist(p, actor, 'review_confirmed', { version: v.n, by: String(by).trim(), items: want });
+  save();
+  return view(p);
+}
+
 function approve(projectId, { fingerprint: shown, by }, actor = 'owner') {
   const { p, v } = reviewable(projectId);
   const fp = fingerprint(v);
@@ -413,6 +452,15 @@ function requestChanges(projectId, body, actor = 'owner') {
   hist(p, actor, 'changes_requested', { version: v.n, note, overrides: opts.style_overrides ?? null, hasDecisions: !!opts.decisions });
   if (opts.style_overrides) p.styleOverrides = { ...p.styleOverrides, ...opts.style_overrides };
   const adapter = opts.adapter ?? p.adapter;
+  if (!opts.decisions && adapter === 'claude' && v.package) {
+    opts.adapter = 'claude';
+    opts.previous = { segment: v.package.segment, cards: v.package.cards.map(c => ({ text: c.text, highlight: c.highlight ?? [] })),
+      cover: v.package.cover, caption: { text: v.caption?.text ?? v.package.caption.text, cta: v.caption?.cta ?? null } };
+    p.pendingChange = null;
+    enqueueEdit(p, opts, actor);
+    save();
+    return view(p);
+  }
   // A free-text note needs judgement. Rules cannot act on it, so nothing is re-rendered blindly.
   if (!opts.style_overrides && !opts.decisions && adapter === 'heuristic') {
     v.status = 'changes_requested'; p.status = 'changes_requested'; v.changeNote = note;
@@ -487,6 +535,8 @@ function view(p) {
       exceptions: v.exceptions, unresolved: unresolved(v),
       package: v.package ? { duration: v.package.duration, segment: v.package.segment, adapter: v.package.adapter, spokenText: v.package.spoken_text,
         cards: v.package.cards, cover: v.package.cover, checks: v.package.checks, issues: v.package.issues, style: v.package.style,
+        considered: v.package.considered ?? [], revisionNote: v.package.revision_note ?? '', spelling: v.package.spelling ?? [],
+        usage: v.package.judgement_usage ?? null, bundle: v.package.instruction_bundle ?? null,
         timings: v.package.timings_s, totalSeconds: v.package.total_s, pipelineVersion: v.package.pipeline_version } : null,
       hasVideo: !!v.artifacts['final.mp4'], hasCover: !!v.artifacts['cover.jpg'],
     } : null,
@@ -507,5 +557,5 @@ function reconcileOnStartup() { state(); return recover('server_restart'); }
 module.exports = {
   StudioError, ARTIFACTS, registerUpload, getProject, currentVersion, view, list, workerStatus, workerHello, heartbeat, lease, leasedJob,
   progress, acceptArtifact, complete, fail, recover, reconcileOnStartup, fingerprint, unresolved, approvalValid, editPackage, recordException,
-  approve, requestChanges, reject, setConsent, retry, sourcePath, artifactPath, dir, save, state, hist, _resetForTests,
+  approve, confirmReview, requestChanges, reject, setConsent, retry, sourcePath, artifactPath, dir, save, state, hist, _resetForTests,
 };
