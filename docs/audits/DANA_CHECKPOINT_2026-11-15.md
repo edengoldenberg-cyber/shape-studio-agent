@@ -241,3 +241,10 @@ code is deployed (not approved yet). After a future approved deployment: GET /ap
 - Shape check (value never printed): DANA_IG_ACCESS_TOKEN is 80 chars, contains spaces, "|", the words railway/clipboard/variable/skip-deploys/dana_ig, does not start with EAA → the clipboard held the COMMAND text, not the token. The real token was never stored. Publishing switches, worker token, notify vars: all unset.
 - Adapter header (Authorization: Bearer) is NOT yet proven or disproven; the error is explained by the value alone ("|" = app-token form).
 - Needed: owner re-stores the token (paste command first, do not press Enter, copy token, then Enter), shape check again, then ONE restart (railway redeploy) needs approval because --skip-deploys does not reach the running process. Proposed code fix, not deployed: reject a token with whitespace before any call; label code 190 "token invalid or expired", not "expired".
+
+## Redeploy to load the corrected token (2026-11-15 14:35 IL), owner-approved
+
+- Token re-stored by the owner; shape check passed (204 chars, alphanumeric, starts with EAA, no whitespace). Value never printed.
+- `railway redeploy -y` of the same version: deployment 5f5f7633-5784-4927-912b-3343f4584f6b SUCCESS, started 2026-11-15T12:35:29Z (previous 983664c8 removed). No code or switch change.
+- Before: no webhook POST in the available HTTP log window. After: /health 200, Dana API 401 without session, worker API 503, browser redirect to login, 0 error lines in the startup log, Green API authorized; all publishing/notify/worker switches still unset.
+- STILL OPEN: the logged-in read-only probe GET /api/dana/studio/publisher/status?probe=1 — only the owner can run it (dashboard password not available to this session). This is also the first real test of the Authorization: Bearer header.
