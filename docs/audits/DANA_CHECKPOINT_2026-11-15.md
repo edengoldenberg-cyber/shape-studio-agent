@@ -143,3 +143,42 @@ Not authorized: deployment, real notification, media upload, publication.
 
 - Owner-reported, read-only, with the Shape Studio PAGE token (2026-11-15): GET 17841401323322547?fields=id,username → id 17841401323322547, username pilates_barre_power; GET 17841401323322547/content_publishing_limit?fields=quota_usage,config → quota_usage 0, quota_total 100, quota_duration 86400. Evidence that a Page token can read the account and the publishing quota (live quota 100 per 24 h). NOT proof of successful publishing or insights.
 - Decision: store a long-lived PAGE token derived from a FRESH long-lived user token (not the Explorer token that appeared in screenshots). Its type and expiry (including data_access_expires_at) are to be read in the Access Token Debugger before storing; "never expires" is not assumed.
+
+## RESUME HERE — credential preparation in progress (saved 2026-11-15, before context compaction)
+
+Branch `dana-phase-1a`, all work committed and pushed. Nothing deployed; no Railway variable changed; no
+notification, upload to Meta, or publication. Autostart not installed. Tomer/Barak/Arbox untouched.
+
+Established so far (owner-reported live read-only evidence; no token value was ever shared):
+- Instagram account for Dana: @pilates_barre_power ("Shape studio"), professional, linked to Page "Shape Studio".
+- Page ID 2015202785199287; Instagram account ID 17841401323322547; Graph API v26.0 answers.
+- User token permissions granted: pages_show_list, instagram_basic, instagram_manage_insights,
+  instagram_content_publish, pages_read_engagement (+ business_management, leads_retrieval, public_profile).
+- With the PAGE token: account read OK; content_publishing_limit → usage 0, total 100, duration 86400.
+- Meta app selected in the Explorer: "SHAPE CONTROLLAPP". Whether production lead ingestion uses this same
+  app is NOT verified — do not assume. App mode (Live / Development) was not reported yet.
+- The Explorer token appeared in screenshots → exposed; must not be extended or stored.
+- The bio price is not approved for content. Facts given are not approvals.
+
+Decision: store a long-lived PAGE token, derived from a FRESH long-lived user token of SHAPE CONTROLLAPP.
+
+Guided sequence with the owner (one step per message, never ask for a token/secret in chat):
+1. DONE — which app the token belongs to (SHAPE CONTROLLAPP).
+2. NEXT — generate a fresh user token in the Graph API Explorer (app SHAPE CONTROLLAPP, "User Token"),
+   keeping every existing permission checked (incl. leads_retrieval); no screenshots; owner replies "done".
+3. Open it in the Access Token Debugger; owner reports only: App, Type, Expires, Data access expires, scopes.
+4. Press "Extend Access Token" there; debug the new token; report Type and Expires (expect about 60 days).
+5. With the long-lived user token: GET me/accounts?fields=name,access_token → take the Shape Studio Page
+   token (not shown to anyone); debug it; report Type (Page), Expires, Data access expires. Do NOT assume
+   "never expires" — record what the tool shows.
+6. Re-run with that Page token: GET 17841401323322547?fields=id,username and the content_publishing_limit read.
+7. Only after deployment approval: owner types the values in Railway → Variables (names):
+   DANA_IG_LOGIN=facebook, DANA_IG_API_VERSION=v26.0, DANA_IG_USER_ID=17841401323322547,
+   DANA_IG_ACCESS_TOKEN=<Page token>. Switches stay off: DANA_PUBLISHER_MODE, DANA_INSTAGRAM_LIVE,
+   DANA_PUBLISHING_ENABLED. Then GET /api/dana/studio/publisher/status?probe=1 (read-only).
+8. Record the expiry date and set a renewal reminder.
+
+Also still open: brand setting instagram_account must be set to pilates_barre_power in the deployed
+environment (PUT /api/dana/studio/brand/instagram_account) so packages carry the destination.
+Other pending owner items: deployment approval + DANA_WORKER_TOKEN, notification approval, a new source
+clip, consent, cover decision. Docs: DANA_DEPLOY_PLAN.md, DANA_INSTAGRAM_CONTRACT.md, DANA_PHASE_1D_2026-11-15.md.
