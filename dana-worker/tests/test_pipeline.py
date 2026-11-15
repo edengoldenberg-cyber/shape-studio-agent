@@ -142,6 +142,20 @@ class Judgement(unittest.TestCase):
         self.assertTrue(dec["caption"]["is_draft"])
         self.assertNotIn("cover_text_not_a_quotation", [i["code"] for i in issues])
 
+    def test_editorial_note_is_short_and_audience_only_when_verified(self):
+        seg = {"in_s": 0.9, "out_s": 8.2, "message": "מה שנאמר", "stands_alone": "מובן לבד", "audience": "נשים בנות 40"}
+        dec, issues = judgement.validate({**DEC, "segment": seg}, SRC, 10.0, CFG, STYLE)
+        self.assertEqual((dec["segment"]["complete_thought"], dec["segment"]["reason"], dec["segment"]["audience_relevance"]),
+                         ("מה שנאמר", "מובן לבד", ""))                                # unverified audience is dropped
+        self.assertIn("audience_not_verified", [i["code"] for i in issues])
+        dec, _ = judgement.validate({**DEC, "segment": seg}, SRC, 10.0, CFG, STYLE, audience_verified=True)
+        self.assertEqual(dec["segment"]["audience_relevance"], "נשים בנות 40")
+        props = judgement.DECISIONS_SCHEMA["properties"]
+        self.assertEqual(sorted(props["segment"]["properties"]), ["audience", "in_s", "message", "out_s", "stands_alone"])
+        for gone in ("alternatives", "considered", "reason", "reasoning"):
+            self.assertNotIn(gone, props)
+        self.assertNotIn("reason", judgement.CLAUDE_SYSTEM.lower().replace("reasons", ""))
+
     def test_content_can_never_be_markup_or_extra_fields(self):
         for bad in ({**DEC, "cards": [{"text": "<script>alert(1)</script>"}]},
                     {**DEC, "cards": [{"text": "שלום", "highlight": ["לא בכרטיס"]}]},

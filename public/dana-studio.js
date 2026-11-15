@@ -95,11 +95,11 @@
     if (pkg) {
       h.push(`<div class="card"><h2>הסרטון הסופי</h2><video controls playsinline preload="metadata" poster="${base}/cover" src="${base}/video"></video>
         <div class="small mute" style="margin-top:6px">${pkg.duration}s · מקור ${pkg.segment.in_s}–${pkg.segment.out_s}s · בחירה: ${esc(pkg.adapter)} · נערך ב-${Math.round(pkg.totalSeconds)}s</div></div>`);
-      if (pkg.segment.reason) h.push(`<div class="card"><h2>למה הקטע הזה</h2>
+      if (pkg.segment.reason) h.push(`<div class="card"><h2>מה נבחר ולמה</h2>
         ${pkg.revisionNote ? `<div class="pill info">מה השתנה בגרסה הזו</div><div class="quote">${esc(pkg.revisionNote)}</div>` : ''}
-        <div>${esc(pkg.segment.reason)}</div>
-        ${pkg.segment.complete_thought ? `<label>המחשבה השלמה</label><div>${esc(pkg.segment.complete_thought)}</div>` : ''}
-        ${pkg.segment.audience_relevance ? `<label>למה זה חשוב לקהל</label><div>${esc(pkg.segment.audience_relevance)}</div>` : ''}
+        ${pkg.segment.complete_thought ? `<label>המסר שנבחר</label><div>${esc(pkg.segment.complete_thought)}</div>` : ''}
+        <label>למה הקטע עומד בפני עצמו</label><div>${esc(pkg.segment.reason)}</div>
+        ${pkg.segment.audience_relevance ? `<label>קהל יעד (מהגדרות המותג)</label><div>${esc(pkg.segment.audience_relevance)}</div>` : ''}
         ${pkg.considered.length ? `<details class="small"><summary>חלופות שנשקלו (${pkg.considered.length})</summary><ul class="plain">${pkg.considered.map(c => `<li>${c.in_s}–${c.out_s}s: ${esc(c.why_not)}</li>`).join('')}</ul></details>` : ''}
         ${pkg.usage ? `<div class="small mute" style="margin-top:6px">נבחר על ידי ${esc(pkg.usage.calls.map(c => c.models_used.join('+') || c.model_requested).join(', '))} · ${pkg.usage.calls.length} קריאות · ${pkg.usage.calls.reduce((t, c) => t + (c.elapsed_s || 0), 0).toFixed(0)}s · עלות מדווחת $${pkg.usage.calls.reduce((t, c) => t + (c.cost_usd_reported || 0), 0).toFixed(3)}</div>` : ''}</div>`);
       h.push(`<div class="card"><h2>קאבר</h2><img class="cover" alt="קאבר" src="${base}/cover"><div class="small mute" style="margin-top:6px">טקסט: ${esc(pkg.cover.text || '— ללא —')}</div></div>`);

@@ -32,14 +32,10 @@ DECISIONS_SCHEMA = {
     "required": ["segment", "cards", "cover", "caption"],
     "properties": {
         "segment": {"type": "object", "additionalProperties": False,
-                    "required": ["in_s", "out_s", "summary", "main_point", "audience_relevance"],
+                    "required": ["in_s", "out_s", "message", "stands_alone"],
                     "properties": {"in_s": {"type": "number"}, "out_s": {"type": "number"},
-                                   "summary": {"type": "string"}, "main_point": {"type": "string"},
-                                   "audience_relevance": {"type": "string"}}},
-        "alternatives": {"type": "array", "maxItems": 3,
-                         "items": {"type": "object", "additionalProperties": False, "required": ["in_s", "out_s", "note"],
-                                   "properties": {"in_s": {"type": "number"}, "out_s": {"type": "number"},
-                                                  "note": {"type": "string"}}}},
+                                   "message": {"type": "string"}, "stands_alone": {"type": "string"},
+                                   "audience": {"type": ["string", "null"]}}},
         "cards": {"type": "array", "minItems": 1, "maxItems": 200,
                   "items": {"type": "object", "additionalProperties": False, "required": ["text"],
                             "properties": {"text": {"type": "string"},
@@ -49,13 +45,13 @@ DECISIONS_SCHEMA = {
         "caption": {"type": "object", "additionalProperties": False, "required": ["text"],
                     "properties": {"text": {"type": "string"}, "cta": {"type": ["string", "null"]}}},
         "spelling": {"type": "array", "maxItems": 20,
-                     "items": {"type": "object", "additionalProperties": False, "required": ["heard", "shown", "reason"],
+                     "items": {"type": "object", "additionalProperties": False, "required": ["heard", "shown", "context"],
                                "properties": {"heard": {"type": "string"}, "shown": {"type": "string"},
-                                              "reason": {"type": "string"}}}},
+                                              "context": {"type": "string"}}}},
         "revision_note": {"type": "string"},
     },
 }
-EXTRA_KEYS = {"adapter", "notes", "_usage", "homophones", "considered"}   # legacy / operator-supplied keys
+EXTRA_KEYS = {"adapter", "notes", "_usage", "homophones", "considered", "alternatives"}   # legacy / operator-supplied keys
 
 
 def strip(word):
@@ -128,7 +124,7 @@ def snap_segment(seg, words, duration, fps, cfg):
     return round(in_s, 3), round(out_s, 3), notes
 
 
-def validate(dec, words, duration, cfg, style, exclude=None):
+def validate(dec, words, duration, cfg, style, exclude=None, audience_verified=False):
     """Return (clean decisions, issues). Raises PipelineError(judgement_invalid)."""
     if not isinstance(dec, dict):
         raise PipelineError("judgement_invalid", "decisions must be an object")
@@ -177,7 +173,7 @@ def validate(dec, words, duration, cfg, style, exclude=None):
         if not any(heard in g and shown in g for g in groups):
             raise PipelineError("judgement_invalid", f"spelling '{heard}'→'{shown}' is not a known homophone pair; "
                                                      "captions may differ from the audio only between listed homophones")
-        clean_spelling.append({"heard": heard, "shown": shown, "reason": str(sp.get("reason") or "")[:300]})
+        clean_spelling.append({"heard": heard, "shown": shown, "reason": str(sp.get("context") or sp.get("reason") or "")[:300]})
 
     seg_words = [w for w in words if w["end"] > in_s + 0.05 and w["start"] < out_s - 0.05]
     seg_text = " ".join(canon(w["word"], groups) for w in seg_words)
@@ -202,9 +198,16 @@ def validate(dec, words, duration, cfg, style, exclude=None):
     for k in ("reason", "complete_thought"):                      # operator files may use the internal names
         if k in seg_in and not isinstance(seg_in[k], str):
             raise PipelineError("judgement_invalid", f"segment.{k} must be text")
-    clean = {"segment": {"in_s": in_s, "out_s": out_s, "reason": str(seg_in.get("summary") or seg_in.get("reason") or "")[:800],
-                         "complete_thought": str(seg_in.get("main_point") or seg_in.get("complete_thought") or "")[:500],
-                         "audience_relevance": str(seg_in.get("audience_relevance") or "")[:500]},
+    # Short editorial note: the selected message, why the excerpt stands alone, and the audience
+    # ONLY when an audience is defined in the verified brand facts (otherwise it is dropped).
+    audience = str(seg_in.get("audience") or seg_in.get("audience_relevance") or "")[:300]
+    if audience and not audience_verified:
+        issues.append(issue("audience_not_verified", "info", "לא הוגדר קהל יעד מאומת — הערת הקהל של המתאם הושמטה"))
+        audience = ""
+    clean = {"segment": {"in_s": in_s, "out_s": out_s,
+                         "reason": str(seg_in.get("stands_alone") or seg_in.get("summary") or seg_in.get("reason") or "")[:400],
+                         "complete_thought": str(seg_in.get("message") or seg_in.get("main_point") or seg_in.get("complete_thought") or "")[:300],
+                         "audience_relevance": audience},
              "considered": [{"in_s": float(c["in_s"]), "out_s": float(c["out_s"]), "why_not": str(c.get("note") or c.get("why_not") or "")[:300]}
                             for c in (dec.get("alternatives") or dec.get("considered") or [])[:5]
                             if isinstance(c, dict) and isinstance(c.get("in_s"), (int, float)) and isinstance(c.get("out_s"), (int, float))],
@@ -295,7 +298,7 @@ THE TASK
 1. Choose ONE continuous segment of the recording for a vertical short video.
    - It must be a complete thought that a stranger understands with no other context.
    - It must matter to a person who is considering training at this studio (see <brand_facts>).
-   - Choose for meaning. How densely someone speaks is not a reason.
+   - Choose for meaning. How densely someone speaks is not a criterion.
    - One speaker, one continuous statement. Never start or end inside a sentence. If the transcript
      contains an interviewer's question, do not include it unless the answer is meaningless without it.
    - Stay inside the allowed length and outside the excluded time ranges.
@@ -309,7 +312,7 @@ THE TASK
    - "highlight" marks the few words that carry the point. Use it on at most a quarter of the cards.
    - The only permitted difference from the transcript is the spelling of a word that belongs to one
      of the listed homophone pairs, when the context shows the other spelling is the correct word.
-     Report each such choice in "spelling" with the reason. Never use this to change meaning.
+     Report each such choice in "spelling" with the neighbouring words ("context"). Never use this to change meaning.
 3. Cover: a short exact quotation from the segment (2-5 words) and the time inside the segment
    (seconds from the segment start) of a frame where it is being said.
 4. Caption: a short Hebrew draft built only from what the speaker says and the verified brand facts.
@@ -317,10 +320,9 @@ THE TASK
    - No prices, offers, numbers, results, schedules, guarantees or medical claims.
    - If no approved call to action is given, "cta" is null. Do not invent one.
    - No brand voice is defined: write plainly.
-5. Editorial notes for the owner, in Hebrew, one or two sentences each: "summary" (what the segment is
-   about and why it works as a short video), "main_point" (what the speaker says, in one sentence),
-   "audience_relevance" (who it speaks to). Optionally up to three "alternatives": other segments
-   worth a look, each with a short note.
+5. A short editorial note for the owner, in Hebrew, one sentence each: "message" (what the speaker
+   says in this excerpt), "stands_alone" (why a stranger understands it without the rest of the
+   recording). "audience" is null unless <brand_facts> defines an audience; never guess one.
 6. If <owner_change_request> is present, produce a revised version that addresses it, keep
    everything it does not ask to change, and say what changed in "revision_note". A request that
    would require inventing words, facts or prices cannot be met: keep to the rules and say so.
@@ -461,11 +463,12 @@ def decide_validated(job, words, duration, cfg, style, job_dir, check):
     options = job.get("options") or {}
     adapter = options.get("adapter") or cfg["judgement"]["adapter"]
     exclude = options.get("exclude_ranges") or []
+    audience_ok = any((options.get("brand") or {}).get(k) for k in ("audience_strength", "audience_pilates"))
     if adapter not in ("heuristic", "scripted", "claude"):
         raise PipelineError("judgement_invalid", f"unknown adapter '{adapter}'")
     if adapter != "claude":
         raw = scripted(Path(job_dir) / "decisions.json") if adapter == "scripted" else heuristic(words, duration, cfg, exclude)
-        dec, issues = validate(raw, words, duration, cfg, style, exclude)
+        dec, issues = validate(raw, words, duration, cfg, style, exclude, audience_ok)
         return dec, issues, check(dec), None
     c = cfg["judgement"]["claude"]
     if not c.get("enabled"):
@@ -481,7 +484,7 @@ def decide_validated(job, words, duration, cfg, style, job_dir, check):
             raise
         usages.append(usage)
         try:
-            dec, issues = validate(raw, words, duration, cfg, style, exclude)
+            dec, issues = validate(raw, words, duration, cfg, style, exclude, audience_ok)
             return dec, issues, check(dec), {"calls": usages}
         except PipelineError as e:
             if attempt == 2 or e.code not in ("judgement_invalid", "caption_text_mismatch"):
