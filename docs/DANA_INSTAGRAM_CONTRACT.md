@@ -78,3 +78,17 @@ public URL is not implemented (owner decision).
 - https://developers.facebook.com/docs/facebook-login/guides/access-tokens/get-long-lived
 - https://developers.facebook.com/docs/graph-api/guides/error-handling · https://developers.facebook.com/docs/graph-api/overview/rate-limiting
 - https://developers.facebook.com/docs/instagram-platform/instagram-graph-api/reference/error-codes
+
+## Live read-only evidence (reported by the owner, 2026-11-15)
+
+Run by the owner in the Graph API Explorer on v26.0; no value of any token was shared.
+
+| Call | Token | Result |
+|---|---|---|
+|  | user | Page "Shape Studio" (2015202785199287) ↔ Instagram  (17841401323322547) |
+|  | user | granted: , , , ,  (+ , , ) |
+|  | Page | id and username returned |
+|  | Page |  0,  100,  86400 |
+
+Settled by this: v26.0 answers; the account is linked; a **Page token** can read the account and the quota; the live quota is **100** per 24 hours.
+Still open: every write call (container, upload, publish), media read-back, insights, the Bearer header, caption line breaks.
