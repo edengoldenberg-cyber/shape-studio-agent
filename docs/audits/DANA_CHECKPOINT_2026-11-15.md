@@ -135,3 +135,8 @@ This proves: the Page exists for that login, the Instagram professional account 
 Values for the adapter (not secrets): DANA_IG_LOGIN=facebook, DANA_IG_API_VERSION=v26.0, DANA_IG_USER_ID=17841401323322547. DANA_IG_ACCESS_TOKEN is entered by the owner in Railway only — never in chat, never the lead-ads token.
 Next read-only checks (owner runs them): me/permissions; then the account read and content_publishing_limit with the token that will be stored.
 Not authorized: deployment, real notification, media upload, publication.
+
+- Owner-reported, read-only (2026-11-15): GET me/permissions → granted: pages_show_list, instagram_basic, instagram_manage_insights, instagram_content_publish, pages_read_engagement (all five required), plus business_management, leads_retrieval, public_profile. This shows the permissions are granted to that user token; it is still not proof that publishing or insights calls succeed.
+- The Explorer token used for these checks appeared in screenshots → treated as exposed; it must NOT be stored for production. A fresh dedicated credential is to be created, and its type and expiry verified (debug tool), not assumed.
+- Do not revoke or modify the lead integration; when re-authorising, do not uncheck leads_retrieval or any existing permission.
+- Next read-only check: with the Page token, GET 17841401323322547?fields=id,username and GET 17841401323322547/content_publishing_limit?fields=quota_usage,config (decides Page vs User token).
