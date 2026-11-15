@@ -214,3 +214,23 @@ code is deployed (not approved yet). After a future approved deployment: GET /ap
   pilates_barre_power, matchesConfiguredId true, limit.total 100.
 - Rollback: `git checkout 8a81337 && railway up --detach`, then `git checkout dana-phase-1a`.
 - Reminder: data access of the token expires 2027-02-13; remind late January 2027.
+
+## DEPLOYED — step A done (2026-11-15 14:19 IL), owner-approved for commit 02e14ee only
+
+- Deployment id 983664c8-6d6d-43a1-8d07-693526749aa7 (SUCCESS), service shape-studio-agent / production,
+  started 2026-11-15T12:20:24Z. Previous: a773838f-7263-4450-9747-bcc5833226ec (commit 8a81337).
+- Before deploying: HEAD = 02e14ee; no uploaded file differed from the commit (local differences are only
+  data/, .claude/, agents/*.bak, scripts/probe_arbox.mjs — all in .railwayignore); the last 15 minutes of
+  HTTP logs held only panel polling GETs, no webhook POST.
+- Checks passed without a session: /health 200; /api/version shows the new id, tomerMode test_only;
+  /api/dana/studio/status, /projects, /publisher/status?probe=1 → 401; worker API → 503 (DANA_WORKER_TOKEN
+  unset); browser request to /, /dana-studio.html → 302 to /login.html (200); /api/leads, /api/stats,
+  /api/barak/callbacks → 401 as before. Startup log: Green API authorized, sync complete errors 0
+  (several getChatHistory 429 warnings during the startup sync), no error lines, no send, no Dana scheduler.
+- NOT done (needs the owner's logged-in browser; the dashboard password is not available to this session):
+  panels of Barak/Tomer load after login; GET /api/dana/studio/status; the read-only Instagram probe
+  GET /api/dana/studio/publisher/status?probe=1 (expect enabled false, instagram.ready false,
+  credentialsConfigured true, account.username pilates_barre_power, matchesConfiguredId true, limit.total 100).
+- Still off: publishing switches, real notifications, worker token. No media uploaded, nothing published.
+- Rollback if needed: `git checkout 8a81337 && railway up --detach && git checkout dana-phase-1a`.
+- Never run `railway config migrate` (the CLI suggests it on every command).
