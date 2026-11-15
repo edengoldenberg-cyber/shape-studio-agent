@@ -248,3 +248,12 @@ code is deployed (not approved yet). After a future approved deployment: GET /ap
 - `railway redeploy -y` of the same version: deployment 5f5f7633-5784-4927-912b-3343f4584f6b SUCCESS, started 2026-11-15T12:35:29Z (previous 983664c8 removed). No code or switch change.
 - Before: no webhook POST in the available HTTP log window. After: /health 200, Dana API 401 without session, worker API 503, browser redirect to login, 0 error lines in the startup log, Green API authorized; all publishing/notify/worker switches still unset.
 - STILL OPEN: the logged-in read-only probe GET /api/dana/studio/publisher/status?probe=1 — only the owner can run it (dashboard password not available to this session). This is also the first real test of the Authorization: Bearer header.
+
+## Read-only Instagram probe from the server PASSED (owner-reported, 2026-11-15, deployment 5f5f7633)
+
+- account.username pilates_barre_power, matchesConfiguredId true, limit.used 0, limit.total 100, no probeError; enabled false, instagram.ready false.
+- Settles: the Graph API accepts the Page token in the Authorization: Bearer header for GET requests on v26.0. Still unproven: container, upload (OAuth header on rupload), publish, media read-back, insights.
+- verifiedAgainstRealAccount is a HARD-CODED false in services/dana_instagram.js status() — a static label written before any live call, not a computed result. Do not flip it. Proposed (not written, not deployed): replace it with evidence fields (read access verified at <time> by probe; publishing verified only after a real publish), plus the token-shape guard and the code-190 wording.
+- Prepared for the end-to-end test (step C): C:/Users/owner/dana-work/worker.config.production.json (server_url = production; no secret inside). Local machine preflight OK (paths, ffmpeg, GPU, 176 GB free, no STOP file).
+- Needed before step C: owner generates DANA_WORKER_TOKEN locally (user env + Railway via --stdin --skip-deploys), then ONE approved redeploy; a new source clip under 300 MB. Unknown: free space on /data, platform body-size limit.
+- GAP: the review page has no control to set brand fields (only lists missing ones); instagram_account must be set through PUT /api/dana/studio/brand/instagram_account from a logged-in session, or by a small page change in a later approved deploy.
