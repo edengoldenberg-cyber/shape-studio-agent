@@ -85,10 +85,12 @@ Run by the owner in the Graph API Explorer on v26.0; no value of any token was s
 
 | Call | Token | Result |
 |---|---|---|
-|  | user | Page "Shape Studio" (2015202785199287) ↔ Instagram  (17841401323322547) |
-|  | user | granted: , , , ,  (+ , , ) |
-|  | Page | id and username returned |
-|  | Page |  0,  100,  86400 |
+| `GET me/accounts?fields=id,name,instagram_business_account{id,username}` | user | Page "Shape Studio" (2015202785199287) ↔ Instagram `pilates_barre_power` (17841401323322547) |
+| `GET me/permissions` | user | granted: `pages_show_list`, `instagram_basic`, `instagram_manage_insights`, `instagram_content_publish`, `pages_read_engagement` (+ `business_management`, `leads_retrieval`, `public_profile`) |
+| `GET 17841401323322547?fields=id,username` | Page | id and username returned |
+| `GET 17841401323322547/content_publishing_limit?fields=quota_usage,config` | Page | `quota_usage` 0, `quota_total` 100, `quota_duration` 86400 |
 
-Settled by this: v26.0 answers; the account is linked; a **Page token** can read the account and the quota; the live quota is **100** per 24 hours.
-Still open: every write call (container, upload, publish), media read-back, insights, the Bearer header, caption line breaks.
+Settled by this: v26.0 answers; the account is linked to the Page; a **Page token** can read the
+account and the quota; the live quota is **100** per 24 hours.
+Still open: every write call (container, upload, publish), media read-back, insights, the Bearer
+header, caption line breaks.
