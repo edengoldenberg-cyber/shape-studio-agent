@@ -124,3 +124,14 @@ Local facts: local .env has a placeholder Meta token and a notify number that is
 - This was account information only: no approval for deployment, notifications or publication.
 
 - UPDATE (owner, from screenshots, 2026-11-15): account type shown = Professional (Business vs Creator not distinguished; both are eligible per the docs); linked Facebook Page = "Shape Studio". Still not verified through the API. Next: Meta app name / mode / permissions, step by step from the phone. No approval for deployment or publication.
+
+## Live API evidence reported by the owner (2026-11-15) — discovery and linkage ONLY
+
+Read-only call run by the owner (not by this session), Graph API v26.0:
+GET me/accounts?fields=id,name,instagram_business_account{id,username}
+→ Page "Shape Studio", Page ID 2015202785199287, Instagram username pilates_barre_power, Instagram account ID 17841401323322547.
+
+This proves: the Page exists for that login, the Instagram professional account is linked to it, and v26.0 answers. It does NOT prove publishing or insights access, token type, or permissions.
+Values for the adapter (not secrets): DANA_IG_LOGIN=facebook, DANA_IG_API_VERSION=v26.0, DANA_IG_USER_ID=17841401323322547. DANA_IG_ACCESS_TOKEN is entered by the owner in Railway only — never in chat, never the lead-ads token.
+Next read-only checks (owner runs them): me/permissions; then the account read and content_publishing_limit with the token that will be stored.
+Not authorized: deployment, real notification, media upload, publication.
