@@ -169,24 +169,35 @@ def edit(j, dec, words, sp, sha_before, check, cache):
         voice_words = checks.transcribe(cfg, v16)["words"]
 
     with j.stage("render_cards"):
-        for split_round in range(3):
+        joined = {}
+        for split_round in range(4):
             try:
                 tspans, _ = captions.align_cards(dec["cards"], voice_words, groups)
             except PipelineError:
                 tspans, timing_source = check(dec)[0], "source_transcript"   # same words, stamps from the source transcript
             cards = captions.time_cards(dec["cards"], tspans, st["fps"], cfg["cards"]["hold_after_s"], dur, align)
+            if split_round == 0:
+                # Routine fix: cards that would flash by are joined to a neighbour (same words, same order).
+                new, joined = captions.merge_short(dec["cards"], cards, cfg["cards"]["min_on_screen_s"], cfg["cards"]["merge_max_chars"])
+                if joined:
+                    issues.append(judgement.issue("short_cards_joined", "info",
+                                                  f"{len(joined)} כרטיסים קצרים מדי אוחדו עם שכן (אותן מילים, אותו סדר): " + " | ".join(joined)))
+                    dec["cards"] = new
+                    continue
             png_dir = captions.render_png(cfg, st, [{"name": f"c{c['i']:03d}", "text": c["plain"], "highlight": c["highlight"]}
                                                     for c in cards], j.work / "caps")
             width, zone = checks.check_width(png_dir, cards, st["width"]), checks.check_safe_zone(cfg, png_dir, cards)
             too_wide = sorted(set(width["data"]["cards"]) | set(zone["data"]["cards"]))
             splittable = [i for i in too_wide if len(dec["cards"][i - 1]["text"].split()) > 1]
-            if not splittable or split_round == 2:
+            if not splittable or split_round == 3:
                 break
             # Routine fix: a card that does not fit is split in two. Same words, same order.
             new = []
             for n, c in enumerate(dec["cards"], 1):
                 w = c["text"].split()
-                if n in splittable:
+                if n in splittable and c["text"] in joined:
+                    new += joined[c["text"]]              # a join that does not fit the safe zone is undone
+                elif n in splittable:
                     for part in (w[:(len(w) + 1) // 2], w[(len(w) + 1) // 2:]):
                         text = " ".join(part)
                         new.append({"text": text, "highlight": [h for h in c["highlight"] if h in text]})
@@ -346,7 +357,7 @@ def pipeline(j):
         write_json(j.ed / "plan.json", plan)
 
     use_model = dec["adapter"] == "claude" and cfg["judgement"]["claude"].get("enabled")
-    sent_prev, res, tools, det, review = [], None, None, [], None
+    sent_prev, res, tools, det, review, prev_signature = [], None, None, [], None, set()
     for n in range(ecfg["max_cycles"] + 1):
         # ── EDIT ────────────────────────────────────────────────────────────
         t_edit = time.time()
@@ -369,7 +380,10 @@ def pipeline(j):
             findings = det + (review["findings"] if review else [])
             verification = editorial.verify(sent_prev, det, review, dec.get("addressed")) if sent_prev else []
             # advisory findings are offered to the editor once; blocking ones every cycle
-            actionable = [f for f in findings if f["fix"] in editorial.EDITOR_FIXES and (f["severity"] == "blocking" or n == 0)]
+            actionable = [f for f in findings if f["fix"] in editorial.EDITOR_FIXES and not f["key"].startswith("comfort:")
+                          and (f["severity"] == "blocking" or n == 0)]
+            signature = {(f["asset"], f.get("card"), f["fix"]) for f in actionable if f["severity"] == "blocking"}
+            repeated = bool(n) and bool(signature) and signature <= prev_signature
             cost, secs = spent()
             cycle = {"cycle": n, "segment_s": [dec["segment"]["in_s"], dec["segment"]["out_s"]], "cards": len(res["cards"]),
                      "caption": dec["caption"]["text"], "cover_text": dec["cover"]["text"], "edit_seconds": edit_s,
@@ -390,6 +404,13 @@ def pipeline(j):
         if not actionable:
             stop = "accepted" if not blocking_left else "needs_owner"
             break
+        if repeated:                                # the same blocking request again: another cycle would change nothing
+            stop = "no_progress"
+            cycles[-1]["sent_to_editor"] = []
+            cycles[-1]["stopped_because"] = "the same blocking findings were returned after a revision; escalated to the owner with the evidence"
+            write_json(j.ed / f"cycle_{n}.json", cycles[-1])
+            break
+        prev_signature = signature
         if n == ecfg["max_cycles"]:
             stop = "cycle_limit"
             break

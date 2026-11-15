@@ -98,7 +98,11 @@ const upload = (req, res, next) => multer({
 
 panelRouter.get('/status', wrap((_req, res) => res.json({ ok: true, worker: studio.workerStatus(), publishingEnabled: publisher.enabled(),
   notifications: require('../services/dana_notify').realEnabled() ? 'real' : 'mock', maxUploadMb: maxUploadMb(), brandMissing: brand.missing() })));
-panelRouter.get('/projects', wrap((_req, res) => { studio.recover(); res.json({ ok: true, worker: studio.workerStatus(), projects: studio.list() }); }));
+// ── Notification: configuration check and ONE explicit test (real mode only) ──
+panelRouter.get('/notify/status', wrap((_req, res) => res.json({ ok: true, notify: require('../services/dana_notify').status() })));
+panelRouter.post('/notify/test', json, wrap(async (req, res) => res.json({ ok: true, ...(await require('../services/dana_notify').sendTest(req.body ?? {})) })));
+
+panelRouter.get('/projects', wrap((_req, res) => { studio.recover(); require('../services/dana_notify').flush().catch(() => {}); res.json({ ok: true, worker: studio.workerStatus(), projects: studio.list() }); }));
 panelRouter.get('/projects/:id', wrap((req, res) => { studio.recover(); res.json({ ok: true, worker: studio.workerStatus(), project: studio.view(studio.getProject(req.params.id)) }); }));
 
 panelRouter.post('/upload', upload, wrap(async (req, res) => {

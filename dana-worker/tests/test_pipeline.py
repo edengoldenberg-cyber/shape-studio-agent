@@ -334,6 +334,17 @@ class Captions(unittest.TestCase):
         with self.assertRaises(PipelineError):
             captions.match_cards([{"text": "אם להמשיך"}], heard, [])
 
+    def test_short_cards_are_joined_to_a_neighbour_without_changing_words(self):
+        dcards = [{"text": "אני עושה"}, {"text": "את"}, {"text": "התרגילים,", "highlight": ["התרגילים"]}, {"text": "ומה המשקלים שאני עושה"}, {"text": "חזקה"}]
+        timed = [{"start": 0.0, "dur": 0.8}, {"start": 0.8, "dur": 0.2}, {"start": 1.0, "dur": 0.6}, {"start": 1.6, "dur": 1.5}, {"start": 4.0, "dur": 0.3}]
+        new, joined = captions.merge_short(dcards, timed, 0.5, 20)
+        self.assertEqual([c["text"] for c in new], ["אני עושה", "את התרגילים,", "ומה המשקלים שאני עושה", "חזקה"])
+        self.assertEqual(" ".join(c["text"] for c in new), " ".join(c["text"] for c in dcards))      # same words, same order
+        self.assertEqual(new[1]["highlight"], ["התרגילים"])
+        self.assertEqual([c["text"] for c in joined["את התרגילים,"]], ["את", "התרגילים,"])           # can be undone
+        # 'חזקה' is short but its only neighbour would make the card too long, and a pause separates it: left as is
+        self.assertEqual(new[-1]["text"], "חזקה")
+
     def test_card_html_is_escaped(self):
         html = captions.card_html('a < b & "c"', ["b"], dict(STYLE, backing=False))
         self.assertEqual(html, 'a &lt; <span class="hl">b</span> &amp; &quot;c&quot;')

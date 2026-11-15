@@ -120,7 +120,8 @@
       const KIND = { timing: 'תזמון', text: 'איות', acoustic: 'שמיעה', technical: 'טכני', content: 'תוכן' };
       const VERD = { suspected_false_positive: ['כנראה אזעקת שווא', 'info'], confirmed: ['כשל מאומת', 'bad'], needs_reading: ['לקרוא', 'warn'],
         needs_listening: ['להאזין', 'warn'], needs_decision: ['להחליט', 'warn'] };
-      h.push(`<div class="card" id="review"><h2>${open.length ? `<span class="bad">לבדיקה שלך: ${open.length} פריטים</span>` : '<span class="ok">אין פריטים פתוחים לבדיקה</span>'}</h2>
+      h.push(`<div class="card" id="review"><h2>${open.length ? `<span class="bad">חוסמים — נדרשת הבדיקה שלך: ${open.length}</span>` : '<span class="ok">אין חוסמים פתוחים</span>'}</h2>
+        <p class="small mute">בדיקות אוטומטיות שנכשלו והחלטות תוכן. בלי אישור שלך לפריטים האלה אי אפשר לאשר את החבילה.</p>
         <ul class="plain">${open.map(u => { const vd = VERD[u.verdict] || ['לבדוק', 'warn']; return `<li>
           <div class="row"><span class="pill mute">${esc(KIND[u.kind] || 'בדיקה')}</span><span class="pill ${vd[1]}">${vd[0]}</span>
             ${u.t0 != null ? `<button data-play="${u.t0},${u.t1}" style="margin-inline-start:auto">▶ ${u.t0}s</button>` : ''}</div>
@@ -133,6 +134,14 @@
         ${v.exceptions.length ? `<details><summary>פריטים שאושרו (${v.exceptions.length})</summary><ul class="plain small">${v.exceptions.map(e => `<li><b>${esc(e.id)}</b> · ${esc(e.by)} · ${fmt(e.at)}<div>${esc(e.original || '')}</div><div class="quote">${esc(e.reason)}</div></li>`).join('')}</ul></details>` : ''}
         <p class="small mute">התוצאה המקורית של כל בדיקה נשמרת כמו שהיא. אישור אחד מכסה את כל הפריטים המוצגים, ונרשם בהיסטוריה. אפשר גם לבקש שינויים במקום לאשר.</p></div>`);
 
+      const lastCycle = pkg.editorial && pkg.editorial.cycles.length ? pkg.editorial.cycles[pkg.editorial.cycles.length - 1] : null;
+      const sugg = lastCycle ? lastCycle.findings.filter(f => f.severity === 'advisory') : [];
+      if (sugg.length) h.push(`<div class="card"><h2><span class="warn">הצעות עריכה (לא חוסם): ${sugg.length}</span></h2>
+        <ul class="plain">${sugg.map(f => { const cd = f.card ? pkg.cards[f.card - 1] : null; return `<li>
+          <div class="row"><span class="pill mute">${esc({ card: 'כתובית', caption: 'קפשן', cover: 'קאבר', highlight: 'הדגשה', segment_start: 'פתיחה', segment_end: 'סיום', frame: 'פריים' }[f.asset] || f.asset)}</span>
+            ${cd ? `<button data-play="${Math.max(0, cd.start - 1).toFixed(2)},${(cd.start + cd.dur + 0.8).toFixed(2)}" style="margin-inline-start:auto">▶ ${cd.start.toFixed(1)}s</button>` : ''}</div>
+          <div>${esc(f.problem)}</div><div class="small mute">→ ${esc(f.correction)}</div></li>`; }).join('')}</ul>
+        <p class="small mute">אלה המלצות שדנה לא הצליחה ליישם אוטומטית בלי לשנות מילים. אפשר לאשר כמו שזה, או לכתוב "בקש שינויים".</p></div>`);
       h.push(`<div class="card"><details ${open.length ? '' : 'open'}><summary><b>בדיקות (${pkg.checks.length})</b></summary><ul class="plain small">${pkg.checks.map(c => {
         const [t, cl] = CHECK[c.status] || [c.status, 'mute']; return `<li><span class="pill ${cl}">${t}</span> <b>${esc(c.id)}</b><div>${esc(c.summary)}</div></li>`; }).join('')}</ul>
         <a class="small" href="${base}/checks" target="_blank" rel="noopener">פלט הבדיקות המלא (JSON)</a></details></div>`);

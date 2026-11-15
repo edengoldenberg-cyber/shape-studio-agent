@@ -124,6 +124,40 @@ def time_cards(cards, spans, fps, hold_after, total_dur, align=None):
     return out
 
 
+def merge_short(dec_cards, timed, min_s, max_chars, max_words=4):
+    """Routine fix for cards that flash by: a card that would be on screen for less than `min_s`
+    is joined to a neighbour — same words, same order — when the joined text stays short.
+    Returns (new cards, {joined text: [first, second]}) so a join that turns out too wide for
+    the safe zone can be undone. Nothing is reworded and no timing rule is relaxed."""
+    out, joined, i = [], {}, 0
+    n = len(dec_cards)
+    end = lambda k: timed[k]["start"] + timed[k]["dur"]
+
+    def fits(text):
+        return len(text) <= max_chars and len(text.split()) <= max_words
+
+    def join(a, b):
+        text = a["text"] + " " + b["text"]
+        joined[text] = [a, b]
+        return {"text": text, "highlight": list(a.get("highlight") or []) + list(b.get("highlight") or [])}
+
+    while i < n:
+        c = dec_cards[i]
+        if timed[i]["dur"] + 0.001 < min_s:
+            # forward first (a short function word belongs with what follows), then backward
+            if i + 1 < n and fits(c["text"] + " " + dec_cards[i + 1]["text"]) and timed[i + 1]["start"] - end(i) < 0.25:
+                out.append(join(c, dec_cards[i + 1]))
+                i += 2
+                continue
+            if out and out[-1]["text"] not in joined and i > 0 and fits(out[-1]["text"] + " " + c["text"]) and timed[i]["start"] - end(i - 1) < 0.25:
+                out[-1] = join(out[-1], c)
+                i += 1
+                continue
+        out.append(c)
+        i += 1
+    return out, joined
+
+
 def card_html(text, highlight, style):
     """Plain text -> escaped HTML. Content can never become markup."""
     out = html.escape(text)

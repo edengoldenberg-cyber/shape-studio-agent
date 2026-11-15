@@ -50,7 +50,7 @@ DEFAULTS = {
     "sync": {"drift_warn_s": 0.080, "drift_fail_s": 0.120, "prob_threshold": 0.80,
              "min_word_dur_s": 0.050, "rms_floor_db": -38.0, "max_fix_attempts": 2},
     "segment": {"min_s": 5.0, "max_s": 90.0},
-    "cards": {"max_words": 3, "max_chars": 16, "gap_break_s": 0.35, "hold_after_s": 0.40,
+    "cards": {"max_words": 3, "max_chars": 16, "gap_break_s": 0.35, "hold_after_s": 0.40, "merge_max_chars": 20,
               "min_on_screen_s": 0.50, "max_chars_per_s": 17.0},
     "judgement": {"adapter": "heuristic",
                   "claude": {"enabled": False, "model": "claude-sonnet-5-5", "timeout_s": 300, "max_budget_usd": 1.0,
