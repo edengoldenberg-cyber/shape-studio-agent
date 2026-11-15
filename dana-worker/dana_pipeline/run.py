@@ -428,8 +428,9 @@ def pipeline(j):
     skill_text, skill_info, default_profile = story.load_skill()
     profile = j.profile = story.resolve_profile(options, default_profile)
     pp = profile["params"]
-    j.style = st = dict(cfg["style"], **{k: pp[k] for k in ("caption_size", "caption_y_px", "caption_max_lines", "backing", "highlight_enabled", "font_family")},
-                        **j.style_overrides)
+    # defaults < profile < the owner's overrides for this project
+    j.style = st = {**cfg["style"], **{k: pp[k] for k in ("caption_size", "caption_y_px", "caption_max_lines", "backing", "highlight_enabled", "font_family", "caption_shadow") if k in pp},
+                    **j.style_overrides}
     cfg["cards"].update(min_on_screen_s=pp["min_on_screen_s"], max_chars_per_s=pp["max_chars_per_s"])
     source_words = words
     words, corrections = story.apply_caption_edits([dict(w, src_start=w["start"], src_end=w["end"]) for w in words], options.get("caption_edits"))

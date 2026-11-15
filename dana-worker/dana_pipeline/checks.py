@@ -283,6 +283,7 @@ def cards_in_motion(cfg, final, base, png_dir, cards, fps):
         return rec("cards_in_motion", "fail", "אין כרטיסים לבדיקה")
     W, H = cfg["style"]["width"], cfg["style"]["height"]
     x0, y0 = max(0, min(b[0] for b in boxes) - 8), max(0, min(b[1] for b in boxes) - 8)
+    x0, y0 = x0 // 2 * 2, y0 // 2 * 2          # ffmpeg crops 4:2:0 video at even offsets; an odd offset here shifted the card layer by one pixel
     x1, y1 = min(W, max(b[2] for b in boxes) + 8), min(H, max(b[3] for b in boxes) + 8)
     w, h = (x1 - x0) // 2 * 2, (y1 - y0) // 2 * 2
 

@@ -272,3 +272,15 @@ code is deployed (not approved yet). After a future approved deployment: GET /ap
 - Verified locally: dana_tab_browser_check 47/0 at 1400x900 and 390x844 (seeded with the local e2e-full test package), Jest 437/437, mjs 373/0, Barak panel browser check 33/33. Screenshots: C:/Users/owner/dana-work/review/dana-tab/.
 - Not verified: a real phone; production. Known, pre-existing: the panel tab row is wider than a phone screen (page pans sideways); not changed.
 - Production still runs 02e14ee (deployment d226d305). The worker is running as a session background task against production.
+
+## Phase 2 — real content process prepared (2026-11-15), NOT deployed
+
+- Read docs/DANA_PHASE_2_2026-11-15.md. Root cause of v1: server defaulted every upload to adapter heuristic. Fixed on both sides.
+- New: dana-worker/dana_pipeline/story.py (content plan, joined parts, zooms, face-aware captions, doubts), dana-worker/skill/dana-editing (skill + profile center-bold-v1, unapproved), server revise/rules/references/profiles endpoints and review-page editor.
+- The clip the owner uploaded (prj_mwhu0wmt8b8ce592, source 410ff3b5…) already has burned-in captions: Dana adds no caption layer and no zoom there. Local v2: C:/Users/owner/dana-work/jobs/v2b (18.8 s, intro dropped, accepted, 0 revisions).
+- Raw-footage test (local clip MVI_0548): C:/Users/owner/dana-work/jobs/raw3 — 3 parts joined, 2 zooms, captions 96px two lines with outline.
+- Worker is STOPPED (C:/Users/owner/dana-work/STOP exists). To restart after a deploy: delete STOP, start with worker.config.production.json and the token from the user environment.
+- Production still 02e14ee / d226d305. v2 has NOT been attached to the production project: that needs the new server code deployed, then the owner presses "הפק גרסה מתוקנת".
+- Open owner decisions: deploy; safe-zone width for centre captions; approve profile; consent; raw clip for a full acceptance.
+- Local end-to-end through the server (scripts/dana_e2e_revise.cjs, raw clip uploaded as "ראיון מתאמנת.mp4", data C:/Users/owner/dana-work/e2e-phase2): v1 = model plan, 2 parts, 2 zooms, accepted with 0 revisions; revise (TEST actor: caption edit, size 104, one zoom removed, project note) → v2 with all three applied, v1 still playable. It caught and fixed a real bug (profile + owner style collided). Final tests: python 72, Jest 450, mjs 373/0, Barak panel 33/0, Dana tab 72/0.
+- Known limits: a revision re-runs the content plan; the previous plan is now sent with it (server change, unit-tested, NOT re-run end to end). An owner caption correction is not yet substituted into the final-audio text check. Reference analysis not implemented. Phone screenshots of the new review page with real data were not captured faithfully (headless window minimum width); the CDP check covers phone size.

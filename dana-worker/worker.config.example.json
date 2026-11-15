@@ -16,16 +16,23 @@
       "C:/Users/owner/AppData/Local/Programs/Python/Python310/Lib/site-packages/nvidia/cudnn/bin"
     ],
     "claude_exe": "C:/Users/owner/AppData/Roaming/npm/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
-    "skills_dir": "C:/Users/owner/.claude/skills"
+    "skills_dir": "C:/Users/owner/.claude/skills",
+    "face_model": "C:/Users/owner/scripts/blaze_face_short_range.tflite"
   },
   "judgement": {
-    "adapter": "heuristic",
+    "adapter": "claude",
     "claude": {
       "enabled": false,
       "model": "claude-sonnet-5-5",
       "timeout_s": 300,
       "max_budget_usd": 1.0
-    }
+    },
+    "job_adapters_allowed": [
+      "scripted"
+    ],
+    "on_model_failure": "fail",
+    "second_pass": true,
+    "_comment": "adapter: what this worker uses. job_adapters_allowed: adapters a job may ask for instead (production: scripted only). on_model_failure: fail | fallback_marked. The Claude adapter still needs claude.enabled=true (owner approval)."
   },
   "_claude": "The Claude adapter is used only for jobs that ask for it (adapter=claude) and only when enabled=true here. Model id, timeout and spending cap are explicit.",
   "editorial": {

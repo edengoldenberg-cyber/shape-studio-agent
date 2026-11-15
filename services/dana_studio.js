@@ -559,7 +559,13 @@ function queueChange(p, v, opts, note, actor, { hasEdits = false } = {}) {
   if (!opts.decisions && (adapter === 'claude' || adapter == null) && v.package) {
     if (adapter === 'claude') opts.adapter = 'claude';
     opts.previous = { segment: v.package.segment, cards: v.package.cards.map(c => ({ text: c.text, highlight: c.highlight ?? [] })),
-      cover: v.package.cover, caption: { text: v.caption?.text ?? v.package.caption.text, cta: v.caption?.cta ?? null } };
+      cover: v.package.cover, caption: { text: v.caption?.text ?? v.package.caption.text, cta: v.caption?.cta ?? null },
+      // the content plan of the version being revised, so a revision keeps what the owner did not ask to change
+      ...(v.package.plan?.content_judgement === 'model' ? { story_plan: {
+        message: v.package.plan.message, hook: v.package.plan.hook,
+        segments: (v.package.plan.segments ?? []).map(x => ({ in_s: x.source_in_s, out_s: x.source_out_s, role: x.role })),
+        zooms: (v.package.zooms ?? []).map(z => ({ at_s: z.source_t_s, strength: z.strength, reason: z.reason })),
+        cover_quote: v.package.cover?.text ?? '' } } : {}) };
     p.pendingChange = null;
     enqueueEdit(p, opts, actor);
     save();

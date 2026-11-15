@@ -24,6 +24,8 @@
     "zoom_min_start_s": 2.0,
     "zoom_min_gap_s": 4.0,
     "zoom_min_hold_s": 1.2,
-    "zoom_face_margin": 0.04
-  }
+    "zoom_face_margin": 0.04,
+    "caption_shadow": "0 0 3px #000, 3px 3px 0 #000, -3px -3px 0 #000, 3px -3px 0 #000, -3px 3px 0 #000, 0 3px 0 #000, 0 -3px 0 #000, 3px 0 0 #000, -3px 0 0 #000, 0 6px 16px rgba(0,0,0,0.85)"
+  },
+  "_legibility": "White text gets a solid dark outline (text-shadow) so it stays readable over light clothing or background; found necessary on the first raw test (white text on a white shirt)."
 }
