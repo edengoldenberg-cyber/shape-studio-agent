@@ -3726,3 +3726,22 @@ window.addEventListener('load', () => {
   const b = document.querySelector('.tab-btn[data-tab="' + h.replace(/[^a-z0-9_-]/gi, '') + '"]');
   if (b) b.click();
 });
+
+/* ── Dana tab: editing studio (default view) and the previous tools ───────── */
+(function danaStudioTab() {
+  const frame = document.getElementById('dana-studio-frame');
+  const tabBtn = document.querySelector('.tab-btn[data-tab="dana"]');
+  if (!frame || !tabBtn) return;
+  const load = () => { if (!frame.getAttribute('src')) frame.setAttribute('src', frame.dataset.src); };   // loaded on first use only
+  const show = view => {
+    document.querySelectorAll('.dana-switch-btn').forEach(b => {
+      const on = b.dataset.danaView === view;
+      b.classList.toggle('active', on); b.setAttribute('aria-selected', String(on));
+    });
+    document.getElementById('dana-view-studio').hidden = view !== 'studio';
+    document.getElementById('dana-view-tools').hidden = view !== 'tools';
+    if (view === 'studio') load();
+  };
+  document.querySelectorAll('.dana-switch-btn').forEach(b => b.addEventListener('click', () => show(b.dataset.danaView)));
+  tabBtn.addEventListener('click', () => { if (!document.getElementById('dana-view-studio').hidden) load(); });
+})();

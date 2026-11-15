@@ -3,6 +3,11 @@
 (() => {
   const $ = s => document.querySelector(s);
   const API = '/api/dana/studio';
+  // Embedded in the panel's Dana tab (?embed=1): the panel is already around the page, and a lost
+  // session must send the WHOLE window to the login page, not just this frame.
+  const EMBED = new URLSearchParams(location.search).has('embed') && window.top !== window;
+  if (EMBED) document.documentElement.classList.add('embed');
+  const toLogin = () => { (EMBED ? window.top : window).location.href = '/login.html'; };
   const csrf = () => { const m = /(?:^|;\s*)ss_csrf=([^;]+)/.exec(document.cookie); return m ? decodeURIComponent(m[1]) : null; };
   const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const fmt = iso => iso ? new Date(iso).toLocaleString('he-IL', { dateStyle: 'short', timeStyle: 'short', timeZone: 'Asia/Jerusalem' }) : '—';
@@ -14,7 +19,7 @@
     if (method !== 'GET' && t) headers['X-CSRF-Token'] = t;
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     const r = await fetch(API + path, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined, credentials: 'same-origin' });
-    if (r.status === 401) { location.href = '/login.html'; throw new Error('נדרשת התחברות'); }
+    if (r.status === 401) { toLogin(); throw new Error('נדרשת התחברות'); }
     const j = await r.json().catch(() => ({}));
     if (!r.ok) { const e = new Error(j.message || j.error || ('HTTP ' + r.status)); e.data = j; throw e; }
     return j;
@@ -63,7 +68,7 @@
     x.onerror = () => done('ההעלאה נכשלה (בעיית רשת). הקובץ לא נשמר — נסה/י שוב.', 'bad');
     x.onload = () => {
       let j = {}; try { j = JSON.parse(x.responseText); } catch { /* */ }
-      if (x.status === 401) return (location.href = '/login.html');
+      if (x.status === 401) return toLogin();
       if (x.status >= 400) return done(j.message || 'ההעלאה נכשלה', 'bad');
       done(j.duplicate ? 'הקובץ הזה כבר הועלה בעבר — נפתח הפרויקט הקיים, בלי עותק נוסף.' : 'הקובץ התקבל. העריכה נכנסה לתור.', j.duplicate ? 'warn' : 'ok');
       open(j.project.id);

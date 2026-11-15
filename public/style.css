@@ -2998,3 +2998,21 @@ input:checked + .toggle-slider::before { transform: translateX(16px); }
 .btn-logout { margin-inline-start: 10px; padding: 4px 12px; font: inherit; font-size: 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--card); color: var(--text); cursor: pointer; }
 .btn-logout:hover { border-color: var(--primary); color: var(--primary); }
 @media (max-width: 640px) { .tw-case-panel { width: 100vw; max-width: 100vw; } .tw-cd-k { flex-basis: 78px; } }
+
+/* ── Dana tab: editing studio (default) + previous tools ─────────────────── */
+.dana-switch { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+.dana-switch-btn { font: inherit; padding: 9px 16px; min-height: 44px; border-radius: 10px; cursor: pointer;
+  border: 1px solid rgba(128,128,128,.35); background: transparent; color: inherit; }
+.dana-switch-btn.active { background: #ec4899; border-color: #ec4899; color: #fff; font-weight: 600; }
+.dana-switch-link { margin-inline-start: auto; font-size: 13px; color: inherit; opacity: .75; text-decoration: none; padding: 9px 4px; }
+.dana-view[hidden] { display: none; }
+#dana-studio-frame { display: block; width: 100%; height: calc(100vh - 210px); height: calc(100dvh - 210px); min-height: 520px;
+  border: 1px solid rgba(128,128,128,.25); border-radius: 14px; background: transparent; }
+@media (max-width: 700px) {
+  /* the panel's main area has 28px side padding; on a phone the studio uses the full screen width */
+  #dana-view-studio { margin-inline: -28px; }
+  .dana-switch-btn { flex: 1; padding: 9px 8px; }
+  .dana-switch-link { flex-basis: 100%; text-align: center; margin: 0; padding: 2px; }
+  /* header + tab row + switch take about 285px: the frame ends at the bottom of the screen, so the approval bar stays in view */
+  #dana-studio-frame { height: calc(100vh - 285px); height: calc(100dvh - 285px); min-height: 420px; border-radius: 0; border-inline: 0; }
+}

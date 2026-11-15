@@ -144,6 +144,17 @@
          DANA — Content, Social & Video Analysis
     ══════════════════════════════════════════════════════════════════════════ -->
     <section id="tab-dana" class="tab-panel">
+      <div class="dana-switch" role="tablist" aria-label="דנה">
+        <button type="button" class="dana-switch-btn active" data-dana-view="studio" role="tab" aria-selected="true">🎬 סטודיו עריכה</button>
+        <button type="button" class="dana-switch-btn" data-dana-view="tools" role="tab" aria-selected="false">🧰 כלים קודמים</button>
+        <a class="dana-switch-link" href="/dana-studio.html" target="_blank" rel="noopener">מסך מלא ↗</a>
+      </div>
+      <!-- Editing studio: upload, worker status, processing progress, review and approval package -->
+      <div id="dana-view-studio" class="dana-view">
+        <iframe id="dana-studio-frame" title="דנה — סטודיו עריכה" data-src="/dana-studio.html?embed=1"></iframe>
+      </div>
+      <!-- Previous tools (content generation, video analysis, chat) — unchanged -->
+      <div id="dana-view-tools" class="dana-view" hidden>
       <div class="dana-layout">
 
         <!-- Left sidebar: tools + mini chat -->
@@ -408,6 +419,7 @@
           </div>
         </div>
       </div>
+    </div>
     </section>
 
     <!-- ═══════════════════════════════════════════════════
