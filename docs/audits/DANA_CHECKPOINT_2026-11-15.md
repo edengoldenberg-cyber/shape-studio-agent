@@ -115,3 +115,10 @@ State: real Instagram adapter (services/dana_instagram.js) and real notification
 Selected: Facebook Login for Business, graph.facebook.com, API v26.0 pinned, resumable upload, cover via thumb_offset.
 Next actions are all owner-gated: deployment approval + DANA_WORKER_TOKEN; Instagram account facts; token entered in Railway (never in chat); notification approval; new source clip; consent.
 Local facts: local .env has a placeholder Meta token and a notify number that is NOT 972547598919; production values were not readable from this session.
+
+## Owner-stated account facts (2026-11-15)
+
+- Instagram account intended for Dana: @pilates_barre_power, display name "Shape studio". Stated by the owner; NOT yet entered as a brand setting anywhere and NOT verified through the API.
+- Account type (Business / Creator) and Facebook Page link: not verified yet — being checked with the owner from the phone, one step at a time.
+- The price shown in the account bio is NOT approved for use in content or as an offer.
+- This was account information only: no approval for deployment, notifications or publication.
