@@ -182,3 +182,18 @@ Also still open: brand setting instagram_account must be set to pilates_barre_po
 environment (PUT /api/dana/studio/brand/instagram_account) so packages carry the destination.
 Other pending owner items: deployment approval + DANA_WORKER_TOKEN, notification approval, a new source
 clip, consent, cover decision. Docs: DANA_DEPLOY_PLAN.md, DANA_INSTAGRAM_CONTRACT.md, DANA_PHASE_1D_2026-11-15.md.
+
+## Credential validated by the owner (2026-11-15) — steps 2–6 of the guided sequence DONE
+
+Owner-reported from the Access Token Debugger and read-only calls (the token value was never shared):
+- App: SHAPE CONTROLLAPP · Type: Page · Valid: True · Expires: Never · Data Access Expires: 1802519622
+  = 2027-02-13 11:53 UTC. After that date data access must be re-authorised: put a reminder about two weeks earlier.
+- GET me → Shape Studio (2015202785199287). Instagram read → pilates_barre_power (17841401323322547).
+- content_publishing_limit → quota_usage 0, quota_total 100, quota_duration 86400.
+Still not proven: any write call, media read-back, insights.
+
+NEXT (step 7, owner only, in their OWN terminal — not in this chat): store four variables in Railway with
+`--skip-deploys` (no restart, no deployment): DANA_IG_LOGIN=facebook, DANA_IG_API_VERSION=v26.0,
+DANA_IG_USER_ID=17841401323322547, DANA_IG_ACCESS_TOKEN=<the Page token>. Do NOT set or change
+DANA_PUBLISHER_MODE, DANA_INSTAGRAM_LIVE, DANA_PUBLISHING_ENABLED. The variables are inert until Dana's
+code is deployed (not approved yet). After a future approved deployment: GET /api/dana/studio/publisher/status?probe=1.
