@@ -394,11 +394,17 @@ def check_source_unchanged(source, sha_before):
                before=sha_before, after=after)
 
 
-def check_boundary(words, in_s, out_s, in_level_db=None, floor_db=None):
+def check_boundary(words, in_s, out_s, in_level_db=None, floor_db=None, out_level_db=None):
     """out_s inside a word = fail (locked rule). in_s inside a word's stamp is decided by the
     measured audio level at the cut: speech at the cut = fail, silence = pass."""
     names = lambda ws: ", ".join(f"'{w['word']}' {w['start']}-{w['end']}" for w in ws)
     cut_out = [w for w in words if w["start"] < out_s < w["end"]]
+    # A word after a pause carries the pause inside its stamp. When the segment ends inside such a stamp
+    # AND the audio at the cut is measured at room-tone level, the cut is in the pause before the word,
+    # not in the word. Without that measurement, or for a normally stamped word, the locked rule applies.
+    in_pause = [w for w in cut_out if w["end"] - w["start"] > max(0.60, 0.20 * len(strip(w["word"])))
+                and out_level_db is not None and floor_db is not None and out_level_db <= floor_db + 12.0]
+    cut_out = [w for w in cut_out if w not in in_pause]
     in_stamp = [w for w in words if w["start"] < in_s < w["end"]]
     # Adaptive: the cut is quiet when it is within 12 dB of this recording's own room tone
     # (a fixed threshold mistakes room tone for speech).
@@ -412,6 +418,9 @@ def check_boundary(words, in_s, out_s, in_level_db=None, floor_db=None):
         return rec("clip_boundary", "fail", "; ".join(msg), cut_out=cut_out, in_stamp=in_stamp, in_level_db=in_level_db)
     note = (f" (תחילת הקליפ בתוך חותמת Whisper של {names(in_stamp)}, אך נמדד שקט בנקודת החיתוך: {in_level_db} dB, רעש חדר {floor_db} dB)"
             if in_stamp else "")
+    if in_pause:
+        note += (f" (סוף הקליפ בתוך חותמת של {names(in_pause)} שכוללת הפסקה; נמדד שקט בנקודת החיתוך: {out_level_db} dB, "
+                 f"רעש חדר {floor_db} dB — המילה עצמה אינה בקליפ)")
     return rec("clip_boundary", "pass", "גבולות הקליפ לא חותכים מילה" + note, in_stamp=in_stamp, in_level_db=in_level_db,
                in_s=in_s, out_s=out_s)
 

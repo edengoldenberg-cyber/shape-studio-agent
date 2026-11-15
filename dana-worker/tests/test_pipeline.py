@@ -337,7 +337,7 @@ class Captions(unittest.TestCase):
     def test_short_cards_are_joined_to_a_neighbour_without_changing_words(self):
         dcards = [{"text": "אני עושה"}, {"text": "את"}, {"text": "התרגילים,", "highlight": ["התרגילים"]}, {"text": "ומה המשקלים שאני עושה"}, {"text": "חזקה"}]
         timed = [{"start": 0.0, "dur": 0.8}, {"start": 0.8, "dur": 0.2}, {"start": 1.0, "dur": 0.6}, {"start": 1.6, "dur": 1.5}, {"start": 4.0, "dur": 0.3}]
-        new, joined = captions.merge_short(dcards, timed, 0.5, 20)
+        new, joined = captions.merge_short(dcards, timed, 0.5, 20, max_words=4)
         self.assertEqual([c["text"] for c in new], ["אני עושה", "את התרגילים,", "ומה המשקלים שאני עושה", "חזקה"])
         self.assertEqual(" ".join(c["text"] for c in new), " ".join(c["text"] for c in dcards))      # same words, same order
         self.assertEqual(new[1]["highlight"], ["התרגילים"])
@@ -482,6 +482,14 @@ class TextAndAcoustic(unittest.TestCase):
         self.assertEqual(checks.check_boundary(SRC, 1.2, 8.2, in_level_db=-33.0, floor_db=-36.0)["status"], "pass")
         self.assertEqual(checks.check_boundary(SRC, 1.2, 8.2, in_level_db=-12.0, floor_db=-36.0)["status"], "fail")
         self.assertEqual(checks.check_boundary(SRC, 1.2, 8.2)["status"], "fail")
+        # out point inside the stamp of a word that absorbed a pause: decided by the measured level at the cut
+        ws = words(("מסוגלת", 5.0, 5.6), ("וזה", 5.6, 7.3), ("טוב", 7.3, 7.7))
+        self.assertEqual(checks.check_boundary(ws, 0.5, 5.75)["status"], "fail")                                   # no measurement
+        self.assertEqual(checks.check_boundary(ws, 0.5, 5.75, -40.0, -36.0, out_level_db=-12.0)["status"], "fail")   # speech at the cut
+        ok = checks.check_boundary(ws, 0.5, 5.75, -40.0, -36.0, out_level_db=-34.0)
+        self.assertEqual(ok["status"], "pass")
+        self.assertIn("המילה עצמה אינה בקליפ", ok["summary"])
+        self.assertEqual(checks.check_boundary(ws, 0.5, 5.3, -40.0, -36.0, out_level_db=-34.0)["status"], "fail")    # a normally stamped word: locked rule
 
 
 class Editorial(unittest.TestCase):
@@ -605,6 +613,14 @@ class Editorial(unittest.TestCase):
         self.assertEqual(dec["plan"]["facts_used"], ["studio_name: Shape Studio"])
         self.assertEqual(dec["plan"]["missing_info"], ["CTA", "הצעה נוכחית"])
         self.assertIn("plan_fact_not_verified", [i["code"] for i in issues])
+
+    def test_a_revision_may_not_make_mandatory_checks_worse(self):
+        ok, bad = checks.rec("sync_lead", "pass", ""), checks.rec("sync_lead", "fail", "")
+        self.assertEqual(runner.hard_failures([ok, checks.rec("reading_comfort", "warn", ""), checks.rec("caption_text", "review", "")]), 0)
+        self.assertEqual(runner.hard_failures([bad, checks.rec("sync_tail", "fail", ""), ok]), 2)
+        src = (ROOT / "dana_pipeline" / "run.py").read_text(encoding="utf-8")
+        self.assertIn('stop = "revision_regressed"', src)
+        self.assertIn('stop = "no_progress"', src)
 
     def test_limits_and_perception_are_explicit(self):
         from dana_pipeline import editorial

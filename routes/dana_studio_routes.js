@@ -152,10 +152,21 @@ panelRouter.get('/calendar', wrap((_req, res) => res.json({ ok: true, timezone: 
 panelRouter.post('/settings/pause', json, wrap((req, res) => res.json({ ok: true, settings: publisher.setPaused(req.body?.paused === true) })));
 panelRouter.post('/projects/:id/publish/resume', json, wrap((req, res) => { const p = studio.getProject(req.params.id); publisher.resume(p); res.json({ ok: true, project: studio.view(p) }); }));
 panelRouter.post('/projects/:id/publish/reconcile', json, wrap(async (req, res) => { const p = studio.getProject(req.params.id); await publisher.reconcile(p, publisher.configuredPublisher()); res.json({ ok: true, project: studio.view(p) }); }));
-/** One scheduler pass. Exists only with the MOCK publisher; refuses otherwise. `now` lets a dry run reach a scheduled time. */
+/** One scheduler pass. `now` may be supplied only with the MOCK publisher (a dry run reaching a scheduled time); a real provider always uses the clock. */
 panelRouter.post('/publisher/tick', json, wrap(async (req, res) => {
-  const now = req.body?.now ? Date.parse(req.body.now) : Date.now();
-  res.json({ ok: true, mock: true, report: await publisher.tick(publisher.configuredPublisher(), { now }) });
+  const mock = publisher.mode() === 'mock';
+  const now = mock && req.body?.now ? Date.parse(req.body.now) : Date.now();
+  res.json({ ok: true, mock, report: await publisher.tick(publisher.configuredPublisher(), { now }) });
+}));
+/** Read-only connection check for the real provider: configuration (names only) and, on request, who the token belongs to. Publishes nothing. */
+panelRouter.get('/publisher/status', wrap(async (req, res) => {
+  const ig = require('../services/dana_instagram');
+  const out = { ok: true, enabled: publisher.enabled(), mode: publisher.mode(), paused: publisher.paused(), instagram: ig.status() };
+  if (req.query.probe === '1' && publisher.mode() === 'instagram' && ig.status().ready) {
+    const p = new ig.InstagramPublisher({ files: () => null });
+    try { out.account = await p.whoAmI(); out.limit = await p.publishingLimit(); } catch (e) { out.probeError = { code: e.code, message: e.message }; }
+  }
+  res.json(out);
 }));
 
 panelRouter.get('/brand', wrap((_req, res) => res.json({ ok: true, brand: brand.get() })));

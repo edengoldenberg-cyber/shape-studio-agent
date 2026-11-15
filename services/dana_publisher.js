@@ -94,13 +94,20 @@ function setPaused(value, actor = 'owner') {
 function gate(project) {
   const s = studio(), v = s.currentVersion(project), blocked = [];
   if (!enabled()) blocked.push({ code: 'publishing_disabled', message: 'פרסום כבוי בשלב הזה (DANA_PUBLISHING_ENABLED)' });
-  else if (mode() !== 'mock') blocked.push({ code: 'publisher_not_configured', message: 'לא מחובר ספק פרסום. בשלב הזה קיים רק מצב MOCK לבדיקות.' });
+  else if (mode() === 'instagram') {
+    const ig = require('./dana_instagram').status();
+    if (!ig.ready) blocked.push({ code: 'publisher_not_configured', message: 'חיבור אינסטגרם לא הושלם: ' + ig.problems.join('; ') });
+  }
+  else if (mode() !== 'mock') blocked.push({ code: 'publisher_not_configured', message: 'לא מחובר ספק פרסום (DANA_PUBLISHER_MODE).' });
   if (paused()) blocked.push({ code: 'publishing_paused', message: 'כל הפרסומים מושהים (השהיה כללית)' });
   if (!v || !s.approvalValid(v)) blocked.push({ code: 'not_approved', message: 'אין אישור תקף של הבעלים לגרסה הנוכחית' });
   if (project.consent?.status !== 'confirmed') blocked.push({ code: 'consent_missing', message: 'לא תועדה הסכמה לפרסום של המצולמים' });
   if (!v?.destination?.account) blocked.push({ code: 'destination_missing', message: 'חשבון היעד לא הוגדר' });
   if (!v?.scheduledAt) blocked.push({ code: 'schedule_missing', message: 'לא נקבע מועד פרסום' });
-  return { allowed: blocked.length === 0, blocked, mode: enabled() ? mode() : null, paused: paused() };
+  // Through the API the cover is a frame of the video (thumb_offset). The designed cover with text would need a
+  // public image URL, which is not offered; the page says so instead of promising a cover that will not be used.
+  const coverNote = mode() === 'instagram' ? `בפרסום דרך ה-API הקאבר יהיה הפריים בשנייה ${v?.package?.cover?.frame_s ?? 0} של הסרטון, בלי שכבת הטקסט. קאבר מעוצב עם טקסט מוחלף ידנית באפליקציה אחרי הפרסום.` : null;
+  return { allowed: blocked.length === 0, blocked, mode: enabled() ? mode() : null, paused: paused(), coverNote };
 }
 
 function createPublication(project, actor = 'owner') {
@@ -162,9 +169,19 @@ async function advance(project, publisher, { now = Date.now() } = {}) {
     move(project, 'processing', { attempts: pub.attempts + 1 });
   }
   try {
+    // A real provider: before anything is created, the token must belong to the account the owner approved.
+    if (publisher.whoAmI && !pub.accountVerified) {
+      const me = await publisher.whoAmI();
+      const want = String(v.destination.account || '').replace(/^@/, '').toLowerCase();
+      if (!me.matchesConfiguredId || !me.username || me.username.toLowerCase() !== want) {
+        move(project, 'failed', { error: `החשבון המחובר (@${me.username ?? '?'}) אינו חשבון היעד שאושר (@${want}) — לא נשלח דבר`, errorCode: 'destination_mismatch', resumable: true });
+        return pub;
+      }
+      move(project, 'processing', { accountVerified: { id: me.id, username: me.username, at: new Date().toISOString() } });
+    }
     if (!pub.containerId) {
       const { containerId } = await publisher.createContainer({ projectId: project.id, version: pub.version, clientRef: pub.id,
-        caption: [v.caption.text, v.caption.cta].filter(Boolean).join('\n\n'), destination: v.destination,
+        caption: [v.caption.text, v.caption.cta].filter(Boolean).join('\n\n'), destination: v.destination, coverFrameS: v.package?.cover?.frame_s,
         videoSha256: v.artifacts['final.mp4']?.sha256, coverSha256: v.artifacts['cover.jpg']?.sha256 });
       move(project, 'processing', { containerId });
     }
@@ -209,7 +226,8 @@ async function reconcile(project, publisher) {
   try {
     if (pub.mediaId) { pub.reconciled = true; return await finish(project, publisher); }
     const status = await publisher.getContainerStatus(pub.containerId);
-    const found = publisher.findByRef ? await publisher.findByRef(pub.id) : [];
+    const v = s.currentVersion(project);
+    const found = publisher.findByRef ? await publisher.findByRef(pub.id, { caption: [v.caption.text, v.caption.cta].filter(Boolean).join('\n\n'), since: pub.publishRequestedAt }) : [];
     if (found.length === 1) { pub.reconciled = true; move(project, 'processing', { mediaId: found[0].id, publishedAt: found[0].timestamp ?? new Date().toISOString() }); return await finish(project, publisher); }
     if (found.length === 0 && status === 'FINISHED') { move(project, 'processing', { publishRequestedAt: null, error: null, note: 'provider reports the container unpublished — safe to continue' }); return pub; }
     move(project, 'uncertain', { error: `reconciliation inconclusive (container ${status}, ${found.length} matching posts) — check the account manually` });
@@ -230,7 +248,7 @@ async function collectMetrics(project, publisher, { now = Date.now() } = {}) {
       s.hist(project, 'system', 'metrics_rejected', { offsetHours: h, expected: pub.mediaId, got: r?.media_id ?? null });
       continue;
     }
-    const m = { offsetHours: h, collectedAt: new Date(now).toISOString(), mediaId: pub.mediaId, source: pub.mode === 'mock' ? 'MOCK' : pub.mode,
+    const m = { offsetHours: h, collectedAt: new Date(now).toISOString(), mediaId: pub.mediaId, source: pub.mode === 'mock' ? 'MOCK' : 'instagram',
                 values: r.values ?? {}, note: pub.mode === 'mock' ? 'נתוני דמה לבדיקת החיבור — לא ביצועים אמיתיים' : null };
     pub.metrics.push(m); added.push(m);
     s.hist(project, 'system', 'metrics_collected', { offsetHours: h, mediaId: pub.mediaId, source: m.source });
@@ -293,9 +311,33 @@ class MockPublisher {
 }
 
 function configuredPublisher() {
-  if (!enabled() || mode() !== 'mock') throw new (studio().StudioError)(409, 'publisher_not_configured', 'אין ספק פרסום פעיל (רק MOCK קיים בשלב הזה)');
-  return new HttpPublisher();
+  const s = studio();
+  if (enabled() && mode() === 'mock') return new HttpPublisher();
+  if (enabled() && mode() === 'instagram') {
+    const ig = require('./dana_instagram');
+    if (!ig.status().ready) throw new s.StudioError(409, 'publisher_not_configured', 'חיבור אינסטגרם לא הושלם', { problems: ig.status().problems });
+    return new ig.InstagramPublisher({ files: (projectId, n, name) => s.artifactPath(projectId, n, name) });
+  }
+  throw new s.StudioError(409, 'publisher_not_configured', 'אין ספק פרסום פעיל');
 }
 
-module.exports = { TZ, enabled, mode, gate, createPublication, cancel, advance, resume, reconcile, collectMetrics, tick, calendar, proposeTime,
+/**
+ * The production scheduler: one pass a minute, only when publishing is switched on with a real
+ * provider. Never starts under test or in mock mode (dry runs call tick explicitly). A pass that
+ * is still running is not overlapped, and an error in one pass does not stop the next.
+ */
+let _timer = null, _busy = false;
+function startScheduler() {
+  if (_timer || process.env.TEST_NO_BIND === 'true' || !enabled() || mode() !== 'instagram') return false;
+  _timer = setInterval(async () => {
+    if (_busy) return; _busy = true;
+    try { await tick(configuredPublisher()); }
+    catch (e) { try { require('../utils/logger').error('[dana-publisher] scheduler pass failed', { error: e.message }); } catch { /* */ } }
+    finally { _busy = false; }
+  }, 60 * 1000);
+  _timer.unref?.();
+  return true;
+}
+
+module.exports = { startScheduler, TZ, enabled, mode, gate, createPublication, cancel, advance, resume, reconcile, collectMetrics, tick, calendar, proposeTime,
   paused, setPaused, fromLocal, toLocal, HttpPublisher, MockPublisher, configuredPublisher };

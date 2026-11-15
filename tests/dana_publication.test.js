@@ -54,11 +54,16 @@ async function scheduled({ when = Date.now() - 1000 } = {}) {
 
 describe('calendar and proposed time (Asia/Jerusalem)', () => {
   test('a new package gets a concrete proposal: next day 12:00 Israel time, a day apart from other items', async () => {
+    // on an empty calendar (independent of the machine clock)
+    expect(publisher.toLocal(publisher.proposeTime(Date.parse('2026-11-15T08:00:00Z')))).toBe('2026-11-16T12:00');
+    expect(publisher.toLocal(publisher.proposeTime(Date.parse('2026-07-01T08:00:00Z')))).toBe('2026-07-02T12:00');   // summer time handled
     const a = await scheduled(); const pa = await get(a);
     expect(pa.version.timezone).toBe('Asia/Jerusalem');
-    const noon = publisher.proposeTime(Date.parse('2026-11-15T08:00:00Z'));
-    expect(publisher.toLocal(noon)).toBe('2026-11-16T12:00');
-    expect(publisher.toLocal(publisher.proposeTime(Date.parse('2026-07-01T08:00:00Z')))).toBe('2026-07-02T12:00');   // summer time handled
+    // an item already on the calendar pushes the next proposal at least a day away from it
+    const busy = Date.parse(studio.getProject(a).publication.scheduledAt);
+    const next = Date.parse(publisher.proposeTime(busy - 20 * 3600e3));
+    expect(Math.abs(next - busy)).toBeGreaterThanOrEqual(24 * 3600e3);
+    expect(publisher.toLocal(new Date(next).toISOString())).toMatch(/T12:00$/);
     expect(publisher.fromLocal('2026-11-16T12:00').toISOString()).toBe('2026-11-16T10:00:00.000Z');
     expect(publisher.fromLocal('2026-07-02T12:00').toISOString()).toBe('2026-07-02T09:00:00.000Z');
     const r = await request(app).patch(A(a) + '/package').send({ scheduledLocal: '2026-12-01T19:30' });

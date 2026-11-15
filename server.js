@@ -305,7 +305,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // ── Dana studio: upload → edit → mobile review package (behind the dashboard auth) ──
 app.use('/api/dana/studio', require('./routes/dana_studio_routes').panelRouter);
-try { require('./services/dana_studio').reconcileOnStartup(); }
+try { require('./services/dana_studio').reconcileOnStartup(); require('./services/dana_publisher').startScheduler(); }
 catch (err) { logger.error('[startup] Dana studio reconciliation failed', { error: err.message }); }
 
 // ── Health check ──────────────────────────────────────────────────────────────

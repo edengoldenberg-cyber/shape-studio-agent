@@ -179,16 +179,17 @@
     const pub = p.publication.record;
     const PS = { scheduled: ['מתוזמן', 'info'], processing: ['בתהליך', 'info'], published: ['פורסם', 'ok'], failed: ['נכשל', 'bad'], uncertain: ['לא ודאי', 'warn'], cancelled: ['בוטל', 'mute'] };
     h.push(`<div class="card"><h2>פרסום</h2>
-      ${pub ? `<div class="row"><span class="pill ${PS[pub.state][1]}">${PS[pub.state][0]}</span>${pub.mode === 'mock' ? '<span class="pill bad">MOCK — לא פרסום אמיתי</span>' : ''}<span class="small mute">${fmt(pub.scheduledAt)} שעון ישראל</span></div>
+      ${pub ? `<div class="row"><span class="pill ${PS[pub.state][1]}">${PS[pub.state][0]}</span>${pub.mode === 'mock' ? '<span class="pill bad">MOCK — לא פרסום אמיתי</span>' : '<span class="pill ok">אינסטגרם</span>'}<span class="small mute">${fmt(pub.scheduledAt)} שעון ישראל</span></div>
         ${pub.permalink ? `<div class="small">קישור: <code>${esc(pub.permalink)}</code> · מזהה <code>${esc(pub.mediaId)}</code>${pub.verification ? ` · קפשן תואם: ${pub.verification.captionMatches === true ? 'כן' : pub.verification.captionMatches === false ? 'לא' : '—'}` : ''}</div>` : ''}
         ${pub.error ? `<div class="small bad">${esc(pub.error)}</div>` : ''}
         ${pub.metrics.length ? `<ul class="plain small">${pub.metrics.map(m => `<li><span class="pill bad">${esc(m.source)}</span> אחרי ${m.offsetHours} שעות: ${Object.entries(m.values).map(([k, x]) => `${esc(k)} ${esc(x)}`).join(' · ')}</li>`).join('')}</ul>` : ''}
         ${pub.state === 'scheduled' ? '<button data-do="pubcancel" class="danger" style="margin-top:8px">ביטול הפרסום המתוזמן</button>' : ''}`
       : `<div class="pill ${p.publication.allowed ? 'ok' : 'bad'}">${p.publication.allowed ? 'מותר לתזמן' : 'חסום'}</div>
         <ul class="plain small">${p.publication.blocked.map(b => `<li>${esc(b.message)}</li>`).join('')}</ul>
-        ${p.publication.allowed ? '<button data-do="pubschedule" class="primary" style="margin-top:8px">תזמון הפרסום (MOCK)</button>' : ''}`}
+        ${p.publication.allowed ? `<button data-do="pubschedule" class="primary" style="margin-top:8px">תזמון הפרסום${p.publication.mode === 'mock' ? ' (MOCK)' : ' באינסטגרם'}</button>` : ''}`}
       ${p.publication.paused ? '<div class="pill warn" style="margin-top:8px">כל הפרסומים מושהים</div>' : ''}
-      <p class="small mute">אין חיבור לאינסטגרם. במצב בדיקה קיים רק ספק דמה מקומי; שום דבר לא מתפרסם בפועל.</p></div>`);
+      ${p.publication.coverNote ? `<div class="small warn" style="margin-top:8px">${esc(p.publication.coverNote)}</div>` : ''}
+      <p class="small mute">${p.publication.mode === 'instagram' ? 'מחובר ספק אינסטגרם אמיתי: פרסום יוצא רק אחרי אישור שלך לחבילה המדויקת, הסכמה מתועדת ומועד.' : p.publication.mode === 'mock' ? 'ספק דמה מקומי לבדיקות — שום דבר לא מתפרסם בפועל.' : 'פרסום כבוי. שום דבר לא מתפרסם.'}</p></div>`);
 
     if (v && v.approval) h.push(`<div class="card"><h2 class="${v.approvalValid ? 'ok' : 'bad'}">${v.approvalValid ? 'אושר' : 'האישור אינו תקף (התוכן השתנה)'}</h2>
       <div class="small mute">${esc(v.approval.by)} · ${fmt(v.approval.at)} · טביעת גרסה <code>${esc(v.approval.fingerprint.slice(0, 16))}…</code></div></div>`);
@@ -233,7 +234,10 @@
     if (t.dataset.do === 'save') return act('/package', { caption: $('#cap').value, cta: $('#cta').value, account: $('#acct').value,
       scheduledLocal: $('#when').value || null }, 'נשמר. אם היה אישור — הוא בוטל ויש לאשר מחדש.', 'PATCH');
     if (t.dataset.do === 'retry') return act('/retry', {}, 'העריכה חזרה לתור.');
-    if (t.dataset.do === 'pubschedule') return act('/publish', {}, 'הפרסום תוזמן (MOCK).');
+    if (t.dataset.do === 'pubschedule') {
+      if (current.publication.mode !== 'mock' && !confirm(`לתזמן פרסום אמיתי באינסטגרם?\nחשבון: @${current.version.destination.account}\nמועד: ${current.version.scheduledLocal} שעון ישראל\nאפשר לבטל עד רגע הפרסום.`)) return;
+      return act('/publish', {}, 'הפרסום תוזמן.');
+    }
     if (t.dataset.do === 'pubcancel') return act('/publish/cancel', {}, 'הפרסום המתוזמן בוטל.');
     if (t.dataset.play) {
       const [t0, t1] = t.dataset.play.split(',').map(Number), vid = $('#detail video');

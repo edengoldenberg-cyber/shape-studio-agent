@@ -20,6 +20,7 @@ Non-interactive: it never prompts and never opens a player. The outcome is alway
 import argparse
 import hashlib
 import json
+import shutil
 import sys
 import time
 import traceback
@@ -127,6 +128,11 @@ def as_raw(dec):
             "missing_info": dec["plan"]["missing_info"], "adapter": dec["adapter"]}
 
 
+def hard_failures(records):
+    """How many mandatory automatic checks failed. A revision may not make this number worse."""
+    return sum(1 for r in records if r["status"] == "fail")
+
+
 def edit(j, dec, words, sp, sha_before, check, cache):
     """EDIT stage: execute the decisions through the canonical pipeline and run every check."""
     cfg, st = j.cfg, j.style
@@ -159,7 +165,8 @@ def edit(j, dec, words, sp, sha_before, check, cache):
     with j.stage("render_base"):
         base, voice, dur, audio_src = render_base_and_voice(j, sp, in_s, out_s, spans[-1][-1]["end"])
         records.append(checks.check_boundary(words, in_s, out_s, checks.level_db(j.work / "voice_raw.wav", 0.0, 0.05),
-                                              checks.room_tone_db(j.work / "voice_raw.wav")))
+                                              checks.room_tone_db(j.work / "voice_raw.wav"),
+                                              checks.level_db(j.work / "voice_raw.wav", max(0.0, dur - 0.05), dur)))
 
     with j.stage("align"):
         # The reference is the FINAL audio: the words as they are heard in the cut, normalised voice track.
@@ -357,7 +364,7 @@ def pipeline(j):
         write_json(j.ed / "plan.json", plan)
 
     use_model = dec["adapter"] == "claude" and cfg["judgement"]["claude"].get("enabled")
-    sent_prev, res, tools, det, review, prev_signature = [], None, None, [], None, set()
+    sent_prev, res, tools, det, review, prev_signature, kept, final_cycle = [], None, None, [], None, set(), None, 0
     for n in range(ecfg["max_cycles"] + 1):
         # ── EDIT ────────────────────────────────────────────────────────────
         t_edit = time.time()
@@ -397,6 +404,20 @@ def pipeline(j):
                      "cost_usd_reported_so_far": cost, "seconds_so_far": secs}
             cycles.append(cycle)
             write_json(j.ed / f"cycle_{n}.json", cycle)
+        # A revision that makes the mandatory checks WORSE is rejected: the previous result is restored
+        # and the finding that triggered it goes to the owner instead.
+        if kept is not None and hard_failures(res["records"]) > hard_failures(kept["res"]["records"]):
+            cycles[-1]["rejected"] = (f"the revision raised the number of failed checks from {hard_failures(kept['res']['records'])} "
+                                      f"to {hard_failures(res['records'])}; the previous result was restored")
+            cycles[-1]["sent_to_editor"] = []
+            write_json(j.ed / f"cycle_{n}.json", cycles[-1])
+            shutil.copyfile(j.work / "kept_final.mp4", j.out / "final.mp4")
+            shutil.copyfile(j.work / "kept_cover.jpg", j.out / "cover.jpg")
+            dec, res, j_issues, final_cycle = kept["dec"], kept["res"], kept["issues"], kept["cycle"]
+            render_cache.clear()
+            stop = "revision_regressed"
+            break
+        final_cycle = n
         blocking_left = [f for f in findings if f["severity"] == "blocking"]
         if not use_model:
             stop = "no_editor_model"
@@ -418,6 +439,9 @@ def pipeline(j):
             stop = "budget"
             break
         # ── REVISE: findings go back to the editor as data ─────────────────
+        shutil.copyfile(j.out / "final.mp4", j.work / "kept_final.mp4")
+        shutil.copyfile(j.out / "cover.jpg", j.work / "kept_cover.jpg")
+        kept = {"dec": dec, "res": res, "issues": j_issues, "cycle": n}
         with j.stage("revise"):
             opts = dict(options, previous=as_raw(dec), _tag=f"edit{n + 1}", allowed_spellings=editorial.allowed_spellings(res),
                         review_findings=[{k: f[k] for k in ("id", "asset", "card", "time_s", "problem", "correction", "evidence", "severity")}
@@ -441,7 +465,7 @@ def pipeline(j):
     if chosen:
         issues.append(judgement.issue("orthography_chosen", "info", "כתיב שהוכרע לפי ההקשר (אותו דיבור, איות שונה בין שני התמלולים): " + ", ".join(chosen)))
     review_items = checks.review_items(records, issues, cards, res["sync"], res["adjudications"], res["dur"])
-    final_findings = cycles[-1]["findings"]
+    final_findings = cycles[final_cycle]["findings"]          # the findings of the result that is actually delivered
     already = {"issue:unverified_number": "content:unverified_number", "issue:words_omitted": "content:words_omitted_inside_segment"}
     have = {r["id"] for r in review_items}
     for f in final_findings:
@@ -492,8 +516,8 @@ def pipeline(j):
         "editorial": {"status": ed["status"], "stop_reason": stop, "revisions": ed["revisions"], "test_injection": injection,
                       "objective": plan["objective"], "brief": plan["edit_brief"], "missing_information": plan["missing_information"],
                       "verified_facts": plan["verified_facts"], "perception": editorial.PERCEPTION,
-                      "criteria": cycles[-1]["criteria"],
-                      "cycles": [{"cycle": c["cycle"], "findings": [{k: f[k] for k in ("id", "source", "asset", "card", "problem", "correction", "severity", "fix")} for f in c["findings"]],
+                      "criteria": cycles[final_cycle]["criteria"], "delivered_cycle": final_cycle,
+                      "cycles": [{"cycle": c["cycle"], "rejected": c.get("rejected"), "stopped_because": c.get("stopped_because"), "findings": [{k: f[k] for k in ("id", "source", "asset", "card", "problem", "correction", "severity", "fix")} for f in c["findings"]],
                                   "sent_to_editor": c["sent_to_editor"], "verification_of_previous": c["verification_of_previous"],
                                   "caption": c["caption"], "cover_text": c["cover_text"], "reused_render": c["reused_render"]} for c in cycles],
                       "budget": ed["budget"]},
