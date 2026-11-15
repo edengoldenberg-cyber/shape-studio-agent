@@ -1,0 +1,2 @@
+# Byte-exact backup of the locally customized caption renderer (its sha256 is pinned)
+dana-worker/vendor/* -text

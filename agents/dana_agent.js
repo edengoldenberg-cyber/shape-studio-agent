@@ -11,12 +11,12 @@ const videoSvc       = require('../services/video.service');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-const BUSINESS_CONTEXT = fs.readFileSync(
-  path.join(__dirname, '../prompts/business_context.md'), 'utf8'
-);
-const DANA_PROMPT = BUSINESS_CONTEXT + '\n\n---\n\n' + fs.readFileSync(
-  path.join(__dirname, '../prompts/dana_prompt.md'), 'utf8'
-);
+// Dana does NOT use the shared sales context (prompts/business_context.md): it carries an
+// audience, an offer and a voice the owner has not confirmed for content. Her prompt is
+// built from verified brand settings with explicit "missing" states (utils/dana_brand.js).
+const brand = require('../utils/dana_brand');
+const DANA_PROMPT_BODY = fs.readFileSync(path.join(__dirname, '../prompts/dana_prompt.md'), 'utf8');
+const danaPrompt = () => brand.promptBlock() + '\n\n---\n\n' + DANA_PROMPT_BODY;
 
 // ── Mosseri skill paths ────────────────────────────────────────────────────────
 const SKILL_DIR        = path.join(__dirname, '../mosseri-skill-main/mosseri');
@@ -87,10 +87,14 @@ const WEIGHTS  = { C1: 25, C2: 20, C3: 20, C4: 15, C5: 10, C6: 5, C7: 5 };
 const PENALTIES = { wordmark: 15, aggregated: 15, reupload: 20, unpaid_promise: 10, ai_slick: 5 };
 const HARD_FLAGS = new Set(['wordmark', 'aggregated', 'reupload']);
 
-const STUDIO_CLASSES = [
-  'Strength Training', 'Reformer Pilates', 'Pilates Barre',
-  'ALL IN (פונקציונלי)', 'Concept Toning / Sculpt', 'Ashtanga Yoga', 'Kangoo Jumps',
-];
+// Active classes come from the owner's brand settings. When they are not set, Dana works
+// from the two stated lines of business and says the class list is missing.
+function studioClasses() {
+  const v = brand.get().active_classes.value;
+  if (Array.isArray(v) && v.length) return v.map(String);
+  if (typeof v === 'string' && v.trim()) return v.split(/[,\n]/).map(x => x.trim()).filter(Boolean);
+  return ['אימוני כוח', 'פילאטיס מכשירים'];
+}
 
 let danaHistory = [];
 
@@ -747,7 +751,7 @@ async function chat(userMessage) {
     const completion = await openai.chat.completions.create({
       model:       process.env.OPENAI_MODEL ?? 'gpt-4o',
       messages:    [
-        { role: 'system', content: DANA_PROMPT },
+        { role: 'system', content: danaPrompt() },
         { role: 'system', content: context },
         ...danaHistory,
       ],
@@ -800,7 +804,7 @@ async function analyzeVideo({
     transcript  && `**תמליל / תסריט:**\n${transcript}`,
     `**פורמט:** ${format}`,
     `**מטרה עסקית:** ${goal}`,
-    `**הקשר:** Shape Studio — סטודיו כושר בוטיק בפרדס חנה-כרכור, קהל נשים 30-60`,
+    `**הקשר:** ${brand.get().studio_name.value} — ${brand.get().business_type.value}, ${brand.get().location.value}. קהל יעד: ${audienceText()}`,
   ].filter(Boolean).join('\n\n');
 
   const scoringPrompt = `
@@ -1053,7 +1057,7 @@ C7 נושא (5): 5=נושא אחד ברור, 1=שני נושאים+
 // ── Content pack generation ───────────────────────────────────────────────────
 
 async function generateContentPack(focusClass) {
-  const cls = focusClass ?? pickRandom(STUDIO_CLASSES);
+  const cls = focusClass ?? pickRandom(studioClasses());
   logger.info('Dana generating content pack', { focusClass: cls });
 
   const prompt =
@@ -1062,13 +1066,13 @@ async function generateContentPack(focusClass) {
     `📸 **רעיון לסטורי:**\n[תיאור קצר — 2-3 משפטים]\n\n` +
     `🎬 **רעיון לריל:**\n[שורת הוק | מבנה ויזואלי | סגנון מוזיקה | CTA]\n\n` +
     `✍️ **קפשן לפוסט פיד:**\n[3-5 שורות + 6-8 האשטאגים רלוונטיים]\n\n` +
-    `כל הטקסטים בעברית טבעית ולפי קול המותג של Shape Studio.`;
+    `כל הטקסטים בעברית טבעית. אין פרופיל קול מאושר — זו טיוטה. אל תמציאי מחירים, הצעות או מספרים: השאירי {{placeholder}}.`;
 
   try {
     const completion = await openai.chat.completions.create({
       model:       process.env.OPENAI_MODEL ?? 'gpt-4o',
       messages:    [
-        { role: 'system', content: DANA_PROMPT },
+        { role: 'system', content: danaPrompt() },
         { role: 'user',   content: prompt },
       ],
       temperature: 0.85,
@@ -1085,7 +1089,7 @@ async function generateContentPack(focusClass) {
 }
 
 async function generateAdCopy({ format = '4:5', objective = 'conversion', className } = {}) {
-  const cls = className ?? pickRandom(STUDIO_CLASSES);
+  const cls = className ?? pickRandom(studioClasses());
   logger.info('Dana generating ad copy', { format, objective, className: cls });
 
   const formatGuide = {
@@ -1096,7 +1100,7 @@ async function generateAdCopy({ format = '4:5', objective = 'conversion', classN
   };
   const objectiveGuide = {
     awareness:  'מודעות — תדמית ומותג, לא מכירה',
-    conversion: 'המרה — לחיצה לקבוע ניסיון, הצעת 60 ש״ח ל-2 אימונים',
+    conversion: `המרה — ${brand.get().current_offer.value ? 'ההצעה המאושרת: ' + brand.get().current_offer.value : 'אין הצעה מאושרת: השאירי {{הצעה}} ואל תנקבי במחיר'}`,
     retention:  'שימור — בניית קהילה וגאווה בחברים',
   };
 
@@ -1110,7 +1114,7 @@ async function generateAdCopy({ format = '4:5', objective = 'conversion', classN
   try {
     const completion = await openai.chat.completions.create({
       model:       process.env.OPENAI_MODEL ?? 'gpt-4o',
-      messages:    [{ role: 'system', content: DANA_PROMPT }, { role: 'user', content: prompt }],
+      messages:    [{ role: 'system', content: danaPrompt() }, { role: 'user', content: prompt }],
       temperature: 0.8,
       max_tokens:  500,
     });
@@ -1135,10 +1139,10 @@ function buildContext() {
     `## הקשר תוכן של דנה — ${now}`,
     '',
     '### שיעורי Shape Studio',
-    STUDIO_CLASSES.map(c => `  • ${c}`).join('\n'),
+    studioClasses().map(c => `  • ${c}`).join('\n'),
     '',
     '### קהל יעד',
-    '  נשים גילאי 30-60 | פרדס חנה-כרכור | מחפשות תוצאות אמיתיות בסביבה פרמיום',
+    '  ' + audienceText(),
     '',
     '### תוכן אחרון שנוצר',
     lastPack    ? `  חבילה: ${timeSince(lastPack.ts)}, פוקוס: ${lastPack.data?.focusClass ?? '?'}` : '  חבילה: עדיין לא נוצרה',
@@ -1167,14 +1171,13 @@ function clearHistory() { danaHistory = []; }
 // ── Default audience from business context (Fix 7) ───────────────────────────
 // Loaded once from business_context.md so it stays current with studio settings.
 // Can be overridden per-request; never hardcoded in code.
-function getDefaultAudience() {
-  try {
-    const ctx = fs.readFileSync(path.join(__dirname, '../prompts/business_context.md'), 'utf8');
-    const m   = ctx.match(/## Target Audience\n([\s\S]*?)(?:\n## |\n---)/);
-    if (m) return m[1].replace(/\*\*/g, '').replace(/^-\s*/gm, '').trim().split('\n')[0].trim();
-  } catch {}
-  return 'לקוחות Shape Studio, שרון'; // minimal fallback, no hardcoded demographics
+function audienceText() {
+  const b = brand.get();
+  const parts = [b.audience_strength.value && `אימוני כוח: ${b.audience_strength.value}`,
+                 b.audience_pilates.value && `פילאטיס מכשירים: ${b.audience_pilates.value}`].filter(Boolean);
+  return parts.length ? parts.join(' | ') : 'לא הוגדר על ידי הבעלים (אין להניח קהל יעד)';
 }
+function getDefaultAudience() { return audienceText(); }
 
 // ── Skill connection status (Fix 5) ──────────────────────────────────────────
 function getSkillStatus() {
@@ -1238,7 +1241,7 @@ function buildPhase2SystemMsg({ doctrineChapters, sentChapterNums, sentChapterCo
     `ניקוד C1–C7 כבר בוצע בעין עיוורת (ללא הקשר עסקי). הציונים נעולים.`,
     `תפקידך עכשיו: תרגמי ציונים לתיקונים ספציפיים ו-Shape-Studio-aware.`,
     '',
-    DANA_PROMPT,
+    danaPrompt(),
     '',
     audioLimitNote ?? '',
     '',

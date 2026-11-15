@@ -3,7 +3,7 @@
 
     python -m dana_pipeline.run --config worker.config.json --job-dir <dir> --source <file>
 
-Non-interactive: no input(), no player launch. The outcome is always written to
+Non-interactive: it never prompts and never opens a player. The outcome is always written to
 <job-dir>/result.json and mirrored by the exit code:
 
     0 success          package ready, every automated check passed
@@ -113,7 +113,10 @@ def pipeline(j):
         want = ((j.job.get("source") or {}).get("sha256") or "").lower()
         if want and want != sha_before:
             raise PipelineError("source_hash_mismatch", "the downloaded source does not match the uploaded file", True)
-        sp = probe(cfg, j.source)
+        try:
+            sp = probe(cfg, j.source)
+        except PipelineError as e:
+            raise PipelineError("source_unreadable", "הקובץ אינו וידאו שניתן לקרוא — יש להעלות קובץ אחר", False, e.detail)
         if not sp["has_audio"]:
             raise PipelineError("no_audio", "the source has no audio track — captions need speech")
         if sp["duration"] < cfg["segment"]["min_s"]:
