@@ -122,3 +122,5 @@ Local facts: local .env has a placeholder Meta token and a notify number that is
 - Account type (Business / Creator) and Facebook Page link: not verified yet — being checked with the owner from the phone, one step at a time.
 - The price shown in the account bio is NOT approved for use in content or as an offer.
 - This was account information only: no approval for deployment, notifications or publication.
+
+- UPDATE (owner, from screenshots, 2026-11-15): account type shown = Professional (Business vs Creator not distinguished; both are eligible per the docs); linked Facebook Page = "Shape Studio". Still not verified through the API. Next: Meta app name / mode / permissions, step by step from the phone. No approval for deployment or publication.
