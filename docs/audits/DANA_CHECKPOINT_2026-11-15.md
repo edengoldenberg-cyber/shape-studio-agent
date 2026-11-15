@@ -91,3 +91,7 @@ Acceptance criteria: report section G.
 - Do not treat a chat/WhatsApp "yes" as publication approval.
 - Do not use browser automation to work around unsupported API features.
 - Do not deploy, change Railway variables, or run `railway config migrate`.
+
+## UPDATE 2026-11-15 — phase 1A implemented
+
+Branch `dana-phase-1a`. Status, evidence, preview commands and next steps: `docs/DANA_PHASE_1A_2026-11-15.md`. Not deployed; publishing and real notifications off.
