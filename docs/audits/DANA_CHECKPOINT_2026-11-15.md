@@ -258,3 +258,10 @@ code is deployed (not approved yet). After a future approved deployment: GET /ap
 - Needed before step C: owner generates DANA_WORKER_TOKEN locally (user env + Railway via --stdin --skip-deploys), then ONE approved redeploy; a new source clip under 300 MB. Unknown: free space on /data, platform body-size limit.
 - GAP: the review page has no control to set brand fields (only lists missing ones); instagram_account must be set through PUT /api/dana/studio/brand/instagram_account from a logged-in session, or by a small page change in a later approved deploy.
 - Correction to the GAP above: the destination account can be typed per package in the review page (services/dana_studio.js line 396, body.account), so the missing brand-settings control does not block the end-to-end test; it only means the account is not pre-filled.
+
+## Worker connected to the production queue (2026-11-15 14:45 IL), owner-approved redeploy
+
+- Worker token: Railway and user-environment values identical (48 alphanumeric chars), compared without printing. IG token shape unchanged.
+- `railway redeploy -y`: deployment d226d305-332c-4d45-b7c8-6062e24c43e5 SUCCESS, started 2026-11-15T12:45:24Z; same code (02e14ee). /health 200; Dana API 401 without session; worker API now 401 without a token (was 503); 0 error lines; tomer test_only.
+- Worker started on the editing machine as a background task of the Claude Code session (not autostart): config C:/Users/owner/dana-work/worker.config.production.json, log C:/Users/owner/dana-work/worker.production.log. Server log shows hello 200 and lease 204 (empty queue). It stops if the session or the computer closes; stop with a STOP file in C:/Users/owner/dana-work.
+- Publishing and real notifications still unset. No clip uploaded by this session. NEXT: owner uploads a NEW clip at https://shape-studio-agent-production.up.railway.app/dana-studio.html (under 300 MB first).
