@@ -107,3 +107,11 @@ Re-run the demonstration: `node scripts/dana_e2e_full.cjs <source.mp4> --exclude
 Preview the last test project: `set DANA_PREVIEW_DATA=C:/Users/owner/dana-work/e2e-full` then `node scripts/dana_studio_preview.cjs`.
 Still true: not deployed, publishing off by default (`DANA_PUBLISHING_ENABLED`, `DANA_PUBLISHER_MODE=mock` only), notifications mocked, autostart not installed, no real Instagram adapter exists.
 Next: owner-supplied clip as editorial acceptance; then the account/credential/deployment approvals listed in the phase 1C doc.
+
+## UPDATE 2026-11-15 — phase 1D (real Instagram adapter prepared, mobile path, deploy plan)
+
+Read: docs/DANA_PHASE_1D_2026-11-15.md, docs/DANA_INSTAGRAM_CONTRACT.md, docs/DANA_DEPLOY_PLAN.md.
+State: real Instagram adapter (services/dana_instagram.js) and real notification path exist behind disabled switches; contract-tested against local fakes only. Nothing deployed, nothing sent, no call to Meta.
+Selected: Facebook Login for Business, graph.facebook.com, API v26.0 pinned, resumable upload, cover via thumb_offset.
+Next actions are all owner-gated: deployment approval + DANA_WORKER_TOKEN; Instagram account facts; token entered in Railway (never in chat); notification approval; new source clip; consent.
+Local facts: local .env has a placeholder Meta token and a notify number that is NOT 972547598919; production values were not readable from this session.
