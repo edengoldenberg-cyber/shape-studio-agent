@@ -1,0 +1,20 @@
+{
+  "_comment": "Copy to worker.config.json (not committed) and adjust. Every path the pipeline uses comes from here.",
+  "server_url": "http://127.0.0.1:3000",
+  "worker_id": "windows-editor-1",
+  "token_env": "DANA_WORKER_TOKEN",
+  "poll_seconds": 5,
+  "caption_renderer_sha256": "b57f0574f7b2de60bbbf1d77360875ec7a3d02429b18dd85026963ae34340d1a",
+  "paths": {
+    "work_root": "C:/Users/owner/dana-work",
+    "chrome": "C:/Program Files/Google/Chrome/Application/chrome.exe",
+    "caption_renderer": "C:/Users/owner/.claude/skills/ai-video-editor/scripts/caption_layer.py",
+    "font_dir": "C:/Users/owner/Desktop/גלם עריכות/1/assets/fonts",
+    "safe_zone": "C:/Users/owner/.claude/instagram/tools/reels_safe_zone.json",
+    "cuda_dll_dirs": [
+      "C:/Users/owner/AppData/Local/Programs/Python/Python310/Lib/site-packages/nvidia/cublas/bin",
+      "C:/Users/owner/AppData/Local/Programs/Python/Python310/Lib/site-packages/nvidia/cudnn/bin"
+    ]
+  },
+  "judgement": { "adapter": "heuristic", "claude": { "enabled": false } }
+}

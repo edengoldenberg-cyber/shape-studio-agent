@@ -289,6 +289,11 @@ app.use((req, _res, next) => {
   next();
 });
 
+// ── Dana studio: local editing worker API ─────────────────────────────────────
+// Mounted BEFORE the dashboard auth on purpose: it has its own scoped credential
+// (DANA_WORKER_TOKEN, fails closed when unset) and accepts nothing else.
+app.use('/api/dana/worker', require('./routes/dana_studio_routes').workerRouter);
+
 // ── Authentication ────────────────────────────────────────────────────────────
 // Mounted BEFORE the static dashboard and every API route. Public exceptions (provider
 // webhooks, /health, /api/version, calendar .ics, timetable images) are listed in
@@ -297,6 +302,11 @@ require('./middleware/auth').mount(app, express);
 
 // ── Static dashboard ──────────────────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, 'public')));
+
+// ── Dana studio: upload → edit → mobile review package (behind the dashboard auth) ──
+app.use('/api/dana/studio', require('./routes/dana_studio_routes').panelRouter);
+try { require('./services/dana_studio').reconcileOnStartup(); }
+catch (err) { logger.error('[startup] Dana studio reconciliation failed', { error: err.message }); }
 
 // ── Health check ──────────────────────────────────────────────────────────────
 // _startupComplete: set after phoneRegistry.init + persist.loadLeads + initWorkers.

@@ -1,0 +1,39 @@
+{
+  "notes": "Owner-approved segment and card texts of pilot project 6 (brief.md / make_cards.py, 2026-11-15). Used as scripted judgement for the controlled dry run. The opening 'כן,' and 'אם' (ASR heard 'עם') are still open owner decisions.",
+  "segment": { "in_s": 225.24, "out_s": 251.28, "reason": "קטע שאושר על ידי הבעלים בפיילוט (פרויקט 6): 225.38–251.25" },
+  "homophones": { "עם": "אם" },
+  "cards": [
+    { "text": "כן, אני חושבת" },
+    { "text": "שהיו לי חששות", "highlight": ["חששות"] },
+    { "text": "אם להמשיך" },
+    { "text": "להתאמן" },
+    { "text": "כי אני מרגישה" },
+    { "text": "שדרושה המון" },
+    { "text": "תשומת לב" },
+    { "text": "לגוף שלי" },
+    { "text": "ולהבין שאני" },
+    { "text": "לא עובדת" },
+    { "text": "יותר מדי קשה" },
+    { "text": "או לא נכון" },
+    { "text": "או בצורה" },
+    { "text": "שהיא יכולה" },
+    { "text": "להשפיע לרעה", "highlight": ["לרעה"] },
+    { "text": "לגוף" },
+    { "text": "אני חושבת" },
+    { "text": "שזה היה החשש", "highlight": ["החשש"] },
+    { "text": "העיקרי שלי", "highlight": ["העיקרי"] },
+    { "text": "ואני קולטת" },
+    { "text": "שהמקום הזה" },
+    { "text": "ממש נותן לי" },
+    { "text": "לסמוך על עצמי", "highlight": ["לסמוך על עצמי"] },
+    { "text": "ועל היכולות" },
+    { "text": "שלי" },
+    { "text": "וגם זה באמת" },
+    { "text": "ליווי צמוד", "highlight": ["ליווי צמוד"] }
+  ],
+  "cover": { "text": "לסמוך על עצמי", "frame_s": 19.9 },
+  "caption": {
+    "text": "[טיוטה — ציטוט מדויק מהסרטון, לא נוסח שיווקי]\n\"אני חושבת שהיו לי חששות אם להמשיך להתאמן... ואני קולטת שהמקום הזה ממש נותן לי לסמוך על עצמי ועל היכולות שלי\"",
+    "cta": null
+  }
+}

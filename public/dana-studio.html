@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>דנה סטודיו</title>
+<style>
+  :root { --bg:#f6f5f2; --card:#fff; --ink:#1c1b1a; --mute:#6b6862; --line:#e4e1da; --accent:#c2186a; --ok:#1d7a46; --warn:#a15c00; --bad:#b3261e; --info:#2b5fb3; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#151413; --card:#201f1d; --ink:#f1efea; --mute:#a39f96; --line:#35332f; --accent:#f06aa9; --ok:#62c98f; --warn:#e5a84a; --bad:#f2837b; --info:#8ab4f8; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.5 system-ui,-apple-system,"Segoe UI",Heebo,Arial,sans-serif; }
+  header { position:sticky; top:0; z-index:5; background:var(--card); border-bottom:1px solid var(--line); padding:10px 16px; display:flex; align-items:center; gap:10px; }
+  header h1 { font-size:18px; margin:0; flex:1; }
+  header a { color:var(--mute); text-decoration:none; font-size:14px; }
+  main { max-width:640px; margin:0 auto; padding:12px 16px 96px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; margin:12px 0; }
+  .card h2 { font-size:16px; margin:0 0 8px; }
+  .pill { display:inline-block; font-size:12px; padding:2px 9px; border-radius:99px; border:1px solid currentColor; white-space:nowrap; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); } .info { color:var(--info); } .mute { color:var(--mute); }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .grow { flex:1; min-width:0; }
+  button, .btn { font:inherit; border:1px solid var(--line); background:var(--card); color:var(--ink); border-radius:10px; padding:10px 14px; cursor:pointer; min-height:44px; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600; }
+  button.danger { color:var(--bad); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  input[type=text], input[type=datetime-local], textarea, select { font:inherit; width:100%; padding:10px; border:1px solid var(--line); border-radius:10px; background:var(--bg); color:var(--ink); }
+  textarea { min-height:120px; resize:vertical; }
+  label { display:block; font-size:13px; color:var(--mute); margin:10px 0 4px; }
+  video, img.cover { width:100%; max-height:70vh; background:#000; border-radius:12px; display:block; object-fit:contain; }
+  ul.plain { list-style:none; margin:0; padding:0; }
+  ul.plain li { padding:8px 0; border-top:1px solid var(--line); font-size:14px; overflow-wrap:anywhere; }
+  ul.plain li:first-child { border-top:0; }
+  .proj { display:block; width:100%; text-align:start; }
+  .bar { height:6px; border-radius:6px; background:var(--line); overflow:hidden; margin-top:8px; }
+  .bar i { display:block; height:100%; width:0; background:var(--accent); transition:width .3s; }
+  .actions { position:fixed; bottom:0; inset-inline:0; background:var(--card); border-top:1px solid var(--line); padding:10px 12px calc(10px + env(safe-area-inset-bottom)); display:grid; grid-template-columns:1.4fr 1fr 1fr 1fr; gap:8px; }
+  .actions button { padding:10px 4px; font-size:14px; }
+  .quote { border-inline-start:3px solid var(--line); padding-inline-start:10px; color:var(--mute); font-size:14px; }
+  .small { font-size:13px; } .hidden { display:none !important; }
+  details summary { cursor:pointer; padding:6px 0; }
+  code { font-size:12px; overflow-wrap:anywhere; }
+</style>
+</head>
+<body>
+<header>
+  <button id="back" class="hidden" aria-label="חזרה לרשימה">→</button>
+  <h1>🎬 דנה סטודיו</h1>
+  <span id="worker" class="pill mute">בודק עובד…</span>
+  <a href="/">פאנל</a>
+</header>
+<main>
+  <div id="notice" class="card hidden"></div>
+  <section id="list">
+    <div class="card">
+      <h2>העלאת חומר גלם</h2>
+      <p class="small mute">קליפ מקור אחד → ריל אנכי אחד עם כתוביות. המקור נשמר כמו שהוא ולא משתנה.</p>
+      <input type="file" id="file" accept="video/*,.mp4,.mov,.m4v,.webm,.mkv,.avi" class="hidden">
+      <button class="primary" id="pick" style="width:100%">בחירת סרטון מהטלפון</button>
+      <div id="upstate" class="small mute" style="margin-top:8px"></div>
+      <div class="bar hidden" id="upbar"><i></i></div>
+    </div>
+    <div class="card"><h2>פרויקטים</h2><ul class="plain" id="projects"><li class="mute">טוען…</li></ul></div>
+    <div class="card"><h2>הגדרות מותג חסרות</h2><ul class="plain small" id="brand"></ul>
+      <p class="small mute">פרטים חסרים לא חוסמים עריכה. דנה לא ממציאה אותם — הם מסומנים כחסרים עד שתגדיר/י.</p></div>
+  </section>
+  <section id="detail" class="hidden"></section>
+</main>
+<div class="actions hidden" id="actions">
+  <button class="primary" data-act="approve">אשר</button>
+  <button data-act="changes">בקש שינויים</button>
+  <button data-act="reschedule">דחה מועד</button>
+  <button class="danger" data-act="reject">דחה</button>
+</div>
+<script src="/dana-studio.js"></script>
+</body>
+</html>

@@ -5,3 +5,7 @@ logs/
 # revision.json (deployed commit marker) is intentionally NOT listed here: `railway up`
 # skips everything in .gitignore, which made /api/version report "unknown". It is kept
 # out of git through .git/info/exclude instead (add the line `revision.json` there).
+
+# Dana worker: machine-local config and caches
+dana-worker/worker.config.json
+__pycache__/

@@ -13,3 +13,6 @@ tests/panel_demo_local.js
 tests/panel_check_local.js
 agents/*.bak
 scripts/probe_arbox.mjs
+
+# Dana local editing worker (runs on the Windows editing machine, never on the server)
+dana-worker/
