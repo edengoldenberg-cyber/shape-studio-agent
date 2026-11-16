@@ -88,7 +88,7 @@ try {
     await openStep(mont.id, 'review');
     await waitFor(() => has('#finalreview'));
     const fr = await text('#finalreview');
-    check(`${name}: the compilation has its final review, with what was not checked and that it is not an approval`, /הביקורת הסופית של דנה/.test(fr) && /מה לא נבדק/.test(fr) && /זו אינה אישור/.test(fr));
+    check(`${name}: the compilation has its final review, with what was not checked and that it is not an approval`, /הדירוג הסופי של דנה/.test(fr) && /מה לא נבדק/.test(fr) && /זו אינה אישור/.test(fr));
 
     await goto(`${base}/dana-studio.html`); await waitFor(() => has('[data-home="about"]'));
     await ev(`document.querySelector('[data-home="about"]').click()`); await waitFor(() => has('#connectors'));

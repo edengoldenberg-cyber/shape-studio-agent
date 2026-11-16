@@ -91,6 +91,9 @@ workerRouter.put('/jobs/:id/artifacts/:name', wrap(async (req, res) => {
 }));
 workerRouter.post('/jobs/:id/complete', json, wrap((req, res) => { studio.complete(req.params.id, leaseOf(req), req.body ?? {}); res.json({ ok: true }); }));
 workerRouter.post('/jobs/:id/fail',     json, wrap((req, res) => res.json({ ok: true, ...studio.fail(req.params.id, leaseOf(req), req.body ?? {}) })));
+// Rating of an EXISTING final file: the worker reads the version's package and check records, and returns a review. No video moves.
+workerRouter.get('/jobs/:id/review-input/:name', wrap((req, res) => sendRange(req, res, studio.ratingInput(req.params.id, leaseOf(req), String(req.params.name)), 'application/json')));
+workerRouter.post('/jobs/:id/review-result', express.json({ limit: '2mb' }), wrap((req, res) => { studio.submitRating(req.params.id, leaseOf(req), req.body ?? {}); res.json({ ok: true }); }));
 // Reference analysis: the worker leases a reference FILE the owner uploaded, analyses it locally and posts the result.
 workerRouter.post('/references/lease', json, wrap((req, res) => { const l = refs.leaseNext(req.body ?? {}); return l ? res.json(l) : res.status(204).end(); }));
 workerRouter.get('/references/:id/file', wrap((req, res) => {
@@ -252,6 +255,8 @@ panelRouter.post('/projects/:id/captions/verify', ...act(studio.verifyCaption));
 panelRouter.patch('/projects/:id/settings',       ...act(studio.setSettings));
 /** "יישם שיפורים והפק גרסה חדשה": Dana applies what her review found and she may change by herself. */
 panelRouter.post('/projects/:id/apply-review',    ...act(studio.applyReview));
+/** "דרג את הקובץ הקיים": Dana's rating of the stored final file of a version. Nothing is edited or rendered and no version is created. */
+panelRouter.post('/projects/:id/rating', json, wrap(async (req, res) => res.json({ ok: true, project: await studio.requestRating(req.params.id, req.body ?? {}) })));
 /** A new version of this project, planned, edited and reviewed by a library skill (the project's choice or the approved default). */
 panelRouter.post('/projects/:id/apply-skill',     ...act(studio.applySkill));
 panelRouter.post('/projects/:id/consent',         ...act(studio.setConsent));

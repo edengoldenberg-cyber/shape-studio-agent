@@ -411,7 +411,7 @@ function releaseJob(j, reason) {
   if (p) hist(p, 'system', 'job_released', { jobId: j.id, reason, status: j.status, attempts: j.attempts });
 }
 function finishVersion(p, j, status) {
-  if (!p) return;
+  if (!p || j.type === 'rereview') return;          // rating an existing file never changes the state of its version
   const v = p.versions.find(x => x.n === j.version);
   if (v) v.status = status;
   if (p.currentVersion === j.version) p.status = status === 'failed' ? 'failed' : status;
@@ -495,6 +495,7 @@ async function acceptArtifact(jobId, token, name, tmpPath, claimedSha, claimedBy
 
 function complete(jobId, token, body) {
   const j = leasedJob(jobId, token);
+  if (j.type === 'rereview') throw new StudioError(400, 'wrong_job_type', 'a rating job delivers a review, not a package');
   const p = getProject(j.projectId), v = p.versions.find(x => x.n === j.version);
   if (!['success', 'review_required'].includes(body.status)) throw new StudioError(400, 'status_invalid', 'status must be success | review_required');
   const required = j.type === 'review' ? REVIEW_REQUIRED : Object.entries(ARTIFACTS).filter(([, spec]) => spec.required).map(([name]) => name);
@@ -571,6 +572,91 @@ function fail(jobId, token, body) {
   hist(p, 'worker', 'job_failed', { jobId: j.id, status: j.status, attempt: j.attempts, ...j.error, detail: undefined });
   save();
   return { status: j.status, attempts: j.attempts };
+}
+
+// ── Dana's rating of an EXISTING final file (no edit, no render, no new version) ──────────────
+// A review used to be built only at the end of an edit job, so bringing it up to date meant a new render. A rating job
+// (type 'rereview') is about ONE stored file, identified by its SHA-256: the worker rates it from what was measured on
+// that file and returns a review. Every review of a version is kept in `v.reviews`, oldest first; the last one is what
+// the package shows. The video, its artifacts and the version's status are never touched.
+const storedFile = (p, v) => v.videoIsSource ? { path: sourcePath(p.source), sha256: p.source.sha256 }
+  : { path: path.join(versionDir(p.id, v.n), 'final.mp4'), sha256: v.artifacts?.['final.mp4']?.sha256 ?? null };
+/** The review a version was delivered with, as the first entry of its history. */
+function firstReview(v) {
+  const pk = v.package, prov = pk.review_provenance ?? {};
+  return { id: 'rev_delivered', at: prov.reviewed_at ?? v.createdAt, mode: 'delivered', by: 'worker', jobId: v.jobId, file_sha256: prov.final_sha256 ?? null,
+    rubric_version: pk.dana_review?.rubric_version ?? null, score_version: pk.final_review?.score?.version ?? null, skills: pk.final_review?.skills ?? [],
+    dana_review: pk.dana_review ?? null, final_review: pk.final_review ?? null, review_compact: pk.review_compact ?? null, review_provenance: pk.review_provenance ?? null };
+}
+async function requestRating(projectId, body = {}, actor = 'owner') {
+  const p = getProject(projectId);
+  const v = body.version != null ? p.versions.find(x => x.n === Number(body.version)) : currentVersion(p);
+  const by = String(body.by || '').trim().slice(0, 80);
+  if (!by) throw new StudioError(400, 'by_required', 'נדרש שם מי שמבקש/ת');
+  if (!v?.package?.dana_review || v.status === 'editing') throw new StudioError(409, 'not_reviewable', 'לגרסה הזו אין ביקורת שמורה שאפשר לדרג ממנה');
+  if (Object.values(state().jobs).some(j => j.projectId === p.id && ['queued', 'leased'].includes(j.status))) throw new StudioError(409, 'job_in_progress', 'כבר יש עבודה פעילה לפרויקט הזה');
+  const f = storedFile(p, v);
+  let sha;
+  try { sha = await hashFile(f.path); } catch { throw new StudioError(409, 'file_missing', 'קובץ הווידאו של הגרסה הזו לא נמצא באחסון'); }
+  if (!f.sha256 || sha !== f.sha256) throw new StudioError(409, 'file_changed', 'קובץ הווידאו השמור שונה מהקובץ שנרשם לגרסה הזו — אי אפשר לדרג אותו מהמדידות השמורות');
+  const job = { id: newId('job'), projectId: p.id, version: v.n, type: 'rereview', status: 'queued', attempts: 0, maxAttempts: MAX_ATTEMPTS, lease: null, notBefore: null,
+    stage: 'queued', note: 'ממתין לעובד: דירוג הקובץ הקיים, בלי רינדור', error: null, uploaded: {}, requestedBy: by,
+    options: { review_of: { version: v.n, file_sha256: sha } }, stageLog: [], createdAt: now(), updatedAt: now() };
+  state().jobs[job.id] = job;
+  hist(p, actor, 'rating_requested', { jobId: job.id, version: v.n, by, file: sha.slice(0, 12) });
+  save();
+  return view(p, v.n);
+}
+/** The two JSON files of the version a rating job is about - nothing else is served to it. */
+function ratingInput(jobId, token, name) {
+  const j = leasedJob(jobId, token);
+  if (j.type !== 'rereview' || !['package.json', 'checks.json'].includes(name)) throw new StudioError(404, 'file_not_found', 'not an input of this job');
+  return artifactPath(j.projectId, j.version, name);
+}
+const markOk = (x) => x === null || (Number.isInteger(x) && x >= 0 && x <= 100);
+function submitRating(jobId, token, body = {}) {
+  const j = leasedJob(jobId, token);
+  if (j.type !== 'rereview') throw new StudioError(400, 'wrong_job_type', 'not a rating job');
+  const p = getProject(j.projectId), v = p.versions.find(x => x.n === j.version), r = body.review;
+  const bad = (why) => new StudioError(422, 'review_invalid', `the rating was refused: ${why}`);
+  if (!v?.package || !r || typeof r !== 'object') throw bad('no review');
+  if (r.file_sha256 !== j.options.review_of.file_sha256 || r.file_sha256 !== storedFile(p, v).sha256) throw bad('it is about a different file');
+  if (r.version !== v.n) throw bad('it is about a different version');
+  if (typeof r.rubric_version !== 'string' || !Array.isArray(r.dana_review?.categories) || r.dana_review.rubric_version !== r.rubric_version) throw bad('no criteria');
+  const sc = r.final_review?.score;
+  if (!sc || typeof sc.version !== 'string' || !markOk(sc.overall) || !Array.isArray(sc.groups) || !sc.groups.every(g => markOk(g.score) && typeof g.label === 'string')) throw bad('the mark is malformed');
+  // no number where nothing was decided, and none without it being computable from the criteria that were sent
+  for (const g of sc.groups) if ((g.score === null) !== (g.decided === 0) || (g.decided && g.score !== Math.round(100 * g.met / g.decided))) throw bad('a mark does not follow from its criteria');
+  const marked = sc.groups.filter(g => g.score !== null).map(g => g.score);
+  if ((sc.overall === null) !== (marked.length === 0) || (marked.length && sc.overall !== Math.round(marked.reduce((a, b) => a + b, 0) / marked.length))) throw bad('the total does not follow from its areas');
+  if (r.rendered !== false) throw bad('a rating job must not render');
+  if (JSON.stringify(r).length > 1500000) throw bad('too large');
+  if (!v.reviews) v.reviews = [firstReview(v)];
+  v.reviews.push({ id: newId('rev'), at: now(), mode: String(r.mode ?? 'rating').slice(0, 40), by: j.requestedBy ?? null, jobId: j.id, file_sha256: r.file_sha256,
+    rubric_version: r.rubric_version, score_version: sc.version, skills: Array.isArray(r.skills) ? r.skills.slice(0, 12) : [], model_called: r.model_called === true,
+    dana_review: r.dana_review, final_review: r.final_review, review_compact: r.review_compact ?? null, review_provenance: r.review_provenance ?? null });
+  if (v.reviews.length > 30) v.reviews.splice(1, v.reviews.length - 30);          // the delivered review is always kept
+  v.package = { ...v.package, dana_review: r.dana_review, final_review: r.final_review, review_compact: r.review_compact ?? v.package.review_compact,
+    review_provenance: r.review_provenance ?? v.package.review_provenance };
+  j.status = 'succeeded'; j.lease = null; j.stage = 'done'; j.note = 'הדירוג עודכן'; j.updatedAt = now();
+  if (state().worker) state().worker.state = 'idle';
+  hist(p, 'worker', 'rating_ready', { version: v.n, mode: r.mode, rubric: r.rubric_version, overall: sc.overall, file: r.file_sha256.slice(0, 12) });
+  save();
+  return view(p, v.n);
+}
+/** Every review of one version, oldest first, without the bodies. `aboutStoredFile` is false once the stored video is another file. */
+function reviewHistory(p, v) {
+  if (!v?.package?.dana_review) return [];
+  const sha = storedFile(p, v).sha256, list = v.reviews ?? [firstReview(v)];
+  return list.map((e, i) => ({ id: e.id, at: e.at, mode: e.mode, by: e.by ?? null, version: v.n, fileSha256: e.file_sha256 ?? null, rubricVersion: e.rubric_version ?? null,
+    scoreVersion: e.score_version ?? null, overall: e.final_review?.score?.overall ?? null, verdict: e.final_review?.verdict ?? null,
+    skills: (e.skills ?? []).map(k => ({ name: k.name, version: k.version, role: k.role })), shown: i === list.length - 1,
+    aboutStoredFile: !!sha && e.file_sha256 === sha, upToDate: !!sha && e.file_sha256 === sha && v.n === p.currentVersion }));
+}
+function ratingJob(p, v) {
+  const j = Object.values(state().jobs).filter(x => x.projectId === p.id && x.type === 'rereview' && (!v || x.version === v.n)).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+  return j ? { id: j.id, status: j.status, version: j.version, note: j.note, at: j.updatedAt, by: j.requestedBy ?? null,
+    error: j.error ? { code: j.error.code, message: j.error.message } : null } : null;
 }
 
 // ── Review package: fingerprint, exceptions, approval ─────────────────────────
@@ -1282,6 +1368,7 @@ function view(p, viewN) {
     pendingCorrections: pendingEdits(p, cur).length, cardStates: cardStates(p, v),
     shown: v ? { n: v.n, isCurrent: v.n === p.currentVersion, currentN: p.currentVersion, currentStatus: cur?.status ?? null, currentHasPackage: !!cur?.package } : null,
     review: reviewInfo(p, v, cur), skill: p.skill ?? { mode: 'default' },
+    reviews: reviewHistory(p, v), rating: ratingJob(p, v),          // every review of the version on screen; the state of a rating in progress
     consent: p.consent, rights: p.rights, pendingChange: p.pendingChange ?? null,
     adapter: projectAdapter(p),                                    // null = the worker's configuration decides
     captionEdits: p.captionEdits ?? [], zoomEdits: p.zoomEdits ?? [], styleOverrides: p.styleOverrides ?? {},
@@ -1343,4 +1430,5 @@ module.exports = {
   listRules, activeRules, addRule, editRule, retireRule, previousOf, fixName, projectAdapter, judgementMode, judgementMissing, STYLE_OVERRIDABLE,
   verifyCaption, setSettings, applyReview, progressOf, nextAction, cardStates, pendingEdits, ADJUSTMENT_KINDS, PHASES,
   applySkill, testSkill, reviewInfo, TARGETS, decideHearing, start, replan, fixName, storage,
+  requestRating, ratingInput, submitRating, reviewHistory,
 };

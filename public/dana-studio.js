@@ -733,7 +733,7 @@
     const key = `${project.id}:${project.shown ? project.shown.n : 0}`;
     if (key !== draftKey) { const keep = draft ? { note: draft.note, scope: draft.scope } : {}; draft = Object.assign(newDraft(), first ? {} : keep); draftKey = key; pvSource = null; }
     renderSide(data.worker); renderSteps(); renderPanel(); renderActions();   // each goes through setHtml: no change → the DOM is not touched
-    if (busy()) timer = setTimeout(() => open(id, true), 3000);
+    if (busy() || rating()) timer = setTimeout(() => open(id, true), 3000);
   }
   function defaultStep(p) {
     const k = p.nextAction && p.nextAction.key;
@@ -1176,30 +1176,77 @@
    * What the owner needs from Dana's final review, in plain words. `compact` is the card beside the video (every step);
    * the full one opens the review step. Nothing is scored here that was not checked, and it says which file it is about.
    */
+  const SL = { 'טוב': 'lv-ok', 'דורש שיפור': 'lv-mid', 'חלש': 'lv-bad', 'לא נבדק': 'lv-none' };
+  const RMODE = { delivered: 'הביקורת שנמסרה עם הגרסה', rubric_upgrade: 'דירוג הקובץ הקיים: עדכון לקריטריונים שבתוקף', rating_added: 'דירוג הקובץ הקיים: נוספו ציון מסכם וצעדים הבאים' };
+  const rating = () => !!(current && current.rating && ['queued', 'leased'].includes(current.rating.status));
+  /** The summary mark and the five areas. Nothing is drawn as a number unless the review carries it. */
+  function scoreBlock(p, v, f, compact) {
+    const s = f.score, rj = p.rating, wait = rating();
+    const state = wait ? `<div class="pill info" style="white-space:normal">הדירוג מתעדכן: ${esc(rj.note || '')}. הסרטון לא משתנה.</div>`
+      : rj && rj.status === 'failed' && rj.version === v.n ? `<div class="pill bad" style="white-space:normal">עדכון הדירוג נכשל: ${esc((rj.error || {}).message || '')}</div>` : '';
+    const btn = (label) => `<button class="sm" data-do="rate" style="margin-top:6px" ${busy() || wait ? 'disabled' : ''}>${label}</button>`;
+    if (!s) return `<div id="scorebox"><div class="score none"><b>אין ציון מסכם</b></div>
+      <div class="small">הביקורת של הגרסה הזו נעשתה לפני שהוגדר הציון המסכם. אפשר לדרג את הקובץ הקיים: הסרטון לא משתנה ולא נוצרת גרסה חדשה.</div>${state}${btn('דרג את הקובץ הקיים (בלי רינדור)')}</div>`;
+    const col = x => x === null ? 'line' : x >= 85 ? 'ok' : x >= 60 ? 'warn' : 'bad', bb = x => x.by_basis || {};
+    const basis = x => ` · נמדד בקוד ${bb(x).measured.met}/${bb(x).measured.decided} · הערכת מודל ${bb(x).model.met}/${bb(x).model.decided}${bb(x).frames.decided ? ` · פריימים ${bb(x).frames.met}/${bb(x).frames.decided}` : ''}${x.human_only ? ` · ממתין לשיפוט שלך: ${x.human_only}` : ''}${x.not_applicable ? ` · לא רלוונטי: ${x.not_applicable}` : ''}`;
+    const groups = s.groups.map(x => `<div class="sg" data-group="${esc(x.key)}"><div class="row"><span class="grow">${esc(x.label)}</span><b class="${SL[x.level]}">${x.score === null ? 'לא נבדק' : x.score}</b></div>
+        <div class="bar"><i style="width:${x.score === null ? 0 : x.score}%;background:var(--${col(x.score)})"></i></div>
+        <div class="small mute">${x.decided ? `${x.met} מתוך ${x.decided} קריטריונים שנבדקו${x.not_checked ? ` · ${x.not_checked} לא נבדקו` : ''}` : 'אף קריטריון לא נבדק, ולכן אין ציון'}${compact || !x.decided ? '' : basis(x)}</div></div>`).join('');
+    const c = s.coverage, bl = s.blocking || { count: 0, items: [] };
+    return `<div id="scorebox"><div class="row" style="align-items:flex-end"><div class="score"><b class="${s.overall === null ? 'lv-none' : SL[s.overall >= 85 ? 'טוב' : s.overall >= 60 ? 'דורש שיפור' : 'חלש']}">${s.overall === null ? '—' : s.overall}</b><span>${s.overall === null ? 'אין ציון: שום קריטריון לא נבדק' : 'מתוך 100'}</span></div>
+        <div class="small mute grow">${compact ? `מבוסס על ${c.decided} מתוך ${c.applicable} קריטריונים רלוונטיים (${c.percent}%). ${c.not_checked} לא נבדקו ואינם בציון.` : esc(c.text)}</div></div>
+      ${bl.count ? `<div class="bad small" id="blocking" style="margin-top:6px"><b>${esc(bl.text)}</b>${compact ? '' : `<ul class="plain">${bl.items.map(x => `<li>${esc(x)}</li>`).join('')}</ul>`}</div>` : (compact ? '' : `<div class="small ok" style="margin-top:6px">${esc(bl.text)}</div>`)}
+      ${state}${groups}
+      ${compact ? '' : `<div class="small mute" style="margin-top:8px"><b>איך מחושב:</b> ${esc(s.how)} ${esc(s.levels)}. גרסת החישוב ${esc(s.version)}, קריטריונים ${esc(s.rubric_version || f.rubric_version)}.</div>
+        <div class="small mute">${(s.limits || []).map(esc).join(' · ')}.</div>${btn('דרג שוב את הקובץ הקיים לפי הקריטריונים שבתוקף (בלי רינדור)')}`}</div>`;
+  }
+  /** Where to go from here: what Dana can do, what needs the owner, what is blocked. */
+  function nextSteps(v, f, compact) {
+    const ns = f.next_steps; if (!ns) return '';
+    if (compact) return `<div class="small" id="nscount" style="margin-top:8px"><b>מה הלאה:</b> <span class="ok">דנה יכולה לבצע ${ns.dana.length}</span> · <span class="warn">דורש אותך ${ns.owner.length}</span> · <span class="bad">חסום ${ns.blockers.length}</span></div>`;
+    const tbtn = x => isNum(x.time_s) && v.hasVideo ? `<button class="sm" data-play="${Math.max(0, x.time_s - 0.5).toFixed(2)},${(x.time_s + 4).toFixed(2)}">▶ ${tfmt(x.time_s)}</button>` : '';
+    const li = (x, extra) => `<li><div class="row"><span class="grow">${esc(x.title)}</span>${extra || ''}${tbtn(x)}</div>${x.action ? `<div class="small"><b>מה לעשות:</b> ${esc(x.action)}</div>` : ''}</li>`;
+    return `<div class="card" id="nextsteps" style="margin-top:10px"><h3>מה הלאה</h3>
+      <div class="ns"><b class="ok">1. דנה והעובד יכולים לבצע (${ns.dana.length})</b><ul class="plain small">${ns.dana.map(x => li(x, `<span class="pill ${x.replan ? 'warn' : 'ok'}">${esc(x.how)}</span>`)).join('') || '<li class="mute">אין כרגע.</li>'}</ul></div>
+      <div class="ns"><b class="warn">2. דורש החלטה או אימות שלך (${ns.owner.length})</b><ul class="plain small">${ns.owner.map(x => li(x)).join('') || '<li class="mute">אין כרגע.</li>'}</ul>
+        ${ns.open_items ? `<div class="small mute">בנוסף, ${ns.open_items} פריטים פתוחים להאזנה או לצפייה מופיעים בהמשך המסך הזה.</div>` : ''}</div>
+      <div class="ns"><b class="bad">3. חסום: חומר, יכולת, מידע עסקי או רישיון (${ns.blockers.length})</b><ul class="plain small">${ns.blockers.map(x => li(x, `<span class="pill bad">${esc(x.kind)}</span>`)).join('') || '<li class="mute">אין חסם.</li>'}</ul></div></div>`;
+  }
+  /**
+   * "הדירוג הסופי של דנה", in plain words. `compact` is the card beside the video (every step); the full one opens the
+   * review step. Nothing is scored here that was not checked, and it says which file and which skills it is about.
+   */
   function reviewHead(p, v, pkg, compact) {
     const f = pkg.finalReview; if (!f) return '';
-    const r = p.review, stale = r && !r.upToDate, pl = f.plain || {}, { top, total } = topOf(pkg), c = f.coverage || {};
+    const r = p.review, stale = r && !r.upToDate, pl = f.plain || {}, { top, total } = topOf(pkg), c = f.coverage || {}, ns = f.next_steps;
     const cls = stale ? 'bad' : ({ needs_fix: 'bad', needs_owner: 'warn', ready_for_viewing: 'ok' }[f.verdict] || 'mute');
-    const status = stale ? 'הביקורת אינה עדכנית' : (pl.status || f.verdict_text);
+    const status = stale ? 'הדירוג אינו עדכני' : (pl.status || f.verdict_text);
     const cats = f.categories || [], okc = cats.filter(x => x.decided && x.met === x.decided), weak = cats.filter(x => x.decided && x.met < x.decided);
     const works = pl.works || ('מה עובד: ' + (okc.map(x => x.label).join(', ') || '—') + '.'), weakT = pl.weak || (weak.length ? 'מה עדיין חלש: ' + weak.map(x => `${x.label} (${x.met} מתוך ${x.decided})`).join('; ') + '.' : 'בקריטריונים שנבדקו לא נמצא דבר חלש.');
-    const canApply = top.filter(x => x.who === 'dana').length || ((pkg.danaReview || {}).improvements || []).filter(i => i.can_apply).length + (pkg.danaCanApply || []).length;
+    const canApply = ns ? ns.dana.length : top.filter(x => x.who === 'dana').length || ((pkg.danaReview || {}).improvements || []).filter(i => i.can_apply).length + (pkg.danaCanApply || []).length;
     const imp = (x, n) => `<li class="imp"><div class="row"><b class="grow">${n}. ${esc(x.title)}</b>${isNum(x.time_s) && v.hasVideo ? `<button class="sm" data-play="${Math.max(0, x.time_s - 0.5).toFixed(2)},${(x.time_s + 4).toFixed(2)}">▶ ${tfmt(x.time_s)}</button>` : ''}</div>
       <div class="row">${x.category ? `<span class="pill mute">${esc(x.category)}</span>` : ''}${x.basis_label ? `<span class="pill mute">${esc(x.basis_label)}</span>` : ''}<span class="pill ${x.who === 'dana' ? 'ok' : 'warn'}">${esc(x.who_label || '')}</span></div>
-      ${compact ? '' : `${x.why ? `<div class="small mute">למה: ${esc(x.why)}</div>` : ''}<div class="small"><b>מה לעשות:</b> ${esc(x.action || '—')}</div>`}</li>`;
+      ${x.why ? `<div class="small mute">למה: ${esc(compact && x.why.length > 130 ? x.why.slice(0, 130) + '…' : x.why)}</div>` : ''}<div class="small"><b>מה לעשות:</b> ${esc(x.action || '—')}</div></li>`;
+    const skillsLine = `<div class="small mute" id="reviewbasis" style="margin-top:6px">גרסה ${v.n} של הסרטון${f.file_sha256 ? ` · קובץ <code>${esc(f.file_sha256.slice(0, 12))}…</code>` : ''} · לפי הסקילים: ${(f.skills || []).map(x => `<b>${esc(x.name)}</b> ${esc(x.version)}`).join(' · ')}${f.rating ? ` · דורג ${fmt(f.rating.rated_at)}` : f.reviewed_at ? ` · נבדק ${fmt(f.reviewed_at)}` : ''}</div>`;
     const head = `<div class="row"><span class="pill ${cls}" style="font-size:16px;padding:5px 14px;font-weight:700">${esc(status)}</span>
-        <span class="small mute">גרסה ${v.n} · ${esc((pkg.target || {}).label || 'ריל')}${f.reviewed_at ? ' · נבדק ' + fmt(f.reviewed_at) : ''}</span></div>
+        <span class="small mute">גרסה ${v.n} · ${esc((pkg.target || {}).label || 'ריל')}</span></div>
       ${stale ? `<ul class="plain small">${r.stale.map(x => `<li class="bad">${esc(x)}</li>`).join('')}</ul><div class="small">הדירוג למטה שייך לקובץ שנבדק אז, לא למה שמוצג עכשיו.</div>` : ''}
       ${pl.note ? `<div class="pill warn" style="white-space:normal">${esc(pl.note)}</div>` : ''}
-      <div class="small" style="margin-top:6px"><span class="ok">●</span> ${esc(works)}</div><div class="small"><span class="${weak.length ? 'bad' : 'ok'}">●</span> ${esc(weakT)}</div>`;
-    const list = top.length ? `<div style="margin-top:8px"><b>${top.length === 1 ? 'השיפור החשוב ביותר' : `${top.length} השיפורים החשובים ביותר`}</b>${total > top.length ? ` <span class="small mute">(מתוך ${total})</span>` : ''}</div><ul class="plain">${top.map((x, i) => imp(x, i + 1)).join('')}</ul>`
+      ${scoreBlock(p, v, f, compact)}
+      <div class="small" style="margin-top:8px"><span class="ok">●</span> ${esc(works)}</div><div class="small"><span class="${weak.length ? 'bad' : 'ok'}">●</span> ${esc(weakT)}</div>`;
+    const list = top.length ? `<div style="margin-top:8px"><b>${top.length === 1 ? 'השיפור החשוב ביותר' : `${top.length} השיפורים החשובים ביותר, לפי סדר עדיפות`}</b>${total > top.length ? ` <span class="small mute">(מתוך ${total})</span>` : ''}</div><ul class="plain">${top.map((x, i) => imp(x, i + 1)).join('')}</ul>`
       : '<div class="small ok" style="margin-top:8px">בקריטריונים שנבדקו לא נמצא שיפור נדרש.</div>';
-    if (compact) return `<div class="card" id="sidereview" style="border:2px solid var(--${cls})"><div class="small mute">הביקורת הסופית של דנה</div>${head}${list}
-      <button class="sm" data-go="review" style="margin-top:8px;width:100%">לביקורת המלאה, לדירוג וליישום השיפורים</button>
-      <div class="small mute">הדירוג אינו אישור פרסום. המודל ראה תמלול ופריימים בודדים; איש לא צפה ולא האזין.</div></div>`;
+    if (compact) return `<div class="card" id="sidereview" style="border:2px solid var(--${cls})"><h2 style="margin:0 0 6px">הדירוג הסופי של דנה</h2>${head}${list}${nextSteps(v, f, true)}${skillsLine}
+      <button class="sm" data-go="review" style="margin-top:8px;width:100%">לדירוג המלא, לצעדים הבאים וליישום השיפורים</button>
+      <div class="small mute">הציון אינו אישור פרסום ואינו מבטל כשל מחייב. המודל ראה תמלול ופריימים בודדים; איש לא צפה ולא האזין.</div></div>`;
     const dir = f.direction && f.direction.text ? `<div class="small" style="margin-top:6px"><b>כיוון העריכה</b> <span class="pill ${f.direction.source === 'owner_brief' ? 'ok' : 'warn'}">${esc(f.direction.label)}</span><div>${esc(f.direction.text)}</div></div>` : '';
-    return `${head}${dir}
-      <div class="small mute" style="margin-top:6px">לפי הסקילים: ${(f.skills || []).map(x => `<b>${esc(x.name)}</b> ${esc(x.version)} (${esc(x.role)})`).join(' · ')}${f.file_sha256 ? ` · קובץ <code>${esc(f.file_sha256.slice(0, 12))}…</code>` : ''}</div>
+    const sf = f.same_file, hist = (p.reviews || []);
+    const history = hist.length ? `<details class="small" id="reviewhistory" data-keep="rvhist" style="margin-top:8px"><summary><b>היסטוריית הביקורות של הגרסה הזו (${hist.length})</b></summary>
+        <ul class="plain" id="reviewlist">${hist.slice().reverse().map(e => `<li>${fmt(e.at)} · ${esc(RMODE[e.mode] || e.mode)} · קריטריונים ${esc(e.rubricVersion || '—')} · ${e.overall === null ? 'בלי ציון מסכם' : `ציון ${e.overall}`}${e.fileSha256 ? ` · קובץ <code>${esc(e.fileSha256.slice(0, 12))}…</code>` : ''}${e.by && e.mode !== 'delivered' ? ` · ביקש/ה: ${esc(e.by)}` : ''}
+          ${e.shown ? '<span class="pill info">מוצגת</span>' : ''}${e.aboutStoredFile ? '' : '<span class="pill bad">על קובץ אחר: לא עדכנית</span>'}</li>`).join('')}</ul>
+        ${sf ? `<div><b>שינוי בדירוג לאותו קובץ:</b> ${esc(sf.text)}</div>${(sf.criteria || []).length ? `<ul class="plain">${sf.criteria.map(x => `<li><span class="pill mute">${esc(x.category)}</span> ${esc(x.criterion)}: ${esc(x.before)} → <b>${esc(x.after)}</b>${x.why ? `<div class="mute">${esc(x.why)}</div>` : ''}</li>`).join('')}</ul>` : ''}` : ''}
+        ${f.rating ? `<div class="mute">${esc(f.rating.note)}</div>` : ''}</details>` : '';
+    return `${head}${dir}${skillsLine}
       <h3 style="margin-top:10px">דירוג לפי קטגוריות</h3>
       <div class="grid">${cats.map(x => `<div class="cat"><b>${esc(x.label)}</b><span class="${LV[x.level]}">${esc(x.level)}</span><div class="small mute">${x.decided ? `${x.met} מתוך ${x.decided}` : 'לא נבדק'}${x.not_checked ? ` · ${x.not_checked} לא נבדקו` : ''}</div></div>`).join('')}</div>
       <div class="small mute">הדירוג סופר רק קריטריונים שנבדקו. ${c.measured ? `נמדד בקובץ: ${c.measured.met}/${c.measured.decided} · הערכת מודל על תמלול ופריימים בודדים: ${c.model.met}/${c.model.decided}${c.frames && c.frames.decided ? ` · פריימים: ${c.frames.met}/${c.frames.decided}` : ''} · לא נבדקו: ${c.not_checked}, מהם ${(c.human_only || []).length} שרק צפייה או האזנה שלך יכולה להכריע (בלי ציון).` : ''}</div>
@@ -1207,11 +1254,13 @@
       <div class="small" style="margin-top:8px"><b>מה לא נבדק (${(f.not_checked || []).length}):</b> ${(f.not_checked || []).slice(0, 6).map(x => esc(x.criterion)).join(' · ') || '—'}${(f.not_checked || []).length > 6 ? ' ועוד' : ''}.
         לדברים האלה אין ציון: המודל ראה תמלול ופריימים בודדים, ואיש לא צפה בתנועה ולא האזין.</div>
       <div class="small mute">זו אינה אישור: רק את/ה מאשר/ת גרסה, ואישור אינו פרסום ואינו הבטחה לביצועים.</div>
+      ${history}${nextSteps(v, f, false)}
       <div class="card" id="applybox" style="margin-top:10px;background:var(--accent-soft)">
         <b>יישם את השיפורים של דנה והפק גרסה חדשה</b>
-        <div class="small">${canApply ? `דנה תיישם בעצמה ${canApply} שיפורים שבתוך ההוראות והסגנון המאושרים. שיפור של תוכן (פתיחה, מבנה, קצב) מיושם בתכנון מחדש של החיתוך, מאותו חומר.` : 'בביקורת הזו אין שיפור שדנה יכולה ליישם בעצמה. אפשר לכתוב לה משוב, והיא תפיק גרסה חדשה לפיו.'} מה שדורש החלטה או האזנה שלך נשאר אצלך. הגרסה הנוכחית נשמרת.</div>
+        <div class="small">${ns ? esc(ns.apply.text) : canApply ? `דנה תיישם בעצמה ${canApply} שיפורים שבתוך ההוראות והסגנון המאושרים. שיפור של תוכן (פתיחה, מבנה, קצב) מיושם בתכנון מחדש של החיתוך, מאותו חומר.` : 'בביקורת הזו אין שיפור שדנה יכולה ליישם בעצמה. אפשר לכתוב לה משוב, והיא תפיק גרסה חדשה לפיו.'} ${ns && !ns.dana.length ? 'אפשר לכתוב לה משוב, והיא תפיק גרסה חדשה לפיו. ' : ''}הגרסה הנוכחית נשמרת. שום דבר לא מופק עד שלוחצים.</div>
+        ${ns && ns.dana.length ? `<ul class="plain small" id="applylist">${ns.dana.map(x => `<li>${esc(x.title)} <span class="mute">— ${esc(x.how)}</span></li>`).join('')}</ul>` : ''}
         <textarea id="arnote" data-keep="arnote" style="min-height:44px;margin-top:6px" placeholder="משוב שלך לגרסה הבאה (לא חובה). למשל: לפתוח במשפט על הקהילה, לקצר את ההקדמה">${esc((draftNotes[p.id] || {}).ar || '')}</textarea>
-        <button class="primary" data-do="applyreview" style="margin-top:6px;width:100%" ${busy() || stale ? 'disabled' : ''}>יישם את השיפורים של דנה והפק גרסה חדשה</button>
+        <button class="primary" data-do="applyreview" style="margin-top:6px;width:100%" ${busy() || rating() || stale ? 'disabled' : ''}>יישם את השיפורים של דנה והפק גרסה חדשה</button>
         <details class="small" style="margin-top:8px"><summary>צרף את הביקורת והמשוב שלי לטיוטת שדרוג של סקיל עריכה</summary>
           <div class="mute">נוצרת טיוטה בלבד: מוצג מה השתנה ולמה, ורק את/ה מאשר/ת סקיל. פרויקטים קיימים לא משתנים.</div>
           <select id="arskill" style="margin-top:6px">${(skillsNow || []).filter(k => k.approved).map(k => `<option value="${esc(k.id)}">${esc(k.name)}</option>`).join('') || '<option value="">אין סקיל מאושר בספרייה</option>'}</select>
@@ -1222,7 +1271,7 @@
     const f = pkg.finalReview, r = p.review; if (!f) return '';
     const V = { ready_for_viewing: ['ok', 'מוכן לצפייה שלך'], needs_owner: ['warn', f.verdict_text], needs_fix: ['bad', f.verdict_text] }[f.verdict] || ['mute', f.verdict_text];
     const stale = r && !r.upToDate, c = f.coverage, sc = f.skill_compliance, B = { measured: 'נמדד', model: 'הערכת מודל', frames: 'פריימים בודדים', human: 'דורש אותך' };
-    return `<div class="card" id="finalreview" style="border:2px solid var(--${stale ? 'bad' : V[0]})"><h2>הביקורת הסופית של דנה — גרסה ${v.n} · ${esc((pkg.target || {}).label || 'ריל')}</h2>
+    return `<div class="card" id="finalreview" style="border:2px solid var(--${stale ? 'bad' : V[0]})"><h2>הדירוג הסופי של דנה — גרסה ${v.n} · ${esc((pkg.target || {}).label || 'ריל')}</h2>
       ${reviewHead(p, v, pkg, false)}
       <details open class="small" style="margin-top:10px"><summary><b>פירוט מלא: כל הבדיקות, הקריטריונים והראיות</b></summary>
       ${stale ? `<div class="pill bad">הביקורת אינה עדכנית</div><ul class="plain small">${r.stale.map(x => `<li class="bad">${esc(x)}</li>`).join('')}</ul>` : `<div class="row"><span class="pill ${V[0]}" style="font-size:15px;padding:4px 12px">${esc(V[1])}</span></div>`}
@@ -1458,7 +1507,11 @@
 
   // ── Events ──
   $('#panel').addEventListener('input', e => {
-    const t = e.target, d = t.dataset; if (!draft) return;
+    const t = e.target, d = t.dataset;
+    // the feedback for the next version is kept per project until it is sent: an action on the page (asking for a rating,
+    // settling a doubt) redraws the panel and must not wipe what was typed
+    if (t.id === 'arnote' && current) { (draftNotes[current.id] = draftNotes[current.id] || {}).ar = t.value; return; }
+    if (!draft) return;
     if (d.card) { draft.captions[Number(d.card)] = t.value; return; }
     if (d.style) { if (t.type === 'checkbox') draft.style[d.style] = t.checked; else draft.style[d.style] = Number(t.value);
       if (d.style === 'caption_size') $('#st_size_v').textContent = t.value; if (d.style === 'caption_y_px') $('#st_y_v').textContent = t.value; }
@@ -1579,6 +1632,8 @@
       document.querySelectorAll('#brief [data-dirty]').forEach(i => delete i.dataset.dirty);
       if (d.do === 'savebrief') { await open(current.id, true); return notice('הכיוון נשמר. הוא ייכנס לגרסה הבאה; הגרסה הקיימת לא השתנתה.', 'ok'); }
       return act('/replan', { by }, 'דנה מתכננת ומפיקה מחדש לפי הכיוון שהגדרת. הגרסה הקודמת נשמרת.'); }
+    if (d.do === 'rate') { const by = who(); if (!by) return;
+      return act('/rating', { by, version: current.version.n }, 'התבקש דירוג של הקובץ הקיים. הסרטון לא משתנה ולא נוצרת גרסה חדשה.'); }
     if (d.do === 'applyreview') { const by = who(); if (!by) return;
       const note = ($('#arnote') ? $('#arnote').value : '').trim();
       if (!confirm('דנה תיישם בעצמה את השיפורים שבתוך הכללים המאושרים' + (note ? ' ואת המשוב שכתבת' : '') + ' ותפיק גרסה חדשה. הגרסה הנוכחית נשמרת להשוואה. להמשיך?')) return;

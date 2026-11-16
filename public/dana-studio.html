@@ -60,6 +60,8 @@
   .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:8px; }
   .cat { border:1px solid var(--line); border-radius:12px; padding:10px; text-align:start; min-height:0; display:block; width:100%; }
   .cat b { display:block; } .cat.sel { border-color:var(--accent); background:var(--accent-soft); }
+  .score { display:flex; align-items:baseline; gap:6px; } .score b { font-size:46px; line-height:1; font-weight:800; } .score span { color:var(--mute); font-size:14px; } .score.none b { font-size:18px; color:var(--mute); }
+  .sg { margin-top:8px; } .sg .bar { margin-top:3px; } .ns { margin-top:8px; }
   .lv-ok { color:var(--ok); } .lv-mid { color:var(--warn); } .lv-bad { color:var(--bad); } .lv-none { color:var(--mute); }
   table.cmp { width:100%; border-collapse:collapse; font-size:13px; } table.cmp th, table.cmp td { border-top:1px solid var(--line); padding:6px 4px; text-align:start; vertical-align:top; }
   .capline { display:grid; grid-template-columns:auto 1fr; gap:6px 8px; align-items:center; }

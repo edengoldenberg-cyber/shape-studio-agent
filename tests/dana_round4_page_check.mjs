@@ -75,7 +75,7 @@ try {
     await openStep(reel.id, 'review');
     await waitFor(() => has('#finalreview'));
     const fr = await text('#finalreview');
-    check(`${name}: "הביקורת הסופית של דנה" is on the review step, for this version and target`, /הביקורת הסופית של דנה — גרסה \d+ · ריל/.test(fr), fr.slice(0, 80));
+    check(`${name}: "הביקורת הסופית של דנה" is on the review step, for this version and target`, /הדירוג הסופי של דנה — גרסה \d+ · ריל/.test(fr), fr.slice(0, 80));
     check(`${name}: final review — skills and versions, coverage, compliance`, /dana-review/.test(fr) && /היקף הכיסוי/.test(fr) && /עמידה בכללי הסקילים/.test(fr));
     check(`${name}: final review — what worked / needs improvement / not checked / limits`, /מה הצליח/.test(fr) && /מה דורש שיפור/.test(fr) && /מה לא נבדק/.test(fr) && /מגבלות הביקורת/.test(fr));
     check(`${name}: final review — says it is not an approval and not by score alone`, /זו אינה אישור/.test(fr) && /לא לפי הדירוג לבדו/.test(fr));
