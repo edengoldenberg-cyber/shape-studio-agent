@@ -270,7 +270,10 @@ function enqueueEdit(project, options, actor) {
   if (open) throw new StudioError(409, 'job_in_progress', 'כבר יש עריכה פעילה לפרויקט הזה');
   const n = (project.versions.at(-1)?.n ?? 0) + 1;
   const adapter = options.adapter ?? projectAdapter(project);
-  const rules = activeRules(), profile = require('./dana_references').defaultProfile();
+  const rules = activeRules();
+  const sk = options.skill_payload ?? require('./dana_skills').forProject(project);
+  // an approved library skill outranks the older "default profile"; without one the older default still applies
+  const profile = sk?.profile ?? require('./dana_references').defaultProfile();
   const adjustments = { ...(project.adjustments ?? {}), ...(options.adjustments ?? {}) };
   const job = {
     id: newId('job'), projectId: project.id, version: n, type: 'edit', status: 'queued',
@@ -287,13 +290,16 @@ function enqueueEdit(project, options, actor) {
                ...(Object.keys(adjustments).length ? { adjustments } : {}),
                // an improved version of the owner's own finished edit: the content is kept, only technical improvements are applied
                ...(project.polish ? { polish: project.polish } : {}), ...(options.apply_review ? { apply_review: true } : {}),
-               ...(rules.length ? { rules } : {}), ...(profile ? { profile } : {}) },
+               ...(rules.length ? { rules } : {}), ...(profile ? { profile } : {}),
+               ...(sk?.skill ? { skill: sk.skill } : {}), ...(sk?.candidates ? { skill_candidates: sk.candidates } : {}) },
+    skillTest: options.skill_test && sk?.skill ? { id: sk.skill.id, version: sk.skill.version } : null,
     stageLog: [], createdAt: now(), updatedAt: now(),
   };
   s.jobs[job.id] = job;
   project.versions.push({ n, jobId: job.id, createdAt: now(), status: 'editing', package: null, artifacts: {},
     caption: null, destination: null, scheduledAt: null, exceptions: [], approval: null, notifiedAt: null,
-    changeRequest: options.change_request ?? null, kind: 'edit', appliedReview: !!options.apply_review || (!!project.polish && n > 1) });
+    changeRequest: options.change_request ?? null, kind: 'edit', appliedReview: !!options.apply_review || (!!project.polish && n > 1),
+    skill: sk?.skill ? { id: sk.skill.id, name: sk.skill.name, version: sk.skill.version, test: !!options.skill_test } : null, skillSuggest: !!sk?.candidates });
   project.currentVersion = n;
   project.status = 'editing';
   hist(project, actor, 'edit_queued', { jobId: job.id, version: n, adapter: job.options.adapter ?? 'worker_default' });
@@ -320,13 +326,15 @@ function workerStatus() {
   const online = !!w && Date.now() - Date.parse(w.lastSeen) < WORKER_ALIVE_MS;
   const jobs = Object.values(state().jobs);
   return { online, state: online ? w.state : 'offline', lastSeen: w?.lastSeen ?? null, workerId: w?.workerId ?? null,
-           pipelineVersion: w?.pipelineVersion ?? null,
+           pipelineVersion: w?.pipelineVersion ?? null, capabilities: w?.capabilities ?? null,
            queued: jobs.filter(j => j.status === 'queued').length, running: jobs.filter(j => j.status === 'leased').length };
 }
 function touchWorker(info) {
   const s = state();
   s.worker = { workerId: String(info.workerId || 'worker').slice(0, 60), state: info.state === 'busy' ? 'busy' : 'idle',
-               pipelineVersion: String(info.pipelineVersion || s.worker?.pipelineVersion || '').slice(0, 20), lastSeen: now() };
+               pipelineVersion: String(info.pipelineVersion || s.worker?.pipelineVersion || '').slice(0, 20), lastSeen: now(),
+               // what the worker found on its own machine at start (tools present, model enabled) — shown as is, never assumed
+               capabilities: info.capabilities && typeof info.capabilities === 'object' && JSON.stringify(info.capabilities).length < 4000 ? info.capabilities : (s.worker?.capabilities ?? null) };
 }
 
 /** Return expired leases to the queue (or fail them when the attempts are used up). */
@@ -467,6 +475,14 @@ function complete(jobId, token, body) {
   if (pkg.caption?.text && pkg.transcript?.status !== 'owner_corrected')
     pkg.caption.text = String(pkg.caption.text).replace(/ציטוט מדויק מהסרטון/g, 'תמלול אוטומטי מהסרטון — לא אומת');
   v.caption = { text: String(pkg.caption?.text ?? ''), cta: pkg.caption?.cta ?? brand.cta_default.value ?? null, isDraft: true };
+  if (pkg.skill_report?.skill) v.skill = { id: pkg.skill_report.skill.id, name: pkg.skill_report.skill.name, version: pkg.skill_report.skill.version, test: !!j.skillTest,
+    chosenBy: pkg.skill_report.skill.chosen_by ?? null };
+  if (j.skillTest) {
+    const rep = pkg.skill_report?.rules ?? [];
+    try { require('./dana_skills').recordSample(j.skillTest.id, j.skillTest.version, { projectId: p.id, projectTitle: fixName(p.title), versionN: v.n,
+      applied: rep.filter(r => r.status === 'applied').length, not_followed: rep.filter(r => r.status === 'not_followed').length,
+      not_applicable: rep.filter(r => r.status === 'not_applicable').length, not_checked: rep.filter(r => r.status === 'not_checked').length }); } catch { /* the package is still valid */ }
+  }
   v.destination = { platform: 'instagram', format: 'reel', account: p.account ?? brand.instagram_account.value ?? null };
   v.scheduledAt = require('./dana_publisher').proposeTime();
   v.scheduleProposed = true;                       // a neutral default, not a timing recommendation
@@ -823,6 +839,8 @@ function setSettings(projectId, body = {}, actor = 'owner') {
     }
   }
   if (body.adjustments !== undefined) p.adjustments = { ...(p.adjustments ?? {}), ...sanitizeAdjustments(body.adjustments) };   // applies from the next version
+  // which library skill the NEXT version uses. Existing versions are never changed by this.
+  if (body.skill !== undefined) p.skill = require('./dana_skills').selection(body.skill);
   hist(p, actor, 'settings_changed', { account: p.account ?? null, adjustments: p.adjustments ?? {} });
   save();
   return view(p);
@@ -851,6 +869,73 @@ function applyReview(projectId, body = {}, actor = 'owner') {
   } else enqueueEdit(p, { apply_review: true, previous: previousOf(v) }, actor);
   save();
   return view(p);
+}
+
+// ── Library skills on a project ────────────────────────────────────────────────
+function idleProject(projectId) {
+  const p = getProject(projectId), v = currentVersion(p);
+  if (!v || v.status === 'editing') throw new StudioError(409, 'not_reviewable', 'העריכה עדיין רצה');
+  if (Object.values(state().jobs).some(j => j.projectId === p.id && ['queued', 'leased'].includes(j.status))) throw new StudioError(409, 'job_in_progress', 'כבר יש עריכה פעילה לפרויקט הזה');
+  if (p.kind === 'review_only') throw new StudioError(409, 'review_only', 'סרטון שהועלה לביקורת בלבד נשמר כמו שהוא — סקיל עריכה חל על חומר גלם');
+  return { p, v };
+}
+/**
+ * Apply a library skill to a project that already has a version: a NEW version is planned, edited and reviewed by that
+ * skill. The existing version stays as it is, and its approval is dropped because the output is about to change.
+ */
+function applySkill(projectId, body = {}, actor = 'owner') {
+  const by = String(body.by || '').trim().slice(0, 80);
+  if (!by) throw new StudioError(400, 'by_required', 'נדרש שם מי שמבקש/ת');
+  const { p, v } = idleProject(projectId);
+  if (body.skill !== undefined) p.skill = require('./dana_skills').selection(body.skill);
+  const sk = require('./dana_skills').forProject(p);
+  if (!sk) throw new StudioError(409, 'no_skill', 'לא נבחר סקיל מאושר לפרויקט ואין ברירת מחדל מאושרת');
+  dropApproval(p, v, actor, 'skill_applied');
+  hist(p, actor, 'skill_applied', { version: v.n, by, skill: sk.skill ? { id: sk.skill.id, version: sk.skill.version } : 'dana_suggests' });
+  enqueueEdit(p, {}, actor);
+  save();
+  return view(p);
+}
+/** Try a DRAFT skill on one clip. The result is a new version of that project, marked as a skill test; nothing becomes a default. */
+function testSkill(skillId, body = {}, actor = 'owner') {
+  const by = String(body.by || '').trim().slice(0, 80);
+  if (!by) throw new StudioError(400, 'by_required', 'נדרש שם מי שמבקש/ת');
+  const payload = require('./dana_skills').testPayload(skillId);
+  const { p, v } = idleProject(String(body.projectId ?? ''));
+  dropApproval(p, v, actor, 'skill_test');
+  hist(p, actor, 'skill_test_requested', { version: v.n, by, skill: { id: payload.skill.id, version: payload.skill.version } });
+  enqueueEdit(p, { skill_payload: payload, skill_test: true }, actor);
+  save();
+  return view(p);
+}
+
+/**
+ * What exactly was reviewed, and is that review still about what is on screen? Built from what the worker recorded
+ * (`review_provenance`) and from what happened on the server since.
+ */
+function reviewInfo(p, v, cur) {
+  const pk = v?.package;
+  if (!pk?.dana_review) return null;
+  const prov = pk.review_provenance ?? null, rows = (pk.dana_review.categories ?? []).flatMap(c => c.criteria ?? []);
+  const count = (basis, statuses) => rows.filter(r => r.basis === basis && statuses.includes(r.status)).length;
+  const fileSha = v.videoIsSource ? p.source.sha256 : v.artifacts?.['final.mp4']?.sha256 ?? null;
+  const stale = [];
+  if (cur && v.n !== cur.n) stale.push(`זו הביקורת של גרסה ${v.n}. הגרסה הנוכחית היא ${cur.n}${cur.package ? '' : ' (עדיין בעבודה)'} — הדירוג כאן אינו שלה.`);
+  if (cur && v.n === cur.n && pendingEdits(p, v).length) stale.push(`${pendingEdits(p, v).length} תיקוני מלל נשמרו אחרי הביקורת ועדיין לא בסרטון.`);
+  if (v.caption && pk.caption && v.caption.isDraft === false && v.caption.text !== pk.caption.text) stale.push('קפשן הפוסט נערך אחרי הביקורת.');
+  if (prov?.final_sha256 && fileSha && prov.final_sha256 !== fileSha) stale.push('קובץ הווידאו השמור שונה מהקובץ שנבדק.');
+  return {
+    versionN: v.n, reviewedAt: prov?.reviewed_at ?? null, packageReadyAt: (p.history.find(h => h.action === 'package_ready' && h.detail?.version === v.n) ?? p.history.find(h => h.action === 'review_ready' && h.detail?.version === v.n))?.at ?? null,
+    onFinalFile: prov ? prov.on_delivered_file === true && (!fileSha || !prov.final_sha256 || prov.final_sha256 === fileSha) : null,
+    finalSha256: fileSha, rounds: prov?.review_rounds ?? null, basis: prov?.basis ?? pk.dana_review.perception ?? null,
+    counts: { measured: count('measured', ['met', 'not_met']), frames: count('frames', ['met', 'not_met']), model: count('model', ['met', 'not_met']),
+              not_checked: rows.filter(r => r.status === 'not_checked').length },
+    notChecked: rows.filter(r => r.status === 'not_checked').map(r => ({ criterion: r.criterion, why: r.basis === 'human' ? 'דורש צפייה או האזנה שלך' : r.note })),
+    rubricVersion: pk.dana_review.rubric_version, editingSkill: pk.rules_used?.skill ? { name: pk.rules_used.skill.name, version: pk.rules_used.skill.version } : null,
+    librarySkill: pk.skill_report?.skill ?? null, profile: pk.rules_used?.profile ? { id: pk.rules_used.profile.id, version: pk.rules_used.profile.version, status: pk.rules_used.profile.status } : null,
+    references: pk.rules_used?.references ?? [], stale, upToDate: stale.length === 0,
+    note: 'הדירוג הוא מידע לבעלים. הוא אינו אישור פרסום ואינו מבטיח ביצועים באינסטגרם; הערכת מודל יכולה להשתנות בין הרצות.',
+  };
 }
 
 // ── Progress: measured stage times; the percentage is a labelled estimate ────
@@ -1009,15 +1094,20 @@ function retry(projectId, actor = 'owner') {
 }
 
 // ── Views ─────────────────────────────────────────────────────────────────────
-function view(p) {
-  const s = state(), v = currentVersion(p), job = v ? s.jobs[v.jobId] : null;
+function view(p, viewN) {
+  const s = state(), cur = currentVersion(p), job = cur ? s.jobs[cur.jobId] : null;
+  // The version on screen: the one asked for; else the current one; and while the current one is still being made,
+  // the last finished version stays visible (its review and transcript must not vanish because a new version was queued).
+  const v = (viewN != null && p.versions.find(x => x.n === Number(viewN))) || (cur?.package ? cur : [...p.versions].reverse().find(x => x.package) ?? cur);
   const publisher = require('./dana_publisher');
   return {
     id: p.id, title: fixName(p.title), status: p.status, createdAt: p.createdAt, currentVersion: p.currentVersion,
     source: { sha256: p.source.sha256, bytes: p.source.bytes, originalName: fixName(p.source.originalName), ext: p.source.ext },
     kind: p.kind ?? 'edit', account: p.account ?? null, adjustments: p.adjustments ?? {}, adjustmentKinds: ADJUSTMENT_KINDS,
-    progress: progressOf(p, v, job), nextAction: nextAction(p, v, job),
-    pendingCorrections: pendingEdits(p, v).length, cardStates: cardStates(p, v),
+    progress: progressOf(p, cur, job), nextAction: nextAction(p, cur, job),
+    pendingCorrections: pendingEdits(p, cur).length, cardStates: cardStates(p, v),
+    shown: v ? { n: v.n, isCurrent: v.n === p.currentVersion, currentN: p.currentVersion, currentStatus: cur?.status ?? null, currentHasPackage: !!cur?.package } : null,
+    review: reviewInfo(p, v, cur), skill: p.skill ?? { mode: 'default' },
     consent: p.consent, rights: p.rights, pendingChange: p.pendingChange ?? null,
     adapter: projectAdapter(p),                                    // null = the worker's configuration decides
     captionEdits: p.captionEdits ?? [], zoomEdits: p.zoomEdits ?? [], styleOverrides: p.styleOverrides ?? {},
@@ -1039,7 +1129,7 @@ function view(p) {
         requestInterpretation: v.package.request_interpretation ?? null, derivedTextUpdates: v.package.derived_text_updates ?? [],
         measured: v.package.measured ?? null, burnedInText: v.package.burned_in_text ?? v.package.plan?.burned_in_text ?? null,
         danaCanApply: v.package.dana_can_apply ?? null, graphicsSeen: v.package.graphics_seen ?? null, note: v.package.note ?? null,
-        tools: v.package.tools ?? null,
+        tools: v.package.tools ?? null, skillReport: v.package.skill_report ?? null, reviewProvenance: v.package.review_provenance ?? null,
         considered: v.package.considered ?? [], revisionNote: v.package.revision_note ?? '', spelling: v.package.spelling ?? [],
         usage: v.package.judgement_usage ?? null, bundle: v.package.instruction_bundle ?? null, editorial: v.package.editorial ?? null,
         timings: v.package.timings_s, totalSeconds: v.package.total_s, pipelineVersion: v.package.pipeline_version,
@@ -1051,7 +1141,7 @@ function view(p) {
     } : null,
     versions: p.versions.map(x => ({ n: x.n, status: x.status, createdAt: x.createdAt, approved: !!x.approval, changeRequest: x.changeRequest ?? null,
       hasVideo: !!x.artifacts?.['final.mp4'] || !!x.videoIsSource, hasCover: !!x.artifacts?.['cover.jpg'], duration: x.package?.duration ?? null,
-      kind: x.kind ?? 'edit', appliedReview: !!x.appliedReview, hasCompare: !!x.artifacts?.['compare_frames.jpg'],
+      kind: x.kind ?? 'edit', appliedReview: !!x.appliedReview, hasCompare: !!x.artifacts?.['compare_frames.jpg'], hasPackage: !!x.package, skill: x.skill ?? null,
       reviewLevels: (x.package?.dana_review?.categories ?? []).map(c => ({ key: c.key, label: c.label, level: c.level, met: c.met, decided: c.decided })),
       judgementMode: judgementMode(x.package), profile: x.package?.rules_used?.profile ?? null, revisionMode: x.package?.revision_mode ?? null })),
     publication: { ...publisher.gate(p), record: p.publication },
@@ -1074,4 +1164,5 @@ module.exports = {
   approve, confirmReview, requestChanges, revise, reject, setConsent, retry, sourcePath, artifactPath, dir, save, state, hist, _resetForTests,
   listRules, activeRules, addRule, editRule, retireRule, previousOf, fixName, projectAdapter, judgementMode, judgementMissing, STYLE_OVERRIDABLE,
   verifyCaption, setSettings, applyReview, progressOf, nextAction, cardStates, pendingEdits, ADJUSTMENT_KINDS, PHASES,
+  applySkill, testSkill, reviewInfo,
 };

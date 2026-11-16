@@ -20,6 +20,7 @@ dana-worker/
     review.py               Dana's review by category from a fixed, versioned rubric
     review_only.py          review of a finished video the owner uploaded (edits nothing)
     reference.py            style analysis of a reference video → a proposed profile
+    skillgen.py             library skills: draft one from the owner's instructions, choose one for a clip, report rule by rule
     editorial.py            plan → edit → review → revise loop
     run.py                  orchestrator
   motion/gsap.min.js        GSAP 3.15.0, vendored so a graphic renders without network access (gsap.com/standard-license)
@@ -65,6 +66,31 @@ switch each kind off per project (`options.adjustments`): `color`, `audio_cleanu
 
 Job kinds: an edit (`dana_pipeline.run`) or a review of an uploaded finished video (`dana_pipeline.review_only`).
 `options.polish` (set by the server after such a review) keeps the owner's cut and applies technical improvements only.
+
+## Library skills (the server's skill library → this worker)
+
+The base rules are `skill/dana-editing/SKILL.md` (always loaded). On top of them a job may carry ONE library skill
+(`options.skill` + `options.profile`): the project's choice, the owner-approved default, or — when the project says
+"let Dana suggest" — one of the approved candidates chosen here by a tool-free model call (`skillgen.choose`).
+A draft arrives only in an explicit test on one clip (`status: draft_test`) and is never reported as approved.
+
+Where a skill acts, and nowhere else:
+
+| | |
+|---|---|
+| planning | its ACTIVE rule texts go to the content planner and the caption editor as owner rules |
+| rendering | its parameters are the editing profile (caption size / position / lines / colours / animation, zoom strengths…) |
+| review | the reviewer is given the rules and the skill's own criteria and answers for every id |
+
+The package then carries `skill_report`: every rule as `applied / not_followed / not_applicable / unsupported / not_checked`
+(model assessment on transcript, cards and stills), every parameter compared by code with the rendered style, and the
+skill's criteria. A rule the worker cannot carry out (music, sound effects, B-roll, styled transitions, anything that is
+not editing) is `unsupported` by its AREA and is never judged "applied". `review_provenance` records the sha256 of the
+file the review looked at, so the page can say whether a review is about the file on screen.
+
+`python -m dana_pipeline.skillgen` structures the owner's written instructions into a draft (rules with an area and an
+"executable" flag, parameters inside fixed limits, review criteria, contradictions with a proposed resolution). The prompt
+and the reference findings are data for a tool-free call: nothing in them runs, reads a file or publishes.
 
 ## States and exit codes
 
@@ -186,5 +212,6 @@ registered with `install.ps1 -WhatIf`.
 python -X utf8 -m unittest discover -s dana-worker/tests -v
 npx jest --runInBand tests/dana_studio.test.js tests/dana_round2.test.js tests/dana_references.test.js tests/dana_feedback.test.js
 node scripts/dana_e2e_round2.cjs <raw> <edited> <ref1> <ref2>        # the five owner-path checks, real worker, local only
+node scripts/dana_e2e_skills.cjs <second raw clip>                    # skill from analysis / from instructions → used on other clips
 node tests/dana_studio_page_check.mjs http://127.0.0.1:<port>        # the page in a headless browser, desktop + phone
 ```

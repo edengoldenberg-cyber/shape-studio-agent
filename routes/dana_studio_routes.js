@@ -21,6 +21,7 @@ const studio    = require('../services/dana_studio');
 const publisher = require('../services/dana_publisher');
 const brand     = require('../utils/dana_brand');
 const refs      = require('../services/dana_references');
+const skills    = require('../services/dana_skills');
 
 const json = express.json({ limit: '300kb' });
 const wrap = fn => (req, res) => new Promise(resolve => resolve(fn(req, res))).catch(err => {   // sync throws too
@@ -90,6 +91,9 @@ workerRouter.get('/references/:id/file', wrap((req, res) => {
   sendRange(req, res, f.path, 'application/octet-stream', { 'X-Content-SHA256': f.sha256 });
 }));
 workerRouter.post('/references/:id/analysis', json, wrap((req, res) => { const r = refs.submitAnalysis(req.params.id, leaseOf(req), req.body ?? {}); res.json({ ok: true, status: r.status }); }));
+// Skill drafts from the owner's written instructions: structured by a tool-free model call on the editing computer.
+workerRouter.post('/skills/lease', json, wrap((req, res) => { const l = skills.leaseNext(req.body ?? {}); return l ? res.json(l) : res.status(204).end(); }));
+workerRouter.post('/skills/:id/draft', json, wrap((req, res) => { const k = skills.submitDraft(req.params.id, leaseOf(req), req.body ?? {}); res.json({ ok: true, status: k.status }); }));
 workerRouter.use((_req, res) => res.status(404).json({ ok: false, error: 'not_found' }));
 
 // ── Panel API ─────────────────────────────────────────────────────────────────
@@ -115,7 +119,10 @@ panelRouter.get('/notify/status', wrap((_req, res) => res.json({ ok: true, notif
 panelRouter.post('/notify/test', json, wrap(async (req, res) => res.json({ ok: true, ...(await require('../services/dana_notify').sendTest(req.body ?? {})) })));
 
 panelRouter.get('/projects', wrap((_req, res) => { studio.recover(); require('../services/dana_notify').flush().catch(() => {}); res.json({ ok: true, worker: studio.workerStatus(), projects: studio.list() }); }));
-panelRouter.get('/projects/:id', wrap((req, res) => { studio.recover(); res.json({ ok: true, worker: studio.workerStatus(), project: studio.view(studio.getProject(req.params.id)) }); }));
+/** `?version=N` shows that version (read-only); without it: the current version, or the last finished one while a new one is being made. */
+panelRouter.get('/projects/:id', wrap((req, res) => { studio.recover();
+  const n = req.query.version !== undefined && /^\d{1,4}$/.test(String(req.query.version)) ? Number(req.query.version) : undefined;
+  res.json({ ok: true, worker: studio.workerStatus(), project: studio.view(studio.getProject(req.params.id), n) }); }));
 
 panelRouter.post('/upload', upload, wrap(async (req, res) => {
   if (!req.file) throw new studio.StudioError(400, 'file_missing', 'לא נבחר קובץ וידאו (שדה: video)');
@@ -162,6 +169,8 @@ panelRouter.post('/projects/:id/captions/verify', ...act(studio.verifyCaption));
 panelRouter.patch('/projects/:id/settings',       ...act(studio.setSettings));
 /** "יישם שיפורים והפק גרסה חדשה": Dana applies what her review found and she may change by herself. */
 panelRouter.post('/projects/:id/apply-review',    ...act(studio.applyReview));
+/** A new version of this project, planned, edited and reviewed by a library skill (the project's choice or the approved default). */
+panelRouter.post('/projects/:id/apply-skill',     ...act(studio.applySkill));
 panelRouter.post('/projects/:id/consent',         ...act(studio.setConsent));
 panelRouter.post('/projects/:id/retry',           ...act((id) => studio.retry(id)));
 /** RESCHEDULE: a new time for content that is already approved is a re-approval of the same content. */
@@ -241,12 +250,28 @@ panelRouter.post('/references/:id/reject-profile', json, wrap((req, res) => { co
 panelRouter.get('/references/:id/file', wrap((req, res) => { const f = refs.filePath(req.params.id); sendRange(req, res, f.path, REF_MIME[f.ext] ?? 'application/octet-stream'); }));
 
 /** Two or more analysed references side by side + a proposed combined profile (a proposal only). */
-panelRouter.post('/references/compare', json, wrap((req, res) => res.json({ ok: true, comparison: refs.compare(req.body?.ids) })));
+panelRouter.post('/references/compare', json, wrap((req, res) => res.json({ ok: true, comparison: refs.compare(req.body?.ids, { allowSingle: req.body?.single === true }) })));
 /** The owner approves a combined profile: per number, which reference it is taken from. */
 panelRouter.post('/profiles/combined', json, wrap((req, res) => {
   const out = refs.approveCombined({ by: req.body?.by, ids: req.body?.ids, picks: req.body?.picks, rules: req.body?.rules, make_default: req.body?.make_default === true });
   res.status(201).json({ ok: true, profile: out.profile, profiles: out.profiles, default: refs.defaultProfile() });
 }));
+// ── The editing-skill library (built on the references and profiles above) ───
+const skillsOut = extra => ({ ok: true, skills: skills.list(), domains: skills.DOMAINS, paramLimits: skills.PARAM_LIMITS, profiles: refs.profiles(), ...extra });
+panelRouter.get('/skills', wrap((_req, res) => res.json(skillsOut())));
+panelRouter.get('/skills/:id', wrap((req, res) => res.json({ ok: true, skill: skills.get(req.params.id) })));
+/** "צור סקיל מהניתוח": chosen findings and numbers of analysed references → a draft. */
+panelRouter.post('/skills/from-analysis', json, wrap((req, res) => res.status(201).json(skillsOut({ skill: skills.createFromAnalysis(req.body ?? {}) }))));
+/** "צור סקיל מהוראות": the owner's free text (optionally with reference findings) → a draft, structured by the editing worker. */
+panelRouter.post('/skills/from-prompt', json, wrap((req, res) => res.status(201).json(skillsOut({ skill: skills.createFromPrompt(req.body ?? {}) }))));
+panelRouter.post('/skills/from-profile', json, wrap((req, res) => res.status(201).json(skillsOut({ skill: skills.createFromProfile(req.body ?? {}) }))));
+panelRouter.put('/skills/:id', json, wrap((req, res) => res.json(skillsOut({ skill: skills.saveDraft(req.params.id, req.body ?? {}) }))));
+panelRouter.post('/skills/:id/approve', json, wrap((req, res) => res.json(skillsOut({ skill: skills.approve(req.params.id, req.body ?? {}) }))));
+panelRouter.post('/skills/:id/default', json, wrap((req, res) => res.json(skillsOut({ skill: skills.setDefault(req.params.id, req.body ?? {}) }))));
+panelRouter.post('/skills/:id/retire', json, wrap((req, res) => res.json(skillsOut({ skill: skills.retire(req.params.id, req.body ?? {}) }))));
+/** Try a DRAFT on one clip: a new version of that project, marked as a skill test. */
+panelRouter.post('/skills/:id/test', json, wrap((req, res) => res.json({ ok: true, project: studio.testSkill(req.params.id, req.body ?? {}) })));
+
 panelRouter.get('/profiles', wrap((_req, res) => res.json({ ok: true, profiles: refs.profiles(), default: refs.defaultProfile() })));
 /** Approve the profile that a finished version was actually edited with as the default for future projects. */
 panelRouter.post('/profiles/:id/approve', json, wrap((req, res) => {

@@ -60,6 +60,7 @@ try {
     console.log(`\n── ${vp.name} ${vp.width}x${vp.height}`);
     await cdp('Emulation.setDeviceMetricsOverride', { width: vp.width, height: vp.height, deviceScaleFactor: vp.mobile ? 2 : 1, mobile: vp.mobile });
     await cdp('Page.navigate', { url: `${base}/dana-studio.html` });
+    await until(`!!document.querySelector('[data-home="projects"]')`); await js(`document.querySelector('[data-home="projects"]').click()`);   // the tab is remembered from the previous run
     check('home loads: projects are listed', await until(`document.querySelectorAll('#projects .proj').length > 0`));
     check('worker state is shown in the header', await until(`!/בודק/.test(document.getElementById('worker').textContent)`), await js(`document.getElementById('worker').textContent`));
     check('two upload actions: raw footage, and an edited video for review', await js(`${vis('#pickraw')} && ${vis('#pickreview')} && ${tappable('#pickraw, #pickreview')}`));
@@ -76,6 +77,30 @@ try {
     check('brand: every setting is editable, missing ones are marked missing (nothing pre-filled)', await until(`document.querySelectorAll('#brand [data-brand]').length >= 10 && [...document.querySelectorAll('#brand li')].filter(li => /חסר/.test(li.querySelector('.pill').textContent)).every(li => li.querySelector('textarea').value === '')`));
     check('brand: no horizontal scroll', await js(noOverflow));
     await shot(`${vp.name}-03-brand`);
+
+    // ── the home screen keeps its state through the automatic refreshes (every 10 s; references every 6 s) ──
+    await js(`document.querySelector('[data-home="refs"]').click()`);
+    const hasAnalysis = await until(`!!document.querySelector('#refs details')`, 6000);
+    if (hasAnalysis) await js(`(() => { const d = document.querySelector('#refs details'); d.open = true; const i = d.querySelector('input[data-pk]'); if (i) { i.focus(); i.value = '99'; i.dispatchEvent(new Event('input', { bubbles: true })); } window.__mark = d; })()`);
+    await js(`document.querySelector('[data-home="brand"]').click()`);
+    await js(`(() => { const t = [...document.querySelectorAll('#brand textarea')].find(x => !x.value); t.focus(); t.value = 'טקסט שהוקלד ולא נשמר'; t.dispatchEvent(new Event('input', { bubbles: true })); window.scrollTo(0, 220); window.__y = window.scrollY; window.__k = t.dataset.brand; })()`);
+    await sleep(12500);                                   // longer than both refresh timers
+    check('after the automatic refreshes: still on the same tab', await js(`!document.querySelector('[data-pane="brand"]').classList.contains('hidden')`));
+    check('… text typed into a brand setting was not wiped', await js(`document.querySelector('[data-brand="' + window.__k + '"]').value === 'טקסט שהוקלד ולא נשמר'`), await js(`document.querySelector('[data-brand="' + window.__k + '"]').value`));
+    check('… the scroll position did not move', await js(`Math.abs(window.scrollY - window.__y) <= 2`), await js(`window.scrollY + ' vs ' + window.__y`));
+    await js(`document.querySelector('[data-home="refs"]').click()`);
+    if (hasAnalysis) check("… the open reference analysis is still open, and a number typed into its proposal is still there", await js(`(() => { const d = document.querySelector('#refs details'); const i = d.querySelector('input[data-pk]'); return d.open && (!i || i.value === '99'); })()`));
+    await js(`document.querySelector('[data-home="skills"]').click()`);
+    check('skill library: create from analysis, create from instructions, and the list', await js(`${vis('#skfromrefs')} && ${vis('#skfromprompt')} && ${vis('#sk_prompt')} && !!document.getElementById('skills')`));
+    await js(`(() => { const t = document.getElementById('sk_prompt'); t.value = 'טיוטת הוראות'; t.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+    await shot(`${vp.name}-04-skills`);
+    await js(`document.querySelector('[data-home="about"]').click()`);
+    check('"how it works": the pipeline, who decides what, and capabilities split into active / partial / missing', await until(`/המסלול/.test(document.getElementById('about').textContent) && /Claude מחליט/.test(document.getElementById('about').textContent) && ['פעיל', 'חלקי', 'חסר'].every(x => [...document.querySelectorAll('#about .pill')].some(p => p.textContent === x))`));
+    check('… B-roll and music are listed as missing, not as active', await js(`[...document.querySelectorAll('#about li')].filter(li => /צילומי השלמה|מוזיקה ואפקטים/.test(li.textContent)).every(li => li.querySelector('.pill').textContent === 'חסר')`));
+    check('"how it works": no horizontal scroll', await js(noOverflow));
+    await shot(`${vp.name}-05-how-it-works`);
+    await cdp('Page.reload'); await until(`document.querySelectorAll('#projects .proj').length > 0`);
+    check('after a page reload the same tab is shown again', await js(`!document.querySelector('[data-pane="about"]').classList.contains('hidden')`));
 
     // ── a finished edit ──
     await goto(`${base}/dana-studio.html#${edit.id}`);
@@ -116,6 +141,60 @@ try {
     await step('approve');
     check('approve step: approval of this exact version, cover, destination; publishing shown as off', await js(`${vis('#approve')} && ${vis('img.cover')} && /פרסום כבוי|ספק דמה/.test(document.getElementById('panel').textContent)`));
     await shot(`${vp.name}-15-approve`);
+
+    // ── a project keeps its state while its status is refreshed (simulated: the server data is not touched) ──
+    // The page is made to believe a new version is being produced: the job is "leased" and the version on screen is the
+    // last finished one. That is exactly the situation in which the review used to vanish and the tab used to jump.
+    await goto(`${base}/dana-studio.html#${edit.id}`);
+    await until(`!!document.querySelector('#mainvid[src]')`);
+    await js(`(() => { const real = window.fetch; window.__polls = 0; window.__fail = false;
+      window.fetch = async (u, o) => { const isProject = new RegExp('/projects/[^/?]+([?].*)?$').test(String(u)) && (!o || !o.method || o.method === 'GET');
+        if (isProject && window.__fail) throw new TypeError('Failed to fetch');
+        const r = await real(u, o); if (!isProject) return r;
+        const j = await r.clone().json(); window.__polls++;
+        j.project.job = Object.assign({}, j.project.job, { status: 'leased', stage: 'render_cards', note: 'מרנדר כרטיסי כתוביות (סימולציה)' });
+        j.project.status = 'editing'; j.project.currentVersion = j.project.shown.n + 1;
+        j.project.shown = Object.assign({}, j.project.shown, { isCurrent: false, currentN: j.project.shown.n + 1, currentStatus: 'editing', currentHasPackage: false });
+        j.project.nextAction = { key: 'wait', label: 'דנה עובדת — אין מה לעשות כרגע' };
+        j.project.progress = Object.assign({}, j.project.progress, { phase: 'edit', percent: 40 + window.__polls, percentBasis: 'estimated', percentNote: 'משוער', stage: 'render_cards', note: 'מרנדר', attempts: 1, maxAttempts: 3,
+          phases: (j.project.progress.phases || []).map((x, i) => Object.assign({}, x, { state: i < 3 ? 'done' : i === 3 ? 'current' : 'todo' })) });
+        return new Response(JSON.stringify(j), { status: 200, headers: { 'Content-Type': 'application/json' } }); }; })()`);
+    // re-open the project through the page itself, so the simulated state is what it loads
+    await js(`document.getElementById('back').click()`); await until(`document.querySelectorAll('#projects .proj').length > 0`);
+    await js(`document.querySelector('#projects .proj[data-id="${edit.id}"]').click()`);
+    await until(`window.__polls >= 1 && !!document.querySelector('#mainvid[src]')`, 8000);
+    await step('review');
+    await until(`!!document.getElementById('shownote')`, 8000);
+    check("while a new version is being produced, Dana's review of the last finished version stays on screen", await js(`document.querySelectorAll('#dreview .cat').length === 12 && ${vis('#reviewinfo')}`));
+    check('… and it says which version is shown and that it is not the current one', await js(`/לא הגרסה הנוכחית/.test(document.getElementById('shownote').textContent) && /אינה עדכנית/.test(document.getElementById('reviewinfo').textContent) === false || /הביקורת/.test(document.getElementById('reviewinfo').textContent)`));
+    await js(`document.querySelectorAll('#dreview .cat')[4].click()`); await sleep(200);
+    const catKey = await js(`document.querySelector('#dreview .cat.sel').dataset.cat`);
+    await js(`(() => { const d = [...document.querySelectorAll('#panel details')].find(x => !x.open); d.open = true; window.__det = [...document.querySelectorAll('#panel details')].indexOf(d);
+      const v = document.getElementById('mainvid'); v.muted = true; v.currentTime = 1; v.play(); window.__vid = v; window.scrollTo(0, 300); window.__y = window.scrollY; window.__p0 = window.__polls; })()`);
+    await sleep(4000);                                    // at least one status refresh while the section is open
+    check('a status refresh does not close the open category or an opened section of the review', await js(`document.querySelector('#dreview .cat.sel')?.dataset.cat === ${JSON.stringify(catKey)} && document.querySelectorAll('#panel details')[window.__det].open && window.__polls > window.__p0`));
+    await step('edit');
+    await js(`(() => { const t = document.getElementById('rvnote'); t.focus(); t.value = 'בקשה שנכתבת בזמן רענון'; t.dispatchEvent(new Event('input', { bubbles: true })); window.__panelEl = document.querySelector('#panel .card'); })()`);
+    await sleep(8000);                                    // at least two status refreshes while typing and playing
+    check('several status refreshes happened meanwhile', await js(`window.__polls - window.__p0 >= 2`), await js(`window.__polls - window.__p0`));
+    check('… the step did not jump', await js(`document.querySelector('#steps .on').dataset.step === 'edit'`));
+    check('… the text being typed is still there, and the field kept the focus', await js(`document.getElementById('rvnote').value === 'בקשה שנכתבת בזמן רענון' && document.activeElement === document.getElementById('rvnote')`));
+    check('… the player was not rebuilt and kept playing', await js(`document.getElementById('mainvid') === window.__vid && !window.__vid.paused && window.__vid.currentTime > 2`), await js(`JSON.stringify({ same: document.getElementById('mainvid') === window.__vid, paused: window.__vid.paused, t: window.__vid.currentTime })`));
+    check('… the progress area did update (the refresh is real)', await js(`/[45][0-9]%/.test(document.getElementById('progress').textContent)`), await js(`document.getElementById('progress').textContent.slice(0, 60)`));
+    await step('review');
+    check('… coming back to the review, the chosen category is still chosen', await js(`document.querySelector('#dreview .cat.sel')?.dataset.cat === ${JSON.stringify(catKey)}`));
+    await js(`window.__fail = true`); await sleep(7500);
+    check('a failed refresh says so and keeps the screen as it was', await js(`/הרענון נכשל/.test(document.getElementById('notice').textContent) && document.querySelectorAll('#dreview .cat').length === 12 && !document.getElementById('detail').classList.contains('hidden')`), await js(`document.getElementById('notice').textContent`));
+    await js(`window.__fail = false`); await sleep(7500);
+    check('… and the message goes away when the refresh works again', await js(`document.getElementById('notice').classList.contains('hidden')`));
+    await shot(`${vp.name}-16-review-while-working`);
+    await cdp('Page.reload'); await until(`!!document.querySelector('#mainvid[src]')`);
+    check('after a page reload: the same project, step and category are restored', await until(`document.querySelector('#steps .on')?.dataset.step === 'review' && document.querySelector('#dreview .cat.sel')?.dataset.cat === ${JSON.stringify(catKey)}`, 8000));
+    check('the review states which version it belongs to, when it was made and on which file', await js(`/גרסת הסרטון שנבדקה/.test(document.getElementById('reviewinfo').textContent) && /בוצעה על הקובץ הסופי/.test(document.getElementById('reviewinfo').textContent) && /לא נבדק/.test(document.getElementById('reviewinfo').textContent)`));
+    await step('project');
+    check('project step: a library skill can be chosen (approved default / a skill / let Dana suggest / none)', await js(edit.kind === 'review_only' ? 'true' : `['default', 'suggest', 'none'].every(v => [...document.querySelectorAll('#pskillsel option')].some(o => o.value === v))`));
+    await goto(`${base}/dana-studio.html#prj_doesnotexist000`);
+    check('a project that cannot be loaded shows a clear error instead of an empty screen', await until(`/הפרויקט לא נטען/.test(document.getElementById('notice').textContent)`, 8000), await js(`document.getElementById('notice').textContent`));
 
     if (rev) {
       await goto(`${base}/dana-studio.html#${rev.id}`);

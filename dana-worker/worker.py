@@ -138,7 +138,8 @@ def run_pipeline(cfg, cfg_path, job_dir, source, on_stage, module="dana_pipeline
     return state, result
 
 
-STAGE_HE = {"interpret": "דנה קוראת את הבקשה שלך", "graphics": "מרנדר מואושן גרפיק (HyperFrames)", "compare": "מכין לפני/אחרי",
+STAGE_HE = {"choose_skill": "דנה בוחרת סקיל מתאים מהספרייה",
+            "interpret": "דנה קוראת את הבקשה שלך", "graphics": "מרנדר מואושן גרפיק (HyperFrames)", "compare": "מכין לפני/אחרי",
             "transcribe_check": "האזנה שנייה לבדיקת התמלול", "assemble": "מחבר את החלקים שנבחרו", "measure_picture": "מודד מיקום פנים לכתוביות ולזומים",
             "source": "בודק את קובץ המקור", "transcribe_source": "מתמלל", "judgement": "בוחר קטע וכתוביות",
             "plan": "דנה מתכננת: מסר, קטע ותדריך עריכה", "review": "דנה בודקת את התוצר", "revise": "העורך מתקן לפי הערות דנה",
@@ -217,6 +218,42 @@ def handle(api, cfg, cfg_path, leased):
         stop.set()
 
 
+def capabilities(cfg):
+    """What this machine can really do right now. Reported to the server at start and shown to the owner as is."""
+    paths = cfg.get("paths") or {}
+    hf = paths.get("hyperframes") or shutil.which("hyperframes.cmd") or shutil.which("hyperframes")
+    return {"content_model": {"enabled": bool(cfg["judgement"]["claude"].get("enabled")) and cfg["judgement"]["adapter"] == "claude", "model": cfg["judgement"]["claude"].get("model")},
+            "transcription": {"model": cfg["asr"]["model"], "device": cfg["asr"]["device"], "second_pass": bool(cfg["judgement"].get("second_pass"))},
+            "face_detection": bool(paths.get("face_model") and Path(paths["face_model"]).is_file()),
+            "hyperframes": bool(hf), "caption_renderer": bool(paths.get("caption_renderer") and Path(paths["caption_renderer"]).is_file()),
+            "max_review_rounds": cfg["editorial"]["max_cycles"], "max_cost_usd": cfg["editorial"]["max_total_cost_usd"], "max_seconds": cfg["editorial"]["max_total_s"]}
+
+
+def handle_skill(api, cfg, cfg_path, leased):
+    """Structure the owner's written instructions into a skill DRAFT (tool-free model call). The result is a draft on the server."""
+    sk, h = leased["skill"], {"X-Lease-Token": leased["leaseToken"]}
+    sid = str(sk.get("id") or "")
+    if not SAFE_ID.match(sid):
+        return
+    d = Path(cfg["paths"]["work_root"]) / "skills" / sid
+    if d.exists():
+        shutil.rmtree(d)
+    d.mkdir(parents=True)
+    (d / "request.json").write_text(json.dumps(sk, ensure_ascii=False), encoding="utf-8")
+    try:
+        proc = subprocess.run([sys.executable, "-X", "utf8", "-m", "dana_pipeline.skillgen", "--config", str(cfg_path), "--dir", str(d)], cwd=str(HERE), capture_output=True, timeout=900)
+        if proc.returncode == 0 and (d / "draft.json").is_file():
+            out = json.loads((d / "draft.json").read_text(encoding="utf-8"))
+            code, _ = api.call("POST", f"/api/dana/worker/skills/{sid}/draft", {"status": "drafted", "draft": out["draft"], "usage": out.get("usage")}, h)
+            log(f"skill {sid}: drafted → HTTP {code}")
+            return
+        err = json.loads((d / "error.json").read_text(encoding="utf-8")) if (d / "error.json").is_file() else {"code": "skill_draft_failed", "message": f"exited {proc.returncode}"}
+    except (subprocess.TimeoutExpired, OSError, ValueError) as e:
+        err = {"code": "skill_draft_failed", "message": str(e)[:300]}
+    log(f"skill {sid}: {err['code']}: {err['message']}")
+    api.call("POST", f"/api/dana/worker/skills/{sid}/draft", {"status": "failed", "error": err}, h)
+
+
 def handle_reference(api, cfg, cfg_path, leased):
     """Analyse one reference video the owner added (style only). The result is a PROPOSAL stored on the server."""
     ref, lease = leased["reference"], leased["leaseToken"]
@@ -279,7 +316,7 @@ def main():
         log("STOP file present — worker does not start (delete the file to allow it)")
         return 0
     api = Api(cfg["server_url"], token, cfg.get("worker_id") or "worker")
-    code, body = api.call("POST", "/api/dana/worker/hello", {"workerId": api.worker_id, "pipelineVersion": PIPELINE_VERSION})
+    code, body = api.call("POST", "/api/dana/worker/hello", {"workerId": api.worker_id, "pipelineVersion": PIPELINE_VERSION, "capabilities": capabilities(cfg)})
     if code != 200:
         log(f"server refused the worker: HTTP {code} {body}")
         return 1
@@ -302,6 +339,12 @@ def main():
             if rcode == 200 and rbody and rbody.get("reference"):
                 log(f"reference {rbody['reference'].get('id')} leased for analysis")
                 handle_reference(api, cfg, a.config, rbody)
+                continue
+            # … or written instructions waiting to be structured into a skill draft? (404 = an older server; ignored)
+            scode, sbody = api.call("POST", "/api/dana/worker/skills/lease", {"workerId": api.worker_id})
+            if scode == 200 and sbody and sbody.get("skill"):
+                log(f"skill {sbody['skill'].get('id')} leased for drafting")
+                handle_skill(api, cfg, a.config, sbody)
                 continue
         except (urllib.error.URLError, OSError) as e:
             log(f"server unreachable: {e}")        # keep polling; the server shows the worker as offline

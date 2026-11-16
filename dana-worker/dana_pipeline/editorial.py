@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 
 from . import judgement
-from .core import PipelineError, run, tool
+from .core import PipelineError, run, tool, sha256_file
 from .judgement import skeleton, strip
 
 PERCEPTION = {
@@ -261,12 +261,17 @@ def model_review(cfg, job_dir, dec, res, previous, tag, work):
         ("<zooms>\n" + json.dumps([{k: z.get(k) for k in ("tl_t_s", "hold_until_s", "scale", "reason")} for z in res.get("zooms") or []],
                                    ensure_ascii=False) + "\nEach zoom eases in at tl_t_s and holds until hold_until_s, then cuts back to the wide "
          "frame. You see stills only; judge framing in the stills, not the feel of the motion.\n</zooms>") if res.get("zooms") else "",
+        skill_block(res.get("skill")),
         f"Still frames follow, in order, taken at {', '.join(str(s['t']) + ' s' for s in shots)}; the last image is the cover.",
     ])
     content = [{"type": "text", "text": text}] + [{"type": "image", "path": s["path"]} for s in shots] + [{"type": "image", "path": cover_small}]
     schema = json.loads(json.dumps(REVIEW_SCHEMA))
     if previous:
         schema["required"].append("previous")
+    if res.get("skill"):                         # the library skill this edit was made by: its rules and criteria are judged too
+        from . import skillgen
+        schema["properties"].update(skillgen.REVIEW_PROPS)
+        schema["required"] += ["skill_rules", "skill_criteria"]
     data, usage = judgement.claude_json(cfg, job_dir, REVIEW_SYSTEM, content, schema, tag)
     usage["role"] = "reviewer"
     findings, dropped = [], []
@@ -283,7 +288,17 @@ def model_review(cfg, job_dir, dec, res, previous, tag, work):
     criteria = [{"id": c["id"], "met": bool(c["met"]), "note": str(c["note"])[:300]} for c in data.get("criteria") or [] if c.get("id") in valid]
     prev = [{"id": p["id"], "status": p["status"], "evidence": str(p["evidence"])[:300]} for p in data.get("previous") or []]
     return {"criteria": criteria, "findings": findings, "previous": prev, "frames_s": [s["t"] for s in shots],
+            "skill_rules": [x for x in data.get("skill_rules") or [] if isinstance(x, dict)],
+            "skill_criteria": [x for x in data.get("skill_criteria") or [] if isinstance(x, dict)],
+            "reviewed_sha256": sha256_file(res["final"]),          # the exact file the reviewer's stills were taken from
             "dropped_as_already_measured": dropped}, usage
+
+
+def skill_block(skill):
+    if not skill:
+        return ""
+    from . import skillgen
+    return skillgen.review_block(skill)
 
 
 def criteria_table(dec, res, det, tools, review):

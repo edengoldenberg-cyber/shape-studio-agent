@@ -292,8 +292,8 @@ const basisOf = (r, key) => (r.analysis?.aspects ?? []).find(a => a.aspect === P
  * suggests and on what basis. A number only one reference gives is suggested from it; where several give one, the better
  * founded is suggested (measured > seen in stills > hypothesis) and a tie is left for the owner. Nothing is approved here.
  */
-function compare(ids) {
-  if (!Array.isArray(ids) || ids.length < 2 || ids.length > 4) throw new RefError(400, 'compare_needs_two', 'להשוואה נדרשים 2–4 רפרנסים');
+function compare(ids, { allowSingle = false } = {}) {
+  if (!Array.isArray(ids) || ids.length < (allowSingle ? 1 : 2) || ids.length > 4) throw new RefError(400, 'compare_needs_two', 'להשוואה נדרשים 2–4 רפרנסים');
   const s = settle(refsState());
   const refs = [...new Set(ids.map(String))].map(id => find(s, id));
   const notReady = refs.filter(r => !r.analysis);

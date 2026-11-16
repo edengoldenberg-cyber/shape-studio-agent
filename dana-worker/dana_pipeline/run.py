@@ -28,6 +28,7 @@ from pathlib import Path
 
 from . import PIPELINE_VERSION, adjust, captions, checks, editorial, interpret, judgement, motion, review
 from . import review as review_rubric
+from . import skillgen
 from . import story
 from .align import Alignment
 from .core import (EXIT, FAILURE, REVIEW_REQUIRED, STYLE_OVERRIDABLE, SUCCESS, WAITING, PipelineError, Waiting,
@@ -545,6 +546,25 @@ def pipeline(j):
             j.style_overrides.update(interpretation["style"])
             options.pop("change_request")          # no content request is left: the revision is locked to the previous plan
 
+    # ── LIBRARY SKILL: the owner's choice / the approved default arrive with the job; "let Dana suggest" is decided here ──
+    skill_choice = None
+    if (options.get("skill_candidates") and not options.get("skill") and judgement.resolve_adapter(options, cfg) == "claude"
+            and cfg["judgement"]["claude"].get("enabled")):
+        with j.stage("choose_skill"):
+            cands = [c for c in options["skill_candidates"] if isinstance(c, dict) and isinstance(c.get("skill"), dict) and isinstance(c.get("profile"), dict)]
+            try:
+                hit, why, u = skillgen.choose(cfg, j.dir, words, cands)
+                usages.append(u)
+            except PipelineError as e:
+                hit, why = None, f"הבחירה האוטומטית נכשלה ({e.code}) — נערך בלי סקיל מהספרייה"
+                if getattr(e, "usage", None):
+                    usages.append(e.usage)
+        skill_choice = {"considered": [{"id": c["skill"]["id"], "name": c["skill"]["name"]} for c in cands], "chosen": hit["skill"]["id"] if hit else None, "why": why}
+        if hit:
+            options["skill"], options["profile"] = dict(hit["skill"], chosen_by="dana", why=why), hit["profile"]
+    skill = options.get("skill") if isinstance(options.get("skill"), dict) and isinstance(options.get("profile"), dict) else None
+    reviews = {}
+
     # ── RULES + TRANSCRIPT STATE ────────────────────────────────────────────
     skill_text, skill_info, default_profile = story.load_skill()
     profile = j.profile = story.resolve_profile(options, default_profile)
@@ -703,6 +723,7 @@ def pipeline(j):
         with j.stage("review"):
             tools = editorial.caption_tools(cfg, dec["caption"]["text"])
             res["style_rules"] = [str(r.get("text"))[:300] for r in options.get("rules") or [] if r.get("text")]
+            res["skill"] = skill
             det = editorial.deterministic_findings(cfg, dec, res, tools)
             review, review_error = None, None
             if use_model:
@@ -731,6 +752,9 @@ def pipeline(j):
                      "verification_of_previous": verification, "editor_addressed": dec.get("addressed") or [],
                      "sent_to_editor": [f["id"] for f in actionable] if use_model else [],
                      "cost_usd_reported_so_far": cost, "seconds_so_far": secs}
+            reviews[n] = review
+            cycle["reviewed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            cycle["final_sha256"] = (review or {}).get("reviewed_sha256") or sha256_file(j.out / "final.mp4")
             cycles.append(cycle)
             write_json(j.ed / f"cycle_{n}.json", cycle)
         # A revision that makes the mandatory checks WORSE is rejected: the previous result is restored
@@ -884,6 +908,14 @@ def pipeline(j):
         cover_text=dec["cover"]["text"], captions_added=bool(st["captions_enabled"]), cut_joins=getattr(j, "cut_joins", None),
         burned_in_text=bool(pl and pl["burned_in_text"]["present"])))
     review_vs_previous = review_rubric.compare(prev.get("dana_review"), dana_review)
+    # ── was the review made on the file that is delivered, after every change? ──
+    final_sha = sha256_file(j.out / "final.mp4")
+    fc = cycles[final_cycle]
+    provenance = {"reviewed_at": fc.get("reviewed_at"), "final_sha256": final_sha, "reviewed_sha256": fc.get("final_sha256"),
+                  "on_delivered_file": fc.get("final_sha256") == final_sha, "review_rounds": len(cycles), "delivered_round": final_cycle,
+                  "model_review_ran": bool(reviews.get(final_cycle)),
+                  "basis": "הבדיקות האוטומטיות נמדדו על הקובץ הסופי. הערכת המודל נעשתה על תמלול האודיו של אותו קובץ ועל פריימים בודדים ממנו — לא האזנה ולא צפייה בתנועה."}
+    skill_report = skillgen.report(skill, st, reviews.get(final_cycle), (options.get("profile") or {}).get("params")) if skill else None
     adjustments = {
         "color": res["color"], "audio_cleanup": res["audio_clean"],
         "zooms": {"enabled": adjust.enabled(options, "zooms"), "applied": bool(res.get("zooms")), "count": len(res.get("zooms") or [])},
@@ -913,7 +945,8 @@ def pipeline(j):
                   for z in res.get("zooms") or []],
         "zoom_edits_applied": zoom_log,
         "graphics": res.get("graphics") or [], "adjustments": adjustments, "compare": res.get("compare"),
-        "dana_review": dana_review, "review_vs_previous": review_vs_previous,
+        "dana_review": dana_review, "review_vs_previous": review_vs_previous, "review_provenance": provenance,
+        "skill_report": skill_report, "skill_choice": skill_choice,
         "request_interpretation": interpretation, "derived_text_updates": derived_updates,
         "transcript": {"status": "owner_corrected_partial" if corrections else "auto_unverified",
                        "note": "תמלול אוטומטי (Whisper). מילים בספק מסומנות להאזנה; דנה לא החליפה אף מילה בניחוש.",
@@ -922,6 +955,7 @@ def pipeline(j):
         "rules_used": {"skill": dict(skill_info, text=skill_text), "profile": dict(story.profile_info(profile), params=pp),
                        "standing_rules": [{"id": str(r.get("id")), "version": r.get("version")} for r in standing_rules],
                        "profile_rules": list(profile.get("rules") or []),
+                       "library_skill": {k: skill.get(k) for k in ("id", "name", "version", "sha256", "status", "chosen_by")} if skill else None,
                        "references": [profile["source_reference"]] if profile.get("source_reference") else [], "note": "אין עדיין רפרנסים מנותחים; הפרופיל הוא ברירת המחדל המובנית עד שתאשר/י פרופיל"},
         "source": {"sha256": sha_before, "duration": sp["duration"], "probe": sp},
         "segment": dec["segment"], "considered": dec["considered"], "duration": res["dur"], "adapter": dec["adapter"],

@@ -53,9 +53,11 @@ def resolve_profile(options, default_profile):
         for k, v in p["params"].items():
             if k in merged and isinstance(v, type(merged[k])) or (k in merged and isinstance(merged[k], (int, float)) and isinstance(v, (int, float))):
                 merged[k] = v
-        return {"id": str(p["id"])[:60], "version": str(p.get("version") or "1")[:20], "status": "owner_approved", "params": merged,
+        # "draft_test": a library skill that is being tried on one clip before the owner decides; never reported as approved
+        return {"id": str(p["id"])[:60], "version": str(p.get("version") or "1")[:20],
+                "status": "draft_test" if p.get("status") == "draft_test" else "owner_approved", "params": merged,
                 # style rules that came with the approved profile (from an analysed reference); data for the planner and reviewer
-                "rules": [str(r)[:240] for r in (p.get("rules") or [])[:8] if isinstance(r, str) and r.strip()],
+                "rules": [str(r)[:400] for r in (p.get("rules") or [])[:24] if isinstance(r, str) and r.strip()],
                 "source_reference": str(p["source_reference"])[:80] if p.get("source_reference") else None}
     return dict(default_profile, status=default_profile.get("status") or "unapproved")
 

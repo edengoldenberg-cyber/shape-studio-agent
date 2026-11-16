@@ -16,6 +16,35 @@
   const dur = s => !isNum(s) ? '—' : s < 60 ? Math.round(s) + ' שנ׳' : Math.floor(s / 60) + ':' + String(Math.round(s % 60)).padStart(2, '0') + ' דק׳';
   const mb = b => (b / 1048576).toFixed(b > 104857600 ? 0 : 1);
 
+  // ── The screen keeps its state ─────────────────────────────────────────────
+  // A status refresh must never close an open area, wipe a field being typed in, move the scroll or restart the player.
+  // setHtml() therefore (a) does nothing when the markup is unchanged, and (b) when it did change, puts back which
+  // <details> were open, what was typed into fields the owner touched, the focus and the scroll position.
+  const boxKey = e => { const c = e.closest('[data-refid],[data-skid],[data-field],[id]'); return c ? (c.dataset.refid || c.dataset.skid || c.dataset.field || c.id) : ''; };
+  const detKey = d => { const c = d.parentElement.closest('[data-refid],[data-skid],[id]') || document.body; return boxKey(d.parentElement) + '#' + [...c.querySelectorAll('details')].indexOf(d); };
+  const inKey = i => boxKey(i) + '|' + (i.dataset.pk || i.dataset.brand || i.dataset.card || i.dataset.rule || i.dataset.kp || i.name || i.id || '');
+  function setHtml(el, html) {
+    if (!el || el.__html === html) return false;
+    const open = new Set(), closed = new Set(), vals = new Map();
+    el.querySelectorAll('details').forEach(d => (d.open ? open : closed).add(detKey(d)));
+    el.querySelectorAll('[data-dirty]').forEach(i => vals.set(inKey(i), i.type === 'checkbox' || i.type === 'radio' ? i.checked : i.value));
+    const act = document.activeElement, focus = act && el.contains(act) ? { key: inKey(act), start: act.selectionStart, end: act.selectionEnd } : null, y = window.scrollY;
+    el.innerHTML = html; el.__html = html;
+    el.querySelectorAll('details').forEach(d => { const k = detKey(d); if (open.has(k)) d.open = true; else if (closed.has(k)) d.open = false; });
+    if (vals.size || focus) el.querySelectorAll('input, textarea, select').forEach(i => { const k = inKey(i);
+      if (vals.has(k)) { if (i.type === 'checkbox' || i.type === 'radio') i.checked = vals.get(k); else i.value = vals.get(k); i.dataset.dirty = '1'; }
+      if (focus && k === focus.key) { i.focus({ preventScroll: true }); try { i.setSelectionRange(focus.start, focus.end); } catch { /* not a text field */ } } });
+    if (Math.abs(window.scrollY - y) > 2) window.scrollTo(0, y);
+    return true;
+  }
+  document.addEventListener('input', e => { if (e.target && e.target.dataset && !e.target.dataset.nodirty) e.target.dataset.dirty = '1'; }, true);
+  // remembered across refreshes and reloads of this tab: the home tab, and per project the step, the open category and the version on screen
+  let ui = { home: 'projects', steps: {}, cat: {}, view: {} };
+  try { ui = Object.assign(ui, JSON.parse(sessionStorage.getItem('dana_ui') || '{}')); } catch { /* private mode */ }
+  const remember = () => { try { sessionStorage.setItem('dana_ui', JSON.stringify(ui)); } catch { /* */ } };
+  let refreshFailing = false, playerKey = '';
+  function refreshFailed(e) { refreshFailing = true; notice(`הרענון נכשל (${e.message}). מוצג המצב האחרון שנטען ב-${new Date().toLocaleTimeString('he-IL')}; מנסה שוב אוטומטית. שום דבר שהקלדת לא נמחק.`, 'warn'); }
+  function refreshOk() { if (refreshFailing) { refreshFailing = false; notice(''); } }
   let verOpen = false;
   let me = '', status = null, current = null, timer = null, step = 'project', stepFor = '', draft = null, draftKey = '', listened = {}, selCat = null, cmpN = null, pvSource = null;
   try { me = localStorage.getItem('dana_reviewer') || ''; } catch { /* private mode */ }
@@ -49,24 +78,27 @@
   }
 
   // ═══ HOME ═════════════════════════════════════════════════════════════════
-  $('#hometabs').onclick = e => { const k = e.target.dataset.home; if (!k) return;
-    $$('#hometabs button').forEach(b => b.classList.toggle('on', b === e.target)); $$('[data-pane]').forEach(p => p.classList.toggle('hidden', p.dataset.pane !== k)); };
+  function showHome(k) { if (!document.querySelector(`[data-pane="${k}"]`)) k = 'projects'; ui.home = k; remember();
+    $$('#hometabs button').forEach(b => b.classList.toggle('on', b.dataset.home === k)); $$('[data-pane]').forEach(p => p.classList.toggle('hidden', p.dataset.pane !== k)); }
+  $('#hometabs').onclick = e => { const k = e.target.dataset.home; if (k) showHome(k); };
 
   async function loadHome() {
     const [{ projects, worker }, st] = await Promise.all([api('/projects'), api('/status')]);
     status = st; workerPill(worker); showBanner();
-    $('#projects').innerHTML = projects.length ? projects.map(p => { const pr = p.progress;
+    refreshOk();
+    setHtml($('#projects'), projects.length ? projects.map(p => { const pr = p.progress;
       return `<li><button class="proj" data-id="${esc(p.id)}">
       <div class="row"><b class="grow">${esc(p.title)}</b>${p.kind === 'review_only' ? '<span class="pill mute">הועלה לביקורת</span>' : ''}${pill(p.status)}</div>
       <div class="small mute">${fmt(p.createdAt)} · גרסה ${p.currentVersion}${p.status === 'editing' && pr && pr.phase ? ` · ${esc(phaseLabel(pr.phase))}${isNum(pr.percent) ? ` · ${pr.percent}%${pr.percentBasis === 'estimated' ? ' (משוער)' : ''}` : ''}` : ''}</div>
-      <div class="small">${esc(p.nextAction ? 'הפעולה הבאה: ' + p.nextAction.label : '')}</div></button></li>`; }).join('') : '<li class="mute">עדיין לא הועלה חומר.</li>';
+      <div class="small">${esc(p.nextAction ? 'הפעולה הבאה: ' + p.nextAction.label : '')}</div></button></li>`; }).join('') : '<li class="mute">עדיין לא הועלה חומר.</li>');
     const accts = st.accounts || [];
-    $('#upacct').innerHTML = accts.map(a => `<option value="${esc(a.username)}">@${esc(a.username)} — מחובר, אומת ${esc(a.verifiedAt)}</option>`).join('') + '<option value="">בלי חשבון יעד כרגע</option>';
-    $('#accounts').innerHTML = accts.length ? accts.map(a => `<li><div class="row"><b class="grow" dir="ltr" style="text-align:right">@${esc(a.username)}</b><span class="pill ok">מחובר ✓ אומת ${esc(a.verifiedAt)}</span></div>
-      <div class="small mute">${esc(a.platform)} · ${esc(a.how)}</div></li>`).join('') : '<li class="mute">אין חשבון מחובר.</li>';
+    setHtml($('#upacct'), accts.map(a => `<option value="${esc(a.username)}">@${esc(a.username)} — מחובר, אומת ${esc(a.verifiedAt)}</option>`).join('') + '<option value="">בלי חשבון יעד כרגע</option>');
+    setHtml($('#accounts'), accts.length ? accts.map(a => `<li><div class="row"><b class="grow" dir="ltr" style="text-align:right">@${esc(a.username)}</b><span class="pill ok">מחובר ✓ אומת ${esc(a.verifiedAt)}</span></div>
+      <div class="small mute">${esc(a.platform)} · ${esc(a.how)}</div></li>`).join('') : '<li class="mute">אין חשבון מחובר.</li>');
     $('#profnow').textContent = st.defaultProfile ? `${st.defaultProfile.id} · גרסה ${st.defaultProfile.version} (${st.dataBanner ? 'אישור בדיקה סינתטי — לא אישור שלך' : 'אושר על ידך'})` : 'לא אושר פרופיל — העובד משתמש בפרופיל המובנה שלו, שאינו מאושר';
     if (!worker.online && projects.some(p => p.status === 'editing')) notice('עובד העריכה במחשב לא מחובר. העבודות ממתינות בתור וימשיכו כשהוא יחזור.', 'warn');
-    loadBrand().catch(() => {}); loadRules().catch(() => {}); loadRefs().catch(() => {});
+    renderAbout(worker);
+    loadBrand().catch(() => {}); loadRules().catch(() => {}); loadRefs().catch(() => {}); loadSkills().catch(() => {});
   }
   /** A preview of test material says so on every screen; an approval made there is synthetic, never the owner's. */
   function showBanner() { const b = $('#banner'), t = status && status.dataBanner; b.textContent = t || ''; b.classList.toggle('hidden', !t); }
@@ -76,26 +108,26 @@
   // ── Brand settings: edit, never invent ──
   async function loadBrand() {
     const { brand } = await api('/brand');
-    $('#brand').innerHTML = Object.entries(brand).map(([k, v]) => `<li data-field="${esc(k)}">
+    setHtml($('#brand'), Object.entries(brand).map(([k, v]) => `<li data-field="${esc(k)}">
       <div class="row"><b class="grow">${esc(v.label)}</b><span class="pill ${v.status === 'set' ? 'ok' : 'warn'}">${v.status === 'set' ? 'הוגדר' : 'חסר'}</span></div>
       <textarea data-brand="${esc(k)}" style="min-height:44px" placeholder="לא הוגדר — דנה לא תמציא">${esc(v.value == null ? '' : typeof v.value === 'string' ? v.value : JSON.stringify(v.value))}</textarea>
-      <div class="row"><span class="small mute grow">${v.source ? 'מקור: ' + esc(v.source) : ''}</span><button class="sm" data-brandsave="${esc(k)}">שמירה</button></div></li>`).join('');
+      <div class="row"><span class="small mute grow">${v.source ? 'מקור: ' + esc(v.source) : ''}</span><button class="sm" data-brandsave="${esc(k)}">שמירה</button></div></li>`).join(''));
   }
   $('#brand').onclick = async e => {
     const k = e.target.dataset.brandsave; if (!k) return;
     const by = who(); if (!by) return;
     const val = $(`[data-brand="${k}"]`).value.trim().replace(k === 'instagram_account' ? /^@/ : /^$/, '');
-    try { await api('/brand/' + k, { method: 'PUT', body: { value: val, by } }); await loadBrand(); notice(val ? 'ההגדרה נשמרה. היא תיכנס לעריכות הבאות.' : 'ההגדרה נמחקה ומסומנת כחסרה.', 'ok'); } catch (err) { notice(err.message, 'bad'); }
+    try { await api('/brand/' + k, { method: 'PUT', body: { value: val, by } }); delete $(`[data-brand="${k}"]`).dataset.dirty; await loadBrand(); notice(val ? 'ההגדרה נשמרה. היא תיכנס לעריכות הבאות.' : 'ההגדרה נמחקה ומסומנת כחסרה.', 'ok'); } catch (err) { notice(err.message, 'bad'); }
   };
 
   // ── Standing rules ──
   let rulesNow = [];
   async function loadRules() {
     const { rules } = await api('/rules'); rulesNow = rules.filter(r => r.status === 'active');
-    $('#rules').innerHTML = rulesNow.length ? rulesNow.map(r => { const src = r.source || {}; return `<li><div class="row"><span class="grow">${esc(r.text)}</span><span class="pill mute">גרסה ${esc(r.version ?? 1)}</span></div>
+    setHtml($('#rules'), rulesNow.length ? rulesNow.map(r => { const src = r.source || {}; return `<li><div class="row"><span class="grow">${esc(r.text)}</span><span class="pill mute">גרסה ${esc(r.version ?? 1)}</span></div>
       <div class="small mute">מקור: ${src.project_title ? `פרויקט "${esc(src.project_title)}"${src.version_n ? ' · גרסה ' + esc(src.version_n) : ''}` : 'לא נרשם'} · ${esc(src.by ?? r.by ?? '')} · ${fmt(src.at ?? r.at)}</div>
       <div class="row" style="margin-top:6px"><button class="sm" data-ruleedit="${esc(r.id)}">עריכת הנוסח</button><button class="sm danger" data-rule="${esc(r.id)}">הסר כלל</button></div></li>`; }).join('')
-      : '<li class="mute">אין כללים קבועים.</li>';
+      : '<li class="mute">אין כללים קבועים.</li>');
   }
   $('#rules').onclick = async e => {
     const eid = e.target.dataset.ruleedit, id = e.target.dataset.rule;
@@ -159,7 +191,8 @@
     const { references, worker } = await api('/references'); refsNow = references;
     const RS = { awaiting_analysis: [worker && worker.online ? 'ממתין לניתוח' : 'ממתין לעובד (לא מחובר)', 'warn'], analysing: ['בניתוח', 'info'], analysed: ['נותח — מחכה להחלטה שלך', 'info'],
       analysis_failed: ['הניתוח נכשל', 'bad'], link_only: ['קישור בלבד', 'mute'], approved: ['פרופיל אושר', 'ok'], rejected: ['ההצעה נדחתה', 'mute'] };
-    $('#refs').innerHTML = references.length ? references.map(r => {
+    renderSkillRefs();
+    setHtml($('#refs'), references.length ? references.map(r => {
       const a = r.analysis, m = a && a.measured, pp = r.proposed_profile, st = RS[r.status] || [r.status, 'mute'], cov = a && a.coverage;
       return `<li data-refid="${esc(r.id)}"><div class="row">${a ? `<input type="checkbox" data-refsel="${esc(r.id)}" ${refSel.has(r.id) ? 'checked' : ''} aria-label="בחירה להשוואה">` : ''}<b class="grow">${esc(r.title)}</b><span class="pill ${st[1]}">${st[0]}</span></div>
       <div class="small mute">${r.file ? `${esc(r.file.name)} (${mb(r.file.bytes)}MB)` : r.source_url ? 'קישור' : ''} · ${esc(PERM[r.usage_permission] || r.usage_permission)}</div>
@@ -192,7 +225,7 @@
           <label class="chk"><input type="checkbox" data-refdefault> ברירת מחדל לפרויקטים הבאים</label>
           <div class="row" style="margin-top:6px"><button class="primary sm" data-refapprove="${esc(r.id)}">אשר כפרופיל</button><button class="sm danger" data-refreject="${esc(r.id)}">דחה</button></div>` : ''}</details>` : ''}
       <div class="row" style="margin-top:6px">${isVideo(r) ? `<button class="sm" data-refplay="${esc(r.id)}" data-t="0">▶ צפייה</button>` : ''}
-        ${r.file && !['analysing', 'awaiting_analysis'].includes(r.status) ? `<button class="sm" data-refagain="${esc(r.id)}">נתח שוב</button>` : ''}<button class="sm danger" data-refdel="${esc(r.id)}">מחיקה</button></div></li>`; }).join('') : '<li class="mute">עדיין לא נוסף רפרנס.</li>';
+        ${r.file && !['analysing', 'awaiting_analysis'].includes(r.status) ? `<button class="sm" data-refagain="${esc(r.id)}">נתח שוב</button>` : ''}${a ? `<button class="sm" data-refskill="${esc(r.id)}">צור סקיל מהניתוח</button>` : ''}<button class="sm danger" data-refdel="${esc(r.id)}">מחיקה</button></div></li>`; }).join('') : '<li class="mute">עדיין לא נוסף רפרנס.</li>');
     $('#refcompare').disabled = refSel.size < 2;
     clearTimeout(refTimer);
     if (references.some(r => ['awaiting_analysis', 'analysing'].includes(r.status)) && !$('#home').classList.contains('hidden')) refTimer = setTimeout(() => loadRefs().catch(() => {}), 6000);
@@ -215,6 +248,7 @@
         await loadHome(); return notice(make_default ? 'הפרופיל אושר ונקבע כברירת מחדל.' : 'הפרופיל אושר. הוא לא ברירת מחדל.', 'ok'); }
       if (d.refreject) { const reason = prompt('למה ההצעה נדחית? (לא חובה)'); if (reason === null) return; const by = who(); if (!by) return;
         await api(`/references/${d.refreject}/reject-profile`, { method: 'POST', body: { by, reason } }); await loadRefs(); return notice('ההצעה נדחתה. שום דבר לא השתנה.', 'ok'); }
+      if (d.refskill) { refSel = new Set([d.refskill]); return openSkillPicker(); }
       if (d.refagain) { await api(`/references/${d.refagain}/reanalyse`, { method: 'POST', body: {} }); await loadRefs(); return notice('הרפרנס חזר לתור הניתוח.', 'ok'); }
       if (d.refdel) { if (!confirm('למחוק את הרפרנס?')) return; refSel.delete(d.refdel); await api('/references/' + d.refdel, { method: 'DELETE' }); await loadRefs(); }
     } catch (err) { notice(err.message, 'bad'); }
@@ -289,6 +323,271 @@
       await loadHome(); notice(`הפרופיל המשולב אושר (גרסה ${profile.version})${make_default ? ' ונקבע כברירת מחדל. הוא יופעל בפרויקט הבא.' : '.'}`, 'ok'); } catch (err) { notice(err.message, 'bad'); }
   };
 
+  // ═══ HOW IT WORKS (from the code, plus what the worker reported about its own machine) ═══
+  function renderAbout(worker) {
+    const c = (worker && worker.capabilities) || null, on = worker && worker.online;
+    const CAP = [
+      ['active', 'תמלול עם זמני מילים, פעמיים', 'Whisper large-v3 במחשב העריכה. מילים בספק מסומנות להאזנה; רק האזנה שלך מאמתת מילה.'],
+      ['active', 'תכנון תוכן', 'מודל בלי כלים: מסר, פתיחה, אילו קטעים ובאיזה סדר, רגעי זום, ציטוט לקאבר. רק ממה שנאמר בהקלטה.'],
+      ['active', 'חיתוך וחיבור קטעים', 'חיתוך ישר בין מילים עם מעבר קול קצר. אין מעברים מעוצבים.'],
+      ['active', 'כתוביות צרובות', 'המילים שנאמרו בלבד; גודל, מיקום, שורות וצבע; מוזזות מהפנים שנמדדו ונשארות באזור הבטוח.'],
+      ['partial', 'הנפשת כתוביות', 'כניסה הדרגתית (עם או בלי עלייה) בלבד. אין הנפשת מילה-מילה.'],
+      ['active', 'זומים', 'פנימה והחזקה ברגעי מפתח, ממורכז על הפנים שנמדדו. תחושת התנועה לא נבדקת.'],
+      [c && c.hyperframes === false ? 'missing' : 'partial', 'מואושן גרפיק (HyperFrames)', (c && c.hyperframes === false ? 'הכלי לא נמצא כרגע במחשב העריכה. ' : '') + 'כותרת פתיחה והדגשת משפט מפתח בלבד, מציטוט מדויק, ורק כשיש לזה תפקיד. אין תרשימים או גרפיקה מסבירה.'],
+      ['partial', 'צבע', 'תיקון עדין לפי מדידה (חשיפה, קונטרסט, איזון לבן, רוויה) עם בדיקת גוון עור. אין מראה / גרייד, ואיש לא מסתכל על התוצאה מלבדך.'],
+      ['partial', 'סאונד', 'נרמול עוצמה, וניקוי רעש עדין רק כשנמדד רעש בין המילים. אין מוזיקה, אין אפקטים, ואיש לא מאזין.'],
+      ['active', 'ביקורת על התוצר', 'בדיקות אוטומטיות על הקובץ הסופי + הערכת מודל על התמלול ועל פריימים בודדים, ב-12 קטגוריות עם קריטריונים קבועים.'],
+      ['active', 'סבבי תיקון', `עריכה ← ביקורת ← תיקון ← בדיקה חוזרת${c ? `, עד ${c.max_review_rounds} סבבים, ${Math.round(c.max_seconds / 60)} דקות ו-$${c.max_cost_usd}` : ''}. נעצר כשאין שיפור או כשאותה תקלה חוזרת.`],
+      ['active', 'רפרנסים וסקילי עריכה', 'ניתוח סגנון של רפרנס (מדידות, פריימים, הערכת מודל, השערות — מסומנים בנפרד) וספריית סקילים שנטענים לתכנון, לרינדור ולביקורת.'],
+      ['missing', 'צילומי השלמה (B-roll)', 'לא קיים. אין חומר ואין מנגנון.'],
+      ['missing', 'מוזיקה ואפקטים קוליים', 'לא קיים.'],
+      ['missing', 'האזנה לאודיו וצפייה בתנועה', 'אף רכיב לא מאזין ולא צופה ברצף. זה נשאר אצלך.'],
+      ['missing', 'פרסום', 'כבוי. שום דבר לא עולה ל-Meta בלי אישור נפרד שלך.'],
+    ];
+    const ST = { active: ['פעיל', 'ok'], partial: ['חלקי', 'warn'], missing: ['חסר', 'bad'] };
+    setHtml($('#about'), `<div class="card"><h2>המסלול</h2>
+        <ol class="plain small" style="counter-reset:s">${[
+          ['העלאה', 'הקובץ נשמר כמו שהוא בשרת. השרת רק מתאם; הוא לא עורך.'],
+          ['תמלול ומדידות', 'עובד העריכה במחשב מתמלל פעמיים, מודד עוצמת קול לכל מילה ומיקום פנים.'],
+          ['תכנון', 'Claude (בלי כלים, בלי גישה לקבצים או לרשת) מחליט על המסר, הקטעים, הזומים, הקאבר והגרפיקה. התשובה שלו היא נתונים שהקוד מאמת לפני שימוש.'],
+          ['עריכה', 'העובד מבצע: ffmpeg חותך, מתקן צבע וסאונד לפי מדידה ומקודד; Chrome מצייר כתוביות; HyperFrames מרנדר גרפיקה.'],
+          ['ביקורת על התוצר', 'בדיקות קוד על הקובץ הסופי, והערכת מודל על התמלול של אותו קובץ ועל פריימים בודדים ממנו.'],
+          ['תיקונים', 'מה שאפשר לתקן בתוך הכללים חוזר לעורך ונבדק שוב. ספקות והחלטות עוברים אלייך.'],
+          ['צפייה ואישור שלך', 'רק את/ה מאשר/ת גרסה. אישור חל על הגרסה המדויקת, ואינו פרסום.'],
+        ].map(([t, x], i) => `<li><b>${i + 1}. ${t}</b> — ${x}</li>`).join('')}</ol></div>
+      <div class="card"><h2>מי מחליט מה</h2><ul class="plain small">
+        <li><b>Claude מחליט</b> (שיפוט תוכן, תמיד כנתונים מאומתים): מסר, פתיחה, קטעים וסדר, רגעי זום, ציטוט הקאבר, גרפיקה ותפקידה, חלוקת הכתוביות, טיוטת הקפשן, פירוש בקשה חופשית, ניתוח סגנון של רפרנס, ניסוח טיוטת סקיל.</li>
+        <li><b>עובד העריכה מבצע ומודד</b> (קוד): נקודות חיתוך בין מילים, תזמון כתוביות מהאודיו הסופי, מיקום כתוביות מחוץ לפנים, מיקוד זום, האם נדרש תיקון צבע או סאונד וכמה, מיקום גרפיקה, וכל הבדיקות.</li>
+        <li><b>דנה בודקת בפועל</b>: מילים מול התמלול, סנכרון, מסגרת ואזור בטוח, כיסוי פנים, זמן קריאה, מה שבאמת על המסך פריים-פריים, פורמט, עוצמה, מדידות צבע ורעש, וחיתוכים בין מילים. מודל מעריך מסר, פתיחה, מבנה, קצב וקאבר — מטקסט ומפריימים.</li>
+        <li><b>מה שדנה לא יכולה לבדוק</b>: איך הקול נשמע, תחושת תנועה, האם הצבע נראה נכון, האם תמלול אוטומטי מדויק, המראה בתוך אינסטגרם, וביצועים.</li></ul></div>
+      <div class="card"><h2>יכולות: פעיל, חלקי, חסר</h2>
+        <p class="small mute">לפי הקוד שרץ, לא לפי שמות של סקילים מותקנים. ${c ? `עובד העריכה דיווח בהתחברות האחרונה: מודל תוכן ${c.content_model && c.content_model.enabled ? esc(c.content_model.model) : 'כבוי'} · זיהוי פנים ${c.face_detection ? 'קיים' : 'חסר'} · HyperFrames ${c.hyperframes ? 'קיים' : 'חסר'}${on ? '' : ' (העובד לא מחובר כרגע)'}.` : 'עובד העריכה עוד לא דיווח על היכולות במחשב שלו.'}</p>
+        <ul class="plain">${CAP.map(([st, t, x]) => `<li><div class="row"><b class="grow">${t}</b><span class="pill ${ST[st][1]}">${ST[st][0]}</span></div><div class="small">${x}</div></li>`).join('')}</ul></div>`);
+  }
+
+  // ── a package: which version was reviewed, when, on which file, and is that still what is on screen ──
+  function reviewInfoCard(r) {
+    if (!r) return '';
+    const fin = r.onFinalFile === true ? ['כן — על הקובץ הסופי, אחרי כל השינויים', 'ok'] : r.onFinalFile === false ? ['לא — הקובץ השתנה אחרי הביקורת', 'bad'] : ['לא נרשם בגרסה הזו', 'mute'];
+    return `<div class="card" id="reviewinfo" ${r.upToDate ? '' : 'style="border-color:var(--bad)"'}><h2>על מה הביקורת הזו</h2>
+      ${r.upToDate ? '<span class="pill ok">הביקורת מתייחסת לגרסה המוצגת</span>' : `<span class="pill bad">הביקורת אינה עדכנית</span><ul class="plain small">${r.stale.map(x => `<li class="bad">${esc(x)}</li>`).join('')}</ul>`}
+      <ul class="plain small">
+        <li>גרסת הסרטון שנבדקה: <b>${esc(r.versionN)}</b> · מועד הביקורת: ${r.reviewedAt ? fmt(r.reviewedAt) : r.packageReadyAt ? fmt(r.packageReadyAt) + ' (מועד החבילה)' : 'לא נרשם'}${r.rounds ? ` · ${esc(r.rounds)} סבבי ביקורת` : ''}</li>
+        <li>בוצעה על הקובץ הסופי: <span class="${fin[1]}">${fin[0]}</span>${r.finalSha256 ? ` · <code>${esc(r.finalSha256.slice(0, 12))}…</code>` : ''}</li>
+        <li>נמדד בקוד: <b>${r.counts.measured}</b> קריטריונים · נראה בפריימים: <b>${r.counts.frames}</b> · הערכת מודל: <b>${r.counts.model}</b> · לא נבדק: <b>${r.counts.not_checked}</b></li>
+        <li>סקיל העריכה הבסיסי: ${r.editingSkill ? `${esc(r.editingSkill.name)} גרסה ${esc(r.editingSkill.version)}` : 'לא נרשם'} · סקיל מהספרייה: ${r.librarySkill ? `${esc(r.librarySkill.name)} גרסה ${esc(r.librarySkill.version)}${r.librarySkill.status === 'draft_test' ? ' (בדיקת טיוטה)' : ''}` : 'אין'} · פרופיל: ${r.profile ? `${esc(r.profile.id)} גרסה ${esc(r.profile.version)}` : '—'}</li>
+        <li>רפרנסים ששימשו: ${(r.references || []).length ? r.references.map(x => `<code>${esc(x)}</code>`).join(' · ') : 'אין'} · גרסת קריטריונים <code>${esc(r.rubricVersion)}</code></li></ul>
+      ${(r.notChecked || []).length ? `<details class="small"><summary>מה לא נבדק (${r.notChecked.length})</summary><ul class="plain">${r.notChecked.map(x => `<li>${esc(x.criterion)} <span class="mute">— ${esc(x.why)}</span></li>`).join('')}</ul></details>` : ''}
+      <p class="small mute">${esc(r.basis || '')} ${esc(r.note)}</p></div>`;
+  }
+
+  // ── what a library skill did in this version, rule by rule ──
+  const RST = { applied: ['יושם', 'ok'], not_followed: ['לא יושם', 'bad'], not_applicable: ['לא התאים לסרטון הזה', 'mute'], unsupported: ['לא נתמך', 'bad'], not_checked: ['לא נבדק', 'warn'] };
+  function skillReportCard(pkg) {
+    const r = pkg.skillReport, ch = pkg.skillChoice;
+    if (!r) return ch ? `<div class="card" id="skillreport"><h2>סקיל עריכה</h2><div class="small">דנה לא בחרה סקיל מהספרייה: ${esc(ch.why || '')}</div></div>` : '';
+    const k = r.skill, sm = r.summary, by = { owner: 'בחרת לפרויקט', default: 'ברירת המחדל המאושרת', dana: 'דנה הציעה', owner_test: 'בדיקת טיוטה' }[k.chosen_by] || k.chosen_by;
+    return `<div class="card" id="skillreport"><h2>סקיל העריכה שהופעל: ${esc(k.name)} · גרסה ${esc(k.version)}</h2>
+      <div class="row">${k.status === 'draft_test' ? '<span class="pill warn">טיוטה בבדיקה — לא סקיל מאושר</span>' : approvedPill()}<span class="pill mute">${esc(by)}</span>
+        ${sm.fully_applied ? '<span class="pill ok">כל הכללים יושמו</span>' : '<span class="pill warn">לא יושם במלואו</span>'}</div>
+      ${k.why ? `<div class="small">למה הסקיל הזה: ${esc(k.why)}</div>` : ''}
+      <div class="small" style="margin-top:6px">יושמו ${sm.applied} · לא יושמו ${sm.not_followed} · לא התאימו ${sm.not_applicable} · לא נתמכים ${sm.unsupported} · לא נבדקו ${sm.not_checked}</div>
+      <ul class="plain">${r.rules.map(x => { const s = RST[x.status] || [x.status, 'mute']; return `<li><div class="row"><span class="pill ${s[1]}">${s[0]}</span><span class="pill mute">${esc(domLabel(x.domain))}</span></div>
+        <div>${esc(x.text)}</div><div class="small mute">${esc(x.note || '')}</div></li>`; }).join('') || '<li class="mute">בסקיל אין כללי טקסט, רק פרמטרים.</li>'}</ul>
+      ${r.params.length ? `<details class="small" open><summary>פרמטרים (${r.params.filter(x => x.applied).length} מתוך ${r.params.length} כפי שבסקיל)</summary><ul class="plain">${r.params.map(x => `<li>${esc(PARAM[x.key] || x.key)}: בסקיל <b dir="ltr">${esc(x.skill)}</b> · בסרטון <b dir="ltr">${esc(x.used)}</b> ${x.applied ? '<span class="pill ok">זהה</span>' : `<span class="pill warn">שונה</span> <span class="mute">${esc(x.note || '')}</span>`}</li>`).join('')}</ul></details>` : ''}
+      ${r.criteria.length ? `<details class="small" open><summary>ביקורת לפי קריטריוני הסקיל</summary><ul class="plain">${r.criteria.map(x => `<li><span class="pill ${x.met === true ? 'ok' : x.met === false ? 'bad' : 'warn'}">${x.met === true ? 'מתקיים' : x.met === false ? 'לא מתקיים' : 'לא נבדק'}</span> ${esc(x.text)}<div class="mute">${esc(x.note)}</div></li>`).join('')}</ul></details>` : ''}
+      ${(r.not_adopted || []).length ? `<details class="small"><summary>השערות שלא אומצו ולכן לא הופעלו (${r.not_adopted.length})</summary><ul class="plain">${r.not_adopted.map(x => `<li>${esc(x.text)}</li>`).join('')}</ul></details>` : ''}
+      <p class="small mute">${esc(r.basis)}</p></div>`;
+  }
+
+  // ═══ SKILL LIBRARY ════════════════════════════════════════════════════════
+  let skillsNow = [], skDomains = {}, skProfiles = [], skTimer = null, skPick = null;
+  const domLabel = d => (skDomains[d] && skDomains[d].label) || ASPECT[d] || d;
+  const SUP = { supported: ['נתמך', 'ok'], partial: ['נתמך חלקית', 'warn'], unsupported: ['לא נתמך', 'bad'] };
+  const BASIS2 = Object.assign({}, BASIS, { owner_instruction: ['הוראה שלי', 'ok'] });
+  const SKST = { draft: ['טיוטה', 'warn'], drafting: ['בניסוח אצל עובד העריכה', 'info'], draft_failed: ['הניסוח נכשל', 'bad'], approved: ['מאושר', 'ok'], approved_with_draft: ['מאושר · יש טיוטה לגרסה חדשה', 'ok'], retired: ['הוסר', 'mute'], discarded: ['נזנח', 'mute'] };
+  const approvedSkills = () => skillsNow.filter(k => k.approved);
+  function skillOptions(sel) {
+    sel = sel || { mode: 'default' }; const def = skillsNow.find(k => k.default);
+    return [`<option value="default" ${sel.mode === 'default' ? 'selected' : ''}>ברירת המחדל המאושרת${def ? `: ${esc(def.name)} גרסה ${def.defaultVersion}` : ' (אין — נערך בלי סקיל מהספרייה)'}</option>`,
+      ...approvedSkills().map(k => `<option value="pinned:${esc(k.id)}" ${sel.mode === 'pinned' && sel.id === k.id ? 'selected' : ''}>${esc(k.name)} · גרסה ${k.approved.version}${sel.mode === 'pinned' && sel.id === k.id && sel.version !== k.approved.version ? ` (לפרויקט נעולה גרסה ${sel.version})` : ''}</option>`),
+      `<option value="suggest" ${sel.mode === 'suggest' ? 'selected' : ''}>דנה תציע סקיל מתאים מהספרייה, עם נימוק</option>`,
+      `<option value="none" ${sel.mode === 'none' ? 'selected' : ''}>בלי סקיל מהספרייה</option>`].join('');
+  }
+  const skillChoiceNote = sel => !sel || sel.mode === 'default' ? 'אם הגדרת ברירת מחדל מאושרת, היא מופעלת אוטומטית.' : sel.mode === 'pinned' ? `לפרויקט נעולה גרסה ${sel.version} של "${sel.name}". גרסה חדשה של הסקיל לא תשנה את הפרויקט עד שתבחר/י אותה.`
+    : sel.mode === 'suggest' ? 'דנה תבחר רק מבין הסקילים שאישרת, ותכתוב למה.' : 'הפרויקט נערך לפי הכללים הבסיסיים בלבד.';
+
+  async function loadSkills() {
+    const j = await api('/skills'); skillsNow = j.skills; skDomains = j.domains; skProfiles = j.profiles || [];
+    const def = skillsNow.find(k => k.default);
+    $('#skilldef').textContent = def ? `${def.name} · גרסה ${def.defaultVersion}${status && status.dataBanner ? ' (אישור בדיקה סינתטי)' : ''}` : 'אין — פרויקטים נערכים בלי סקיל מהספרייה';
+    setHtml($('#skills'), (skillsNow.length ? skillsNow.map(k => { const st = SKST[k.status] || [k.status, 'mute'], v = k.draft || k.approved || {}, c = v.counts || {};
+      return `<li data-skid="${esc(k.id)}"><div class="row"><b class="grow">${esc(k.name)}</b><span class="pill ${st[1]}">${st[0]}</span>${k.default ? '<span class="pill ok">ברירת מחדל</span>' : ''}</div>
+        <div class="small mute">${k.approved ? `גרסה מאושרת ${k.approved.version} · ` : ''}${c.active ?? 0} כללים פעילים${c.unsupported ? ` · <span class="bad">${c.unsupported} לא נתמכים</span>` : ''}${c.hypotheses ? ` · ${c.hypotheses} השערות` : ''}${c.open_conflicts ? ` · <span class="bad">${c.open_conflicts} סתירות פתוחות</span>` : ''}</div>
+        <button class="sm" data-skopen="${esc(k.id)}" style="margin-top:4px">${ui.skill === k.id ? 'פתוח למטה' : 'פתיחה'}</button></li>`; }).join('') : '<li class="mute">עדיין אין סקילים בספרייה.</li>')
+      + (skProfiles.length ? `<li><details class="small"><summary>פרופילי פרמטרים מהמנגנון הקודם (${skProfiles.length})</summary><ul class="plain">${skProfiles.map(p => `<li>${esc(p.id)} · גרסה ${esc(p.version)}${p.default ? ' · ברירת מחדל ישנה' : ''} <button class="sm" data-skprofile="${esc(p.id)}|${esc(p.version)}">צור ממנו טיוטת סקיל</button></li>`).join('')}</ul>
+          <div class="mute">סקיל מאושר שהוגדר כברירת מחדל גובר על ברירת המחדל הישנה.</div></details></li>` : ''));
+    renderSkill();
+    clearTimeout(skTimer);
+    if (skillsNow.some(k => k.status === 'drafting') && !$('#home').classList.contains('hidden')) skTimer = setTimeout(() => loadSkills().catch(e => refreshFailed(e)), 5000);
+  }
+  function renderSkillRefs() {
+    const an = refsNow.filter(r => r.analysis);
+    setHtml($('#skrefs'), an.length ? an.map(r => `<label class="chk"><input type="checkbox" data-refsel="${esc(r.id)}" ${refSel.has(r.id) ? 'checked' : ''} data-nodirty="1"> ${esc(r.title)}</label>`).join('') : '<span class="mute">אין עדיין רפרנס מנותח. מעלים רפרנס בלשונית "רפרנסים וסגנון עריכה".</span>');
+    $('#skfromrefs').disabled = refSel.size < 1;
+  }
+  $('#skrefs').onchange = e => { const id = e.target.dataset.refsel; if (!id) return; e.target.checked ? refSel.add(id) : refSel.delete(id); $('#skfromrefs').disabled = refSel.size < 1; $('#refcompare').disabled = refSel.size < 2; };
+  $('#skfromrefs').onclick = () => openSkillPicker();
+
+  // "צור סקיל מהניתוח": choose what to take from each reference
+  async function openSkillPicker() {
+    try { const ids = [...refSel]; const { comparison } = await api('/references/compare', { method: 'POST', body: { ids, single: ids.length === 1 } });
+      skPick = comparison; ui.skill = null; showHome('skills'); renderPicker(); $('#skillcard').scrollIntoView({ block: 'start' }); } catch (err) { notice(err.message, 'bad'); }
+  }
+  function defaultPicks(c) {
+    return { aspects: c.aspects.flatMap(a => a.by_reference.filter(x => x.observation && x.basis !== 'hypothesis').map(x => ({ ref: x.ref, aspect: a.aspect }))),
+             params: Object.fromEntries(Object.entries(c.proposal.params).filter(([, p]) => p.suggested).map(([k, p]) => [k, p.suggested])) };
+  }
+  function renderPicker() {
+    const c = skPick, R = c.references, title = id => (R.find(r => r.id === id) || {}).title || id;
+    $('#skillcard').classList.remove('hidden');
+    setHtml($('#skillcard'), `<h2>צור סקיל מהניתוח: ${R.map(r => esc(r.title)).join(' + ')}</h2>
+      <label for="pk_name">שם הסקיל</label><input type="text" id="pk_name" maxlength="80" placeholder="למשל: ראיון מתאמנת — קצב רגוע">
+      <h3>מה לקחת מכל רפרנס</h3>
+      <p class="small mute">כל שורה מסומנת תהפוך לכלל, מקושר לממצא ולזמנים שלו ברפרנס. ממצא שהוא השערה ייכנס כהשערה בלבד ולא יופעל, עד שתאמצ/י אותו במפורש בטיוטה.</p>
+      <ul class="plain">${c.aspects.map(a => a.by_reference.filter(x => x.observation).map(x => { const b = BASIS[x.basis] || [x.basis, 'mute']; return `<li><label class="chk" style="align-items:flex-start"><input type="checkbox" data-pkasp="${esc(x.ref)}|${esc(a.aspect)}" ${x.basis === 'hypothesis' ? '' : 'checked'}>
+        <span><b>${esc(ASPECT[a.aspect] || a.aspect)}</b> <span class="pill ${b[1]}">${esc(b[0])}</span> <span class="mute">${esc(title(x.ref))}${(x.example_times_s || []).length ? ' · ' + x.example_times_s.map(tfmt).join(', ') : ''}</span>
+          <br>${esc(x.rule || x.observation)}<br><span class="small mute">הממצא: ${esc(x.observation)}</span></span></label></li>`; }).join('')).join('')}</ul>
+      <h3>פרמטרים</h3>
+      <ul class="plain">${Object.entries(c.proposal.params).map(([k, p]) => `<li><b>${esc(PARAM[k] || k)}</b>
+        <div class="row" style="margin-top:4px">${p.options.map(o => `<label class="chk"><input type="radio" name="pkp_${esc(k)}" value="${esc(o.ref)}" ${p.suggested === o.ref ? 'checked' : ''}> ${esc(o.title)}: <b dir="ltr">${esc(o.value)}</b> <span class="pill ${(BASIS[o.basis] || ['', 'mute'])[1]}">${esc((BASIS[o.basis] || [o.basis])[0])}</span></label>`).join('')}
+          <label class="chk"><input type="radio" name="pkp_${esc(k)}" value="" ${p.suggested ? '' : 'checked'}> לא לקחת</label></div></li>`).join('') || '<li class="mute">הניתוחים לא הציעו מספרים.</li>'}</ul>
+      <button class="primary" id="pk_create" style="margin-top:10px;width:100%">צור טיוטת סקיל</button>
+      <p class="small mute">נוצרת טיוטה בלבד. היא לא תשמש אף פרויקט ולא תהיה ברירת מחדל עד שתאשר/י אותה. סגנון בלבד: תוכן, מוזיקה ונכסים של הרפרנס לא מועתקים.</p>`);
+  }
+  function collectPicks() {
+    const aspects = $$('#skillcard [data-pkasp]:checked').map(x => { const [ref, aspect] = x.dataset.pkasp.split('|'); return { ref, aspect }; }), params = {};
+    for (const k of Object.keys(skPick.proposal.params)) { const r = document.querySelector(`#skillcard input[name="pkp_${CSS.escape(k)}"]:checked`); if (r && r.value) params[k] = r.value; }
+    return { aspects, params };
+  }
+  $('#skfromprompt').onclick = async () => {
+    const by = who(); if (!by) return;
+    const body = { by, name: $('#sk_name').value, prompt: $('#sk_prompt').value };
+    try {
+      if ($('#sk_combine').checked) { if (!refSel.size) return notice('סומן "לשלב ממצאים מרפרנסים" אבל לא נבחר רפרנס.', 'warn');
+        const ids = [...refSel]; const picks = skPick && skPick.references.map(r => r.id).sort().join() === ids.slice().sort().join() && $('#pk_create') ? collectPicks()
+          : defaultPicks((await api('/references/compare', { method: 'POST', body: { ids, single: ids.length === 1 } })).comparison);
+        Object.assign(body, { ids, picks }); }
+      const j = await api('/skills/from-prompt', { method: 'POST', body });
+      for (const id of ['#sk_name', '#sk_prompt']) { $(id).value = ''; delete $(id).dataset.dirty; }
+      skPick = null; ui.skill = j.skill.id; remember(); await loadSkills(); notice('ההוראות נשלחו לעובד העריכה לניסוח טיוטה. היא תופיע כאן כטיוטה לבדיקה שלך.', 'ok');
+    } catch (err) { notice(err.message, 'bad'); }
+  };
+  $('#skills').onclick = async e => {
+    const d = e.target.dataset;
+    if (d.skopen) { ui.skill = d.skopen; skPick = null; remember(); await loadSkills(); $('#skillcard').scrollIntoView({ block: 'start' }); }
+    if (d.skprofile) { const by = who(); if (!by) return; const [profileId, version] = d.skprofile.split('|');
+      try { const j = await api('/skills/from-profile', { method: 'POST', body: { by, profileId, version } }); ui.skill = j.skill.id; remember(); await loadSkills(); notice('נוצרה טיוטת סקיל מהפרופיל.', 'ok'); } catch (err) { notice(err.message, 'bad'); } }
+  };
+
+  // one skill: a readable draft that can be edited, tested on a clip and approved
+  function renderSkill() {
+    if (skPick) return renderPicker();
+    const k = skillsNow.find(x => x.id === ui.skill), el = $('#skillcard');
+    if (!k) { el.classList.add('hidden'); return; }
+    el.classList.remove('hidden');
+    const v = k.draft || k.approved; if (!v) return setHtml(el, `<h2>${esc(k.name)}</h2><div class="mute">לסקיל הזה אין גרסה פעילה.</div>`);
+    const isDraft = !!k.draft && v.status === 'draft', st = SKST[k.status] || [k.status, 'mute'], ro = isDraft ? '' : 'disabled';
+    if (v.status === 'drafting') return setHtml(el, `<h2>${esc(k.name)}</h2><span class="pill info">עובד העריכה מנסח את הטיוטה מההוראות שלך…</span><div class="quote" style="margin-top:8px">${esc(v.sources.prompt || '')}</div>
+      <p class="small mute">${(status && status.worker && status.worker.online) ? '' : 'עובד העריכה לא מחובר כרגע — הניסוח ימתין עד שיתחבר.'}</p>`);
+    if (v.status === 'draft_failed') return setHtml(el, `<h2>${esc(k.name)}</h2><span class="pill bad">הניסוח נכשל</span><div class="bad">${esc((v.error || {}).message || '')}</div><button class="sm danger" data-sk="retire" style="margin-top:8px">הסרה</button>`);
+    const rule = r => { const b = BASIS2[r.basis] || [r.basis, 'mute'], s = SUP[r.support], src = r.source || {};
+      return `<li data-rule="${esc(r.id)}"><div class="row"><span class="pill mute">${esc(domLabel(r.domain))}</span><span class="pill ${b[1]}">${esc(b[0])}</span><span class="pill ${s[1]}">${s[0]}</span>
+          ${r.support === 'unsupported' ? '<span class="pill bad">לא יופעל</span>' : r.basis === 'hypothesis' ? '<span class="pill warn">השערה — לא כלל</span>' : r.active ? '<span class="pill ok">פעיל</span>' : '<span class="pill mute">כבוי</span>'}</div>
+        <textarea data-rule="${esc(r.id)}" style="min-height:44px;margin-top:4px" ${ro}>${esc(r.text)}</textarea>
+        <div class="small mute">${src.type === 'reference' ? `מקור: הרפרנס "${esc(src.title)}" · ${esc(ASPECT[src.aspect] || src.aspect)} · ${esc(src.observation || '')} ${(src.times_s || []).map(t => `<button class="sm" data-refplay="${esc(src.ref)}" data-t="${t}">▶ ${tfmt(t)}</button>`).join(' ')}`
+          : src.type === 'prompt' ? 'מקור: ההוראות שכתבת' : src.type === 'conflict_resolution' ? 'מקור: פתרון סתירה שבחרת' : src.type === 'profile' ? 'מקור: פרופיל קודם' : 'מקור: עריכה שלך'}${r.adopted ? ` · אומץ מהשערה על ידי ${esc(r.adopted.by)}` : ''}</div>
+        ${r.support !== 'supported' ? `<div class="small ${r.support === 'unsupported' ? 'bad' : 'warn'}">${esc(r.support_note)}</div>` : ''}
+        ${isDraft ? `<div class="row" style="margin-top:4px">${r.basis === 'hypothesis' && r.support !== 'unsupported' ? `<button class="sm" data-sk="adopt" data-id="${esc(r.id)}">לאמץ כהוראה שלי</button>` : ''}
+          ${r.support !== 'unsupported' && r.basis !== 'hypothesis' ? `<label class="chk" style="margin:0"><input type="checkbox" data-ruleon="${esc(r.id)}" ${r.active ? 'checked' : ''}> פעיל</label>` : ''}<button class="sm danger" data-sk="rmrule" data-id="${esc(r.id)}">הסרה</button></div>` : ''}</li>`; };
+    const c = v.counts;
+    setHtml(el, `<div class="row"><h2 class="grow">${esc(k.name)} · גרסה ${v.version}</h2><span class="pill ${st[1]}">${st[0]}</span>${k.default ? '<span class="pill ok">ברירת מחדל</span>' : ''}</div>
+      <div class="small mute">מזהה <code>${esc(k.id)}</code> · נוצר ${fmt(v.createdAt)} על ידי ${esc(v.createdBy || '—')} · מקור: ${esc({ analysis: 'ניתוח רפרנסים', prompt: 'הוראות', combined: 'הוראות + ניתוח רפרנסים', profile: 'פרופיל קודם' }[v.origin] || v.origin)}${v.approvedAt ? ` · אושר ${fmt(v.approvedAt)} על ידי ${esc(v.approvedBy)}${status && status.dataBanner ? ' (אישור בדיקה סינתטי)' : ''}` : ''}</div>
+      ${!isDraft && k.approved ? '<div class="small" style="margin-top:6px">גרסה מאושרת אינה משתנה. שמירת שינוי תפתח טיוטה של גרסה חדשה; פרויקטים קיימים נשארים על הגרסה שלהם.</div>' : '<div class="pill warn" style="margin-top:6px">טיוטה — לא משמשת אף פרויקט ולא ברירת מחדל עד שתאשר/י</div>'}
+      ${c.unsupported ? `<div class="card" style="border-color:var(--bad)"><b class="bad">${c.unsupported} מהכללים אינם נתמכים על ידי עובד העריכה.</b><div class="small">הם נשמרים לתיעוד, לא יופעלו ולא ייספרו כמיושמים. הסקיל לא ייושם במלואו.</div></div>` : ''}
+      <label for="sk_e_name">שם</label><input type="text" id="sk_e_name" value="${esc(k.name)}" maxlength="80" ${k.draft ? '' : 'disabled'}>
+      <label for="sk_e_purpose">מטרת הסקיל</label><textarea id="sk_e_purpose" style="min-height:60px" ${ro}>${esc(v.purpose)}</textarea>
+      <label for="sk_e_suit">סוגי סרטונים מתאימים (שורה לכל סוג)</label><textarea id="sk_e_suit" style="min-height:60px" ${ro}>${esc((v.suitable_for || []).join('\n'))}</textarea>
+      ${(v.conflicts || []).length ? `<h3 class="${c.open_conflicts ? 'bad' : ''}">סתירות בין הוראות (${c.open_conflicts} פתוחות)</h3><ul class="plain">${v.conflicts.map(x => { const A = v.rules.find(r => r.id === x.a) || {}, B = v.rules.find(r => r.id === x.b) || {};
+        return `<li><div class="small">${esc(x.why)}</div>${x.resolution ? `<span class="pill ok">הוכרע: ${esc({ a: 'נשאר הראשון', b: 'נשאר השני', suggestion: 'אומצה ההצעה', keep_both: 'נשארו שניהם' }[x.resolution])}</span>` : `
+          <label class="chk"><input type="radio" name="cf_${esc(x.id)}" value="a"> להשאיר: ${esc(A.text)}</label><label class="chk"><input type="radio" name="cf_${esc(x.id)}" value="b"> להשאיר: ${esc(B.text)}</label>
+          <label class="chk"><input type="radio" name="cf_${esc(x.id)}" value="suggestion"> הצעת דנה: ${esc(x.suggestion)}</label><label class="chk"><input type="radio" name="cf_${esc(x.id)}" value="keep_both"> להשאיר את שניהם בכל זאת</label>`}</li>`; }).join('')}</ul>` : ''}
+      <h3>כללי עריכה (${c.active} פעילים${c.hypotheses ? `, ${c.hypotheses} השערות` : ''}${c.unsupported ? `, ${c.unsupported} לא נתמכים` : ''})</h3>
+      <ul class="plain">${v.rules.map(rule).join('') || '<li class="mute">אין כללי טקסט.</li>'}</ul>
+      ${isDraft ? `<div class="row"><input type="text" id="sk_e_newrule" class="grow" placeholder="כלל נוסף, כהוראה שלי" style="flex:1;min-width:160px"><select id="sk_e_newdom" style="width:auto">${Object.entries(skDomains).map(([d, x]) => `<option value="${d}">${esc(x.label)}</option>`).join('')}</select></div>` : ''}
+      <h3>פרמטרים</h3><ul class="plain">${Object.entries(v.params).map(([key, val]) => `<li><div class="row"><span class="grow">${esc(PARAM[key] || key)} <span class="mute small">${esc((v.param_sources[key] || {}).title || '')}</span></span>
+        ${typeof val === 'boolean' ? `<input type="checkbox" data-kp="${esc(key)}" data-pt="boolean" ${val ? 'checked' : ''} ${ro}>` : `<input type="text" data-kp="${esc(key)}" data-pt="${typeof val}" value="${esc(val)}" dir="ltr" style="width:110px" ${ro}>`}</div></li>`).join('') || '<li class="mute">אין פרמטרים — נשארים המספרים של הפרופיל הבסיסי.</li>'}</ul>
+      <h3>קריטריוני ביקורת</h3><ul class="plain small">${v.criteria.map(x => `<li><code>${esc(x.id)}</code> ${esc(x.text)}</li>`).join('') || '<li class="mute">אין.</li>'}</ul>
+      <h3>יכולות ביצוע שהסקיל דורש</h3><ul class="plain small">${v.requires.map(x => `<li><span class="pill ${SUP[x.support][1]}">${SUP[x.support][0]}</span> <b>${esc(x.label)}</b> — ${esc(x.note)}</li>`).join('')}</ul>
+      <p class="small mute">שם הסקיל הוא תווית בלבד; מה שקובע מה יבוצע הוא היכולות האלה.</p>
+      ${v.sample ? `<div class="card"><b>דוגמת תוצר מבדיקה</b><div class="small">פרויקט "${esc(v.sample.projectTitle)}", גרסה ${esc(v.sample.versionN)} · ${fmt(v.sample.at)} · יושמו ${v.sample.applied}, לא יושמו ${v.sample.not_followed}, לא התאימו ${v.sample.not_applicable}, לא נבדקו ${v.sample.not_checked}</div>
+        <button class="sm" data-id="${esc(v.sample.projectId)}" data-sk="opensample">פתיחת הסרטון</button></div>` : '<div class="small mute">עדיין אין דוגמת תוצר: הסקיל לא נבדק על קליפ.</div>'}
+      <details class="small"><summary>היסטוריית שינויים (${v.history.length})</summary><ul class="plain">${v.history.slice().reverse().map(x => `<li>${fmt(x.at)} · ${esc(x.by || '—')} · ${esc(x.action)}${x.detail && x.detail.changed ? ' — ' + esc(x.detail.changed.join(', ')) : ''}</li>`).join('')}</ul>
+        <div class="mute">גרסאות: ${k.versions.map(x => `${x.version} (${esc((SKST[x.status] || [x.status])[0])})`).join(' · ')}</div></details>
+      <details class="small"><summary>SKILL.md של הגרסה הזו</summary><pre style="white-space:pre-wrap;direction:ltr;text-align:left;font-size:12px">${esc(v.skill_md || '')}</pre></details>
+      <div class="row" style="margin-top:10px">
+        <button data-sk="save" class="${isDraft ? '' : 'hidden'}">שמירת הטיוטה</button>
+        ${isDraft ? `<select id="sk_e_testproj" style="width:auto;flex:1;min-width:150px"><option value="">בדיקה על קליפ: בחר/י פרויקט…</option></select><button data-sk="test">בדוק על הקליפ</button>` : ''}</div>
+      ${isDraft ? `<label class="chk"><input type="checkbox" id="sk_e_default"> להפוך לברירת המחדל אחרי האישור</label>
+        <button class="primary" data-sk="approve" style="width:100%" ${c.open_conflicts ? 'disabled' : ''}>אישור הסקיל</button>
+        <p class="small mute">${c.open_conflicts ? 'יש להכריע בסתירות ולשמור לפני אישור. ' : ''}אישור סקיל מאשר סגנון עריכה. הוא אינו אישור לפרסום.</p>` : ''}
+      <div class="row">${k.approved && !isDraft ? `<button data-sk="startdraft">עריכה (פותח טיוטת גרסה חדשה)</button><button data-sk="${k.default ? 'undefault' : 'default'}">${k.default ? 'הסרה מברירת המחדל' : 'קביעה כברירת מחדל'}</button>` : ''}<button class="danger" data-sk="retire">הסרת הסקיל</button></div>`);
+    const sel = $('#sk_e_testproj'); if (sel && sel.options.length < 2) api('/projects').then(j => { for (const p of j.projects) if (p.kind !== 'review_only' && ['ready_for_review', 'approved'].includes(p.status)) sel.add(new Option(p.title.slice(0, 40), p.id)); }).catch(() => {});
+  }
+  function skillEdits(k, v) {
+    const body = { purpose: $('#sk_e_purpose').value, suitable_for: $('#sk_e_suit').value.split('\n'), rules: [], resolve: [], add_rules: [] };
+    if ($('#sk_e_name').value.trim() !== k.name) body.name = $('#sk_e_name').value;
+    for (const r of v.rules) { const t = document.querySelector(`#skillcard textarea[data-rule="${CSS.escape(r.id)}"]`), on = document.querySelector(`#skillcard [data-ruleon="${CSS.escape(r.id)}"]`), e = { id: r.id };
+      if (t && t.value.trim() && t.value.trim() !== r.text) e.text = t.value; if (on && on.checked !== r.active) e.active = on.checked; if (Object.keys(e).length > 1) body.rules.push(e); }
+    for (const x of v.conflicts || []) { const r = document.querySelector(`#skillcard input[name="cf_${CSS.escape(x.id)}"]:checked`); if (r && !x.resolution) body.resolve.push({ id: x.id, resolution: r.value }); }
+    const nr = $('#sk_e_newrule'); if (nr && nr.value.trim()) body.add_rules.push({ text: nr.value, domain: $('#sk_e_newdom').value });
+    const params = {}; let bad = null;
+    $$('#skillcard [data-kp]').forEach(i => { const val = i.dataset.pt === 'boolean' ? i.checked : i.dataset.pt === 'number' ? Number(i.value) : i.value; if (i.dataset.pt === 'number' && !isFinite(val)) bad = i.dataset.kp; params[i.dataset.kp] = val; });
+    if (bad) throw new Error(`ערך לא תקין בפרמטר ${PARAM[bad] || bad}`);
+    if (JSON.stringify(params) !== JSON.stringify(v.params)) body.params = params;
+    return body;
+  }
+  $('#skillcard').onclick = async e => {
+    const t = e.target.closest('button'); if (!t) return; const d = t.dataset;
+    if (t.id === 'pk_create') { const by = who(); if (!by) return;
+      try { const j = await api('/skills/from-analysis', { method: 'POST', body: { by, name: $('#pk_name').value, ids: skPick.references.map(r => r.id), picks: collectPicks() } });
+        skPick = null; ui.skill = j.skill.id; remember(); await loadSkills(); notice('נוצרה טיוטת סקיל מהניתוח. היא טיוטה עד שתאשר/י.', 'ok'); } catch (err) { notice(err.message, 'bad'); }
+      return; }
+    if (d.refplay) { showHome('refs'); const v = $('#refvid'); if (v.dataset.ref !== d.refplay) { v.src = `${API}/references/${d.refplay}/file`; v.dataset.ref = d.refplay; } v.classList.remove('hidden');
+      const go = () => { try { v.currentTime = Number(d.t) || 0; } catch { /* */ } v.play().catch(() => {}); }; if (v.readyState >= 1) go(); else v.addEventListener('loadedmetadata', go, { once: true }); return v.scrollIntoView({ block: 'center' }); }
+    if (!d.sk) return;
+    const k = skillsNow.find(x => x.id === ui.skill); if (!k) return; const v = k.draft || k.approved;
+    if (d.sk === 'opensample') return open(d.id);
+    const by = who(); if (!by) return;
+    const done = async (j, msg) => { $$('#skillcard [data-dirty]').forEach(i => delete i.dataset.dirty); if ($('#sk_e_newrule')) $('#sk_e_newrule').value = ''; skillsNow = j.skills || skillsNow; await loadSkills(); notice(msg, 'ok'); };
+    try {
+      if (d.sk === 'save') return done(await api('/skills/' + k.id, { method: 'PUT', body: { by, ...skillEdits(k, v) } }), 'הטיוטה נשמרה.');
+      if (d.sk === 'startdraft') return done(await api('/skills/' + k.id, { method: 'PUT', body: { by } }), 'נפתחה טיוטה של גרסה חדשה. הגרסה המאושרת והפרויקטים שמשתמשים בה לא השתנו.');
+      if (d.sk === 'adopt') { if (!confirm('לאמץ את ההשערה כהוראה שלך? היא תהפוך לכלל פעיל, ותסומן שמקורה בהשערה שאימצת.')) return; return done(await api('/skills/' + k.id, { method: 'PUT', body: { by, rules: [{ id: d.id, adopt: true }] } }), 'ההשערה אומצה כהוראה שלך.'); }
+      if (d.sk === 'rmrule') return done(await api('/skills/' + k.id, { method: 'PUT', body: { by, rules: [{ id: d.id, remove: true }] } }), 'הכלל הוסר מהטיוטה.');
+      if (d.sk === 'test') { const pid = $('#sk_e_testproj').value; if (!pid) return notice('יש לבחור פרויקט לבדיקה.', 'warn');
+        await api('/skills/' + k.id, { method: 'PUT', body: { by, ...skillEdits(k, v) } });
+        if (!confirm('להפיק בפרויקט שנבחר גרסה חדשה לפי הטיוטה הזו? זו בדיקה: הגרסה תסומן כבדיקת טיוטה, והסקיל נשאר טיוטה.')) return;
+        const j = await api(`/skills/${k.id}/test`, { method: 'POST', body: { by, projectId: pid } }); notice('הבדיקה נכנסה לתור. התוצר יירשם כדוגמה בסקיל.', 'ok'); return open(j.project.id); }
+      if (d.sk === 'approve') { await api('/skills/' + k.id, { method: 'PUT', body: { by, ...skillEdits(k, v) } }); const make_default = $('#sk_e_default').checked;
+        if (!confirm(`לאשר את הסקיל "${k.name}"${make_default ? ' ולהפוך אותו לברירת המחדל של העריכות הבאות' : ''}?\nזה אישור של סגנון עריכה, לא אישור לפרסום.`)) return;
+        return done(await api(`/skills/${k.id}/approve`, { method: 'POST', body: { by, make_default } }), make_default ? 'הסקיל אושר ונקבע כברירת מחדל.' : 'הסקיל אושר. אפשר לבחור אותו בפרויקט.'); }
+      if (d.sk === 'default') return done(await api(`/skills/${k.id}/default`, { method: 'POST', body: { by } }), 'הסקיל נקבע כברירת מחדל. הוא יופעל בעריכות הבאות; פרויקטים קיימים לא משתנים.');
+      if (d.sk === 'undefault') return done(await api(`/skills/${k.id}/default`, { method: 'POST', body: { by, clear: true } }), 'הסקיל כבר אינו ברירת המחדל.');
+      if (d.sk === 'retire') { if (!confirm('להסיר את הסקיל? הוא לא ישמש יותר עריכות חדשות. גרסאות שנערכו לפיו נשארות.')) return; ui.skill = null; remember(); return done(await api(`/skills/${k.id}/retire`, { method: 'POST', body: { by } }), 'הסקיל הוסר.'); }
+    } catch (err) { notice(err.message + (err.data && err.data.conflicts ? ' (' + err.data.conflicts.join(', ') + ')' : ''), 'bad'); }
+  };
+
   // ═══ PROJECT ══════════════════════════════════════════════════════════════
   const STEPS = [['project', 'פרויקט'], ['transcript', 'תמלול'], ['style', 'סגנון ורפרנסים'], ['edit', 'עריכה'], ['review', 'ביקורת דנה'], ['approve', 'צפייה ואישור']];
   const base = () => `${API}/projects/${current.id}/versions/${current.version ? current.version.n : 0}`;
@@ -297,65 +596,68 @@
 
   async function open(id, quiet) {
     clearTimeout(timer);
-    try {
-      const { project, worker } = await api('/projects/' + id);
-      if (!status) status = await api('/status');
-      showBanner();
-      const changed = !current || current.id !== project.id || current.currentVersion !== project.currentVersion || current.status !== project.status
-        || current.pendingCorrections !== project.pendingCorrections || JSON.stringify(current.cardStates) !== JSON.stringify(project.cardStates);
-      const typing = document.activeElement && ['TEXTAREA', 'INPUT', 'SELECT'].includes(document.activeElement.tagName) && $('#panel').contains(document.activeElement);
-      current = project; workerPill(worker);
-      $('#home').classList.add('hidden'); $('#detail').classList.remove('hidden'); $('#back').classList.remove('hidden');
-      $('#title').textContent = project.title;
-      if (location.hash !== '#' + id) history.replaceState(null, '', '#' + id);
-      const key = `${project.id}:${project.currentVersion}`;
-      if (key !== draftKey) { draft = newDraft(); draftKey = key; listened = {}; selCat = null; cmpN = null; pvSource = null; }
-      if (stepFor !== key + project.status) { step = defaultStep(project); stepFor = key + project.status; }
-      renderSide(worker, quiet && !changed);
-      if (!(quiet && !changed && typing)) { renderSteps(); if (!(quiet && !changed)) renderPanel(); }
-      renderActions();
-      if (busy()) timer = setTimeout(() => open(id, true), 3000);
-    } catch (e) { notice(e.message, 'bad'); }
+    let data;
+    try { data = await api('/projects/' + id + (ui.view[id] ? '?version=' + ui.view[id] : '')); if (!status) status = await api('/status'); }
+    catch (e) {
+      if (quiet && current && current.id === id) { refreshFailed(e); timer = setTimeout(() => open(id, true), 6000); return; }   // keep what is on screen
+      return notice(`הפרויקט לא נטען: ${e.message}. אפשר לנסות שוב או לחזור לרשימת הפרויקטים.`, 'bad');
+    }
+    refreshOk(); showBanner();
+    if (!skillsNow.length) { try { const j = await api('/skills'); skillsNow = j.skills; skDomains = j.domains; } catch { /* the skill list is optional here */ } }
+    const project = data.project, first = !current || current.id !== project.id;
+    current = project; workerPill(data.worker);
+    $('#home').classList.add('hidden'); $('#detail').classList.remove('hidden'); $('#back').classList.remove('hidden');
+    $('#title').textContent = project.title;
+    if (location.hash !== '#' + id) history.replaceState(null, '', '#' + id);
+    if (first) { draft = newDraft(); listened = {}; cmpN = null; pvSource = null; playerKey = '';
+      step = ui.steps[id] || defaultStep(project); selCat = ui.cat[id] || null; }          // only when a project is OPENED - never on a refresh
+    const key = `${project.id}:${project.shown ? project.shown.n : 0}`;
+    if (key !== draftKey) { const keep = draft ? { note: draft.note, scope: draft.scope } : {}; draft = Object.assign(newDraft(), first ? {} : keep); draftKey = key; pvSource = null; }
+    renderSide(data.worker); renderSteps(); renderPanel(); renderActions();   // each goes through setHtml: no change → the DOM is not touched
+    if (busy()) timer = setTimeout(() => open(id, true), 3000);
   }
   function defaultStep(p) {
     const k = p.nextAction && p.nextAction.key;
     if (!p.version || !p.version.package) return 'project';
     return { render_corrections: 'transcript', apply_review: 'review', review_items: 'review', revise: 'edit', watch_approve: 'approve', approved: 'approve' }[k] || 'project';
   }
-  function back() { clearTimeout(timer); current = null; history.replaceState(null, '', location.pathname + location.search); $('#detail').classList.add('hidden'); $('#actions').classList.add('hidden');
+  function back() { clearTimeout(timer); current = null; playerKey = ''; history.replaceState(null, '', location.pathname + location.search); $('#detail').classList.add('hidden'); $('#actions').classList.add('hidden');
     $('#back').classList.add('hidden'); $('#home').classList.remove('hidden'); $('#title').textContent = '🎬 דנה סטודיו'; loadHome().catch(e => notice(e.message, 'bad')); }
   $('#back').onclick = back;
   $('#projects').onclick = e => { const b = e.target.closest('[data-id]'); if (b) { notice(''); open(b.dataset.id); } };
 
   // ── Side: player, worker state, stage, progress, versions, next action ──
-  function renderSide(worker, statusOnly) {
-    const p = current, v = p.version, pr = p.progress;
-    const vd = document.querySelector('#versions details'); if (vd) verOpen = vd.open;
-    if (!statusOnly || !$('#playerbox')) {
+  function renderSide(worker) {
+    const p = current, v = p.version, pr = p.progress, sh = p.shown || {};
+    const pk = `${p.id}:${v ? v.n : 0}:${v && v.hasVideo ? 1 : 0}`;
+    if (pk !== playerKey || !$('#playerbox')) {            // a status refresh never rebuilds the player (it would stop playback)
+      playerKey = pk;
       $('#side').innerHTML = `<div class="card" id="playerbox">${v && v.hasVideo ? `<video id="mainvid" controls playsinline preload="metadata" ${v.hasCover ? `poster="${base()}/cover"` : ''} src="${base()}/video"></video>
-          <div class="small mute" style="margin-top:6px">גרסה ${v.n}${v.kind === 'review_only' ? ' · הסרטון שהעלית (לא נערך)' : ''}${v.package ? ' · ' + tfmt(v.package.duration) : ''}</div>`
+          <div class="small mute" id="playerlabel" style="margin-top:6px"></div>`
           : '<div class="mute" style="padding:30px 0;text-align:center">הסרטון יופיע כאן כשהחבילה תהיה מוכנה לצפייה.</div>'}
           <div id="cmpbox"></div></div><div id="statusbox"></div>`;
+      $('#statusbox').__html = null;
+      if (cmpN) showCompare(cmpN);
     }
+    if ($('#playerlabel')) $('#playerlabel').textContent = `מוצגת גרסה ${v.n}${sh.isCurrent ? ' (הנוכחית)' : ` — לא הנוכחית (${sh.currentN})`}${v.kind === 'review_only' ? ' · הסרטון שהעלית, לא נערך' : ''}${v.package ? ' · ' + tfmt(v.package.duration) : ''}`;
     const h = [];
     h.push(`<div class="card next"><div class="small mute">הפעולה הבאה</div><b>${esc(p.nextAction ? p.nextAction.label : '—')}</b></div>`);
     if (pr && (busy() || ['failed', 'waiting'].includes((p.job || {}).status))) {
-      h.push(`<div class="card" id="progress"><div class="row"><h2 class="grow">${p.job.status === 'queued' ? 'ממתין בתור' : p.job.status === 'leased' ? 'דנה עובדת' : p.job.status === 'failed' ? '<span class="bad">נכשל</span>' : '<span class="warn">ממתין</span>'}</h2>
+      h.push(`<div class="card" id="progress"><div class="row"><h2 class="grow">${p.job.status === 'queued' ? 'ממתין בתור' : p.job.status === 'leased' ? 'דנה עובדת' : p.job.status === 'failed' ? '<span class="bad">נכשל</span>' : '<span class="warn">ממתין</span>'} — גרסה ${p.currentVersion}</h2>
           ${isNum(pr.percent) ? `<b>${pr.percent}%</b>${pr.percentBasis === 'estimated' ? '<span class="pill warn">משוער</span>' : ''}` : ''}</div>
         <div class="phases">${pr.phases.map(x => `<span class="${x.state}">${esc(x.label)}</span>`).join('')}</div>
         ${isNum(pr.percent) ? `<div class="bar"><i style="width:${pr.percent}%"></i></div><div class="small mute">${esc(pr.percentNote || '')}</div>` : '<div class="small mute">אין מדידה לאחוז בשלב הזה — מוצגים שלב, זמן שחלף ועדכון אחרון.</div>'}
-        <ul class="plain small"><li>שלב נוכחי: <b>${esc(pr.note || pr.stage || '—')}</b>${isNum(pr.stageElapsedS) ? ` · ${dur(pr.stageElapsedS)} בשלב הזה` : ''}</li>
-          <li>זמן שחלף: ${dur(pr.elapsedS)} · עדכון אחרון מהעובד: לפני ${dur(pr.sinceUpdateS)}</li>
+        <ul class="plain small"><li>שלב נוכחי: <b>${esc(pr.note || pr.stage || '—')}</b></li>
+          <li>התחיל: ${pr.startedAt ? fmt(pr.startedAt) : 'עוד לא'} · עדכון אחרון מהעובד: ${fmt(pr.lastUpdateAt)}</li>
           <li>ניסיון ${pr.attempts || 1} מתוך ${pr.maxAttempts}${worker && !worker.online ? ' · <span class="bad">העובד לא מחובר — ימשיך כשיחזור</span>' : ''}</li></ul>
         ${p.job.error ? `<div class="bad">${esc(p.job.error.message)}</div><div class="small mute">קוד: ${esc(p.job.error.code)}</div>
           <button data-do="retry" class="primary" style="margin-top:8px;width:100%">נסה שוב</button><div class="small mute">ניסיון חוזר לא מתמלל מחדש ולא מעלה שוב: התמלול וקובץ המקור נשמרים.</div>` : ''}</div>`);
     }
-    if (p.versions.length) h.push(`<div class="card" id="versions"><details ${window.innerWidth >= 980 || verOpen ? 'open' : ''}><summary><b>גרסאות (${p.versions.length})</b></summary><ul class="plain">${p.versions.map(x => `<li><div class="row"><b>גרסה ${x.n}</b>${pill(x.status)}${x.n === p.currentVersion ? '<span class="pill info">נוכחית</span>' : ''}${x.approved ? '<span class="pill ok">מאושרת</span>' : ''}
-        ${x.hasVideo && x.n !== p.currentVersion ? `<button class="sm" data-cmp="${x.n}" style="margin-inline-start:auto">▶ השוואה</button>` : ''}</div>
-        <div class="small mute">${fmt(x.createdAt)}${x.kind === 'review_only' ? ' · הסרטון שהעלית' : ''}${x.appliedReview ? ' · אחרי יישום שיפורי הביקורת' : ''}${x.revisionMode === 'locked_to_previous_plan' ? ' · תיקון ממוקד' : x.revisionMode === 'replanned' ? ' · תוכנן מחדש' : ''}${x.changeRequest ? ' · "' + esc(x.changeRequest) + '"' : ''}</div></li>`).join('')}</ul>
+    if (p.versions.length) h.push(`<div class="card" id="versions"><details ${window.innerWidth >= 980 ? 'open' : ''}><summary><b>גרסאות (${p.versions.length})</b></summary><ul class="plain">${p.versions.map(x => `<li><div class="row"><b>גרסה ${x.n}</b>${pill(x.status)}${x.n === p.currentVersion ? '<span class="pill info">נוכחית</span>' : ''}${x.n === sh.n ? '<span class="pill ok">מוצגת</span>' : ''}${x.approved ? '<span class="pill ok">מאושרת</span>' : ''}</div>
+        <div class="small mute">${fmt(x.createdAt)}${x.kind === 'review_only' ? ' · הסרטון שהעלית' : ''}${x.appliedReview ? ' · אחרי יישום שיפורי הביקורת' : ''}${x.revisionMode === 'locked_to_previous_plan' ? ' · תיקון ממוקד' : x.revisionMode === 'replanned' ? ' · תוכנן מחדש' : ''}${x.skill ? ` · סקיל: ${esc(x.skill.name)} גרסה ${esc(x.skill.version)}${x.skill.test ? ' (בדיקת טיוטה)' : ''}` : ''}${x.changeRequest ? ' · "' + esc(x.changeRequest) + '"' : ''}</div>
+        <div class="row" style="margin-top:4px">${x.hasPackage && x.n !== sh.n ? `<button class="sm" data-view="${x.n}">הצג את הגרסה הזו</button>` : ''}${x.hasVideo && x.n !== sh.n ? `<button class="sm" data-cmp="${x.n}">▶ השוואה לצד המוצגת</button>` : ''}</div></li>`).join('')}</ul>
       <p class="small mute">גרסאות לא נמחקות. אישור חל רק על הגרסה הנוכחית, וכל שינוי בתוצר מבטל אישור קודם.</p></details></div>`);
-    $('#statusbox').innerHTML = h.join('');
-    if (cmpN && !$('#cmpbox').innerHTML) showCompare(cmpN);
+    setHtml($('#statusbox'), h.join(''));
   }
   function showCompare(n) {
     cmpN = n;
@@ -365,29 +667,39 @@
 
   function renderSteps() {
     const p = current, dots = { transcript: p.pendingCorrections > 0, review: p.version && (p.version.unresolved || []).length > 0 };
-    $('#steps').innerHTML = STEPS.map(([k, l], i) => `<button data-step="${k}" class="${k === step ? 'on' : ''}"><span class="n">${i + 1}</span>${l}${dots[k] ? '<span class="dot"></span>' : ''}</button>`).join('');
+    setHtml($('#steps'), STEPS.map(([k, l], i) => `<button data-step="${k}" class="${k === step ? 'on' : ''}"><span class="n">${i + 1}</span>${l}${dots[k] ? '<span class="dot"></span>' : ''}</button>`).join(''));
   }
-  $('#steps').onclick = e => { const b = e.target.closest('[data-step]'); if (!b) return; step = b.dataset.step; renderSteps(); renderPanel(); $('#steps').scrollIntoView({ block: 'nearest' }); };
+  function goStep(k) { step = k; ui.steps[current.id] = k; remember(); renderSteps(); renderPanel(); }
+  $('#steps').onclick = e => { const b = e.target.closest('[data-step]'); if (!b) return; goStep(b.dataset.step); $('#steps').scrollIntoView({ block: 'nearest' }); };
 
   function renderActions() {
     const p = current, v = p.version, pkg = pkgOf(), k = p.nextAction && p.nextAction.key, b = [];
+    if (p.shown && !p.shown.isCurrent && !busy()) { $('#actions').innerHTML = ''; return $('#actions').classList.add('hidden'); }   // actions belong to the current version only
     if (k === 'retry') b.push('<button class="primary" data-do="retry">נסה שוב</button>');
     if (k === 'render_corrections') b.push(`<button class="primary" data-do="rendercorr">הפק גרסה עם ${p.pendingCorrections} התיקונים</button>`);
     if (k === 'apply_review') b.push('<button class="primary" data-do="applyreview">יישם שיפורים והפק גרסה חדשה</button>');
     if (k === 'review_items') b.push('<button class="primary" data-go="review">לפריטים הפתוחים</button>');
-    if (pkg && v.kind !== 'review_only' && ['ready_for_review', 'approved'].includes(v.status) && !busy()) {
+    if (pkg && p.shown.isCurrent && v.kind !== 'review_only' && ['ready_for_review', 'approved'].includes(v.status) && !busy()) {
       const blocked = v.unresolved.length > 0 || v.approvalValid || (v.contentJudgement && v.contentJudgement.missing && !v.contentJudgement.excepted) || p.pendingCorrections > 0;
       b.push(`<button ${k === 'watch_approve' ? 'class="primary"' : ''} data-do="approve" ${blocked ? 'disabled' : ''}>${v.approvalValid ? 'הגרסה מאושרת' : 'אשר גרסה ' + v.n}</button>`);
       b.push('<button data-go="edit">בקש תיקון</button>');
     }
-    $('#actions').innerHTML = b.join(''); $('#actions').classList.toggle('hidden', !b.length);
+    setHtml($('#actions'), b.join('')); $('#actions').classList.toggle('hidden', !b.length);
   }
 
   // ── Panels ──
   function renderPanel() {
     const fn = { project: panelProject, transcript: panelTranscript, style: panelStyle, edit: panelEdit, review: panelReview, approve: panelApprove }[step];
-    $('#panel').innerHTML = fn();
-    if (step === 'style' && pkgOf()) loadPreviewSource(base() + '/cover');
+    const sh = current.shown || {}, v = current.version;
+    // Which version is this? Said at the top of every step, so a review is never read as belonging to another version.
+    const head = !v ? '' : !sh.isCurrent
+      ? `<div class="card" id="shownote" style="border-color:var(--warn)"><b class="warn">מוצגת גרסה ${sh.n} — לא הגרסה הנוכחית.</b>
+          <div class="small">${sh.currentHasPackage ? `הגרסה הנוכחית היא ${sh.currentN}.` : `גרסה ${sh.currentN} עדיין ${busy() ? 'בעבודה' : 'לא הושלמה'}; עד שתהיה מוכנה מוצגת כאן הגרסה האחרונה שהושלמה, כדי שהביקורת, התמלול והעריכה שלה לא ייעלמו.`}
+          כל מה שבשלבים למטה (כולל הדירוג של דנה) שייך לגרסה ${sh.n} בלבד. פעולות חלות רק על הגרסה הנוכחית.</div>
+          ${sh.currentHasPackage ? '<button class="sm" data-view="current" style="margin-top:6px">עבור לגרסה הנוכחית</button>' : ''}</div>` : '';
+    const changed = setHtml($('#panel'), head + fn());
+    if (!sh.isCurrent) $$('#panel [data-do], #panel [data-verify], #panel [data-ex], #panel [data-consent]').forEach(b => { if (!['pvframe', 'gorefs', 'goskills'].includes(b.dataset.do)) b.disabled = true; });
+    if (step === 'style' && pkgOf() && (changed || !pvSource)) loadPreviewSource(base() + '/cover');
     if (step === 'edit') reviseSummary();
   }
   const noPkg = what => `<div class="card"><h2>${what}</h2><div class="mute">${busy() ? 'דנה עדיין עובדת. השלב הזה ייפתח כשהחבילה תהיה מוכנה לצפייה.' : 'אין עדיין חבילה בגרסה הזו.'}</div></div>`;
@@ -405,6 +717,11 @@
         <label for="pacct">חשבון יעד לפרויקט</label>
         <select id="pacct">${accts.map(a => `<option value="${esc(a.username)}" ${p.account === a.username ? 'selected' : ''}>@${esc(a.username)} — מחובר ✓ אומת ${esc(a.verifiedAt)}</option>`).join('')}<option value="" ${p.account ? '' : 'selected'}>ברירת המחדל של המותג / לא נבחר</option></select>
         <div class="small mute">בחירת חשבון אינה פרסום. פרסום כבוי ונשאר מאחורי אישור נפרד שלך.</div></div>
+      ${p.kind === 'review_only' ? '' : `<div class="card" id="pskill"><h2>סקיל עריכה לפרויקט</h2>
+        <select id="pskillsel">${skillOptions(p.skill)}</select>
+        <div class="small mute" style="margin-top:6px">${esc(skillChoiceNote(p.skill))} הבחירה חלה מהגרסה הבאה; גרסאות קיימות לא משתנות. התאמות לפרויקט הזה (סגנון, זומים, הערות) לא משנות את הסקיל עצמו.</div>
+        <button data-do="applyskill" style="margin-top:8px" ${p.version && p.version.package && !busy() ? '' : 'disabled'}>החל את הסקיל והפק גרסה חדשה</button>
+        <div class="small mute">החלה יוצרת גרסה חדשה (תכנון, עריכה וביקורת לפי הסקיל), משאירה את הקיימת להשוואה ומבטלת אישור קודם.</div></div>`}
       <div class="card"><h2>הסכמה וזכויות</h2>
         <div class="row"><span class="grow">הסכמת המצולמים לפרסום</span><span class="pill ${cs[1]}">${cs[0]}</span></div>
         ${c.by ? `<div class="small mute">${esc(c.by)} · ${fmt(c.at)}${c.note ? ' · ' + esc(c.note) : ''}</div>` : ''}
@@ -524,6 +841,7 @@
         <div class="row" style="margin-top:6px">${(ri.domain_labels || []).map(d => `<span class="pill info">${esc(d)}</span>`).join('')}${ri.mode === 'replan' ? '<span class="pill warn">נדרש תכנון חדש — ייתכנו שינויים גם בחלקים אחרים</span>' : ri.mode === 'nothing_applied' ? '<span class="pill bad">לא נמצא שינוי שאפשר ליישם</span>' : '<span class="pill ok">שאר העריכה לא השתנתה</span>'}</div>
         ${(ri.not_applied || []).length ? `<ul class="plain small">${ri.not_applied.map(x => `<li class="warn">לא יושם: ${esc(x)}</li>`).join('')}</ul>` : ''}` : ''}
       ${pkg.revisionNote ? `<div class="quote">${esc(pkg.revisionNote)}</div>` : ''}</div>`);
+    h.push(skillReportCard(pkg));
     if (pl) h.push(`<div class="card" id="plan"><h2>התוכנית של דנה</h2>
       <label>המסר</label><div>${esc(pl.message || '—')}</div><label>הפתיחה</label><div>${esc(pl.hook || '—')}</div><label>למה</label><div>${esc(pl.rationale || '—')}</div>
       <label>מפת הקטעים</label><ul class="plain small">${(pl.segments || []).map(g => `<li><div class="row"><b>${esc(g.n)}.</b><span>מקור ${tfmt(g.source_in_s)}–${tfmt(g.source_out_s)}</span>${isNum(g.tl_in_s) ? `<button class="sm" data-play="${g.tl_in_s},${g.tl_out_s}" style="margin-inline-start:auto">▶ ${tfmt(g.tl_in_s)}</button>` : ''}</div><div>${esc(g.why || '')}</div></li>`).join('')}</ul>
@@ -585,6 +903,7 @@
     const rv = pkg.danaReview, h = [];
     if (!rv) return `<div class="card"><h2>ביקורת דנה</h2><div class="mute">הגרסה הזו נערכה לפני שהביקורת לפי קטגוריות נוספה. גרסה חדשה תכלול אותה.</div></div>` + reviewItems(v, pkg);
     const cats = rv.categories, sel = cats.find(c => c.key === selCat) || null, imps = rv.improvements || [], can = imps.filter(i => i.can_apply).length + (pkg.danaCanApply || []).length;
+    h.push(reviewInfoCard(p.review));
     h.push(`<div class="card" id="dreview"><h2>הביקורת של דנה — לפי קטגוריות</h2>
       <p class="small mute">${esc(rv.note)} <br>${esc(rv.perception)} · גרסת קריטריונים <code>${esc(rv.rubric_version)}</code></p>
       <div class="grid">${cats.map(c => `<button class="cat ${c.key === selCat ? 'sel' : ''}" data-cat="${c.key}"><b>${esc(c.label)}</b><span class="${LV[c.level]}">${esc(c.level)}</span>
@@ -715,10 +1034,11 @@
   });
   $('#panel').addEventListener('change', e => { const t = e.target;
     if (t.id === 'pacct') return act('/settings', { account: t.value }, t.value ? `חשבון היעד של הפרויקט: @${t.value}` : 'חשבון היעד של הפרויקט נוקה.', 'PATCH');
+    if (t.id === 'pskillsel') { const [mode, id] = t.value.split(':'); return act('/settings', { skill: mode === 'pinned' ? { mode, id } : { mode } }, 'בחירת הסקיל נשמרה. היא תחול מהגרסה הבאה.', 'PATCH'); }
     if (t.dataset.zoom || t.dataset.style || t.dataset.styles || t.dataset.adj || t.name === 'rvscope') t.dispatchEvent(new Event('input', { bubbles: true })); });
 
   async function act(path, body, okMsg, method = 'POST') {
-    try { const { project } = await api(`/projects/${current.id}${path}`, { method, body }); notice(okMsg, 'ok'); await open(project.id); }
+    try { const { project } = await api(`/projects/${current.id}${path}`, { method, body }); notice(okMsg, 'ok'); delete ui.view[project.id]; remember(); $$('#panel [data-dirty]').forEach(i => delete i.dataset.dirty); await open(project.id); }
     catch (e) { notice(e.message, 'bad'); if (e.data && e.data.error === 'fingerprint_mismatch') open(current.id); }
   }
   function play(t0, t1) {
@@ -729,13 +1049,18 @@
   function onClick(e) {
     const t = e.target.closest('button, [data-go]') || e.target, d = t.dataset || {};
     if (!current) return;
-    if (d.go) { step = d.go; renderSteps(); renderPanel(); window.scrollTo({ top: 0 }); return; }
-    if (d.cat) { selCat = selCat === d.cat ? null : d.cat; renderPanel(); const el = $('#dreview'); if (el) el.scrollIntoView({ block: 'nearest' }); return; }
+    if (d.go) { goStep(d.go); window.scrollTo({ top: 0 }); return; }
+    if (d.cat) { selCat = selCat === d.cat ? null : d.cat; ui.cat[current.id] = selCat; remember(); renderPanel(); return; }
+    if (d.view) { if (d.view === 'current') delete ui.view[current.id]; else ui.view[current.id] = Number(d.view); remember(); cmpN = null; return open(current.id); }
+    if (d.do === 'goskills') { back(); showHome('skills'); return; }
+    if (d.do === 'applyskill') { const by = who(); if (!by) return;
+      if (!confirm('להפיק גרסה חדשה של הפרויקט לפי הסקיל שנבחר? הגרסה הנוכחית נשמרת להשוואה, ואישור קודם מתבטל.')) return;
+      return act('/apply-skill', { by }, 'גרסה חדשה לפי הסקיל נכנסה לתור.'); }
     if (d.play) { const [t0, t1] = d.play.split(',').map(Number); if (d.listen) listened[d.listen] = true; return play(t0, t1); }
     if (d.cmp) return showCompare(Number(d.cmp));
     if (d.do === 'cmpclose') { cmpN = null; $('#cmpbox').innerHTML = ''; return; }
     if (d.do === 'cmpsync') { const a = $('#mainvid'), b = $('#cmp'); if (a && b) { a.currentTime = 0; b.currentTime = 0; b.muted = true; a.play().catch(() => {}); b.play().catch(() => {}); } return; }
-    if (d.do === 'gorefs') { back(); $('[data-home="refs"]').click(); return; }
+    if (d.do === 'gorefs') { back(); showHome('refs'); return; }
     if (d.verify) {
       const pkg = pkgOf(), c = pkg.cards.find(x => x.i === Number(d.verify)), sp = span(pkg, c), s = (current.cardStates || []).find(x => x.i === c.i) || {};
       const text = ($(`[data-card="${c.i}"]`).value || '').trim();
@@ -780,7 +1105,8 @@
   $('#detail').addEventListener('click', onClick);
   $('#actions').addEventListener('click', onClick);
 
+  showHome(ui.home);
   const id = location.hash.slice(1);
   (id ? open(id) : loadHome()).catch(e => notice(e.message, 'bad'));
-  setInterval(() => { if (!current) loadHome().catch(() => {}); }, 10000);
+  setInterval(() => { if (!current) loadHome().catch(e => refreshFailed(e)); }, 10000);
 })();
