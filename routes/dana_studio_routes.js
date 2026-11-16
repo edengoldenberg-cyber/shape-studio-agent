@@ -111,7 +111,7 @@ const upload = (req, res, next) => multer({
 panelRouter.get('/status', wrap((_req, res) => res.json({ ok: true, worker: studio.workerStatus(), publishingEnabled: publisher.enabled(),
   notifications: require('../services/dana_notify').realEnabled() ? 'real' : 'mock', maxUploadMb: maxUploadMb(), brandMissing: brand.missing(),
   instagramAccount: brand.get().instagram_account.value ?? null, defaultProfile: refs.defaultProfile(), styleLimits: studio.STYLE_OVERRIDABLE,
-  accounts: brand.accounts(), adjustmentKinds: studio.ADJUSTMENT_KINDS, phases: studio.PHASES,
+  accounts: brand.accounts(), adjustmentKinds: studio.ADJUSTMENT_KINDS, phases: studio.PHASES, targets: studio.TARGETS,
   // Set only on a preview that shows test material: the page then marks everything as test data and synthetic approvals.
   dataBanner: process.env.DANA_DATA_BANNER ? String(process.env.DANA_DATA_BANNER).slice(0, 300) : null })));
 // ── Notification: configuration check and ONE explicit test (real mode only) ──
@@ -149,6 +149,7 @@ panelRouter.get('/projects/:id/versions/:n/video', wrap((req, res) => {
   sendRange(req, res, studio.artifactPath(p.id, n, 'final.mp4'), 'video/mp4', { ETag: `"${v.artifacts['final.mp4'].sha256}"` });
 }));
 panelRouter.get('/projects/:id/versions/:n/compare-frames', media('compare_frames.jpg'));
+for (const k of [1, 2, 3, 4]) panelRouter.get(`/projects/:id/versions/:n/story-part-${k}`, media(`story_part_${k}.mp4`));
 panelRouter.get('/projects/:id/versions/:n/compare-clip',   media('compare_clip.mp4'));
 panelRouter.get('/projects/:id/versions/:n/cover',  media('cover.jpg'));
 panelRouter.get('/projects/:id/versions/:n/checks', media('checks.json'));
@@ -268,6 +269,10 @@ panelRouter.post('/skills/from-profile', json, wrap((req, res) => res.status(201
 panelRouter.put('/skills/:id', json, wrap((req, res) => res.json(skillsOut({ skill: skills.saveDraft(req.params.id, req.body ?? {}) }))));
 panelRouter.post('/skills/:id/approve', json, wrap((req, res) => res.json(skillsOut({ skill: skills.approve(req.params.id, req.body ?? {}) }))));
 panelRouter.post('/skills/:id/default', json, wrap((req, res) => res.json(skillsOut({ skill: skills.setDefault(req.params.id, req.body ?? {}) }))));
+/** "שדרג סקיל באמצעות רפרנס": a draft of the next version with an explicit comparison; nothing in use changes until it is approved. */
+panelRouter.post('/skills/:id/upgrade', json, wrap((req, res) => res.status(201).json(skillsOut({ skill: skills.upgrade(req.params.id, req.body ?? {}) }))));
+/** The approved default COMBINATION of skills, in priority order. */
+panelRouter.post('/skills/default-set', json, wrap((req, res) => { const out = skills.setDefaultSet(req.body ?? {}); res.json(skillsOut({ conflicts: out.conflicts })); }));
 panelRouter.post('/skills/:id/retire', json, wrap((req, res) => res.json(skillsOut({ skill: skills.retire(req.params.id, req.body ?? {}) }))));
 /** Try a DRAFT on one clip: a new version of that project, marked as a skill test. */
 panelRouter.post('/skills/:id/test', json, wrap((req, res) => res.json({ ok: true, project: studio.testSkill(req.params.id, req.body ?? {}) })));

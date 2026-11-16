@@ -99,6 +99,9 @@
         <input type="file" id="file" accept="video/*,.mp4,.mov,.m4v,.webm,.mkv,.avi" class="hidden">
         <label for="upacct">חשבון יעד לפרויקט</label>
         <select id="upacct"></select>
+        <label for="uptarget">יעד</label>
+        <select id="uptarget" data-nodirty="1"><option value="reel">ריל — סרטון רציף שעומד בפני עצמו</option><option value="story">סטורי — רצף כרטיסים קצרים</option><option value="both">שתי גרסאות — ריל וסטורי מאותו מקור</option></select>
+        <div class="small mute">היעד משנה את התכנון והרינדור (מבנה, משך, פתיחה, אזור בטוח, קאבר וקפשן), לא רק את השם. הפקת קובץ לסטורי אינה פרסום: פרסום סטורי דרך החיבור הקיים לא נבדק, והפרסום כבוי.</div>
         <div class="row" style="margin-top:10px">
           <button class="primary grow" id="pickraw">העלאת חומר גלם לעריכה</button>
           <button class="grow" id="pickreview">העלאת סרטון ערוך — הגש לביקורת דנה</button>
@@ -150,8 +153,18 @@
         <p class="small mute">כותבים בשפה רגילה איך לערוך. עובד העריכה מנסח מזה טיוטה: כללים, פרמטרים וקריטריוני ביקורת, ומסמן מה הוא לא מסוגל לבצע וסתירות בין הוראות. הטקסט הוא נתוני עריכה בלבד — הוא לא מריץ קוד ולא מקנה הרשאות.</p>
         <label for="sk_name">שם הסקיל</label><input type="text" id="sk_name" maxlength="80" data-keep>
         <label for="sk_prompt">איך לערוך</label><textarea id="sk_prompt" maxlength="4000" data-keep placeholder="למשל: לפתוח במשפט הכי חזק, כתוביות גדולות במרכז בשורה אחת, זום רק במשפט המפתח, בלי גרפיקה"></textarea>
-        <label class="chk"><input type="checkbox" id="sk_combine"> לשלב גם את הממצאים מהרפרנסים שסומנו למעלה</label>
-        <button id="skfromprompt" class="primary" style="margin-top:8px">צור טיוטת סקיל מההוראות</button></div>
+        <label for="sk_goal">מה אני רוצה להשיג</label><input type="text" id="sk_goal" maxlength="600" data-keep placeholder="למשל: עדויות שמרגישות אישיות ולא פרסומיות">
+        <label for="sk_must">הוראות חובה (שורה לכל הוראה) — דנה לא תשנה אותן כדי להתאים לדוגמה</label><textarea id="sk_must" style="min-height:60px" maxlength="2000"></textarea>
+        <label for="sk_open">פתוח להצעה של דנה (שורה לכל נושא)</label><textarea id="sk_open" style="min-height:44px" maxlength="1000" placeholder="למשל: קצב החיתוכים, איפה לשים זום"></textarea>
+        <label for="sk_avoid">מה לא לקחת מהסרטונים</label><input type="text" id="sk_avoid" maxlength="600" placeholder="למשל: לא את המוזיקה ולא את הלוגו">
+        <label>סרטוני דוגמה: רפרנסים שכבר נותחו (ניתוח קיים לא חוזר על עצמו)</label><div id="skex" class="small"></div>
+        <input type="file" id="sk_files" accept="video/*" multiple class="hidden">
+        <button id="skaddfiles" class="sm" style="margin-top:6px">צירוף סרטון דוגמה חדש</button><div id="sknew" class="small"></div>
+        <button id="skfromprompt" class="primary" style="margin-top:10px;width:100%">צור טיוטת סקיל</button>
+        <input type="checkbox" id="sk_combine" class="hidden"></div>
+      <div class="card"><h2>שילוב סקילים כברירת מחדל</h2>
+        <p class="small mute">אפשר להגדיר כמה סקילים מאושרים שמשלימים זה את זה (למשל תוכן + כתוביות + גרפיקה) כברירת מחדל. הסדר הוא סדר העדיפות: כששניים סותרים, הראשון קובע. דנה ממזגת אותם לתוכנית עריכה אחת.</p>
+        <div id="skset" class="small"></div><button id="sksetsave" class="sm" style="margin-top:6px">קבע את המסומנים כברירת המחדל</button></div>
       <div class="card"><h2>הסקילים</h2><ul class="plain" id="skills"><li class="mute">טוען…</li></ul></div>
       <div class="card hidden" id="skillcard"></div>
     </div>

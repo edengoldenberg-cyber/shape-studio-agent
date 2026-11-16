@@ -29,6 +29,7 @@ from pathlib import Path
 from . import PIPELINE_VERSION, adjust, captions, checks, editorial, interpret, judgement, motion, review
 from . import review as review_rubric
 from . import skillgen
+from . import target as target_mod
 from . import story
 from .align import Alignment
 from .core import (EXIT, FAILURE, REVIEW_REQUIRED, STYLE_OVERRIDABLE, SUCCESS, WAITING, PipelineError, Waiting,
@@ -208,11 +209,13 @@ def edit(j, dec, words, sp, sha_before, check, cache):
     j.active_zooms = zooms
     anim_name = st.get("caption_animation") if adjust.enabled(j.options, "caption_animation") else "none"
     animation = captions.ANIMATIONS.get(anim_name)
-    planned_graphics = motion.shift(getattr(j, "graphics", []), shift, round(out_s - in_s, 3)) if st["captions_enabled"] else []
+    all_planned = motion.shift(getattr(j, "graphics", []), shift, round(out_s - in_s, 3)) if st["captions_enabled"] else []
+    planned_scenes = [g for g in all_planned if g.get("layer") == "replaces_picture"]
+    planned_graphics = [g for g in all_planned if g.get("layer") != "replaces_picture"]
     plan_cover = (getattr(j, "story", None) or {}).get("cover") or {}
     if plan_cover.get("tl_s") is not None:               # the cover frame is the moment the quoted words are said
         dec["cover"]["frame_s"] = round(min(max(plan_cover["tl_s"] + shift + 0.2, 0.0), out_s - in_s - 0.1), 3)
-    key = hashlib.sha1(json.dumps([in_s, out_s, dec["cards"], st, zooms, j.options.get("adjustments"), anim_name, planned_graphics], ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    key = hashlib.sha1(json.dumps([in_s, out_s, dec["cards"], st, zooms, j.options.get("adjustments"), anim_name, all_planned], ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
     spans, skipped = check(dec)
     inner = [s for s in skipped if s["before_card"] not in (1, None)]
     edge = [s for s in skipped if s["before_card"] in (1, None)]
@@ -240,6 +243,19 @@ def edit(j, dec, words, sp, sha_before, check, cache):
         records.append(checks.check_boundary(words, in_s, out_s, checks.level_db(j.work / "voice_raw.wav", 0.0, 0.05),
                                               checks.room_tone_db(j.work / "voice_raw.wav"),
                                               checks.level_db(j.work / "voice_raw.wav", max(0.0, dur - 0.05), dur)))
+    # ── animation scenes: for their seconds they REPLACE the footage in the picture track (the voice is untouched) ──
+    plain_base, scenes, scenes_dropped = base, [], []
+    if planned_scenes:
+        with j.stage("animation"):
+            for g in planned_scenes:
+                try:
+                    frames_dir, n = motion.render_scene(cfg, st, g, j.work / "scenes")
+                    scenes.append(dict(g, frames=str(frames_dir), frames_n=n))
+                except PipelineError as e:        # reported, never left as "planned only"
+                    scenes_dropped.append({"kind": g["kind"], "quote": g["text"], "why": f"הרינדור ב-HyperFrames נכשל ({e.code}) — קטע האנימציה לא נוסף לסרטון"})
+                    issues.append(judgement.issue("animation_scene_not_rendered", "warn", f"קטע האנימציה '{g['text']}' לא נוסף: הרינדור ב-HyperFrames נכשל ({e.code})"))
+            if scenes:
+                base = motion.apply_scenes(cfg, plain_base, scenes, j.work / "base_scenes.mp4", st["fps"], cfg["timeouts"]["ffmpeg_s"])
 
     with j.stage("measure_picture"):
         zone = read_json(cfg["paths"]["safe_zone"])
@@ -344,7 +360,7 @@ def edit(j, dec, words, sp, sha_before, check, cache):
                                   (f"כתוביות שמכסות את אזור הפנים שנמדד: {hit}" if hit else f"אף אחת מ-{len(cards)} הכתוביות אינה מכסה את אזור הפנים שנמדד")
                                   + " (פריים אחד לכל כתובית)", cards=hit))
     # ── motion graphics (HyperFrames): placed clear of the face and of the captions, rendered, then overlaid ──
-    graphics, graphics_dropped, g_faces = [], [], {}
+    graphics, graphics_dropped, g_faces = [], list(scenes_dropped), {}
     if planned_graphics:
         with j.stage("graphics"):
             zone = read_json(cfg["paths"]["safe_zone"])
@@ -352,7 +368,8 @@ def edit(j, dec, words, sp, sha_before, check, cache):
                 g_faces[g["id"]] = story.faces_at(cfg, base, [round(g["tl_start_s"] + 0.3, 2), round((g["tl_start_s"] + g["tl_end_s"]) / 2, 2), round(g["tl_end_s"] - 0.3, 2)]) or []
             inks = [b for b in (checks._ink_box(Path(png_dir) / f"c{c['i']:03d}.png")[1] for c in cards) if b]
             band = (min(b[1] for b in inks), max(b[3] for b in inks)) if inks else None
-            placed, graphics_dropped = motion.place(planned_graphics, zone, g_faces, band, st["height"])
+            placed, not_placed = motion.place(planned_graphics, zone, g_faces, band, st["height"])
+            graphics_dropped += not_placed
             for g in placed:
                 try:
                     frames_dir, n = motion.render(cfg, st, g, j.work / "graphics")
@@ -404,6 +421,8 @@ def edit(j, dec, words, sp, sha_before, check, cache):
             motion_rec = {"data": {}}
         if graphics:
             records.append(motion.check(cfg, final, base, graphics, read_json(cfg["paths"]["safe_zone"]), g_faces, st["width"]))
+        if scenes:
+            records.append(motion.check_scenes(cfg, final, plain_base, scenes))
         records += [checks.check_output(cfg, final, dur), checks.check_loudness(cfg, final),
                     checks.check_source_unchanged(getattr(j, "orig_source", j.source), sha_before)]
         records += checks.HUMAN_CHECKS
@@ -444,7 +463,7 @@ def edit(j, dec, words, sp, sha_before, check, cache):
         issues.append(judgement.issue("owner_correction_kept", "info",
                                       f"ב-{n['t0']}s התמלול החוזר שמע '{n['heard']}' במקום שבו תיקנת ל-'{n['owner']}'. התיקון שלך נשמר; זה מידע בלבד.",
                                       t0=n["t0"], heard=n["heard"], owner=n["owner"]))
-    res = {"color": j.color, "audio_clean": j.audio, "graphics": [{k: v for k, v in g.items() if k != "frames"} for g in graphics],
+    res = {"color": j.color, "audio_clean": j.audio, "graphics": [{k: v for k, v in g.items() if k != "frames"} for g in scenes + graphics],
            "graphics_dropped": graphics_dropped, "compare": compare, "facts": facts, "animation": anim_name if cards and st["captions_enabled"] else "none",
            "captions_added": bool(st["captions_enabled"]), "zooms": zooms, "caption_position": cap_pos, "shift": shift, "key": key, "cards": cards, "records": records, "sync": sync, "adjudications": adjudications, "odiffs": odiffs,
            "heard": heard, "dur": dur, "final": final, "base": base, "cover": cover, "png_dir": png_dir, "attempts": attempts,
@@ -460,6 +479,9 @@ def pipeline(j):
     groups = cfg["language"]["homophone_groups"]
     options = j.options                      # one object: what the request interpretation changes is what the edit stage reads
     ecfg = cfg["editorial"]
+    tg = target_mod.of(options)              # reel | story: changes the plan (structure, length), the safe zone, cover and caption
+    tspec = target_mod.spec(tg)
+    zone_used = target_mod.use_zone(cfg, tg, j.dir)
 
     with j.stage("source"):
         if not j.source.is_file():
@@ -547,22 +569,30 @@ def pipeline(j):
             options.pop("change_request")          # no content request is left: the revision is locked to the previous plan
 
     # ── LIBRARY SKILL: the owner's choice / the approved default arrive with the job; "let Dana suggest" is decided here ──
+    # Several skills may be combined. They are MERGED here, before planning, into one set of rules, parameters and criteria,
+    # so there is one editing plan and no pass that overwrites another.
     skill_choice = None
-    if (options.get("skill_candidates") and not options.get("skill") and judgement.resolve_adapter(options, cfg) == "claude"
-            and cfg["judgement"]["claude"].get("enabled")):
+    ok = lambda c: isinstance(c, dict) and isinstance(c.get("skill"), dict) and isinstance(c.get("profile"), dict)
+    skill_set = [c for c in options.get("skill_set") or [] if ok(c)]
+    if (options.get("skill_candidates") and not skill_set and judgement.resolve_adapter(options, cfg) == "claude" and cfg["judgement"]["claude"].get("enabled")):
         with j.stage("choose_skill"):
-            cands = [c for c in options["skill_candidates"] if isinstance(c, dict) and isinstance(c.get("skill"), dict) and isinstance(c.get("profile"), dict)]
+            cands = [c for c in options["skill_candidates"] if ok(c)]
             try:
-                hit, why, u = skillgen.choose(cfg, j.dir, words, cands)
+                hits, why, u = skillgen.choose(cfg, j.dir, words, cands, tg)
                 usages.append(u)
             except PipelineError as e:
-                hit, why = None, f"הבחירה האוטומטית נכשלה ({e.code}) — נערך בלי סקיל מהספרייה"
+                hits, why = [], f"הבחירה האוטומטית נכשלה ({e.code}) — נערך בלי סקיל מהספרייה"
                 if getattr(e, "usage", None):
                     usages.append(e.usage)
-        skill_choice = {"considered": [{"id": c["skill"]["id"], "name": c["skill"]["name"]} for c in cands], "chosen": hit["skill"]["id"] if hit else None, "why": why}
-        if hit:
-            options["skill"], options["profile"] = dict(hit["skill"], chosen_by="dana", why=why), hit["profile"]
+        skill_choice = {"considered": [{"id": c["skill"]["id"], "name": c["skill"]["name"]} for c in cands], "chosen": [c["skill"]["id"] for c in hits], "why": why}
+        if hits:
+            options["skill"], options["profile"] = skillgen.merge(hits, chosen_by="dana", why=why)
+    elif skill_set:
+        options["skill"], options["profile"] = skillgen.merge(skill_set)
     skill = options.get("skill") if isinstance(options.get("skill"), dict) and isinstance(options.get("profile"), dict) else None
+    # an animation scene is planned only when a chosen skill has a rule about animation, or the owner asked for it on this project
+    options["allow_animation_scene"] = bool(adjust.enabled(options, "animation") and (options.get("animation_scene") is True
+                                            or any(r.get("domain") == "animation" for r in (skill or {}).get("rules") or [])))
     reviews = {}
 
     # ── RULES + TRANSCRIPT STATE ────────────────────────────────────────────
@@ -601,7 +631,7 @@ def pipeline(j):
     elif adapter == "claude" and prev.get("plan") and not str(options.get("change_request") or "").strip():
         # The owner asked only for caption / style / zoom changes: the previous plan is kept exactly, no re-planning.
         try:
-            pl = story.plan_from_previous(prev, words, cfg, profile)
+            pl = story.plan_from_previous(prev, words, cfg, profile, target=tg)
             locked_raw = story.decisions_from_previous(prev, options.get("caption_edits"))
             derived_updates = locked_raw.pop("_derived", [])
             for g in pl.get("graphics") or []:          # a graphic quotes the transcript: it follows the owner's corrections too
@@ -665,16 +695,23 @@ def pipeline(j):
         j.zooms, j.story = pl["zooms"], pl
         j.cut_joins = {"bad": bool(bad_joins), "note": ("חיתוך בתוך מילה: " + " | ".join(bad_joins)) if bad_joins else
                        f"{len(pl['segments'])} חלקים; כל החיתוכים נופלים בין מילים"}
-        if adjust.enabled(options, "graphics"):
-            j.graphics = pl.get("graphics") or []
-        else:
-            j.graphics = []
-            pl["graphics_dropped"] = (pl.get("graphics_dropped") or []) + [
-                {"kind": g["kind"], "quote": g["text"], "why": "מואושן גרפיק כובה לפרויקט הזה"} for g in pl.get("graphics") or []]
+        # each kind can be switched off, and ONE graphic can be removed by its id - nothing else in the edit moves
+        removed = {str(e.get("id")) for e in options.get("graphic_edits") or [] if isinstance(e, dict) and e.get("action") == "remove"}
+        j.graphics = []
+        for g in pl.get("graphics") or []:
+            scene = g.get("layer") == "replaces_picture"
+            why = ("הוסר על ידך בפרויקט הזה" if g["id"] in removed else "קטעי אנימציה כובו לפרויקט הזה" if scene and not adjust.enabled(options, "animation")
+                   else "מואושן גרפיק כובה לפרויקט הזה" if not scene and not adjust.enabled(options, "graphics") else None)
+            if why:
+                pl["graphics_dropped"] = (pl.get("graphics_dropped") or []) + [{"kind": g["kind"], "quote": g["text"], "why": why}]
+            else:
+                j.graphics.append(g)
         options["story"] = {"message": pl["message"], "hook": pl["hook"], "brief": pl["brief"],
                             "cover_quote": "" if not st["captions_enabled"] else pl["cover"]["quote"]}
         options["card_rules"] = (f"each card holds 1-{pp['max_words_per_line'] * pp['caption_max_lines']} words and is shown on at most "
-                                 f"{pp['caption_max_lines']} lines of about {pp['max_chars_per_line']} characters; break cards where a person pauses.")
+                                 f"{pp['caption_max_lines']} lines of about {pp['max_chars_per_line'] + tspec['chars_per_line_bonus']} characters; break cards where a person pauses.")
+        if not tspec["cover_text"]:
+            options["story"]["cover_quote"] = ""            # a story has no cover
         write_json(j.ed / "story_plan.json", pl)
 
     # ── PLAN ────────────────────────────────────────────────────────────────
@@ -698,8 +735,8 @@ def pipeline(j):
             j_issues.append(judgement.issue("heuristic_selection", "warn",
                                             "הקטע, חלוקת הכתוביות והקאבר נבחרו בכלל אוטומטי, לא בשיפוט תוכן — לבדוק לפני אישור"
                                             + (f" (מודל התוכן לא היה זמין: {model_error})" if model_error else "")))
-        if not st["captions_enabled"]:
-            dec["cover"]["text"] = ""          # the frame already shows the source's own caption
+        if not st["captions_enabled"] or not tspec["cover_text"]:
+            dec["cover"]["text"] = ""          # the frame already shows the source's own caption / a story has no cover
         plan = {"objective": dec["plan"]["objective"], "selected_message": dec["segment"]["complete_thought"],
                 "stands_alone": dec["segment"]["reason"], "audience": dec["segment"]["audience_relevance"] or None,
                 "source_range_s": [dec["segment"]["in_s"], dec["segment"]["out_s"]],
@@ -815,7 +852,7 @@ def pipeline(j):
                 write_json(j.ed / f"cycle_{n}.json", cycles[-1])
                 stop = "editor_failed"
                 break
-            if not st["captions_enabled"]:
+            if not st["captions_enabled"] or not tspec["cover_text"]:
                 new_dec["cover"]["text"] = ""
             dec, j_issues, sent_prev = new_dec, new_issues, actionable
 
@@ -916,11 +953,29 @@ def pipeline(j):
                   "model_review_ran": bool(reviews.get(final_cycle)),
                   "basis": "הבדיקות האוטומטיות נמדדו על הקובץ הסופי. הערכת המודל נעשתה על תמלול האודיו של אותו קובץ ועל פריימים בודדים ממנו — לא האזנה ולא צפייה בתנועה."}
     skill_report = skillgen.report(skill, st, reviews.get(final_cycle), (options.get("profile") or {}).get("params")) if skill else None
+    # ── a story is delivered as its cards too: one file per part, cut from the reviewed file ──
+    outputs = [{"name": "final.mp4", "what": "כל הכרטיסים ברצף, לצפייה ולביקורת" if tg == "story" else "הריל", "seconds": res["dur"]}]
+    if tg == "story" and pl:
+        for sg in pl["segments"][:4]:
+            a, b = max(0.0, sg["tl_in_s"] + res.get("shift", 0.0)), min(res["dur"], sg["tl_out_s"] + res.get("shift", 0.0))
+            name = f"story_part_{sg['n']}.mp4"
+            run([tool(cfg, "ffmpeg"), "-y", "-v", "error", "-ss", f"{a:.3f}", "-t", f"{b - a:.3f}", "-i", j.out / "final.mp4", "-c:v", "libx264", "-crf", "16", "-preset", "medium",
+                 "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "256k", "-af", f"afade=t=in:st=0:d=0.02,afade=t=out:st={max(0.0, b - a - 0.03):.3f}:d=0.03", "-movflags", "+faststart", j.out / name],
+                "render_failed", timeout=cfg["timeouts"]["ffmpeg_s"])
+            outputs.append({"name": name, "what": f"כרטיס סטורי {sg['n']}", "seconds": round(b - a, 2), "tl_in_s": round(a, 3), "tl_out_s": round(b, 3)})
+    prev_review = options.get("previous_review") if isinstance(options.get("previous_review"), dict) else prev.get("dana_review")
+    final_review = review_rubric.final(dana_review, skill_report, provenance, review_items, records, prev_review, tg, skill_info)
+    timeline = review_rubric.timeline(pl["segments"], res["dur"], res.get("shift", 0.0), cards, res.get("zooms") or [], res.get("graphics") or [], skill, res["audio_clean"], tg) if pl else None
     adjustments = {
         "color": res["color"], "audio_cleanup": res["audio_clean"],
         "zooms": {"enabled": adjust.enabled(options, "zooms"), "applied": bool(res.get("zooms")), "count": len(res.get("zooms") or [])},
         "caption_animation": {"enabled": adjust.enabled(options, "caption_animation"), "applied": res["animation"] != "none", "style": res["animation"]},
-        "graphics": {"enabled": adjust.enabled(options, "graphics"), "applied": bool(res.get("graphics")), "count": len(res.get("graphics") or []),
+        "animation": {"enabled": adjust.enabled(options, "animation"), "allowed": bool(options.get("allow_animation_scene")),
+                      "applied": any(g.get("layer") == "replaces_picture" for g in res.get("graphics") or []),
+                      "count": sum(1 for g in res.get("graphics") or [] if g.get("layer") == "replaces_picture"),
+                      "what": "טיפוגרפיה מונפשת במסך מלא מציטוט מדויק. אנימציה שממחישה את הנאמר (איור, דמויות, וידאו שנוצר) אינה קיימת במערכת."},
+        "graphics": {"enabled": adjust.enabled(options, "graphics"), "applied": any(g.get("layer") != "replaces_picture" for g in res.get("graphics") or []),
+                     "count": sum(1 for g in res.get("graphics") or [] if g.get("layer") != "replaces_picture"),
                      "engine": "HyperFrames " + (motion.version(cfg) or "?") if res.get("graphics") else None},
     }
     auto = [r for r in records if r["status"] not in ("human_required", "info")]
@@ -946,7 +1001,11 @@ def pipeline(j):
         "zoom_edits_applied": zoom_log,
         "graphics": res.get("graphics") or [], "adjustments": adjustments, "compare": res.get("compare"),
         "dana_review": dana_review, "review_vs_previous": review_vs_previous, "review_provenance": provenance,
-        "skill_report": skill_report, "skill_choice": skill_choice,
+        "skill_report": skill_report, "skill_choice": skill_choice, "final_review": final_review, "timeline": timeline,
+        "review_compact": review_rubric.compact(dana_review),
+        "target": {"key": tg, "label": tspec["label"], "publish": tspec["publish"], "cover_text": tspec["cover_text"], "post_caption": tspec["post_caption"],
+                   "part_max_s": tspec["part_max_s"], "safe_zone": {k: v for k, v in zone_used.items() if not k.startswith("_")}, "safe_zone_source": zone_used.get("_source")},
+        "outputs": outputs,
         "request_interpretation": interpretation, "derived_text_updates": derived_updates,
         "transcript": {"status": "owner_corrected_partial" if corrections else "auto_unverified",
                        "note": "תמלול אוטומטי (Whisper). מילים בספק מסומנות להאזנה; דנה לא החליפה אף מילה בניחוש.",
@@ -967,7 +1026,7 @@ def pipeline(j):
         "cards": [{"i": c["i"], "text": c["plain"], "lines": c.get("lines"), "highlight": c["highlight"], "start": c["start"], "dur": c["dur"],
                    "source_start_s": src_time(c["start"] + 0.02), "source_end_s": src_time(max(c["start"] + 0.02, c["last_word_end_audio_s"]))} for c in cards],
         "cover": dict(dec["cover"], source="plan" if pl else "fallback"),
-        "caption": dict(dec["caption"], status="draft_no_voice"),
+        "caption": dict(dec["caption"], status="draft_no_voice" if tspec["post_caption"] else "not_applicable_story"),
         "checks": [{k: r[k] for k in ("id", "status", "summary")} for r in records],
         "failed_checks": failed, "issues": issues, "review_items": review_items, "audio": res["audio_src"],
         "editorial": {"status": ed["status"], "stop_reason": stop, "revisions": ed["revisions"], "test_injection": injection,
@@ -1003,9 +1062,10 @@ def main(argv=None):
         status, package = pipeline(j)
         arts = []
         for name in ("final.mp4", "cover.jpg", "package.json", "checks.json", "captions.json", "editorial.json",
-                     "transcript_source.json", "transcript_final.json", "compare_frames.jpg", "compare_clip.mp4"):
+                     "transcript_source.json", "transcript_final.json", "compare_frames.jpg", "compare_clip.mp4",
+                     "story_part_1.mp4", "story_part_2.mp4", "story_part_3.mp4", "story_part_4.mp4"):
             p = j.out / name
-            if not p.is_file() and name.startswith("compare_"):
+            if not p.is_file() and name.startswith(("compare_", "story_part_")):
                 continue
             arts.append({"name": name, "sha256": sha256_file(p), "bytes": p.stat().st_size})
         result.update(status=status, artifacts=arts, failed_checks=package["failed_checks"],

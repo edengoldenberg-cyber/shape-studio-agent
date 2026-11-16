@@ -126,7 +126,7 @@ try {
       await js(`${vis('#rulesused')} && ${vis('#pv')} && !!document.querySelector('[data-style=caption_size]') && !!document.querySelector('[data-style=caption_y_px]') && !!document.querySelector('[data-style=caption_max_lines]') && document.querySelectorAll('[data-stylec]').length === 2 && !!document.querySelector('[data-style=highlight_enabled]') && !!document.querySelector('[data-styles=caption_animation]')`));
     await shot(`${vp.name}-12-style`);
     await step('edit');
-    check("edit step: Dana's plan, zooms, motion graphics, adjustments with a switch for each kind", await js(`${vis('#plan')} && ${vis('#zooms')} && ${vis('#graphics')} && ${vis('#adjust')} && document.querySelectorAll('#adjust [data-adj]').length === 5`));
+    check("edit step: Dana's plan, zooms, motion graphics, adjustments with a switch for each kind", await js(`${vis('#plan')} && ${vis('#zooms')} && ${vis('#graphics')} && ${vis('#adjust')} && document.querySelectorAll('#adjust [data-adj]').length === 6`));
     if (editP.version.hasCompare) check('edit step: before / after image and clip are loaded', await until(`(() => { const i = document.querySelector('#compare img'); return i && i.complete && i.naturalWidth > 0 && !!document.querySelector('#compare video[src]'); })()`));
     check('edit step: one "produce a corrected version" action with a free-text request', await js(`${vis('#revise [data-do=revise]')} && ${vis('#revise #rvnote')}`));
     check('edit step: no horizontal scroll', await js(noOverflow));

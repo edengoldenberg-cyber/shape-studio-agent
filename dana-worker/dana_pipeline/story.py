@@ -20,7 +20,7 @@ import re
 import wave
 from pathlib import Path
 
-from . import judgement, motion
+from . import judgement, motion, target as target_mod
 from .core import PipelineError, run, tool
 
 HERE = Path(__file__).resolve().parent
@@ -199,7 +199,7 @@ STORY_SCHEMA = {
                            "properties": {"present": {"type": "boolean"}, "examples": {"type": "array", "maxItems": 8, "items": {
                                "type": "object", "additionalProperties": False, "required": ["at_s", "text"],
                                "properties": {"at_s": {"type": "number"}, "text": {"type": "string"}}}}}},
-        "graphics": {"type": "array", "maxItems": 2, "items": motion.SCHEMA_ITEM},
+        "graphics": {"type": "array", "maxItems": 3, "items": motion.SCHEMA_ITEM},
         "revision_note": {"type": "string"},
     },
 }
@@ -262,8 +262,8 @@ Never invent brand facts, prices, offers, audiences or results. Do not predict p
 
 
 def story_prompt(words, energy, duration, cfg, options, profile, skill_text):
-    c = cfg["judgement"]["claude"]
-    lo = min(float(c.get("min_s", 12)), max(cfg["segment"]["min_s"], duration - 0.5))
+    tg = target_mod.of(options)
+    lo, hi, part_max = target_mod.limits(cfg, tg, duration)
     p = profile["params"]
     lines, cur = [], []
     for i, w in enumerate(words):
@@ -274,7 +274,11 @@ def story_prompt(words, energy, duration, cfg, options, profile, skill_text):
                    + (f",p={w.get('probability', 1):.2f}" if w.get("probability", 1) < 0.8 else "") + ("" if not w.get("owner") else ",owner") + "]")
     if cur:
         lines.append(" ".join(cur))
-    parts = [f"Source duration: {duration:.2f} s. Total length of the chosen parts: {lo:.0f}-{c.get('max_s', 45)} s.",
+    parts = [target_mod.spec(tg)["brief"],
+             f"Source duration: {duration:.2f} s. Total length of the chosen parts: {lo:.0f}-{hi:.0f} s."
+             + (f" No part longer than {part_max:.0f} s; at most {target_mod.spec(tg)['max_parts']} parts." if part_max else ""),
+             ("Motion graphics may include an animation scene for this job:\n" + motion.SCENE_PROMPT) if options.get("allow_animation_scene")
+             else "An animation scene is NOT available for this job: use only hook_title / key_phrase, or nothing.",
              "Each token is word@start-end[loudness relative to the median word of this recording; p=recognition confidence when "
              "it is low; 'owner' = the owner corrected this word by ear]. A new line means a pause of at least 0.5 s.",
              f"Editing profile '{profile['id']}' v{profile['version']} ({profile['status']}): zoom strengths light={p['zoom_scale_light']}, "
@@ -299,7 +303,7 @@ def _norm(t):
     return judgement.skeleton(judgement.BIDI.sub("", t))
 
 
-def validate_story(raw, words, duration, cfg, profile, exclude=None):
+def validate_story(raw, words, duration, cfg, profile, exclude=None, target="reel", allow_scene=False):
     """Model answer → a plan this pipeline can execute. Raises PipelineError(story_invalid)."""
     if not isinstance(raw, dict) or not isinstance(raw.get("segments"), list) or not raw["segments"]:
         raise PipelineError("story_invalid", "the plan has no segments")
@@ -332,10 +336,14 @@ def validate_story(raw, words, duration, cfg, profile, exclude=None):
         for s in segs:
             if s["source_in_s"] < float(b) and s["source_out_s"] > float(a):
                 raise PipelineError("story_invalid", f"segment {s['n']} overlaps material that was already used ({a}-{b})")
-    # adjacent parts in source order with nothing between them are one part
+    tspec = target_mod.spec(target)
+    lo_t, hi_t, part_max = target_mod.limits(cfg, target, duration)
+    if len(segs) > tspec["max_parts"]:
+        raise PipelineError("story_invalid", f"{len(segs)} parts; a {target} has at most {tspec['max_parts']}")
+    # adjacent parts in source order with nothing between them are one part (a reel flows; a story keeps its cards)
     merged = []
     for s in segs:
-        if merged and s["i0"] == merged[-1]["i1"] + 1:
+        if tspec["merge_adjacent"] and merged and s["i0"] == merged[-1]["i1"] + 1:
             merged[-1].update(i1=s["i1"], source_out_s=s["source_out_s"], why=(merged[-1]["why"] + " / " + s["why"])[:300])
             notes.append("שני חלקים רצופים במקור אוחדו לחלק אחד (אין חיתוך ביניהם)")
         else:
@@ -346,9 +354,14 @@ def validate_story(raw, words, duration, cfg, profile, exclude=None):
         s.update(n=n, tl_in_s=round(t, 3), tl_out_s=round(t + d, 3))
         t += d
     total = round(t, 3)
-    lo = min(float(c.get("min_s", 12)), max(cfg["segment"]["min_s"], duration - 0.5))
-    if total < min(lo, cfg["segment"]["min_s"]) or total > cfg["segment"]["max_s"]:
-        raise PipelineError("story_invalid", f"the chosen parts add up to {total:.1f}s, outside the allowed length")
+    lo = lo_t
+    if total < min(lo, cfg["segment"]["min_s"]) or total > (hi_t + 1.0 if target == "story" else cfg["segment"]["max_s"]):
+        raise PipelineError("story_invalid", f"the chosen parts add up to {total:.1f}s, outside the allowed length ({lo:.0f}-{hi_t:.0f}s for a {target})")
+    if part_max:
+        long = [s for s in merged if s["tl_out_s"] - s["tl_in_s"] > part_max + 0.6]
+        if long:
+            raise PipelineError("story_invalid", "; ".join(f"part {s['n']} is {s['tl_out_s'] - s['tl_in_s']:.1f}s" for s in long)
+                                + f" - every part of a story is one card of at most {part_max:.0f}s: split it at a sentence boundary into separate parts")
     reordered = [s["i0"] for s in merged] != sorted(s["i0"] for s in merged)
 
     def to_tl(src_t):
@@ -428,7 +441,13 @@ def validate_story(raw, words, duration, cfg, profile, exclude=None):
         doubts.append({"word_index": wi, "word": words[wi]["word"], "source_start_s": words[wi]["start"], "source_end_s": words[wi]["end"],
                        "kind": "context", "note": str(d.get("note") or "")[:200]})
 
-    graphics, graphics_dropped = motion.validate(raw.get("graphics"), words, merged, to_tl, total)
+    graphics, graphics_dropped = motion.validate(raw.get("graphics"), words, merged, to_tl, total, allow_scene=allow_scene)
+    # a zoom cannot run through an animation scene: the footage is not on screen there
+    scenes = [g for g in graphics if g["layer"] == "replaces_picture"]
+    for z in list(zooms):
+        if any(z["tl_t_s"] < g["tl_end_s"] + 0.2 and z["hold_until_s"] > g["tl_start_s"] - 0.2 for g in scenes):
+            zooms.remove(z)
+            dropped.append({"at_s": z["source_t_s"], "why": "חופף לקטע אנימציה — הצילום לא על המסך באותו זמן"})
 
     return {"graphics": graphics, "graphics_dropped": graphics_dropped,
             "message": str(raw.get("message") or "")[:300], "hook": str(raw.get("hook") or "")[:200],
@@ -438,7 +457,7 @@ def validate_story(raw, words, duration, cfg, profile, exclude=None):
                          for x in (raw.get("left_out") or [])[:8] if isinstance(x, dict) and isinstance(x.get("in_s"), (int, float)) and isinstance(x.get("out_s"), (int, float))],
             "zooms": zooms, "zooms_dropped": dropped,
             "cover": {"quote": quote if quote_ok else "", "quote_is_exact": quote_ok, "tl_s": cov_tl, "why": str(cov.get("why") or "")[:240]},
-            "doubts": doubts, "burned_in_text": burned, "revision_note": str(raw.get("revision_note") or "")[:500], "content_judgement": "model"}
+            "target": target, "doubts": doubts, "burned_in_text": burned, "revision_note": str(raw.get("revision_note") or "")[:500], "content_judgement": "model"}
 
 
 def source_frames(cfg, source, times, out_dir):
@@ -472,7 +491,8 @@ def plan(cfg, job_dir, words, wav16k, duration, options, profile, skill_text, ta
         usage["role"] = "content_planner"
         usages.append(usage)
         try:
-            pl = validate_story(raw, words, duration, cfg, profile, options.get("exclude_ranges"))
+            pl = validate_story(raw, words, duration, cfg, profile, options.get("exclude_ranges"), target=target_mod.of(options),
+                                allow_scene=bool(options.get("allow_animation_scene")))
             for z in pl["zooms"]:
                 z["evidence"] = f"עוצמת הקול במילה: {energy[z.pop('word_index')]:+.1f}dB ביחס לחציון ההקלטה (נמדד); הבחירה עצמה לפי משמעות התמלול — המודל לא שמע את האודיו"
             return pl, usages
@@ -660,7 +680,7 @@ def keep_owner_corrections(heard, groups):
     return out, notes
 
 
-def plan_from_previous(prev, words, cfg, profile):
+def plan_from_previous(prev, words, cfg, profile, target="reel"):
     """The content plan of the version being revised, rebuilt exactly from its package (no model call):
     same parts, same zooms, same cover. Used when the owner asked only for caption / style / zoom changes.
     Raises PipelineError(story_invalid) when the previous plan cannot be reproduced on this transcript."""
@@ -669,7 +689,7 @@ def plan_from_previous(prev, words, cfg, profile):
         raise PipelineError("story_invalid", "the previous version has no model plan to keep")
     raw = {"segments": [{"in_s": s["source_in_s"] + 0.13, "out_s": s["source_out_s"] - 0.23, "role": s.get("role"), "why": s.get("why")}
                         for s in pp["segments"]], "zooms": [], "cover": {}, "transcript_doubts": []}
-    pl = validate_story(raw, words, max(w["end"] for w in words) + 1.0, cfg, profile)
+    pl = validate_story(raw, words, max(w["end"] for w in words) + 1.0, cfg, profile, target=target)
     for a, b in zip(pl["segments"], pp["segments"]):
         if abs(a["source_in_s"] - b["source_in_s"]) > 0.06 or abs(a["source_out_s"] - b["source_out_s"]) > 0.06:
             raise PipelineError("story_invalid", "the previous parts could not be reproduced exactly")
@@ -688,7 +708,8 @@ def plan_from_previous(prev, words, cfg, profile):
     for g in prev.get("graphics") or []:
         seg = next((s for s in pl["segments"] if s["source_in_s"] - 0.05 <= g.get("source_t_s", -1) <= s["source_out_s"] + 0.05), None)
         if seg is not None and g.get("kind") in motion.KINDS:
-            graphics.append({k: g.get(k) for k in ("id", "kind", "label", "text", "source_t_s", "tl_start_s", "tl_end_s", "reason", "quote_is_exact")})
+            graphics.append(dict({k: g.get(k) for k in ("id", "kind", "label", "text", "source_t_s", "tl_start_s", "tl_end_s", "reason", "quote_is_exact")},
+                                 layer=g.get("layer") or motion.KINDS[g["kind"]]["layer"]))
     pl.update(graphics=graphics, graphics_dropped=list(pp.get("graphics_not_used") or []))
     pl.update(message=str(pp.get("message") or ""), hook=str(pp.get("hook") or ""), rationale=str(pp.get("rationale") or ""),
               brief=list(pp.get("brief") or []), left_out=list(pp.get("left_out") or []), zooms=zooms,

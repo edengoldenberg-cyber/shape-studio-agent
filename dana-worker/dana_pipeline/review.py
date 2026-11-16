@@ -259,3 +259,125 @@ def compare(prev, cur):
     a = {c["key"]: c for c in prev["categories"]}
     return [{"key": c["key"], "label": c["label"], "before": {"level": a[c["key"]]["level"], "met": a[c["key"]]["met"], "decided": a[c["key"]]["decided"]},
              "after": {"level": c["level"], "met": c["met"], "decided": c["decided"]}} for c in cur["categories"] if c["key"] in a]
+
+
+# ── "הביקורת הסופית של דנה": the last word on ONE delivered file ────────────────────────────────────
+REVIEW_SKILL = {"name": "dana-review", "version": RUBRIC_VERSION, "what": "הקריטריונים הקבועים של הביקורת (12 קטגוריות)"}
+
+
+def final(dana_review, skill_report, provenance, review_items, records, previous, target, base_skill):
+    """Built AFTER the last correction round, from what was measured and assessed on the delivered file.
+
+    It never adds a judgement of its own: it gathers the category review, the compliance with the skills that were
+    applied, the coverage (how much was actually decided), what changed since the previous version, and ONE statement:
+    does the edit need another fix, or is it ready for the owner to watch. That statement follows from failed mandatory
+    checks and open items — never from a score. It is not an approval, and it says nothing about performance."""
+    rows = [c for cat in dana_review["categories"] for c in cat["criteria"]]
+    decided = [r for r in rows if r["status"] in ("met", "not_met")]
+    by = lambda basis: {"met": sum(1 for r in decided if r["basis"] == basis and r["status"] == "met"), "decided": sum(1 for r in decided if r["basis"] == basis)}
+    coverage = {"criteria": len(rows), "decided": len(decided), "met": sum(1 for r in decided if r["status"] == "met"),
+                "not_checked": sum(1 for r in rows if r["status"] == "not_checked"), "not_applicable": sum(1 for r in rows if r["status"] == "na"),
+                "measured": by("measured"), "frames": by("frames"), "model": by("model"),
+                "human_only": [r["criterion"] for r in rows if r["basis"] == "human"],
+                "note": "הסיכום סופר רק קריטריונים שנבדקו. מה שדורש האזנה או צפייה בתנועה אינו נספר ואין לו ציון."}
+    failed = [r for r in records if r["status"] in ("fail", "review")]
+    imps = dana_review.get("improvements") or []
+    fixable = [i for i in imps if i.get("can_apply") and i.get("importance") == 1]
+    sk = (skill_report or {}).get("summary")
+    if failed or fixable:
+        verdict, vtext = "needs_fix", "נדרש תיקון נוסף לפני צפייה"
+    elif review_items:
+        verdict, vtext = "needs_owner", "מוכן לצפייה שלך — עם פריטים שרק את/ה יכול/ה להכריע"
+    else:
+        verdict, vtext = "ready_for_viewing", "מוכן לצפייה שלך"
+    reasons = ([f"בדיקה אוטומטית נכשלה: {r['id']} — {r['summary']}"[:260] for r in failed[:6]]
+               + [f"שיפור טכני שדנה עוד יכולה ליישם: {i['problem']}"[:260] for i in fixable[:4]]
+               + ([f"{len(review_items)} פריטים פתוחים שדורשים צפייה או האזנה שלך"] if review_items else []))
+    if sk and not sk["fully_applied"]:
+        reasons.append(f"הסקילים לא יושמו במלואם: {sk['applied']} כללים יושמו, {sk['not_followed']} לא יושמו, {sk['unsupported']} לא נתמכים, {sk['not_checked']} לא נבדקו")
+    worked = [{"category": c["label"], "what": f"{c['met']} מתוך {c['decided']} קריטריונים שנבדקו מתקיימים"} for c in dana_review["categories"] if c["decided"] and c["met"] == c["decided"]]
+    needs = [{"category": next(c["label"] for c in dana_review["categories"] if c["key"] == r["category"]), "criterion": r["criterion"], "evidence": r["note"],
+              "time_s": r.get("time_s"), "basis": r["basis"]} for r in rows if r["status"] == "not_met"]
+    needs += [{"category": "כללי הסקיל", "criterion": x["text"], "evidence": x["note"], "time_s": None, "basis": "model", "skill": x.get("skill")}
+              for x in (skill_report or {}).get("rules") or [] if x["status"] == "not_followed"]
+    unchecked = [{"criterion": r["criterion"], "why": "דורש צפייה או האזנה שלך" if r["basis"] == "human" else r["note"]} for r in rows if r["status"] == "not_checked"]
+    unchecked += [{"criterion": x["text"], "why": x["note"], "skill": x.get("skill")} for x in (skill_report or {}).get("rules") or [] if x["status"] == "not_checked"]
+    skills = [dict(REVIEW_SKILL, role="סקיל הביקורת")]
+    if base_skill:
+        skills.append({"name": base_skill.get("name"), "version": base_skill.get("version"), "role": "כללי העריכה הבסיסיים"})
+    for x in ((skill_report or {}).get("skill") or {}).get("skills") or []:
+        skills.append({"name": x.get("name"), "version": x.get("version"), "role": "סקיל מהספרייה" + (" (טיוטה בבדיקה)" if x.get("status") == "draft_test" else ""), "id": x.get("id")})
+    return {"title": "הביקורת הסופית של דנה", "target": target, "reviewed_at": (provenance or {}).get("reviewed_at"), "file_sha256": (provenance or {}).get("final_sha256"),
+            "on_delivered_file": (provenance or {}).get("on_delivered_file"), "rounds": (provenance or {}).get("review_rounds"),
+            "skills": skills, "rubric_version": dana_review["rubric_version"],
+            "categories": [{k: c[k] for k in ("key", "label", "level", "met", "decided", "not_checked")} for c in dana_review["categories"]],
+            "skill_compliance": ({"summary": sk, "params_as_in_skill": sum(1 for x in skill_report["params"] if x["applied"]), "params_total": len(skill_report["params"]),
+                                  "criteria_met": sum(1 for x in skill_report["criteria"] if x["met"] is True), "criteria_total": len(skill_report["criteria"])} if skill_report else None),
+            "coverage": coverage, "summary": f"{coverage['met']} מתוך {coverage['decided']} קריטריונים שנבדקו מתקיימים; {coverage['not_checked']} לא נבדקו"
+                                              + (f"; מכללי הסקילים יושמו {sk['applied']} מתוך {sk['applied'] + sk['not_followed'] + sk['not_applicable'] + sk['not_checked']} שנתמכים" if sk else ""),
+            "worked": worked, "needs_improvement": needs, "not_checked": unchecked, "verdict": verdict, "verdict_text": vtext, "verdict_reasons": reasons,
+            "verdict_basis": "נקבע לפי בדיקות אוטומטיות שנכשלו ופריטים פתוחים — לא לפי הדירוג לבדו.",
+            "changes": changes(previous, dana_review),
+            "limits": ["הערכת מודל נעשתה על תמלול ופריימים בודדים ויכולה להשתנות בין הרצות", "איש לא האזין לאודיו ולא צפה בתנועה",
+                       "הדירוג אינו אישור פרסום ואינו מבטיח ביצועים באינסטגרם", "כל שינוי בסרטון הופך את הביקורת הזו ללא עדכנית"]}
+
+
+def changes(previous, current):
+    """Why a rating differs from the previous version's: criterion by criterion, with the same rubric. None when not comparable."""
+    if not previous or previous.get("rubric_version") != current["rubric_version"]:
+        return None
+    before = {c["id"]: c["status"] for c in previous.get("criteria") or []}
+    HE = {"met": "מתקיים", "not_met": "לא מתקיים", "not_checked": "לא נבדק", "na": "לא רלוונטי"}
+    out = []
+    for cat in current["categories"]:
+        for c in cat["criteria"]:
+            b = before.get(c["id"])
+            if b and b != c["status"]:
+                out.append({"category": cat["label"], "criterion": c["criterion"], "before": HE.get(b, b), "after": HE.get(c["status"], c["status"]),
+                            "why": c["note"], "basis": c["basis"]})
+    levels = {c["key"]: c for c in previous.get("categories") or []}
+    return {"criteria": out, "categories": [{"label": c["label"], "before": levels[c["key"]]["level"], "after": c["level"]} for c in current["categories"]
+                                             if c["key"] in levels and levels[c["key"]]["level"] != c["level"]],
+            "note": "אותם קריטריונים בשתי הגרסאות. שינוי בקריטריון של הערכת מודל יכול לנבוע גם מהבדל בין הרצות, לא רק מהסרטון." if out else "אין שינוי באף קריטריון מול הגרסה הקודמת."}
+
+
+def compact(dana_review):
+    """What the next version needs in order to explain a change: every criterion's status, and the category levels."""
+    return {"rubric_version": dana_review["rubric_version"],
+            "categories": [{k: c[k] for k in ("key", "label", "level", "met", "decided")} for c in dana_review["categories"]],
+            "criteria": [{"id": c["id"], "status": c["status"]} for cat in dana_review["categories"] for c in cat["criteria"]]}
+
+
+def timeline(segments, dur, shift, cards, zooms, graphics, skill, audio_clean, target):
+    """ONE timeline of the edit: for every stretch of the video - what is in the picture, which skill is responsible,
+    how long, the text on screen, the sound, where the assets come from and how the stretch begins."""
+    owner = lambda domain, fallback: next((r.get("skill") or (skill or {}).get("name") for r in (skill or {}).get("rules") or [] if r["domain"] == domain), fallback)
+    BASE = "כללי העריכה הבסיסיים"
+    scenes = sorted([g for g in graphics if g.get("layer") == "replaces_picture"], key=lambda g: g["tl_start_s"])
+    cuts = sorted({0.0, round(dur, 3)} | {round(min(max(s["tl_in_s"] + shift, 0.0), dur), 3) for s in segments}
+                  | {round(g["tl_start_s"], 3) for g in scenes} | {round(g["tl_end_s"], 3) for g in scenes})
+    spans = []
+    for a, b in zip(cuts, cuts[1:]):
+        if b - a < 0.04:
+            continue
+        mid = (a + b) / 2
+        sc = next((g for g in scenes if g["tl_start_s"] <= mid < g["tl_end_s"]), None)
+        seg = next((s for s in segments if s["tl_in_s"] + shift - 0.02 <= mid < s["tl_out_s"] + shift + 0.02), segments[-1])
+        text = " ".join(c["plain"] for c in cards if a - 0.05 <= c["start"] + c["dur"] / 2 < b + 0.05)
+        prev_scene = bool(spans) and spans[-1]["picture"] == "animation_scene"
+        new_part = bool(spans) and spans[-1].get("part") != seg["n"]
+        spans.append({
+            "t0": a, "t1": b, "seconds": round(b - a, 2), "part": seg["n"],
+            "picture": "animation_scene" if sc else "footage",
+            "picture_label": f"קטע אנימציה במסך מלא: \"{sc['text']}\"" if sc else f"צילום מהמקור (חלק {seg['n']}, {seg['source_in_s']:.1f}–{seg['source_out_s']:.1f} שנ׳ בהקלטה)",
+            "skill": owner("animation", BASE) if sc else owner("structure", owner("opening", BASE)),
+            "text": text, "text_layer": "כתוביות" + (" + טקסט הסצנה" if sc else ""),
+            "audio": "קול הדוברת מההקלטה — נמשך ברצף" + (", אחרי ניקוי רעש עדין" if (audio_clean or {}).get("applied") else "") + ", מנורמל לעוצמת היעד",
+            "assets": "נוצר ב-HyperFrames מהמילים שנאמרו; אין נכס חיצוני" if sc else "קובץ המקור שהעלית",
+            "transition_in": "פתיחת הסרטון" if not spans else "חיתוך ישר לסצנה (הקול ממשיך)" if sc else "חיתוך ישר חזרה לצילום" if prev_scene
+                             else ("כרטיס סטורי חדש" if target == "story" else "חיתוך ישר בין חלקים, מעבר קול של 25ms") if new_part else "המשך רציף"})
+    events = [{"t0": z["tl_t_s"], "t1": z["hold_until_s"], "kind": "zoom", "label": f"זום ×{z['scale']}", "layer": "on_footage", "skill": owner("zooms", BASE), "why": z.get("reason")} for z in zooms]
+    events += [{"t0": g["tl_start_s"], "t1": g["tl_end_s"], "kind": g["kind"], "label": f"{g['label']}: \"{g['text']}\"", "layer": g["layer"], "id": g["id"],
+                "skill": owner("motion_graphics", BASE), "why": g.get("reason"), "assets": "נוצר ב-HyperFrames מהמילים שנאמרו"} for g in graphics if g.get("layer") != "replaces_picture"]
+    return {"spans": spans, "events": sorted(events, key=lambda e: e["t0"]), "duration": round(dur, 3),
+            "note": "תוכנית עריכה אחת: כל הסקילים שנבחרו מוזגו לפני התכנון, ולכן אין שכבה שדורסת אחרת. 'על הצילום' = גרפיקה מעל הדוברת; 'מחליף את הצילום' = קטע אנימציה במסך מלא."}

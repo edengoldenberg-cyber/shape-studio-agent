@@ -24,9 +24,18 @@ from .core import PipelineError, run
 
 HERE = Path(__file__).resolve().parent
 ASSETS = HERE.parent / "motion"
-KINDS = {"hook_title": {"label": "כותרת פתיחה", "min_s": 2.0, "max_s": 3.2},
-         "key_phrase": {"label": "הדגשת משפט מפתח", "min_s": 1.6, "max_s": 4.0}}
-MAX_GRAPHICS = 2
+# Two different things, never mixed up:
+#   layer "over_picture"      an animated graphic drawn OVER the footage (the speaker stays visible)
+#   layer "replaces_picture"  an animation SCENE that takes the whole frame for a few seconds while the voice goes on
+# What the scene can be with the tools installed here: animated typography of an exact quotation (HyperFrames renders
+# HTML). It is NOT an illustration of what is said - no drawings, characters or generated footage exist in this system.
+KINDS = {"hook_title": {"label": "כותרת פתיחה", "min_s": 2.0, "max_s": 3.2, "layer": "over_picture", "words": (2, 6)},
+         "key_phrase": {"label": "הדגשת משפט מפתח", "min_s": 1.6, "max_s": 4.0, "layer": "over_picture", "words": (2, 6)},
+         "animation_scene": {"label": "קטע אנימציה במסך מלא (טיפוגרפיה מונפשת)", "min_s": 2.0, "max_s": 5.0, "layer": "replaces_picture", "words": (2, 8)}}
+MAX_GRAPHICS = 3
+SCENE_PROMPT = """   - "animation_scene": a short SCENE that replaces the picture with full-frame animated typography of the quoted words while
+     the speaker's voice continues, then cuts back to the speaker. Use it at most once, only for the sentence the whole video
+     turns on, and never in the first three seconds. It shows words only: it cannot illustrate, draw or act out anything."""
 SIZE, LINE_H, PAD_Y, MAX_W = 62, 1.16, 24, 620          # px on the 1080x1920 frame; MAX_W = the safe width for centred text
 
 SCHEMA_ITEM = {"type": "object", "additionalProperties": False, "required": ["kind", "quote", "at_s", "why"],
@@ -47,7 +56,7 @@ def _norm(t):
     return judgement.skeleton(judgement.BIDI.sub("", t))
 
 
-def validate(raw, words, segments, to_tl, total_s):
+def validate(raw, words, segments, to_tl, total_s, allow_scene=False):
     """The plan's graphics → executable items (timeline times, exact quotes only). Returns (items, dropped)."""
     items, dropped, seen = [], [], set()
     chosen = [(i, _norm(words[i]["word"])) for s in segments for i in range(s["i0"], s["i1"] + 1)]
@@ -58,11 +67,15 @@ def validate(raw, words, segments, to_tl, total_s):
         quote = " ".join(judgement.BIDI.sub("", str(g.get("quote") or "")).split())[:60]
         toks = [_norm(t) for t in quote.split()]
         toks = [t for t in toks if t]
+        if kind == "animation_scene" and not allow_scene:
+            dropped.append({"kind": kind, "quote": quote, "why": "קטע אנימציה לא התבקש בסקילים שנבחרו ולא בהוראות — לא נוסף"})
+            continue
         if kind in seen or len(items) >= MAX_GRAPHICS:
             dropped.append({"kind": kind, "quote": quote, "why": "יותר מגרפיקה אחת מאותו סוג / יותר משתיים בסרטון"})
             continue
-        if not 2 <= len(toks) <= 6:
-            dropped.append({"kind": kind, "quote": quote, "why": "הטקסט חייב להיות 2–6 מילים רצופות מהסרטון"})
+        wmin, wmax = KINDS[kind]["words"]
+        if not wmin <= len(toks) <= wmax:
+            dropped.append({"kind": kind, "quote": quote, "why": f"הטקסט חייב להיות {wmin}–{wmax} מילים רצופות מהסרטון"})
             continue
         hits = [k for k in range(len(chosen) - len(toks) + 1) if [c[1] for c in chosen[k:k + len(toks)]] == toks]
         if not hits:
@@ -77,6 +90,9 @@ def validate(raw, words, segments, to_tl, total_s):
             dropped.append({"kind": kind, "quote": quote, "why": "הציטוט נחתך בין שני חלקים — לא נוסף"})
             continue
         spec = KINDS[kind]
+        if kind == "animation_scene" and tl0 < 3.0:
+            dropped.append({"kind": kind, "quote": quote, "why": "קטע אנימציה בשלוש השניות הראשונות — הצופה עוד לא ראה את הדוברת"})
+            continue
         if kind == "hook_title":
             start = 0.25
             end = min(max(start + spec["min_s"], min(start + spec["max_s"], tl1 + 0.6)), total_s - 0.2)
@@ -90,7 +106,8 @@ def validate(raw, words, segments, to_tl, total_s):
             dropped.append({"kind": kind, "quote": quote, "why": "חופף לגרפיקה אחרת"})
             continue
         seen.add(kind)
-        items.append({"id": f"g{len(items) + 1}", "kind": kind, "label": spec["label"], "text": quote, "source_t_s": round(words[i0]["start"], 3),
+        # the id is stable across versions (kind + source time), so the owner can remove ONE graphic and nothing else moves
+        items.append({"id": f"{kind}@{words[i0]['start']:.1f}", "kind": kind, "label": spec["label"], "layer": spec["layer"], "text": quote, "source_t_s": round(words[i0]["start"], 3),
                       "tl_start_s": round(start, 3), "tl_end_s": round(end, 3), "reason": why, "quote_is_exact": True})
     return items, dropped
 
@@ -113,8 +130,11 @@ def lines_of(text):
     return [" ".join(w[:k]), " ".join(w[k:])]
 
 
-def box_height(text):
-    return int(len(lines_of(text)) * SIZE * LINE_H + 2 * PAD_Y + 22)
+SCALES = (1.0, 0.86, 0.72)        # a graphic that does not fit is made smaller before it is given up; never below 72%
+
+
+def box_height(text, scale=1.0):
+    return int(len(lines_of(text)) * int(SIZE * scale) * LINE_H + 2 * PAD_Y + 22)
 
 
 def place(items, zone, face_boxes_by_item, caption_band, H=1920):
@@ -122,27 +142,30 @@ def place(items, zone, face_boxes_by_item, caption_band, H=1920):
     caption band. A graphic with no free place is dropped (recorded), never drawn over a face."""
     placed, dropped = [], []
     for g in items:
-        h = box_height(g["text"])
         boxes = [b for b in (face_boxes_by_item.get(g["id"]) or []) if b]
         face_top = min((b[1] - 0.35 * b[3] for b in boxes), default=None)
         face_bottom = max((b[1] + b[3] * 1.18 for b in boxes), default=None)
-        cands = [zone["top"] + 30]                                   # above the face
+        cands = [zone["top"] + 30, zone["top"] + 4]                  # above the face
         if face_bottom is not None:
             cands.append(int(face_bottom + 40))                      # below the face
-        chosen = None
-        for y in cands:
-            if y < zone["top"] or y + h > zone["bottom"]:
-                continue
-            if face_top is not None and not (y + h + 24 <= face_top or y >= face_bottom + 24):
-                continue
-            if caption_band and y < caption_band[1] + 24 and y + h > caption_band[0] - 24:
-                continue
-            chosen = y
-            break
+        chosen, scale, h = None, 1.0, box_height(g["text"])
+        for sc in SCALES:
+            hh = box_height(g["text"], sc)
+            for y in cands:
+                if y < zone["top"] or y + hh > zone["bottom"]:
+                    continue
+                if face_top is not None and not (y + hh + 24 <= face_top or y >= face_bottom + 24):
+                    continue
+                if caption_band and y < caption_band[1] + 24 and y + hh > caption_band[0] - 24:
+                    continue
+                chosen, scale, h = y, sc, hh
+                break
+            if chosen is not None:
+                break
         if chosen is None:
             dropped.append({"kind": g["kind"], "quote": g["text"], "why": "אין מקום פנוי מהפנים ומהכתוביות בתוך האזור הבטוח — הגרפיקה לא נוספה"})
             continue
-        placed.append(dict(g, y_px=int(chosen), height_px=h, face_measured=bool(boxes)))
+        placed.append(dict(g, y_px=int(chosen), height_px=h, scale=scale, face_measured=bool(boxes)))
     return placed, dropped
 
 
@@ -190,6 +213,118 @@ ANIM = {
 }
 
 
+SCENE_TEMPLATE = """<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="UTF-8" />
+<script src="assets/gsap.min.js"></script>
+<style>
+@font-face {{ font-family: '{family}'; src: url('assets/fonts/{font_file}'); font-weight: 100 900; }}
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+html, body {{ width: {W}px; height: {H}px; overflow: hidden; background: #101116; }}
+#root {{ position: relative; width: {W}px; height: {H}px; background: #101116; }}
+#glow {{ position: absolute; left: -200px; top: 120px; width: 1480px; height: 900px; border-radius: 50%; background: radial-gradient(closest-side, rgba(255,255,255,0.10), rgba(255,255,255,0)); }}
+#stage {{ position: absolute; left: 80px; top: 330px; width: {text_w}px; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; direction: rtl; }}
+.w {{ display: block; font-family: '{family}'; font-weight: 900; font-size: {size}px; line-height: 1.08; color: {ink}; white-space: nowrap; }}
+.w.hot {{ color: {accent}; }}
+#bar {{ display: block; width: 260px; height: 14px; border-radius: 14px; background: {accent}; margin-top: 26px; transform-origin: right center; }}
+</style>
+</head>
+<body>
+<div id="root" data-composition-id="main" data-start="0" data-duration="{dur}" data-width="{W}" data-height="{H}">
+  <div id="glow" class="clip" data-start="0" data-duration="{dur}" data-track-index="0"></div>
+  <div id="stage" class="clip" data-start="0" data-duration="{dur}" data-track-index="1">{lines}<span id="bar"></span></div>
+</div>
+<script>
+const tl = gsap.timeline({{ paused: true }});
+tl.fromTo('#glow', {{ scale: 0.8, opacity: 0 }}, {{ scale: 1.1, opacity: 1, duration: {dur}, ease: 'none' }}, 0);
+tl.fromTo('.w', {{ opacity: 0, x: 60 }}, {{ opacity: 1, x: 0, duration: 0.34, ease: 'power3.out', stagger: {stagger} }}, 0.12);
+tl.fromTo('#bar', {{ scaleX: 0 }}, {{ scaleX: 1, duration: 0.5, ease: 'power2.out' }}, {bar_at});
+window.__timelines['main'] = tl;
+tl.seek(0);
+</script>
+</body>
+</html>
+"""
+
+
+def scene_lines(text):
+    """One or two words per line, in order (layout only). The last line is the accent line."""
+    w = text.split()
+    per = 1 if len(w) <= 3 else 2
+    return [" ".join(w[i:i + per]) for i in range(0, len(w), per)]
+
+
+def render_scene(cfg, style, g, out_dir):
+    """A full-frame animation scene (opaque): the quoted words build up line by line. Returns (frames dir, frame count)."""
+    proj = Path(out_dir) / g["id"].replace("@", "_").replace(".", "_")
+    if proj.exists():
+        shutil.rmtree(proj)
+    (proj / "assets" / "fonts").mkdir(parents=True)
+    fonts = sorted(Path(cfg["paths"]["font_dir"]).glob("*.ttf")) + sorted(Path(cfg["paths"]["font_dir"]).glob("*.otf"))
+    font = next((f for f in fonts if style["font_family"].lower() in f.stem.lower()), fonts[0] if fonts else None)
+    if font is None:
+        raise PipelineError("font_missing", f"no font file in {cfg['paths']['font_dir']}")
+    shutil.copyfile(font, proj / "assets" / "fonts" / font.name)
+    shutil.copyfile(ASSETS / "gsap.min.js", proj / "assets" / "gsap.min.js")
+    dur = round(g["tl_end_s"] - g["tl_start_s"], 2)
+    lines = scene_lines(g["text"])
+    longest = max(len(x) for x in lines)
+    size = int(min(150, max(84, 920 / max(longest, 1) * 1.55)))          # the widest line fits 920 px
+    page = SCENE_TEMPLATE.format(
+        W=style["width"], H=style["height"], family=style["font_family"], font_file=font.name, text_w=920, size=size, ink=style["caption_ink"],
+        accent=style["caption_highlight"], dur=dur, stagger=round(min(0.28, max(0.12, (dur - 1.2) / max(len(lines), 1))), 2),
+        bar_at=round(min(dur - 0.7, 0.3 + 0.28 * len(lines)), 2),
+        lines="".join(f'<span class="w{" hot" if n == len(lines) - 1 else ""}">{html.escape(x)}</span>' for n, x in enumerate(lines)))
+    (proj / "index.html").write_text(page, encoding="utf-8")
+    (proj / "meta.json").write_text(json.dumps({"id": "scene", "name": "dana-animation-scene"}), encoding="utf-8")
+    (proj / "hyperframes.json").write_text(json.dumps({"paths": {"assets": "assets"}, "authoringSkill": "hyperframes"}), encoding="utf-8")
+    frames = proj / "frames"
+    run([cli(cfg), "render", str(proj), "--format", "png-sequence", "-o", str(frames), "--fps", str(style["fps"]), "--quiet", "--skill=hyperframes"],
+        "hyperframes_render_failed", timeout=int(cfg["timeouts"].get("hyperframes_s", 420)), cwd=str(proj))
+    n = len(list(frames.glob("frame_*.png")))
+    if n < int(dur * style["fps"]) - 2:
+        raise PipelineError("hyperframes_render_failed", f"HyperFrames wrote {n} frames for a {dur}s scene", True)
+    return frames, n
+
+
+def apply_scenes(cfg, base, scenes, out, fps, timeout):
+    """Put the animation scenes INTO the picture track: for their seconds the scene replaces the footage (a hard cut in and
+    out); the sound is untouched. Captions are composited later, on top, like on any other part of the video."""
+    inputs, parts, prev = [], [], "0:v"
+    for n, g in enumerate(scenes):
+        inputs += ["-framerate", str(fps), "-start_number", "1", "-i", Path(g["frames"]) / "frame_%06d.png"]
+        parts.append(f"[{n + 1}:v]format=yuv420p,setpts=PTS+{g['tl_start_s']}/TB[s{n}]")
+        parts.append(f"[{prev}][s{n}]overlay=eof_action=pass:enable='between(t,{g['tl_start_s']},{g['tl_end_s']})'[v{n}]")
+        prev = f"v{n}"
+    run([tool_ffmpeg(cfg), "-y", "-v", "error", "-i", base, *inputs, "-filter_complex", ";".join(parts), "-map", f"[{prev}]", "-an",
+         "-c:v", "libx264", "-crf", "10", "-preset", "medium", "-pix_fmt", "yuv420p", out], "render_failed", timeout=timeout)
+    return out
+
+
+def tool_ffmpeg(cfg):
+    return (cfg.get("paths") or {}).get("ffmpeg") or "ffmpeg"
+
+
+def check_scenes(cfg, final, plain_base, scenes):
+    """Is every animation scene really in the finished file - i.e. does the picture differ from the footage there, over the whole frame?"""
+    import numpy as np
+    from .adjust import read_frames
+    from .checks import rec
+    problems, rows = [], []
+    for g in scenes:
+        mid = round((g["tl_start_s"] + g["tl_end_s"]) / 2, 2)
+        a, b = read_frames(cfg, final, [mid], width=180)[0], read_frames(cfg, plain_base, [mid], width=180)[0]
+        diff = float(np.abs(a - b).mean()) if a is not None and b is not None else 0.0
+        before = read_frames(cfg, final, [max(0.0, g["tl_start_s"] - 0.3)], width=180)[0]
+        back = float(np.abs(before - read_frames(cfg, plain_base, [max(0.0, g["tl_start_s"] - 0.3)], width=180)[0]).mean()) if before is not None else 1.0
+        rows.append({"id": g["id"], "t_s": mid, "frame_diff": round(diff, 4), "footage_before_diff": round(back, 4)})
+        if diff < 0.12:
+            problems.append(f"קטע האנימציה '{g['text']}' אינו מחליף את התמונה ב-{mid}s")
+    return rec("animation_scene_rendered", "fail" if problems else "pass",
+               "; ".join(problems) if problems else f"{len(scenes)} קטעי אנימציה מחליפים את הצילום בקובץ הסופי בזמן שנקבע (פריים אמצעי לכל קטע; תחושת התנועה לא נבדקה)", rows=rows)
+
+
 def cli(cfg):
     exe = (cfg.get("paths") or {}).get("hyperframes") or shutil.which("hyperframes.cmd") or shutil.which("hyperframes")
     if not exe:
@@ -220,7 +355,7 @@ def render(cfg, style, g, out_dir):
     dur = round(g["tl_end_s"] - g["tl_start_s"], 2)
     page = TEMPLATE.format(
         W=style["width"], H=style["height"], family=style["font_family"], font_file=font.name, y=g["y_px"], pad=PAD_Y, max_w=MAX_W,
-        size=SIZE, lh=LINE_H, ink=style["caption_ink"], accent=style["caption_highlight"], plate="rgba(15,16,22,0.78)",
+        size=int(SIZE * float(g.get("scale") or 1.0)), lh=LINE_H, ink=style["caption_ink"], accent=style["caption_highlight"], plate="rgba(15,16,22,0.78)",
         shadow="0 2px 8px rgba(0,0,0,0.6)", dur=dur,
         lines="".join(f'<span class="ln">{html.escape(ln)}</span>' for ln in lines_of(g["text"])),
         anim=ANIM[g["kind"]].format(out=round(dur - 0.36, 2)))

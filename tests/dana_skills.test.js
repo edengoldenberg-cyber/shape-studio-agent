@@ -122,22 +122,22 @@ describe('"צור סקיל מהוראות"', () => {
     expect(made.body.skill.status).toBe('drafting');
     expect((await post(`/skills/${id}/approve`, { by: 'עדן' })).body.error).toBe('no_draft');
     const l = (await W(request(app).post('/api/dana/worker/skills/lease')).send({ workerId: 'w1' })).body;
-    expect(l.skill).toMatchObject({ id, name: 'שלי', reference_rules: [{ id: 'r1', domain: 'captions' }] });
+    expect(l.skill).toMatchObject({ id, name: 'שלי', mode: 'draft', reference_rules: [{ id: 'r1', domain: 'captions' }] });
+    expect(l.skill.references[0]).toMatchObject({ title: 'רפרנס א', aspects: expect.any(Array) });      // the SAVED analysis is reused; nothing is analysed again
     expect(l.skill.prompt).toMatch(/מוזיקה קצבית/);
     expect(l.skill.domains.music.support).toBe('unsupported');
     expect((await W(request(app).post(`/api/dana/worker/skills/${id}/draft`)).set('X-Lease-Token', 'wrong').send({ status: 'drafted', draft: DRAFT })).status).toBe(409);
     expect((await W(request(app).post(`/api/dana/worker/skills/${id}/draft`)).set('X-Lease-Token', l.leaseToken).send({ status: 'drafted', draft: DRAFT })).body.status).toBe('draft');
     const d = (await request(app).get(`${S}/skills/${id}`)).body.skill.draft;
     expect(d.origin).toBe('combined');
-    expect(d.rules.map(x => [x.id, x.source.type, x.support, x.active])).toEqual([['r1', 'reference', 'supported', true], ['r2', 'prompt', 'supported', true], ['r3', 'prompt', 'supported', true],
+    expect(d.rules.map(x => [x.id, x.source.type, x.support, x.active])).toEqual([['r1', 'reference', 'supported', false], ['r2', 'prompt', 'supported', true], ['r3', 'prompt', 'supported', true],
       ['r4', 'prompt', 'unsupported', false], ['r5', 'prompt', 'unsupported', false]]);
     expect(d.rules[4].support_note).toBe('סקיל מתאר עריכה בלבד');     // "publish immediately" is not editing and is never executed
     expect(d.params).toEqual({ caption_max_lines: 2, caption_size: 130 });   // clamped to the limits; an unknown key is dropped
-    expect(d.conflicts).toEqual([expect.objectContaining({ a: 'r3', b: 'r1', resolution: null })]);
-    expect((await post(`/skills/${id}/approve`, { by: 'עדן' })).body).toMatchObject({ error: 'conflicts_open', conflicts: ['c1'] });
-    const res = await put(`/skills/${id}`, { by: 'עדן', resolve: [{ id: 'c1', resolution: 'suggestion' }] });
-    const after = res.body.skill.draft;
-    expect(after.rules.filter(x => x.active).map(x => x.text)).toEqual(['לפתוח במשפט הכי חזק', 'שורה אחת, ושתיים רק כשהמשפט ארוך']);
+    // the owner wrote "two lines"; the reference shows one line → the owner's instruction stands, the reference rule is switched off, and it is SHOWN
+    expect(d.conflicts).toEqual([expect.objectContaining({ a: 'r3', b: 'r1', resolution: 'a', auto: true, resolvedBy: 'owner_instruction_wins' })]);
+    expect(d.rules.find(x => x.id === 'r1').overruled).toEqual({ by: 'r3' });
+    expect(d.rules.find(x => x.id === 'r3').text).toBe('כתוביות בשתי שורות');      // not reworded to fit the example
     expect((await post(`/skills/${id}/approve`, { by: 'עדן' })).body.skill).toMatchObject({ status: 'approved', default: false });
   });
 
@@ -161,15 +161,17 @@ describe('approval, default and what a job carries', () => {
     const k = (await post('/skills/from-analysis', { by: 'עדן', name: 'טיוטה', ids: [ref], picks: pick(ref, 'opening') })).body.skill;
     expect((await post(`/skills/${k.id}/default`, { by: 'עדן' })).body.error).toBe('not_approved');
     const a = await project();
-    expect(a.job.options.skill).toBeUndefined();                       // a draft exists, and the job carries nothing of it
+    expect(a.job.options.skill_set).toBeUndefined();                   // a draft exists, and the job carries nothing of it
     expect((await request(app).patch(`${S}/projects/${a.id}/settings`).send({ skill: { mode: 'pinned', id: k.id } })).body.error).toBe('not_approved');
     finishAll();
     const ap = await post(`/skills/${k.id}/approve`, { by: 'עדן', make_default: true });
     expect(ap.body.skill).toMatchObject({ status: 'approved', default: true, defaultVersion: 1 });
     const b = await project();
-    expect(b.job.options.skill).toMatchObject({ id: k.id, name: 'טיוטה', version: 1, chosen_by: 'default', status: 'approved',
+    expect(b.job.options.skill_set).toHaveLength(1);
+    expect(b.job.options.skill_set[0].skill).toMatchObject({ id: k.id, name: 'טיוטה', version: 1, chosen_by: 'default', status: 'approved',
       rules: [{ id: 'r1', domain: 'opening', support: 'supported' }], criteria: [{ id: 'k1' }], unsupported: [] });
-    expect(b.job.options.profile).toMatchObject({ id: `skill:${k.id}`, version: '1', params: { caption_size: 110 }, rules: ['לפתוח על המשפט החזק ביותר'], status: 'owner_approved' });
+    expect(b.job.options.skill_set[0].profile).toMatchObject({ id: `skill:${k.id}`, version: '1', params: { caption_size: 110 }, rules: ['לפתוח על המשפט החזק ביותר'], status: 'owner_approved' });
+    expect(b.job.options.profile).toBeUndefined();                      // the skill replaces the older default profile; it is not sent twice
   });
 
   test('an approved version is immutable: an edit opens a new draft; a pinned project keeps its version; a new project gets the default', async () => {
@@ -185,16 +187,16 @@ describe('approval, default and what a job carries', () => {
     await post(`/skills/${k.id}/approve`, { by: 'עדן' });
     const now = (await request(app).get(`${S}/skills/${k.id}`)).body.skill;
     expect(now.versions.map(v => [v.version, v.status])).toEqual([[1, 'approved'], [2, 'approved']]);
-    expect(now.defaultVersion).toBe(1);                                // a new approved version does not replace the default silently
+    expect(now.defaultVersion).toBe(1);                                // an ordinary new version does not replace the default silently (an approved UPGRADE does, see dana_round4)
     // the pinned project still edits by version 1
     await post(`/projects/${a.id}/revise`, { by: 'עדן', style_overrides: { caption_size: 80 } });
     const l = await lease();
-    expect(l.job.options.skill).toMatchObject({ version: 1, rules: [expect.objectContaining({ text: 'לפתוח על המשפט החזק ביותר' }), expect.anything()] });
+    expect(l.job.options.skill_set[0].skill).toMatchObject({ version: 1, rules: [expect.objectContaining({ text: 'לפתוח על המשפט החזק ביותר' }), expect.anything()] });
     expect(l.job.options.style_overrides).toEqual({ caption_size: 80 });   // a project-only adjustment rides on top; the skill itself is unchanged
     expect((await get(a.id)).versions[0].skill).toMatchObject({ version: 1 });   // the existing version was not rewritten to the new skill version
     finishAll();
     await post(`/skills/${k.id}/default`, { by: 'עדן', version: 2 });
-    expect((await project()).job.options.skill).toMatchObject({ version: 2, rules: [expect.objectContaining({ text: 'לפתוח בשאלה' }), expect.anything()] });
+    expect((await project()).job.options.skill_set[0].skill).toMatchObject({ version: 2, rules: [expect.objectContaining({ text: 'לפתוח בשאלה' }), expect.anything()] });
   });
 
   test('"let Dana suggest": the job carries only APPROVED skills as candidates; "none" carries nothing', async () => {
@@ -206,7 +208,7 @@ describe('approval, default and what a job carries', () => {
     await request(app).patch(`${S}/projects/${a.id}/settings`).send({ skill: { mode: 'suggest' } });
     await post(`/projects/${a.id}/apply-skill`, { by: 'עדן' });
     const l = await lease();
-    expect(l.job.options.skill).toBeUndefined();
+    expect(l.job.options.skill_set).toBeUndefined();
     expect(l.job.options.skill_candidates.map(c => c.skill.name)).toEqual(['אלף']);
     expect(k.id).toBeTruthy();
   });
@@ -220,7 +222,7 @@ describe('approval, default and what a job carries', () => {
     expect(r.body.project).toMatchObject({ currentVersion: 2, status: 'editing' });
     expect(r.body.project.versions[0]).toMatchObject({ n: 1, approved: false, hasVideo: true });
     const l = await lease();
-    expect(l.job.options.skill.id).toBe(k.id);
+    expect(l.job.options.skill_set[0].skill.id).toBe(k.id);
     expect(l.job.options.previous).toBeUndefined();                    // planned again, by the skill
   });
 
@@ -232,8 +234,8 @@ describe('approval, default and what a job carries', () => {
     const t = await post(`/skills/${k.id}/test`, { by: 'עדן', projectId: a.id });
     expect(t.body.project.currentVersion).toBe(2);
     const l = await lease();
-    expect(l.job.options.skill).toMatchObject({ id: k.id, status: 'draft_test', chosen_by: 'owner_test' });
-    expect(l.job.options.profile.status).toBe('draft_test');
+    expect(l.job.options.skill_set[0].skill).toMatchObject({ id: k.id, status: 'draft_test', chosen_by: 'owner_test' });
+    expect(l.job.options.skill_set[0].profile.status).toBe('draft_test');
     const report = { skill: { id: k.id, name: 'לבדיקה', version: 1, status: 'draft_test', chosen_by: 'owner_test' },
       rules: [{ id: 'r1', status: 'applied' }, { id: 'r2', status: 'not_followed' }], params: [], criteria: [], summary: { applied: 1, not_followed: 1, not_applicable: 0, unsupported: 0, not_checked: 0, fully_applied: false } };
     await finish(l, a.sha, pkgFor(a.sha, { skill_report: report }));
@@ -244,7 +246,7 @@ describe('approval, default and what a job carries', () => {
     expect(after).toMatchObject({ status: 'draft', default: false });
     expect(after.draft.sample).toMatchObject({ projectId: a.id, versionN: 2, applied: 1, not_followed: 1 });
     finishAll();
-    expect((await project()).job.options.skill).toBeUndefined();        // the tested draft is still not used by anything else
+    expect((await project()).job.options.skill_set).toBeUndefined();    // the tested draft is still not used by anything else
   });
 });
 

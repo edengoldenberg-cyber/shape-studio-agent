@@ -20,7 +20,7 @@ from pathlib import Path
 
 from .core import PipelineError, run, tool
 
-KINDS = ("color", "audio_cleanup", "zooms", "caption_animation", "graphics")
+KINDS = ("color", "audio_cleanup", "zooms", "caption_animation", "graphics", "animation")
 
 # ── Ranges (working values, recorded in every package) ──────────────────────────────────────────────
 LIMITS = {

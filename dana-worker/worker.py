@@ -37,7 +37,7 @@ from dana_pipeline.core import (FAILURE, REVIEW_REQUIRED, STATE_BY_EXIT, SUCCESS
 SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{4,80}$")
 SAFE_EXT = {"mp4", "mov", "m4v", "webm", "avi", "mkv"}
 UPLOAD_ORDER = ["package.json", "checks.json", "captions.json", "editorial.json", "transcript_source.json", "transcript_final.json",
-                "cover.jpg", "compare_frames.jpg", "compare_clip.mp4", "final.mp4"]
+                "cover.jpg", "compare_frames.jpg", "compare_clip.mp4", "story_part_1.mp4", "story_part_2.mp4", "story_part_3.mp4", "story_part_4.mp4", "final.mp4"]
 TRANSFER_ATTEMPTS = 3
 
 
@@ -138,7 +138,7 @@ def run_pipeline(cfg, cfg_path, job_dir, source, on_stage, module="dana_pipeline
     return state, result
 
 
-STAGE_HE = {"choose_skill": "דנה בוחרת סקיל מתאים מהספרייה",
+STAGE_HE = {"choose_skill": "דנה בוחרת סקילים מתאימים מהספרייה", "animation": "מרנדר קטע אנימציה (HyperFrames)",
             "interpret": "דנה קוראת את הבקשה שלך", "graphics": "מרנדר מואושן גרפיק (HyperFrames)", "compare": "מכין לפני/אחרי",
             "transcribe_check": "האזנה שנייה לבדיקת התמלול", "assemble": "מחבר את החלקים שנבחרו", "measure_picture": "מודד מיקום פנים לכתוביות ולזומים",
             "source": "בודק את קובץ המקור", "transcribe_source": "מתמלל", "judgement": "בוחר קטע וכתוביות",

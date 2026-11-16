@@ -39,10 +39,16 @@ const ARTIFACTS = {            // name → { mime, required }
   'transcript_final.json':  { mime: 'application/json', required: false },
   'compare_frames.jpg':     { mime: 'image/jpeg',       required: false },   // before / after stills (same moments)
   'compare_clip.mp4':       { mime: 'video/mp4',        required: false },   // before / after clip, side by side
+  // a story is also delivered card by card (cut from the reviewed final.mp4)
+  'story_part_1.mp4': { mime: 'video/mp4', required: false }, 'story_part_2.mp4': { mime: 'video/mp4', required: false },
+  'story_part_3.mp4': { mime: 'video/mp4', required: false }, 'story_part_4.mp4': { mime: 'video/mp4', required: false },
 };
+/** Where a video is meant to go. The target changes the plan and the render on the worker (dana_pipeline/target.py). */
+const TARGETS = { reel: 'ריל', story: 'סטורי' };
 /** A review-only job looks at a finished video the owner uploaded; it produces no new video (the source IS the video). */
 const REVIEW_REQUIRED = ['package.json', 'checks.json', 'cover.jpg'];
-const ADJUSTMENT_KINDS = { color: 'תיקון צבע', audio_cleanup: 'ניקוי סאונד', zooms: 'זומים', caption_animation: 'הנפשת כתוביות', graphics: 'מואושן גרפיק' };
+const ADJUSTMENT_KINDS = { color: 'תיקון צבע', audio_cleanup: 'ניקוי סאונד', zooms: 'זומים', caption_animation: 'הנפשת כתוביות', graphics: 'מואושן גרפיק (מעל הצילום)',
+  animation: 'קטעי אנימציה (מחליפים את הצילום)' };
 const SOURCE_EXT       = new Set(['mp4', 'mov', 'm4v', 'webm', 'avi', 'mkv']);
 // Keys a project may override, with the range the worker accepts. Anything else is refused.
 const STYLE_OVERRIDABLE = {
@@ -213,6 +219,15 @@ function sanitizeOptions(o = {}) {
     out.kind = o.kind;
   }
   if (o.account !== undefined) out.account = sanitizeAccount(o.account);
+  if (o.target !== undefined) {
+    if (!['reel', 'story', 'both'].includes(o.target)) throw new StudioError(400, 'target_invalid', 'יעד חייב להיות ריל, סטורי או שתי גרסאות');
+    out.target = o.target;
+  }
+  if (o.graphic_edits !== undefined) {
+    if (!Array.isArray(o.graphic_edits) || o.graphic_edits.length > 20 || !o.graphic_edits.every(g => g && typeof g.id === 'string' && /^[\w@.:-]{1,60}$/.test(g.id) && g.action === 'remove'))
+      throw new StudioError(400, 'graphic_edits_invalid', 'הסרת גרפיקה חייבת לכלול מזהה ופעולה remove');
+    out.graphic_edits = o.graphic_edits.map(g => ({ id: g.id, action: 'remove' }));
+  }
   if (o.caption_edits !== undefined) out.caption_edits = sanitizeCaptionEdits(o.caption_edits);
   if (o.zoom_edits !== undefined) out.zoom_edits = sanitizeZoomEdits(o.zoom_edits);
   if (o.exclude_ranges !== undefined) {
@@ -233,19 +248,28 @@ async function registerUpload({ tmpPath, originalName, options, actor = 'owner' 
   if (bytes < 1024) { fs.rmSync(tmpPath, { force: true }); throw new StudioError(400, 'file_empty', 'הקובץ ריק'); }
   const sha256 = await hashFile(tmpPath);
   const s = state();
-  const existing = Object.values(s.projects).find(p => p.source.sha256 === sha256);
+  let opts0;
+  try { opts0 = sanitizeOptions(options); } catch (e) { fs.rmSync(tmpPath, { force: true }); throw e; }
+  const wanted = opts0.kind === 'review_only' ? ['reel'] : opts0.target === 'both' ? ['reel', 'story'] : [opts0.target ?? 'reel'];
+  const same = Object.values(s.projects).filter(p => p.source.sha256 === sha256);
+  const existing = same.find(p => wanted.includes(p.target ?? 'reel')) && wanted.every(t => same.some(p => (p.target ?? 'reel') === t)) ? same.find(p => (p.target ?? 'reel') === wanted[0]) : null;
   if (existing) {
     fs.rmSync(tmpPath, { force: true });
     hist(existing, actor, 'duplicate_upload', { originalName });
     save();
     return { duplicate: true, project: existing };
   }
-  const opts = sanitizeOptions(options);
+  const opts = opts0;
   const source = { sha256, ext, bytes, originalName: String(originalName).slice(0, 200), uploadedAt: now() };
   const dest = sourcePath(source);
   if (!fs.existsSync(dest)) fs.renameSync(tmpPath, dest); else fs.rmSync(tmpPath, { force: true });
+  // ONE source file, and a separate output (project) per target: each has its own versions, review and approval.
+  const groupId = same[0]?.groupId ?? (wanted.length > 1 || same.length ? newId('grp') : null);
+  if (groupId) for (const p of same) p.groupId = groupId;
+  let first = null;
+  for (const tg of wanted.filter(t => !same.some(p => (p.target ?? 'reel') === t))) {
   const project = {
-    id: newId('prj'), title: String(originalName).replace(/\.[^.]+$/, '').slice(0, 120), createdAt: now(),
+    id: newId('prj'), title: String(originalName).replace(/\.[^.]+$/, '').slice(0, 120), createdAt: now(), target: tg, groupId,
     source, status: 'editing', adapter: opts.adapter ?? null, adapterExplicit: opts.adapter !== undefined,   // null → the worker's configuration decides
     kind: opts.kind ?? 'edit',                                         // 'review_only': a finished video uploaded for Dana's review; nothing is edited
     account: opts.account ?? null,                                     // destination account chosen for this project (null → the brand default)
@@ -258,10 +282,12 @@ async function registerUpload({ tmpPath, originalName, options, actor = 'owner' 
     publication: null, history: [],
   };
   s.projects[project.id] = project;
-  hist(project, actor, 'uploaded', { sha256, bytes, originalName: source.originalName, kind: project.kind });
+  hist(project, actor, 'uploaded', { sha256, bytes, originalName: source.originalName, kind: project.kind, target: tg });
   if (project.kind === 'review_only') enqueueReview(project, actor); else enqueueEdit(project, opts, actor);
+  first = first ?? project;
+  }
   save();
-  return { duplicate: false, project };
+  return { duplicate: false, project: first };
 }
 
 function enqueueEdit(project, options, actor) {
@@ -271,9 +297,11 @@ function enqueueEdit(project, options, actor) {
   const n = (project.versions.at(-1)?.n ?? 0) + 1;
   const adapter = options.adapter ?? projectAdapter(project);
   const rules = activeRules();
-  const sk = options.skill_payload ?? require('./dana_skills').forProject(project);
-  // an approved library skill outranks the older "default profile"; without one the older default still applies
-  const profile = sk?.profile ?? require('./dana_references').defaultProfile();
+  // library skills: a tested draft (explicit test only), else the project's choice / the approved default - one skill or a combination
+  const sk = options.skill_payload ? { skill_set: [options.skill_payload] } : require('./dana_skills').forProject(project);
+  // approved library skills outrank the older "default profile"; without any, the older default still applies
+  const profile = sk?.skill_set ? null : require('./dana_references').defaultProfile();
+  const lastReviewed = [...project.versions].reverse().find(x => x.package?.review_compact)?.package.review_compact ?? null;
   const adjustments = { ...(project.adjustments ?? {}), ...(options.adjustments ?? {}) };
   const job = {
     id: newId('job'), projectId: project.id, version: n, type: 'edit', status: 'queued',
@@ -291,15 +319,21 @@ function enqueueEdit(project, options, actor) {
                // an improved version of the owner's own finished edit: the content is kept, only technical improvements are applied
                ...(project.polish ? { polish: project.polish } : {}), ...(options.apply_review ? { apply_review: true } : {}),
                ...(rules.length ? { rules } : {}), ...(profile ? { profile } : {}),
-               ...(sk?.skill ? { skill: sk.skill } : {}), ...(sk?.candidates ? { skill_candidates: sk.candidates } : {}) },
-    skillTest: options.skill_test && sk?.skill ? { id: sk.skill.id, version: sk.skill.version } : null,
+               ...(sk?.skill_set ? { skill_set: sk.skill_set } : {}), ...(sk?.candidates ? { skill_candidates: sk.candidates } : {}),
+               target: project.target ?? 'reel',
+               ...((project.graphicEdits ?? []).length ? { graphic_edits: project.graphicEdits } : {}),
+               ...(project.animationScene === true ? { animation_scene: true } : {}),
+               // the previous review of this output, so the next one can explain what changed and why
+               ...(lastReviewed ? { previous_review: lastReviewed } : {}) },
+    skillTest: options.skill_test && sk?.skill_set ? { id: sk.skill_set[0].skill.id, version: sk.skill_set[0].skill.version } : null,
     stageLog: [], createdAt: now(), updatedAt: now(),
   };
   s.jobs[job.id] = job;
   project.versions.push({ n, jobId: job.id, createdAt: now(), status: 'editing', package: null, artifacts: {},
     caption: null, destination: null, scheduledAt: null, exceptions: [], approval: null, notifiedAt: null,
     changeRequest: options.change_request ?? null, kind: 'edit', appliedReview: !!options.apply_review || (!!project.polish && n > 1),
-    skill: sk?.skill ? { id: sk.skill.id, name: sk.skill.name, version: sk.skill.version, test: !!options.skill_test } : null, skillSuggest: !!sk?.candidates });
+    skill: sk?.skill_set ? { id: sk.skill_set.map(c => c.skill.id).join('+'), name: sk.skill_set.map(c => c.skill.name).join(' + '), version: sk.skill_set.length === 1 ? sk.skill_set[0].skill.version : sk.skill_set.map(c => c.skill.version).join('+'),
+      test: !!options.skill_test } : null, skillSuggest: !!sk?.candidates });
   project.currentVersion = n;
   project.status = 'editing';
   hist(project, actor, 'edit_queued', { jobId: job.id, version: n, adapter: job.options.adapter ?? 'worker_default' });
@@ -739,7 +773,7 @@ function revise(projectId, body = {}, actor = 'owner') {
   const adjustments = body.adjustments !== undefined ? sanitizeAdjustments(body.adjustments) : null;
   const adjChanged = adjustments && Object.entries(adjustments).some(([k, val]) => (p.adjustments ?? {})[k] !== val && !(val === true && (p.adjustments ?? {})[k] === undefined));
   const pending = pendingEdits(p, v).length;                           // corrections saved with "אמת ושמור תיקון" that are not in a rendered version yet
-  if (!edits.length && !zooms.length && !style && !note && !adjChanged && !pending) throw new StudioError(400, 'nothing_to_revise', 'לא סומן שום תיקון');
+  if (!edits.length && !zooms.length && !style && !note && !adjChanged && !pending && !(Array.isArray(body.graphic_edits) && body.graphic_edits.length)) throw new StudioError(400, 'nothing_to_revise', 'לא סומן שום תיקון');
   if (v.kind === 'review_only') throw new StudioError(409, 'review_only', 'זה סרטון שהועלה לביקורת בלבד — אפשר להפיק ממנו גרסה משופרת דרך "יישם שיפורים"');
   const open = Object.values(state().jobs).find(j => j.projectId === p.id && ['queued', 'leased'].includes(j.status));
   if (open) throw new StudioError(409, 'job_in_progress', 'כבר יש עריכה פעילה לפרויקט הזה');
@@ -758,6 +792,9 @@ function revise(projectId, body = {}, actor = 'owner') {
   p.captionEdits.sort((a, b2) => a.source_start_s - b2.source_start_s);
   for (const z of zooms) { p.zoomEdits = p.zoomEdits.filter(x => x.id !== z.id); p.zoomEdits.push({ ...z, by, at }); }
   if (adjustments) p.adjustments = { ...(p.adjustments ?? {}), ...adjustments };
+  // remove ONE graphic or animation scene by its id; the rest of the edit is kept (locked revision)
+  const gEdits = body.graphic_edits !== undefined ? sanitizeOptions({ graphic_edits: body.graphic_edits }).graphic_edits : [];
+  for (const g of gEdits) { p.graphicEdits = (p.graphicEdits ?? []).filter(x => x.id !== g.id); p.graphicEdits.push({ ...g, by, at }); }
 
   let rule = null;
   if (note && body.note_scope === 'permanent') rule = addRule({ text: note, by, projectId: p.id, projectTitle: fixName(p.title), versionN: v.n });
@@ -767,7 +804,7 @@ function revise(projectId, body = {}, actor = 'owner') {
   dropApproval(p, v, actor, 'revision_requested');
   hist(p, actor, 'revision_requested', { version: v.n, by, captionEdits: edits.length, zoomEdits: zooms.length, style: style ?? null,
     note: note || null, noteScope: note ? body.note_scope : null, ruleId: rule?.id ?? null, adjustments: adjustments ?? null, pendingCorrections: pending });
-  return queueChange(p, v, opts, note, actor, { hasEdits: edits.length > 0 || zooms.length > 0 || !!rule || adjChanged || pending > 0 });
+  return queueChange(p, v, opts, note, actor, { hasEdits: edits.length > 0 || zooms.length > 0 || !!rule || adjChanged || pending > 0 || gEdits.length > 0 });
 }
 
 // ── Transcript: correct, listen, verify ───────────────────────────────────────
@@ -841,6 +878,7 @@ function setSettings(projectId, body = {}, actor = 'owner') {
   if (body.adjustments !== undefined) p.adjustments = { ...(p.adjustments ?? {}), ...sanitizeAdjustments(body.adjustments) };   // applies from the next version
   // which library skill the NEXT version uses. Existing versions are never changed by this.
   if (body.skill !== undefined) p.skill = require('./dana_skills').selection(body.skill);
+  if (body.animation_scene !== undefined) p.animationScene = body.animation_scene === true;
   hist(p, actor, 'settings_changed', { account: p.account ?? null, adjustments: p.adjustments ?? {} });
   save();
   return view(p);
@@ -888,10 +926,17 @@ function applySkill(projectId, body = {}, actor = 'owner') {
   if (!by) throw new StudioError(400, 'by_required', 'נדרש שם מי שמבקש/ת');
   const { p, v } = idleProject(projectId);
   if (body.skill !== undefined) p.skill = require('./dana_skills').selection(body.skill);
+  if (body.animation_scene !== undefined) p.animationScene = body.animation_scene === true;
   const sk = require('./dana_skills').forProject(p);
   if (!sk) throw new StudioError(409, 'no_skill', 'לא נבחר סקיל מאושר לפרויקט ואין ברירת מחדל מאושרת');
+  // A contradiction inside the chosen combination is shown BEFORE anything is produced. It is decided by the order the
+  // owner gave the skills; the owner confirms that here.
+  const hard = (sk.conflicts ?? []).filter(c => c.kind === 'parameter');
+  if (hard.length && body.confirm_conflicts !== true)
+    throw new StudioError(409, 'skill_conflicts', 'הסקילים שנבחרו סותרים זה את זה — יש לאשר את ההכרעה לפני ההפקה', { conflicts: sk.conflicts });
   dropApproval(p, v, actor, 'skill_applied');
-  hist(p, actor, 'skill_applied', { version: v.n, by, skill: sk.skill ? { id: sk.skill.id, version: sk.skill.version } : 'dana_suggests' });
+  hist(p, actor, 'skill_applied', { version: v.n, by, skills: sk.skill_set ? sk.skill_set.map(c => ({ id: c.skill.id, version: c.skill.version })) : 'dana_suggests',
+    conflicts_confirmed: hard.length });
   enqueueEdit(p, {}, actor);
   save();
   return view(p);
@@ -903,6 +948,7 @@ function testSkill(skillId, body = {}, actor = 'owner') {
   const payload = require('./dana_skills').testPayload(skillId);
   const { p, v } = idleProject(String(body.projectId ?? ''));
   dropApproval(p, v, actor, 'skill_test');
+  if (body.animation_scene !== undefined) p.animationScene = body.animation_scene === true;
   hist(p, actor, 'skill_test_requested', { version: v.n, by, skill: { id: payload.skill.id, version: payload.skill.version } });
   enqueueEdit(p, { skill_payload: payload, skill_test: true }, actor);
   save();
@@ -1104,6 +1150,10 @@ function view(p, viewN) {
     id: p.id, title: fixName(p.title), status: p.status, createdAt: p.createdAt, currentVersion: p.currentVersion,
     source: { sha256: p.source.sha256, bytes: p.source.bytes, originalName: fixName(p.source.originalName), ext: p.source.ext },
     kind: p.kind ?? 'edit', account: p.account ?? null, adjustments: p.adjustments ?? {}, adjustmentKinds: ADJUSTMENT_KINDS,
+    target: p.target ?? 'reel', targetLabel: TARGETS[p.target ?? 'reel'], animationScene: p.animationScene === true, graphicEdits: p.graphicEdits ?? [],
+    // the other outputs made from the SAME source file (a reel and a story are separate outputs with their own versions and reviews)
+    siblings: p.groupId ? Object.values(s.projects).filter(x => x.groupId === p.groupId && x.id !== p.id).map(x => ({ id: x.id, target: x.target ?? 'reel', targetLabel: TARGETS[x.target ?? 'reel'], status: x.status, currentVersion: x.currentVersion })) : [],
+    skillConflicts: (() => { try { return require('./dana_skills').forProject(p)?.conflicts ?? []; } catch { return []; } })(),
     progress: progressOf(p, cur, job), nextAction: nextAction(p, cur, job),
     pendingCorrections: pendingEdits(p, cur).length, cardStates: cardStates(p, v),
     shown: v ? { n: v.n, isCurrent: v.n === p.currentVersion, currentN: p.currentVersion, currentStatus: cur?.status ?? null, currentHasPackage: !!cur?.package } : null,
@@ -1117,6 +1167,7 @@ function view(p, viewN) {
     version: v ? {
       n: v.n, status: v.status, createdAt: v.createdAt, changeRequest: v.changeRequest ?? null, kind: v.kind ?? 'edit',
       hasCompare: !!v.artifacts['compare_frames.jpg'], hasCompareClip: !!v.artifacts['compare_clip.mp4'],
+      storyParts: Object.keys(v.artifacts ?? {}).filter(n => /^story_part_\d\.mp4$/.test(n)).sort(),
       fingerprint: fingerprint(v), approval: v.approval, approvalValid: approvalValid(v),
       caption: v.caption, destination: v.destination, scheduledAt: v.scheduledAt,
       scheduledLocal: require('./dana_publisher').toLocal(v.scheduledAt), scheduleProposed: !!v.scheduleProposed, timezone: 'Asia/Jerusalem',
@@ -1130,6 +1181,8 @@ function view(p, viewN) {
         measured: v.package.measured ?? null, burnedInText: v.package.burned_in_text ?? v.package.plan?.burned_in_text ?? null,
         danaCanApply: v.package.dana_can_apply ?? null, graphicsSeen: v.package.graphics_seen ?? null, note: v.package.note ?? null,
         tools: v.package.tools ?? null, skillReport: v.package.skill_report ?? null, reviewProvenance: v.package.review_provenance ?? null,
+        finalReview: v.package.final_review ?? null, timeline: v.package.timeline ?? null, target: v.package.target ?? null, outputs: v.package.outputs ?? null,
+        skillChoice: v.package.skill_choice ?? null,
         considered: v.package.considered ?? [], revisionNote: v.package.revision_note ?? '', spelling: v.package.spelling ?? [],
         usage: v.package.judgement_usage ?? null, bundle: v.package.instruction_bundle ?? null, editorial: v.package.editorial ?? null,
         timings: v.package.timings_s, totalSeconds: v.package.total_s, pipelineVersion: v.package.pipeline_version,
@@ -1151,6 +1204,7 @@ function view(p, viewN) {
 function list() {
   return Object.values(state().projects).sort((a, b) => b.createdAt.localeCompare(a.createdAt))
     .map(p => { const x = view(p); return { id: x.id, title: x.title, status: x.status, createdAt: x.createdAt, currentVersion: x.currentVersion, kind: x.kind,
+      target: x.target, targetLabel: x.targetLabel, groupId: p.groupId ?? null,
       progress: x.progress && { phase: x.progress.phase, percent: x.progress.percent, percentBasis: x.progress.percentBasis }, nextAction: x.nextAction,
       job: x.job && { status: x.job.status, stage: x.job.stage, note: x.job.note }, unresolved: x.version?.unresolved.length ?? 0, consent: x.consent.status }; });
 }
@@ -1164,5 +1218,5 @@ module.exports = {
   approve, confirmReview, requestChanges, revise, reject, setConsent, retry, sourcePath, artifactPath, dir, save, state, hist, _resetForTests,
   listRules, activeRules, addRule, editRule, retireRule, previousOf, fixName, projectAdapter, judgementMode, judgementMissing, STYLE_OVERRIDABLE,
   verifyCaption, setSettings, applyReview, progressOf, nextAction, cardStates, pendingEdits, ADJUSTMENT_KINDS, PHASES,
-  applySkill, testSkill, reviewInfo,
+  applySkill, testSkill, reviewInfo, TARGETS,
 };

@@ -191,7 +191,7 @@ describe('project settings: a connected account and adjustment switches', () => 
 
   test('every kind of adjustment can be switched off; the switch travels with the next job; unknown kinds are refused', async () => {
     const { id } = await ready();
-    expect(Object.keys((await get(id)).adjustmentKinds)).toEqual(['color', 'audio_cleanup', 'zooms', 'caption_animation', 'graphics']);
+    expect(Object.keys((await get(id)).adjustmentKinds)).toEqual(['color', 'audio_cleanup', 'zooms', 'caption_animation', 'graphics', 'animation']);
     expect((await post(`/projects/${id}/revise`, { by: 'עדן', adjustments: { sparkle: false } })).body.error).toBe('adjustments_invalid');
     const r = await post(`/projects/${id}/revise`, { by: 'עדן', adjustments: { color: false, graphics: false } });
     expect(r.body.project.currentVersion).toBe(2);
