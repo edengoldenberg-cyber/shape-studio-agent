@@ -47,7 +47,8 @@ function quiet() { try { return require('../utils/time').isQuietHours(); } catch
 
 function buildMessage(project, version) {
   const open = (version.package?.review_items ?? version.package?.failed_checks ?? []).length;
-  const link = baseUrl() ? `${baseUrl()}/dana-studio.html#${project.id}` : `(פתח/י את הפאנל → דנה סטודיו → ${project.title})`;
+  // the link opens THIS project at THIS version (the page reads "#<project>/v<n>")
+  const link = baseUrl() ? `${baseUrl()}/dana-studio.html#${project.id}/v${version.n}` : `(פתח/י את הפאנל → דנה סטודיו → ${project.title} → גרסה ${version.n})`;
   return [`🎬 דנה: חבילת פרסום מוכנה לבדיקה — "${project.title}" (גרסה ${version.n})`,
           open ? `⚠️ ${open} פריטים דורשים את הבדיקה שלך.` : '✅ כל הבדיקות האוטומטיות עברו.',
           `לצפייה ולאישור (נדרשת התחברות): ${link}`,

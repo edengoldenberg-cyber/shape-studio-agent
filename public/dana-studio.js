@@ -98,6 +98,7 @@
     $('#profnow').textContent = st.defaultProfile ? `${st.defaultProfile.id} · גרסה ${st.defaultProfile.version} (${st.dataBanner ? 'אישור בדיקה סינתטי — לא אישור שלך' : 'אושר על ידך'})` : 'לא אושר פרופיל — העובד משתמש בפרופיל המובנה שלו, שאינו מאושר';
     if (!worker.online && projects.some(p => p.status === 'editing')) notice('עובד העריכה במחשב לא מחובר. העבודות ממתינות בתור וימשיכו כשהוא יחזור.', 'warn');
     renderAbout(worker);
+    loadStorage().then(() => { $('#about').__html = null; renderAbout(worker); }).catch(() => {});
     loadBrand().catch(() => {}); loadRules().catch(() => {}); loadRefs().catch(() => {}); loadSkills().catch(() => {});
   }
   /** A preview of test material says so on every screen; an approval made there is synthetic, never the owner's. */
@@ -161,14 +162,24 @@
     });
   }
   $('#file').onchange = async () => {
-    const f = $('#file').files[0]; if (!f) return;
+    const all = Array.from($('#file').files), f = all[0]; if (!f) return;
+    const rest = upKind === 'edit' ? all.slice(1, 12) : [];
     const fd = new FormData(); fd.append('video', f, f.name);
-    fd.append('options', JSON.stringify({ kind: upKind, ...(upKind === 'edit' ? { target: $('#uptarget').value } : {}), ...($('#upacct').value ? { account: $('#upacct').value } : {}) }));
+    fd.append('options', JSON.stringify({ kind: upKind, ...(upKind === 'edit' ? { target: $('#uptarget').value, project_type: $('#uptype').value, ...(rest.length ? { more_files: true } : {}) } : {}), ...($('#upacct').value ? { account: $('#upacct').value } : {}) }));
     $('#upbox').classList.remove('hidden'); $('#pickraw').disabled = $('#pickreview').disabled = true;
     try {
       const j = await sendFile('/upload', fd, (sent, total, sec) => { const pct = 100 * sent / total;
         $('#upbar').style.width = pct.toFixed(1) + '%'; $('#uppct').textContent = pct.toFixed(pct < 100 ? 1 : 0) + '%';
         $('#upstate').textContent = `${mb(sent)} מתוך ${mb(total)}MB${sec > 1 ? ' · ' + (sent / 1048576 / sec).toFixed(1) + 'MB/שנ׳' : ''}${pct >= 100 ? ' · השרת מאמת את הקובץ…' : ''}`; });
+      const prog = label => (sent, total, sec) => { const pct = 100 * sent / total; $('#upbar').style.width = pct.toFixed(1) + '%'; $('#uppct').textContent = pct.toFixed(pct < 100 ? 1 : 0) + '%';
+        $('#upstate').textContent = `${label} · ${mb(sent)} מתוך ${mb(total)}MB${sec > 1 ? ' · ' + (sent / 1048576 / sec).toFixed(1) + 'MB/שנ׳' : ''}`; };
+      if (rest.length && !j.duplicate) {                    // the other files go into the SAME project; the edit starts only when all of them are in
+        const by = who() || 'הבעלים';
+        for (let i = 0; i < rest.length; i++) { const f2 = new FormData(); f2.append('by', by); f2.append('video', rest[i], rest[i].name);
+          await sendFile(`/projects/${j.project.id}/sources`, f2, prog(`קובץ ${i + 2} מתוך ${rest.length + 1}`)); }
+        await api(`/projects/${j.project.id}/start`, { method: 'POST', body: { by } });
+        notice(`${rest.length + 1} קובצי מקור התקבלו בפרויקט אחד. העריכה נכנסה לתור.`, 'ok'); return open(j.project.id);
+      }
       notice(j.duplicate ? 'הקובץ הזה כבר הועלה בעבר — נפתח הפרויקט הקיים, בלי עותק נוסף ובלי עבודה כפולה.' : upKind === 'review_only' ? 'הסרטון התקבל והוגש לביקורת דנה.' : 'הקובץ התקבל. העריכה נכנסה לתור.', j.duplicate ? 'warn' : 'ok');
       open(j.project.id);
     } catch (err) { notice(err.message, 'bad'); }
@@ -343,6 +354,12 @@
       ['missing', 'אנימציה שממחישה את הנאמר', 'לא קיים: אין איור, דמויות או וידאו שנוצר. יידרש שירות יצירה בתשלום ושליחת חומר לספק חדש — רק אחרי הצגת העלות וההרשאה ואישור שלך.'],
       ['active', 'יעד: ריל או סטורי', 'היעד משנה את התכנון (מבנה, משך, פתיחה), את האזור הבטוח, את הקאבר והקפשן. לסטורי מופקים גם קבצים נפרדים לכל כרטיס.'],
       ['missing', 'פרסום סטורי', 'לא נבדק מעולם דרך החיבור הקיים. הקבצים מופקים; הפרסום אינו נתמך.'],
+      ['active', 'לקט מכמה קובצי מקור', 'הקבצים מאוחדים לקובץ עבודה אחד עם מפה: לכל קטע בסרטון רשומים הקובץ והזמן בתוכו. בלקט דנה בוחרת לפי מה שרואים (תנועה, חדות, פריים אחד לכל רגע) — היא לא צופה בתנועה, לא מזהה תרגילים ולא שופטת ביצוע.'],
+      ['active', 'מוזיקה וקריינות בהעלאה', 'מיקס: דיבור ← מוזיקה (נקודת התחלה, עוצמה, כניסה/יציאה) ← הנמכה מתחת לדיבור ← נרמול. נמדדים עוצמה, שיא, עיוות והיחס בין דיבור למוזיקה. קובץ שהועלה אינו מסומן כמורשה.'],
+      ['partial', 'עריכה לפי קצב', 'בלקט בלבד: זיהוי פעימות (librosa) והזזת חיתוך לפעימה רק כשהיא קרובה. לא נכפה חיתוך בכל פעימה.'],
+      ['missing', 'כתוביות לקריינות', 'לא קיים עדיין: קריינות שהועלתה נכנסת למיקס, אבל לא נוצרות לה כתוביות.'],
+      ['missing', 'קריינות ודיבוב ב-ElevenLabs', 'החיבור מוכן אך כבוי. נדרשים: חשבון בתשלום (המסלול החינמי אסור לשימוש מסחרי), מפתח, ואישור עלות שלך. שום חומר לא נשלח לספק.'],
+      ['missing', 'ספריית מוזיקה חיצונית', 'אין חיבור פעיל. ל-CapCut אין API ותנאיו אוסרים שימוש מחוץ לאפליקציה. אפשרויות חוקיות ועלויות מפורטות במסמך; עד אז — העלאה ידנית עם רישום רישיון.'],
       ['active', 'שילוב סקילים', 'כמה סקילים מאושרים ממוזגים לפני התכנון לתוכנית אחת, לפי סדר עדיפות. סתירה בפרמטרים מוצגת לפני ההפקה.'],
       ['missing', 'צילומי השלמה (B-roll)', 'לא קיים. אין חומר ואין מנגנון.'],
       ['missing', 'מוזיקה ואפקטים קוליים', 'לא קיים.'],
@@ -350,7 +367,7 @@
       ['missing', 'פרסום', 'כבוי. שום דבר לא עולה ל-Meta בלי אישור נפרד שלך.'],
     ];
     const ST = { active: ['פעיל', 'ok'], partial: ['חלקי', 'warn'], missing: ['חסר', 'bad'] };
-    setHtml($('#about'), `<div class="card"><h2>המסלול</h2>
+    setHtml($('#about'), connectorsCard() + storageCard(worker) + `<div class="card"><h2>המסלול</h2>
         <ol class="plain small" style="counter-reset:s">${[
           ['העלאה', 'הקובץ נשמר כמו שהוא בשרת. השרת רק מתאם; הוא לא עורך.'],
           ['תמלול ומדידות', 'עובד העריכה במחשב מתמלל פעמיים, מודד עוצמת קול לכל מילה ומיקום פנים.'],
@@ -531,6 +548,31 @@
       notice(j.skill.status === 'waiting_analysis' ? 'סרטון הדוגמה נכנס לניתוח; הטיוטה תנוסח כשהניתוח יסתיים.' : 'הבקשה נשלחה לעובד העריכה לניסוח טיוטה. ניתוחים קיימים של רפרנסים לא חוזרים על עצמם.', 'ok');
     } catch (err) { notice(err.message, 'bad'); } finally { $('#skfromprompt').disabled = false; }
   };
+  let storageNow = null;
+  const gb = b => b == null ? '—' : (b / 1024 ** 3).toFixed(1) + 'GB';
+  async function loadStorage() { try { storageNow = (await api('/storage')).storage; } catch { storageNow = null; } }
+  function storageCard(worker) {
+    const s = storageNow; if (!s) return '';
+    const w = s.worker;
+    return `<div class="card" id="storage"><h2>אחסון ועבודה שוטפת</h2><ul class="plain small">
+      <li>גודל העלאה מרבי לקובץ: ${esc(s.uploadLimitMb)}MB</li>
+      <li class="${s.lowSpace ? 'bad' : ''}">מקום פנוי בשרת: ${gb(s.freeBytes)} מתוך ${gb(s.totalBytes)}${s.lowSpace ? ' — מעט מקום: כדאי לפנות לפני העלאה גדולה' : ''}</li>
+      <li>בשימוש: מקורות ואודיו ${gb(s.used.sources_and_audio.bytes)} (${s.used.sources_and_audio.files} קבצים) · גרסאות ${gb(s.used.versions.bytes)} · רפרנסים ${gb(s.used.references.bytes)}</li>
+      <li>מחשב העריכה: ${w ? `${esc(w.free_gb)}GB פנויים (נדרשים ${esc(w.min_free_gb)}GB כדי לקבל משימה)${w.ok ? '' : ' — <b class="bad">לא מקבל משימות עד שיתפנה מקום</b>'}` : 'לא דווח'}${s.workerKeepsJobFoldersDays ? ` · תיקיות עבודה זמניות נמחקות אחרי ${esc(s.workerKeepsJobFoldersDays)} ימים` : ''}</li>
+      <li>עובד העריכה: ${worker && worker.online ? '<span class="ok">מחובר</span>' : '<span class="bad">לא מחובר</span> — משימות ימתינו בתור ולא יאבדו'} · משימה שנקטעה חוזרת לתור (עד 3 ניסיונות), בלי כפילות</li>
+      <li>שאריות של העלאות שנקטעו: ${s.uploadLeftovers.files} קבצים (${gb(s.uploadLeftovers.bytes)}) ${s.uploadLeftovers.files ? '<button class="sm" id="st_clean">למחוק את השאריות</button>' : ''}</li></ul>
+      <details class="small"><summary>מדיניות מחיקה</summary><ul class="plain">${s.policy.map(x => `<li>${esc(x)}</li>`).join('')}</ul></details>
+      <details class="small"><summary>הפעלה קבועה של עובד העריכה</summary><div>העובד יכול לעלות לבד עם הכניסה למחשב (משימה מתוזמנת אחת של Windows, בלי הרשאות מנהל). ההתקנה היא פעולה אחת שלך במחשב העריכה, לא מהפאנל:
+        <code dir="ltr">powershell -ExecutionPolicy Bypass -File dana-worker\\autostart\\install.ps1</code>. לעצירה: <code dir="ltr">stop.ps1</code>; להסרה: <code dir="ltr">uninstall.ps1</code>.</div></details></div>`;
+  }
+  $('#about').onclick = async e => {
+    if (e.target.id === 'st_clean') { const by = who(); if (!by) return; if (!confirm('למחוק שאריות של העלאות שנקטעו (מעל 24 שעות)? קובצי מקור ותוצרים לא נמחקים.')) return;
+      try { storageNow = (await api('/storage/cleanup-upload-leftovers', { method: 'POST', body: { by } })).storage; notice('השאריות נמחקו.', 'ok'); $('#about').__html = null; renderAbout(status && status.worker); } catch (err) { notice(err.message, 'bad'); }
+      return; }
+    if (e.target.id !== 'tts_est') return;
+    try { const j = await api('/narration/estimate', { method: 'POST', body: { text: $('#tts_text').value } }), x = j.estimate;
+      $('#tts_out').textContent = x.characters + ' תווים · כ-' + x.estimated_usd + '$ ליצירה אחת (' + x.model + ', ' + x.usd_per_1000_chars + '$ לאלף תווים). ' + x.basis; }
+    catch (err) { notice(err.message, 'bad'); } };
   $('#skills').onclick = async e => {
     const d = e.target.dataset;
     if (d.skopen) { ui.skill = d.skopen; skPick = null; remember(); await loadSkills(); $('#skillcard').scrollIntoView({ block: 'start' }); }
@@ -779,6 +821,114 @@
   const noPkg = what => `<div class="card"><h2>${what}</h2><div class="mute">${busy() ? 'דנה עדיין עובדת. השלב הזה ייפתח כשהחבילה תהיה מוכנה לצפייה.' : 'אין עדיין חבילה בגרסה הזו.'}</div></div>`;
   const reviewOnlyNote = '<div class="card"><div class="pill info">סרטון שהועלה לביקורת בלבד</div><p class="small mute">דנה לא ערכה את הסרטון הזה. כדי לקבל גרסה משופרת שלו: שלב "ביקורת דנה" ← "יישם שיפורים והפק גרסה חדשה".</p></div>';
 
+  /** The files of the project (source videos with the owner's marks, music, narration) and the mix for the next version. */
+  const mediaDraft = { audio: null, for: '' };
+  function audioDraft(p) { if (mediaDraft.for !== p.id || !mediaDraft.audio) { mediaDraft.for = p.id; mediaDraft.audio = JSON.parse(JSON.stringify(p.media.audio)); } return mediaDraft.audio; }
+  function mediaCard(p) {
+    const m = p.media; if (!m || p.kind === 'review_only') return '';
+    const au = audioDraft(p), pu = `${API}/projects/${p.id}`, music = m.assets.filter(a => a.kind === 'music'), nar = m.assets.filter(a => a.kind === 'narration');
+    const segs = ((pkgOf() || {}).plan || {}).segments || [], lockedOut = busy() && !p.waitingForFiles;
+    const numf = (id, label, val, step, min, max) => `<label class="small" style="display:inline-block;margin-inline-end:10px">${label} <input type="number" data-au="${id}" value="${esc(val)}" step="${step}" min="${min}" max="${max}" style="width:84px"></label>`;
+    return `<div class="card" id="media"><h2>קבצים, מוזיקה וקריינות</h2>
+      ${p.waitingForFiles ? `<div class="pill info">העריכה ממתינה לקבצים נוספים</div> <button class="primary" data-do="startfiles" style="margin-top:6px">כל הקבצים כאן — התחל עריכה</button><div class="small mute">אם לא תלחצ/י, העריכה תתחיל לבד אחרי 15 דקות עם הקבצים שהועלו.</div>` : ''}
+      <label for="mtype">סוג הפרויקט</label><select id="mtype" data-nodirty="1">${Object.entries(m.projectTypes).map(([k, l]) => `<option value="${k}" ${m.projectType === k ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
+      <h3>קובצי מקור (${m.sources.filter(x => !x.removed).length})</h3>
+      <ul class="plain">${m.sources.map(x => `<li id="src_${esc(x.id)}"><div class="row"><b class="grow">${esc(x.name)}</b><span class="pill mute">${mb(x.bytes)}MB</span>${x.primary ? '<span class="pill info">ראשון</span>' : ''}${x.removed ? '<span class="pill bad">הוסר מגרסאות הבאות</span>' : ''}</div>
+        <details data-keep="src_${esc(x.id)}"><summary class="small">צפייה וסימון קטעים${x.marks.length ? ` (${x.marks.length} סימונים)` : ''}</summary>
+          <video controls playsinline preload="none" id="sv_${esc(x.id)}" src="${pu}/sources/${esc(x.id)}/video" style="max-height:40vh"></video>
+          <ul class="plain small">${x.marks.map((k, i) => `<li><span class="pill ${k.kind === 'must' ? 'ok' : 'bad'}">${k.kind === 'must' ? 'חייב להיכלל' : 'לא להשתמש'}</span> ${tfmt(k.from_s)}–${tfmt(k.to_s)}${k.note ? ' · ' + esc(k.note) : ''}
+            <button class="sm" data-mark-del="${esc(x.id)}" data-i="${i}">הסר סימון</button></li>`).join('') || '<li class="mute">אין סימונים. בלי סימון דנה בוחרת בעצמה.</li>'}</ul>
+          <div class="row small"><input type="number" id="mf_${esc(x.id)}" placeholder="מ- (שנ׳)" step="0.1" min="0" style="width:90px"><button class="sm" data-mark-now="mf_${esc(x.id)}" data-v="sv_${esc(x.id)}">מהנגן</button>
+            <input type="number" id="mt_${esc(x.id)}" placeholder="עד (שנ׳)" step="0.1" min="0" style="width:90px"><button class="sm" data-mark-now="mt_${esc(x.id)}" data-v="sv_${esc(x.id)}">מהנגן</button>
+            <select id="mk_${esc(x.id)}" data-nodirty="1"><option value="must">חייב להיכלל</option><option value="never">לא להשתמש</option></select>
+            <input type="text" id="mn_${esc(x.id)}" placeholder="הערה (לא חובה)" maxlength="200" style="flex:1;min-width:120px"><button class="sm" data-mark-add="${esc(x.id)}">הוסף סימון</button></div>
+          ${!x.primary && !x.removed ? `<button class="sm danger" data-src-del="${esc(x.id)}" style="margin-top:6px">לא להשתמש בקובץ הזה בגרסאות הבאות</button>` : ''}
+        </details></li>`).join('')}</ul>
+      <input type="file" id="addsrc" accept="video/*,.mp4,.mov,.m4v,.webm,.mkv,.avi" class="hidden" multiple><button class="sm" data-do="addsrc" ${lockedOut ? 'disabled' : ''}>הוספת קובצי מקור</button>
+      <span id="addsrc_s" class="small mute"></span>
+      <h3>מוזיקה</h3>
+      ${music.map(a => `<div style="margin:6px 0"><label class="chk"><input type="radio" name="au_music" value="${esc(a.id)}" ${au.music && au.music.asset === a.id ? 'checked' : ''} data-nodirty="1"> <b>${esc(a.name)}</b></label>
+        <audio controls preload="none" src="${pu}/assets/${esc(a.id)}/audio" style="width:100%"></audio>
+        ${a.license.status === 'owner_confirmed' ? `<div class="small ok">רישיון: אושר על ידי ${esc(a.license.by)} · ${esc(a.license.source)}</div>`
+          : `<div class="small bad">רישיון: לא אושר. קובץ שהועלה אינו מסומן אוטומטית כמורשה, והחבילה תיחסם לפרסום עד שיירשמו מקור ורישיון.</div>
+             <div class="row small"><input type="text" id="lic_${esc(a.id)}" placeholder="מקור הרצועה והרישיון (למשל: שם הספרייה, מספר רישיון)" maxlength="300" style="flex:1;min-width:160px"><button class="sm" data-lic="${esc(a.id)}">אני מאשר/ת שיש לי רישיון לשימוש הזה</button></div>`}</div>`).join('') || '<div class="small mute">לא הועלתה מוזיקה.</div>'}
+      ${music.length ? `<label class="chk"><input type="radio" name="au_music" value="" ${au.music ? '' : 'checked'} data-nodirty="1"> בלי מוזיקה</label>
+        <div class="small" style="margin-top:6px">${numf('music.start_s', 'נקודת התחלה ברצועה (שנ׳)', au.music ? au.music.start_s : 0, 0.5, 0, 3600)}${numf('music.volume_db', 'עוצמה (dB)', au.music ? au.music.volume_db : -18, 1, -40, 0)}
+          ${numf('music.fade_in_s', 'כניסה (שנ׳)', au.music ? au.music.fade_in_s : 0.5, 0.1, 0, 10)}${numf('music.fade_out_s', 'יציאה (שנ׳)', au.music ? au.music.fade_out_s : 1.5, 0.1, 0, 10)}</div>
+        <label class="chk"><input type="checkbox" data-au="music.duck" ${!au.music || au.music.duck !== false ? 'checked' : ''}> להנמיך את המוזיקה אוטומטית מתחת לדיבור</label>
+        <label class="chk"><input type="checkbox" data-au="cut_on_beat" ${au.cut_on_beat ? 'checked' : ''}> בלקט: להזיז חיתוכים לפעימות המוזיקה כשפעימה קרובה (לא נכפה)</label>` : ''}
+      <input type="file" id="addmusic" accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg,.flac" class="hidden"><button class="sm" data-do="addmusic">העלאת קובץ מוזיקה</button>
+      <h3>קריינות</h3>
+      ${nar.map(a => `<div style="margin:6px 0"><label class="chk"><input type="radio" name="au_nar" value="${esc(a.id)}" ${au.narration && au.narration.asset === a.id ? 'checked' : ''} data-nodirty="1"> <b>${esc(a.name)}</b></label>
+        <audio controls preload="none" src="${pu}/assets/${esc(a.id)}/audio" style="width:100%"></audio>
+        <label class="chk small"><input type="checkbox" data-nscript="${esc(a.id)}" ${a.script && a.script.is_script ? 'checked' : ''} data-nodirty="1"> זה תסריט שנכתב לסרטון (לא ציטוט של המצולמים)</label>
+        ${a.script && a.script.is_script === null ? '<div class="small warn">לא סומן אם זה תסריט או דברי המצולמים. הקריינות תוצג כקריינות בלבד, לא כציטוט.</div>' : ''}</div>`).join('') || '<div class="small mute">לא הועלתה קריינות.</div>'}
+      ${nar.length ? `<label class="chk"><input type="radio" name="au_nar" value="" ${au.narration ? '' : 'checked'} data-nodirty="1"> בלי קריינות</label>
+        <div class="small">${numf('narration.start_s', 'מתחילה בשנייה', au.narration ? au.narration.start_s : 0, 0.5, 0, 600)}${numf('narration.volume_db', 'עוצמה (dB)', au.narration ? au.narration.volume_db : 0, 1, -12, 6)}</div>` : ''}
+      <input type="file" id="addnar" accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg,.flac" class="hidden"><button class="sm" data-do="addnar">העלאת קריינות מוכנה</button>
+      <div class="small mute">קריינות מטקסט (ElevenLabs) מוכנה בצד המערכת אך אינה פעילה: נדרשים חשבון בתשלום, מפתח ואישור עלות שלך. ראה לשונית "איך דנה עובדת".</div>
+      <h3>הסאונד המקורי</h3>
+      <select data-au="original.mode" data-nodirty="1"><option value="keep" ${au.original.mode === 'keep' ? 'selected' : ''}>לשמור</option><option value="mute" ${au.original.mode === 'mute' ? 'selected' : ''}>להשתיק בכל הסרטון</option></select>
+      ${segs.length > 1 && au.original.mode === 'keep' ? `<div class="small">להשתיק רק בקטעים: ${segs.map(g => `<label class="chk" style="display:inline-flex;margin-inline-end:8px"><input type="checkbox" data-mute-seg="${g.n}" ${au.original.mute_segments.includes(g.n) ? 'checked' : ''}> ${g.n}</label>`).join('')}</div>` : ''}
+      <div class="row" style="margin-top:10px">
+        <button data-do="saveaudio" ${lockedOut ? 'disabled' : ''}>שמירת הגדרות המיקס (לגרסה הבאה)</button>
+        <button class="primary" data-do="remix" ${p.version && p.version.package && !busy() ? '' : 'disabled'}>הפק גרסה עם המיקס הזה — בלי לתכנן מחדש</button>
+        <button data-do="replan" ${p.version && p.version.package && !busy() ? '' : 'disabled'}>תכנן והפק מחדש מכל המקורות</button></div>
+      <div class="small mute">שינוי במיקס או בקבצים אינו נוגע בגרסה קיימת. הוא נכנס רק לגרסה חדשה, והגרסה הנוכחית נשמרת להשוואה.</div></div>`;
+  }
+  function readAudio() {
+    const au = audioDraft(current), g = sel => document.querySelector(`#media [data-au="${sel}"]`), n = sel => { const e = g(sel); return e ? Number(e.value) : undefined; };
+    const m = document.querySelector('#media input[name="au_music"]:checked'), na = document.querySelector('#media input[name="au_nar"]:checked');
+    return { music: m && m.value ? { asset: m.value, start_s: n('music.start_s'), volume_db: n('music.volume_db'), fade_in_s: n('music.fade_in_s'), fade_out_s: n('music.fade_out_s'), duck: g('music.duck') ? g('music.duck').checked : true } : null,
+      narration: na && na.value ? { asset: na.value, start_s: n('narration.start_s'), volume_db: n('narration.volume_db') } : null,
+      original: { mode: g('original.mode') ? g('original.mode').value : au.original.mode, mute_segments: $$('#media [data-mute-seg]:checked').map(e => Number(e.dataset.muteSeg)) },
+      cut_on_beat: g('cut_on_beat') ? g('cut_on_beat').checked : !!au.cut_on_beat };
+  }
+  /** The parts of a multi-file video with their files and times; in a compilation a part can be replaced or removed on its own. */
+  function sourceMapCard(p, pkg) {
+    const segs = (pkg.plan || {}).segments || []; if (!pkg.sourceMap || !segs.some(g => g.source_name)) return '';
+    const mont = (pkg.plan || {}).kind === 'montage', srcs = (p.media || {}).sources || [];
+    return `<div class="card" id="sourcemap"><h2>מפת המקורות (${pkg.sourceMap.length} קבצים, ${segs.length} קטעים)</h2>
+      ${mont ? `<div class="small mute">${esc((pkg.plan || {}).basis || '')}</div>` : ''}
+      <ul class="plain">${segs.map(g => `<li><div class="row"><button class="sm" data-play="${g.tl_in_s},${g.tl_out_s}">▶ ${tfmt(g.tl_in_s)}–${tfmt(g.tl_out_s)}</button><span class="pill info">קטע ${g.n}</span><span class="pill mute">${esc(g.source_name)}</span>
+          ${g.must ? '<span class="pill ok">חובה</span>' : ''}${g.replaced_by_owner ? '<span class="pill warn">הוחלף לבקשתך</span>' : ''}${g.on_beat ? '<span class="pill mute">על פעימה</span>' : ''}</div>
+        <div class="small">בקובץ: ${Number(g.file_in_s).toFixed(1)}–${Number(g.file_out_s).toFixed(1)} שנ׳${g.seen ? ` · נראה: ${esc(g.seen)}` : ''}</div><div class="small mute">${esc(g.why || '')}</div>
+        ${mont ? `<details class="small" data-keep="seg_${g.n}"><summary>להחליף או להסיר רק את הקטע הזה</summary><div class="row">
+            <select id="sr_src_${g.n}" data-nodirty="1">${srcs.filter(x => !x.removed).map(x => `<option value="${esc(x.id)}" ${x.id === g.source_id ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select>
+            <input type="number" id="sr_a_${g.n}" placeholder="מ- (שנ׳ בקובץ)" step="0.1" min="0" style="width:120px"><input type="number" id="sr_b_${g.n}" placeholder="עד" step="0.1" min="0" style="width:90px">
+            <button class="sm" data-seg-replace="${g.n}" ${busy() ? 'disabled' : ''}>החלף והפק גרסה</button><button class="sm danger" data-seg-remove="${g.n}" ${busy() ? 'disabled' : ''}>הסר והפק גרסה</button></div>
+            <div class="mute">שאר הקטעים והמיקס לא משתנים. הגרסה הנוכחית נשמרת.</div></details>` : ''}</li>`).join('')}</ul></div>`;
+  }
+  /** External connections as they really are: prepared / active / not possible, and the one action still needed. */
+  function connectorsCard() {
+    const c = (status && status.connectors) || null; if (!c) return '';
+    const t = c.narration_tts, m = c.music_library;
+    return `<div class="card" id="connectors"><h2>חיבורים חיצוניים</h2>
+      <h3>קריינות מטקסט — ${esc(t.provider)} <span class="pill ${t.state === 'active' ? 'ok' : 'warn'}">${t.state === 'active' ? 'פעיל' : 'מוכן, לא פעיל'}</span></h3>
+      <div class="small">${esc(t.what)}</div>
+      ${t.never_called ? '<div class="small mute">לא בוצעה אף קריאה לספק ולא נשלח אליו חומר.</div>' : ''}
+      ${(t.needs || []).length ? `<div class="small">מה חסר:</div><ul class="plain small">${t.needs.map(x => `<li>${esc(x)}</li>`).join('')}</ul><div class="small"><b>הפעולה הבאה שלך:</b> ${esc(t.next_action)}</div>` : ''}
+      <label for="tts_text">הערכת עלות לתסריט (חישוב בלבד — שום דבר לא נשלח)</label><textarea id="tts_text" style="min-height:60px" maxlength="5000" placeholder="טקסט התסריט. הוא יסומן כתסריט, לא כציטוט של המצולמים."></textarea>
+      <button class="sm" id="tts_est" style="margin-top:6px">חשב עלות</button> <span id="tts_out" class="small"></span>
+      <h3>ספריית מוזיקה <span class="pill mute">העלאה ידנית בלבד</span></h3><div class="small">${esc(m.what)}</div>
+      <ul class="plain small">${m.options.map(o => `<li><b>${esc(o.name)}</b> — ${esc(o.state)}<div class="mute">${esc(o.needs)}</div></li>`).join('')}</ul>
+      <div class="small"><b>הפעולה הבאה שלך:</b> ${esc(m.next_action)}</div>
+      <h3>פרסום <span class="pill mute">כבוי</span></h3><div class="small">${esc(c.publishing.what)}</div></div>`;
+  }
+  function mixCard(pkg) {
+    const m = pkg.mix; if (!m || !m.applied) return '';
+    const x = m.measured || {}, pr = m.params || {}, lic = m.music_license;
+    return `<div class="card" id="mix"><h2>מיקס האודיו</h2><div class="small mute">${esc(m.structure || '')}</div>
+      <ul class="plain small">
+        <li>סאונד מקורי: ${pr.original && pr.original.mode === 'mute' ? 'מושתק' : 'נשמר'}${pr.original && (pr.original.muted_spans_s || []).length ? ` · מושתק בקטעים ${pr.original.muted_spans_s.map(a => a.join('–')).join(', ')}` : ''}</li>
+        ${pr.music ? `<li>מוזיקה: <b>${esc(pr.music.file)}</b> · מנקודה ${esc(pr.music.start_s)} שנ׳ · ${esc(pr.music.volume_db)} dB · כניסה ${esc(pr.music.fade_in_s)} / יציאה ${esc(pr.music.fade_out_s)} שנ׳ · הנמכה מתחת לדיבור: ${pr.music.duck ? 'כן' : 'לא'}</li>
+          <li class="${lic && lic.status === 'owner_confirmed' ? 'ok' : 'bad'}">רישיון המוזיקה: ${lic && lic.status === 'owner_confirmed' ? `אושר על ידי ${esc(lic.by)} · ${esc(lic.source)}` : 'לא אושר — אין לפרסם'}</li>` : '<li>מוזיקה: אין</li>'}
+        ${pr.narration ? `<li>קריינות: <b>${esc(pr.narration.file)}</b> · מתחילה ב-${esc(pr.narration.start_s)} שנ׳ · ${esc(pr.narration.volume_db)} dB${m.narration_script && m.narration_script.is_script ? ' · <span class="pill info">תסריט — לא ציטוט</span>' : ''}</li>` : ''}
+        <li>נמדד: שיא ${esc(x.peak_dbfs)} dBFS · ${esc(x.clipped_samples)} דגימות בשיא מלא${x.speech_over_music_db != null ? ` · בזמן דיבור המוזיקה נמוכה ב-${esc(x.speech_over_music_db)} dB` : ''}${x.ducking_db != null ? ` · הנמכה שנמדדה ${esc(x.ducking_db)} dB` : ''}
+          ${x.speech_words_recognised_after_mix != null ? ` · אחרי המיקס זוהו ${Math.round(x.speech_words_recognised_after_mix * 100)}% מהמילים` : ''}</li>
+        ${m.beats && m.beats.requested ? `<li>עריכה לפי קצב: ${m.beats.cuts_on_beat != null ? `${esc(m.beats.cuts_on_beat)} מתוך ${esc(m.beats.cuts)} חיתוכים על פעימה (${esc(m.beats.tempo_bpm)} BPM). ${esc(m.beats.note || '')}` : 'התבקשה ולא בוצעה (זיהוי פעימות לא היה זמין)'}</li>` : ''}
+        <li class="mute">${esc(m.not_checked || '')}</li></ul></div>`;
+  }
   function panelProject() {
     const p = current, c = p.consent, cs = { unknown: ['לא תועדה', 'warn'], confirmed: ['אושרה', 'ok'], denied: ['סירוב', 'bad'] }[c.status], accts = (status && status.accounts) || [];
     const H = { uploaded: 'הועלה', duplicate_upload: 'העלאה כפולה זוהתה', edit_queued: 'עריכה נכנסה לתור', review_queued: 'הוגש לביקורת דנה', review_ready: 'הביקורת מוכנה', job_leased: 'העובד התחיל', job_released: 'הוחזר לתור',
@@ -793,6 +943,7 @@
         <label for="pacct">חשבון יעד לפרויקט</label>
         <select id="pacct">${accts.map(a => `<option value="${esc(a.username)}" ${p.account === a.username ? 'selected' : ''}>@${esc(a.username)} — מחובר ✓ אומת ${esc(a.verifiedAt)}</option>`).join('')}<option value="" ${p.account ? '' : 'selected'}>ברירת המחדל של המותג / לא נבחר</option></select>
         <div class="small mute">בחירת חשבון אינה פרסום. פרסום כבוי ונשאר מאחורי אישור נפרד שלך.</div></div>
+      ${mediaCard(p)}
       ${p.kind === 'review_only' ? '' : `<div class="card" id="pskill"><h2>סקיל עריכה לפרויקט</h2>
         <select id="pskillsel" data-nodirty="1">${skillOptions(p.skill)}</select>
         ${['set', 'pinned'].includes((p.skill || {}).mode) ? skillSetBox(p.skill) : ''}
@@ -997,6 +1148,8 @@
         ${(ri.not_applied || []).length ? `<ul class="plain small">${ri.not_applied.map(x => `<li class="warn">לא יושם: ${esc(x)}</li>`).join('')}</ul>` : ''}` : ''}
       ${pkg.revisionNote ? `<div class="quote">${esc(pkg.revisionNote)}</div>` : ''}</div>`);
     h.push(targetCard(p, v, pkg));
+    h.push(sourceMapCard(p, pkg));
+    h.push(mixCard(pkg));
     h.push(readabilityCard(pkg));
     h.push(skillReportCard(pkg));
     h.push(timelineCard(pkg, v));
@@ -1093,9 +1246,9 @@
     if (ed) { const STOP = { accepted: 'הביקורת הפנימית הסתיימה בלי ממצאים שדנה יכולה לתקן', locked_revision: 'תיקון ממוקד — דנה לא שינתה דבר שלא ביקשת', needs_owner: 'נשארו נושאים שדורשים אותך',
         no_progress: 'אותה תקלה חזרה אחרי תיקון — נעצר והועבר אלייך', cycle_limit: 'הגיע למגבלת הסבבים', budget: 'הגיע למגבלת הזמן או העלות', revision_regressed: 'תיקון החמיר את הבדיקות — הוחזרה הגרסה הקודמת', editor_failed: 'העורך נכשל בסבב התיקון', no_editor_model: 'בלי מודל עריכה' };
       h.push(`<div class="card" id="loop"><h2>סבבי העבודה של דנה</h2><ul class="plain small">
-        <li>עריכה ← ביקורת ← תיקון ← בדיקה חוזרת: <b>${esc(ed.revisions)}</b> סבבי תיקון מתוך ${esc(ed.budget.max_cycles)} מותרים</li>
+        <li>עריכה ← ביקורת ← תיקון ← בדיקה חוזרת: <b>${esc(ed.revisions)}</b> סבבי תיקון מתוך ${esc((ed.budget || {}).max_cycles)} מותרים</li>
         <li>למה נעצר: ${esc(STOP[ed.stop_reason] || ed.stop_reason || '—')}</li>
-        <li>זמן: ${dur(ed.budget.seconds)} מתוך ${dur(ed.budget.max_total_s)} · עלות מדווחת: $${esc(ed.budget.cost_usd_reported)} מתוך $${esc(ed.budget.max_total_cost_usd)} <span class="mute">(חישוב לפי מחירון של ה-CLI, לא חשבונית)</span></li>
+        <li>זמן: ${dur((ed.budget || {}).seconds)} מתוך ${dur((ed.budget || {}).max_total_s)} · עלות מדווחת: $${esc((ed.budget || {}).cost_usd_reported)} מתוך $${esc((ed.budget || {}).max_total_cost_usd)} <span class="mute">(חישוב לפי מחירון של ה-CLI, לא חשבונית)</span></li>
         <li>${calls.length} קריאות למודל, בלי כלים: ${esc([...new Set(calls.map(c => c.role))].join(' · '))}</li></ul>
         <details class="small"><summary>פירוט הסבבים</summary>${(ed.cycles || []).map(c => `<div style="margin-top:6px"><b>סבב ${c.cycle}</b>${c.reused_render ? ' · רק טקסטים השתנו' : ''}${c.rejected ? ' · <span class="bad">נדחה: החמיר את הבדיקות</span>' : ''}
           <ul class="plain">${c.findings.map(f => `<li><span class="pill ${f.severity === 'blocking' ? 'bad' : 'warn'}">${f.severity === 'blocking' ? 'חוסם' : 'המלצה'}</span> ${esc(f.problem)}<div class="mute">→ ${esc(f.correction)}</div></li>`).join('') || '<li class="ok">אין ממצאים</li>'}</ul>
@@ -1206,7 +1359,7 @@
     else return;
     reviseSummary(); drawPreview();
   });
-  $('#panel').addEventListener('change', e => { const t = e.target;
+  $('#panel').addEventListener('change', async e => { const t = e.target;
     if (t.id === 'pacct') return act('/settings', { account: t.value }, t.value ? `חשבון היעד של הפרויקט: @${t.value}` : 'חשבון היעד של הפרויקט נוקה.', 'PATCH');
     if (t.id === 'pskillsel') { if (t.value === 'set') { const ids = selItems(current.skill).map(x => x.id); if (!ids.length) { current.skill = { mode: 'set', items: [] }; $('#panel').__html = null; return renderPanel(); }
         return act('/settings', { skill: { mode: 'set', ids } }, 'בחירת הסקילים נשמרה.', 'PATCH'); }
@@ -1214,6 +1367,16 @@
     if (t.dataset.pskill) { let ids = selItems(current.skill).map(x => x.id).filter(x => x !== t.dataset.pskill); if (t.checked) ids.push(t.dataset.pskill);
       if (!ids.length) return act('/settings', { skill: { mode: 'default' } }, 'לא נשאר סקיל מסומן — חזרה לברירת המחדל.', 'PATCH');
       return act('/settings', { skill: { mode: 'set', ids } }, 'השילוב נשמר. הסדר שסימנת הוא סדר העדיפות.', 'PATCH'); }
+    if (t.id === 'addsrc' || t.id === 'addmusic' || t.id === 'addnar') { const by = who(); if (!by) { t.value = ''; return; } const files = Array.from(t.files); t.value = '';
+      const out = $('#addsrc_s');
+      try { for (let i = 0; i < files.length; i++) { const fd = new FormData(); fd.append('by', by);
+          if (t.id === 'addsrc') fd.append('video', files[i], files[i].name); else { fd.append('kind', t.id === 'addmusic' ? 'music' : 'narration'); fd.append('file', files[i], files[i].name); }
+          await sendFile(`/projects/${current.id}/${t.id === 'addsrc' ? 'sources' : 'assets'}`, fd, (sent, total) => { if (out) out.textContent = `מעלה ${files[i].name}: ${(100 * sent / total).toFixed(0)}%`; }); }
+        mediaDraft.audio = null; notice(t.id === 'addsrc' ? 'הקובץ נוסף לפרויקט. הוא ישמש בגרסה הבאה — "תכנן והפק מחדש מכל המקורות".' : t.id === 'addmusic' ? 'המוזיקה הועלתה. היא אינה מסומנת כמורשה עד שתאשר/י.' : 'הקריינות הועלתה.', 'ok'); await open(current.id); }
+      catch (err) { notice(err.message, 'bad'); }
+      return; }
+    if (t.dataset.nscript) { const by = who(); if (!by) return; return act(`/assets/${t.dataset.nscript}/narration-info`, { by, is_script: t.checked }, 'נרשם.'); }
+    if (t.id === 'mtype') return;
     if (t.id === 'panim') return act('/settings', { animation_scene: t.checked }, t.checked ? 'קטע אנימציה מותר בפרויקט הזה, מהגרסה הבאה.' : 'קטע אנימציה לא יתווסף בלי סקיל שמבקש אותו.', 'PATCH');
     if (t.dataset.zoom || t.dataset.style || t.dataset.styles || t.dataset.adj || t.name === 'rvscope') t.dispatchEvent(new Event('input', { bubbles: true })); });
 
@@ -1226,7 +1389,7 @@
     const stop = () => { if (vid.currentTime >= t1) { vid.pause(); vid.removeEventListener('timeupdate', stop); } };
     vid.addEventListener('timeupdate', stop); vid.currentTime = t0; vid.play().catch(() => {});
   }
-  function onClick(e) {
+  async function onClick(e) {
     const t = e.target.closest('button, [data-go]') || e.target, d = t.dataset || {};
     if (!current) return;
     if (d.go) { goStep(d.go); window.scrollTo({ top: 0 }); return; }
@@ -1234,6 +1397,30 @@
     if (d.cat) { selCat = selCat === d.cat ? null : d.cat; ui.cat[current.id] = selCat; remember(); renderPanel(); return; }
     if (d.view) { if (d.view === 'current') delete ui.view[current.id]; else ui.view[current.id] = Number(d.view); remember(); cmpN = null; return open(current.id); }
     if (d.do === 'goskills') { back(); showHome('skills'); return; }
+    const pid = current.id, by0 = () => who();
+    if (d.do === 'startfiles') { const by = by0(); if (!by) return; return act('/start', { by }, 'העריכה נכנסה לתור עם כל הקבצים.'); }
+    if (d.do === 'addsrc') return $('#addsrc').click();
+    if (d.do === 'addmusic') return $('#addmusic').click();
+    if (d.do === 'addnar') return $('#addnar').click();
+    if (d.do === 'saveaudio') { const by = by0(); if (!by) return; mediaDraft.audio = null; return act('/audio', { by, ...readAudio() }, 'הגדרות המיקס נשמרו. הן ייכנסו לגרסה הבאה.', 'PATCH'); }
+    if (d.do === 'remix') { const by = by0(); if (!by) return; const audio = readAudio(); mediaDraft.audio = null;
+      return act('/revise', { by, audio }, 'גרסה חדשה עם המיקס הזה נכנסה לתור. החיתוך לא משתנה והגרסה הנוכחית נשמרת.'); }
+    if (d.do === 'replan') { const by = by0(); if (!by) return; if (!confirm('לתכנן ולהפיק מחדש מכל המקורות? נוצרת גרסה חדשה; הגרסה הנוכחית נשמרת.')) return; const audio = readAudio();
+      try { await api(`/projects/${pid}/audio`, { method: 'PATCH', body: { by, ...audio } }); } catch (e2) { return notice(e2.message, 'bad'); }
+      mediaDraft.audio = null; return act('/replan', { by, project_type: $('#mtype') ? $('#mtype').value : undefined }, 'גרסה חדשה מכל המקורות נכנסה לתור.'); }
+    if (d.markNow) { const vd = document.getElementById(d.v), inp = document.getElementById(d.markNow); if (vd && inp) { inp.value = vd.currentTime.toFixed(1); inp.dataset.dirty = '1'; } return; }
+    if (d.markAdd || d.markDel !== undefined && d.markDel) { const by = by0(); if (!by) return; const sid = d.markAdd || d.markDel, src = current.media.sources.find(x => x.id === sid);
+      let marks = src.marks.map(k => ({ from_s: k.from_s, to_s: k.to_s, kind: k.kind, note: k.note }));
+      if (d.markDel) marks.splice(Number(d.i), 1);
+      else marks.push({ from_s: Number($('#mf_' + sid).value), to_s: Number($('#mt_' + sid).value), kind: $('#mk_' + sid).value, note: $('#mn_' + sid).value });
+      return act(`/sources/${sid}/marks`, { by, marks }, 'הסימון נשמר. הוא יחול בגרסה הבאה.', 'PATCH'); }
+    if (d.srcDel) { const by = by0(); if (!by) return; if (!confirm('לא להשתמש בקובץ הזה בגרסאות הבאות? הקובץ עצמו והגרסאות שכבר נעשו איתו נשמרים.')) return;
+      return act(`/sources/${d.srcDel}`, { by }, 'הקובץ לא ישמש גרסאות חדשות.', 'DELETE'); }
+    if (d.lic) { const by = by0(); if (!by) return; const src = $('#lic_' + d.lic).value;
+      return act(`/assets/${d.lic}/license`, { by, status: 'owner_confirmed', source: src }, 'הרישיון נרשם על שמך, עם המקור שכתבת.'); }
+    if (d.segReplace || d.segRemove) { const by = by0(); if (!by) return; const n = Number(d.segReplace || d.segRemove);
+      const e2 = d.segRemove ? { n, action: 'remove' } : { n, action: 'replace', source_id: $('#sr_src_' + n).value, from_s: Number($('#sr_a_' + n).value), to_s: Number($('#sr_b_' + n).value) };
+      return act('/revise', { by, segment_edits: [e2] }, d.segRemove ? 'גרסה בלי הקטע הזה נכנסה לתור. שאר הקטעים לא משתנים.' : 'גרסה עם הקטע המוחלף נכנסה לתור. שאר הקטעים לא משתנים.'); }
     if (d.do === 'usealt') { const by = who(); if (!by) return; const a = ((current.version.package.readability || {}).alternatives || []).find(x => x.key === d.alt); if (!a) return;
       if (!confirm('להפיק גרסה חדשה עם "' + a.label + '"? זה שינוי לפרויקט הזה בלבד; הגרסה הנוכחית נשמרת להשוואה והסקיל לא משתנה.')) return;
       return act('/revise', { by, style_overrides: a.overrides }, 'גרסה עם החלופה הקריאה נכנסה לתור. הגרסה הנוכחית נשמרה.'); }
@@ -1297,7 +1484,9 @@
   $('#actions').addEventListener('click', onClick);
 
   showHome(ui.home);
-  const id = location.hash.slice(1);
+  // a link from a notification names the exact version: "#<project>/v<n>"
+  const [id, vHash] = location.hash.slice(1).split('/');
+  if (id && /^v[0-9]+$/.test(vHash || '')) { ui.view[id] = Number(vHash.slice(1)); remember(); }
   (id ? open(id) : loadHome()).catch(e => notice(e.message, 'bad'));
   setInterval(() => { if (!current) loadHome().catch(e => refreshFailed(e)); }, 10000);
 })();

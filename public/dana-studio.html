@@ -96,7 +96,11 @@
       <div class="card">
         <h2>פרויקט חדש</h2>
         <p class="small mute">המסלול: פרויקט ← תמלול ← סגנון ורפרנסים ← עריכה ← ביקורת דנה ← צפייה ואישור. קובץ המקור נשמר כמו שהוא.</p>
-        <input type="file" id="file" accept="video/*,.mp4,.mov,.m4v,.webm,.mkv,.avi" class="hidden">
+        <input type="file" id="file" accept="video/*,.mp4,.mov,.m4v,.webm,.mkv,.avi" class="hidden" multiple>
+        <label for="uptype">סוג הפרויקט</label>
+        <select id="uptype" data-nodirty="1"><option value="interview">ראיון / עדות — נבחר לפי מה שנאמר</option><option value="montage">לקט אימונים — נבחר לפי מה שרואים, מכמה קבצים</option>
+          <option value="narrated">סרטון עם קריינות — לקט שהקריינות מובילה</option><option value="mixed">שילוב — דיבור מקורי מכמה קבצים, עם מוזיקה או קריינות</option></select>
+        <div class="small mute">אפשר לבחור כמה קובצי וידאו יחד; אפשר גם להוסיף קבצים, מוזיקה וקריינות אחר כך, בשלב "פרויקט".</div>
         <label for="upacct">חשבון יעד לפרויקט</label>
         <select id="upacct"></select>
         <label for="uptarget">יעד</label>

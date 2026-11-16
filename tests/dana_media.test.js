@@ -148,3 +148,23 @@ describe('uploaded music and narration, and the mix', () => {
     expect(j.options.previous).toBeDefined();
   });
 });
+
+describe('external connections are shown as they are', () => {
+  test('narration by ElevenLabs is "prepared, not active"; a cost estimate is arithmetic only; the music library is manual upload', async () => {
+    const st = (await request(app).get(`${S}/status`)).body.connectors;
+    expect(st.narration_tts).toMatchObject({ provider: 'ElevenLabs', state: 'prepared_not_active', never_called: true });
+    expect(st.narration_tts.needs.length).toBeGreaterThanOrEqual(3);
+    expect(st.narration_tts.next_action).toMatch(/חשבון בתשלום/);
+    expect(st.music_library.state).toBe('manual_upload_only');
+    expect(st.music_library.options.find(o => o.name === 'CapCut').state).toBe('לא אפשרי');
+    expect(st.publishing.state).toBe('off');
+    expect((await post('/narration/estimate', { text: '' })).body.error).toBe('text_required');
+    const e = (await post('/narration/estimate', { text: 'א'.repeat(600), takes: 6 })).body;
+    expect(e.estimate).toMatchObject({ characters: 600, model: 'eleven_v3', estimated_usd: 0.288, text_is: 'script', within_request_limit: true });
+    expect(e.estimate.basis).toMatch(/לא נשלח דבר לספק/);
+    // a worker that reports a key and an enabled connection is the only thing that makes it "active"
+    await W(request(app).post('/api/dana/worker/lease')).send({ workerId: 'w1', pipelineVersion: '1.4.0', capabilities: { narration_tts: { active: true, key_present: true, enabled: true } } });
+    expect((await request(app).get(`${S}/status`)).body.connectors.narration_tts).toMatchObject({ state: 'active', needs: [] });
+    expect(JSON.stringify((await request(app).get(`${S}/status`)).body)).not.toMatch(/xi-api-key|ELEVENLABS_API_KEY=/);
+  });
+});

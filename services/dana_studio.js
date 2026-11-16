@@ -985,6 +985,30 @@ function testSkill(skillId, body = {}, actor = 'owner') {
   return view(p);
 }
 
+/**
+ * What is stored and how much room is left. Nothing is deleted here except by the ONE stated rule below.
+ * RULE: only leftovers of interrupted uploads (files in the upload temp folder, older than 24 hours) may be removed, and
+ * only when the owner asks. Source files, audio files, references, skills and every version's outputs are never removed
+ * automatically.
+ */
+function storage({ cleanup = false } = {}) {
+  const root = dir(), size = d => { let n = 0, files = 0; try { for (const e of fs.readdirSync(d, { withFileTypes: true, recursive: true })) if (e.isFile()) { try { n += fs.statSync(path.join(e.parentPath ?? e.path, e.name)).size; files++; } catch { /* gone */ } } } catch { /* no folder */ } return { bytes: n, files }; };
+  const tmp = path.join(root, 'tmp'), old = [];
+  try { for (const f of fs.readdirSync(tmp)) { const st = fs.statSync(path.join(tmp, f)); if (st.isFile() && Date.now() - st.mtimeMs > 24 * 3600 * 1000) old.push({ name: f, bytes: st.size }); } } catch { /* no tmp */ }
+  let removed = 0;
+  if (cleanup) for (const f of old) { try { fs.rmSync(path.join(tmp, f.name), { force: true }); removed++; } catch { /* in use */ } }
+  let free = null, total = null;
+  try { const s = fs.statfsSync(root); free = Number(s.bavail) * Number(s.bsize); total = Number(s.blocks) * Number(s.bsize); } catch { /* not supported */ }
+  const limitMb = Number(process.env.DANA_UPLOAD_MAX_MB) > 0 ? Number(process.env.DANA_UPLOAD_MAX_MB) : 2048;
+  return { uploadLimitMb: limitMb, freeBytes: free, totalBytes: total, lowSpace: free !== null && free < 5 * 1024 ** 3,
+    used: { sources_and_audio: size(path.join(root, 'sources')), versions: size(path.join(root, 'projects')), references: size(path.join(root, 'references')), skills: size(path.join(root, 'skills')) },
+    uploadLeftovers: { files: cleanup ? old.length - removed : old.length, bytes: old.reduce((n, f) => n + f.bytes, 0), removedNow: removed },
+    worker: state().worker?.capabilities?.disk ?? null, workerKeepsJobFoldersDays: state().worker?.capabilities?.keep_job_dirs_days ?? null,
+    policy: ['קובצי מקור, מוזיקה, קריינות, רפרנסים, סקילים וכל גרסה שהופקה — לא נמחקים אוטומטית, לעולם.',
+      'שאריות של העלאות שנקטעו (מעל 24 שעות) נמחקות רק כשאת/ה מבקש/ת.',
+      'במחשב העריכה: תיקיות עבודה זמניות של משימות נמחקות אחרי מספר הימים שמוצג; התוצרים עצמם נמצאים בשרת ואינם נמחקים משם.'] };
+}
+
 /** All the files are in: the waiting edit may start now. */
 function start(projectId, body = {}, actor = 'owner') {
   const p = getProject(projectId);
@@ -1298,5 +1322,5 @@ module.exports = {
   approve, confirmReview, requestChanges, revise, reject, setConsent, retry, sourcePath, artifactPath, dir, save, state, hist, _resetForTests,
   listRules, activeRules, addRule, editRule, retireRule, previousOf, fixName, projectAdapter, judgementMode, judgementMissing, STYLE_OVERRIDABLE,
   verifyCaption, setSettings, applyReview, progressOf, nextAction, cardStates, pendingEdits, ADJUSTMENT_KINDS, PHASES,
-  applySkill, testSkill, reviewInfo, TARGETS, decideHearing, start, replan, fixName,
+  applySkill, testSkill, reviewInfo, TARGETS, decideHearing, start, replan, fixName, storage,
 };

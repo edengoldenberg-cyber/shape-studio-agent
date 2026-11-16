@@ -280,6 +280,8 @@ def story_prompt(words, energy, duration, cfg, options, profile, skill_text):
              ("Motion graphics may include an animation scene for this job:\n" + motion.SCENE_PROMPT) if options.get("allow_animation_scene")
              else "An animation scene is NOT available for this job: use only hook_title / key_phrase, or nothing.",
              *[f"RULE IN FORCE: {x} Leave it out of the brief." for x in options.get("effective_rules") or []],
+             *([("The owner marked these source ranges as MUST BE INCLUDED - every one of them has to be inside a chosen part: "
+                 + "; ".join(f"{m['from_s']:.1f}-{m['to_s']:.1f} s" + (f" ({m['note']})" if m.get("note") else "") for m in options["must_ranges"]))] if options.get("must_ranges") else []),
              "Each token is word@start-end[loudness relative to the median word of this recording; p=recognition confidence when "
              "it is low; 'owner' = the owner corrected this word by ear]. A new line means a pause of at least 0.5 s.",
              f"Editing profile '{profile['id']}' v{profile['version']} ({profile['status']}): zoom strengths light={p['zoom_scale_light']}, "

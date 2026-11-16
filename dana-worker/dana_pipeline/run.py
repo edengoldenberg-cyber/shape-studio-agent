@@ -29,6 +29,9 @@ from pathlib import Path
 from . import PIPELINE_VERSION, adjust, captions, checks, editorial, effective, interpret, judgement, motion, readable, review
 from . import review as review_rubric
 from . import skillgen
+from . import mix as mixer
+from . import montage
+from . import sources as sources_mod
 from . import target as target_mod
 from . import story
 from .align import Alignment
@@ -215,7 +218,7 @@ def edit(j, dec, words, sp, sha_before, check, cache):
     plan_cover = (getattr(j, "story", None) or {}).get("cover") or {}
     if plan_cover.get("tl_s") is not None:               # the cover frame is the moment the quoted words are said
         dec["cover"]["frame_s"] = round(min(max(plan_cover["tl_s"] + shift + 0.2, 0.0), out_s - in_s - 0.1), 3)
-    key = hashlib.sha1(json.dumps([in_s, out_s, dec["cards"], st, zooms, j.options.get("adjustments"), anim_name, all_planned], ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    key = hashlib.sha1(json.dumps([in_s, out_s, dec["cards"], st, zooms, j.options.get("adjustments"), anim_name, all_planned, j.options.get("audio")], ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
     spans, skipped = check(dec)
     inner = [s for s in skipped if s["before_card"] not in (1, None)]
     edge = [s for s in skipped if s["before_card"] in (1, None)]
@@ -442,6 +445,18 @@ def edit(j, dec, words, sp, sha_before, check, cache):
         if [(c["start"], c["dur"]) for c in new_cards] == [(c["start"], c["dur"]) for c in cards]:
             break                                   # nothing left to change automatically
         cards, timing_source = new_cards, "output_audio"
+    mix_rec, audio_o = None, j.options.get("audio") or {}
+    if audio_o.get("music") or audio_o.get("narration") or (audio_o.get("original") or {}).get("mode") == "mute":
+        with j.stage("mix"):
+            voice_only = j.work / "final_voice_only.mp4"
+            shutil.copyfile(final, voice_only)
+            mix_rec = mixer.mix(cfg, voice_only, final, audio_o, dur, [(w["start"], w["end"]) for w in heard], [], j.work / "mix")
+            mix_rec["music_license"] = (audio_o.get("music") or {}).get("license")
+            mix_rec["narration_script"] = (audio_o.get("narration") or {}).get("script")
+            mix_rec["sync_note"] = "הסנכרון נבדק על הקול לפני המיקס; המיקס אינו מזיז את הדיבור (התמונה מועתקת, לא מקודדת מחדש)"
+        music_o = audio_o.get("music")
+        if music_o and (music_o.get("license") or {}).get("status") != "owner_confirmed":
+            issues.append(judgement.issue("music_license_not_confirmed", "blocker", f"הרישיון לשימוש במוזיקה \"{music_o.get('name')}\" לא אושר על ידך. קובץ שהועלה אינו מסומן אוטומטית כמורשה — אין לפרסם לפני שתאשר/י מקור ורישיון"))
     records += checks.sync_records(sync)
     adjudications = []
     if alignment and cards:
@@ -465,8 +480,20 @@ def edit(j, dec, words, sp, sha_before, check, cache):
             records.append(motion.check(cfg, final, base, graphics, read_json(cfg["paths"]["safe_zone"]), g_faces, st["width"]))
         if scenes:
             records.append(motion.check_scenes(cfg, final, plain_base, scenes))
-        records += [checks.check_output(cfg, final, dur), checks.check_loudness(cfg, final),
+        loud_rec = checks.check_loudness(cfg, final)
+        records += [checks.check_output(cfg, final, dur), loud_rec,
                     checks.check_source_unchanged(getattr(j, "orig_source", j.source), sha_before)]
+        if mix_rec:
+            records += mixer.checks(cfg, mix_rec, loud_rec)
+            # the speech must still be there under the music: the MIXED file is transcribed again and compared with the voice
+            mixed_words = checks.transcribe(cfg, to16k(cfg, final, j.work / "final_mixed_16k.wav"))["words"]
+            want = [judgement.canon(w["word"], groups) for w in heard]
+            got = {judgement.canon(w["word"], groups) for w in mixed_words}
+            found = sum(1 for w in want if w in got)
+            share = found / max(1, len(want))
+            mix_rec["measured"]["speech_words_recognised_after_mix"] = round(share, 3)
+            records.append(checks.rec("speech_after_mix", "pass" if share >= 0.85 else "review",
+                                      f"אחרי המיקס זוהו בתמלול חוזר {found} מתוך {len(want)} המילים ({share:.0%})" + ("" if share >= 0.85 else " — ייתכן שהמוזיקה מסתירה דיבור; להאזנה שלך")))
         records += checks.HUMAN_CHECKS
 
     with j.stage("cover"):
@@ -530,7 +557,7 @@ def edit(j, dec, words, sp, sha_before, check, cache):
            "captions_added": bool(st["captions_enabled"]), "zooms": zooms, "caption_position": cap_pos, "shift": shift, "key": key, "cards": cards, "records": records, "sync": sync, "adjudications": adjudications, "odiffs": odiffs,
            "heard": heard, "dur": dur, "final": final, "base": base, "cover": cover, "png_dir": png_dir, "attempts": attempts,
            "timing_source": timing_source, "audio_src": audio_src, "motion_rows": motion_rec["data"].get("rows") or [],
-           "spans": tspans, "voice": voice, "voice_words": voice_words, "comfort_rows": comfort_rows, "caption_fit": {k: v for k, v in (fit or {}).items() if k != "fits"} or None, "source_text": " ".join(w["word"] for w in seg_words), "issues": issues,
+           "mix": mix_rec, "spans": tspans, "voice": voice, "voice_words": voice_words, "comfort_rows": comfort_rows, "caption_fit": {k: v for k, v in (fit or {}).items() if k != "fits"} or None, "source_text": " ".join(w["word"] for w in seg_words), "issues": issues,
            "reused_render": False}
     cache.update(key=key, res=res)
     return res
@@ -556,6 +583,36 @@ def pipeline(j):
             sp = probe(cfg, j.source)
         except PipelineError as e:
             raise PipelineError("source_unreadable", "הקובץ אינו וידאו שניתן לקרוא — יש להעלות קובץ אחר", False, e.detail)
+        # ── several source files, uploaded music / narration: local paths, and ONE joined working file with a map ──
+        files = read_json(j.dir / "files.json") if (j.dir / "files.json").is_file() else {}
+        ptype = options.get("project_type") or "interview"
+        primary_name = (j.job.get("source") or {}).get("originalName") or j.source.name
+        src_list = [{"id": s["id"], "path": files.get(s["sha256"]) or (str(j.source) if s["sha256"] == sha_before else None), "name": s.get("name") or s["id"], "marks": s.get("marks") or []}
+                    for s in options.get("sources") or []] or [{"id": "src1", "path": str(j.source), "name": primary_name, "marks": []}]
+        if any(not s["path"] for s in src_list):
+            raise PipelineError("source_missing", "one of the project's source files was not delivered to the worker", True)
+        audio_o = options.get("audio") or {}
+        for k in ("music", "narration"):
+            if audio_o.get(k):
+                f = audio_o[k].get("file") or {}
+                audio_o[k] = dict(audio_o[k], path=files.get(f.get("sha256")), name=f.get("name"))
+                if not audio_o[k]["path"]:
+                    raise PipelineError("source_missing", "the audio file of the project was not delivered to the worker", True)
+        j.primary_source = j.source
+        smap = j.source_map = None
+        if len(src_list) > 1 or any(s["marks"] for s in src_list) or ptype in ("montage", "narrated"):
+            with j.stage("join"):
+                joined, smap = sources_mod.join(cfg, st, j.work / "join", src_list)
+            j.source_map = smap
+            if Path(joined) != j.source:
+                j.source = Path(joined)
+                sp = probe(cfg, j.source)
+            never, must, bounds = sources_mod.ranges(smap)
+            # what the owner marked "never" and the borders between files are closed to the planner; "must" is an instruction that is checked afterwards
+            options["exclude_ranges"] = list(options.get("exclude_ranges") or []) + [[n["from_s"], n["to_s"]] for n in never] + [[round(b - 0.02, 3), round(b + 0.02, 3)] for b in bounds]
+            options["must_ranges"] = must
+        if ptype in ("montage", "narrated"):       # a compilation is chosen by what is SEEN; it has its own path through to the package
+            return montage.produce(j, j.source, smap, sp, sha_before, tg, tspec, zone_used)
         if not sp["has_audio"]:
             raise PipelineError("no_audio", "the source has no audio track — captions need speech")
         if sp["duration"] < cfg["segment"]["min_s"]:
@@ -684,7 +741,7 @@ def pipeline(j):
     # ── CONTENT PLAN (model): message, opening, parts, zooms, cover ─────────
     adapter = judgement.resolve_adapter(options, cfg)
     mode = {"claude": "model", "scripted": "scripted"}.get(adapter, "fallback_heuristic")
-    j.orig_source, j.zooms, j.story, pl, model_error, zoom_log = j.source, [], None, None, None, []
+    j.orig_source, j.zooms, j.story, pl, model_error, zoom_log = getattr(j, "primary_source", j.source), [], None, None, None, []
     prev, revision_mode, locked_raw = options.get("previous") or {}, None, None
     polish = options.get("polish") if isinstance(options.get("polish"), dict) else None
     if polish and adapter == "claude":
@@ -776,6 +833,13 @@ def pipeline(j):
                                  f"{pp['caption_max_lines']} lines of about {pp['max_chars_per_line'] + tspec['chars_per_line_bonus']} characters; break cards where a person pauses.")
         if not tspec["cover_text"]:
             options["story"]["cover_quote"] = ""            # a story has no cover
+        if getattr(j, "source_map", None):           # the edit map: every part with its file and the time inside that file; the owner's marks are checked
+            sources_mod.describe(j.source_map, pl["segments"])
+            hit, missing = sources_mod.check_marks(j.source_map, pl["segments"])
+            if hit:
+                base_issues.append(judgement.issue("marked_never_used", "blocker", "נעשה שימוש בקטע שסימנת 'לא להשתמש': " + "; ".join(f"{h['name']} {h['from_s']}–{h['to_s']}s" for h in hit)))
+            if missing:
+                base_issues.append(judgement.issue("marked_must_missing", "blocker", "קטע שסימנת 'חייב להיכלל' אינו בתוכנית: " + "; ".join(f"{m['name']}" for m in missing)))
         write_json(j.ed / "story_plan.json", pl)
 
     # ── PLAN ────────────────────────────────────────────────────────────────
@@ -1132,6 +1196,8 @@ def pipeline(j):
         "zoom_edits_applied": zoom_log,
         "graphics": res.get("graphics") or [], "adjustments": adjustments, "compare": res.get("compare"), "readability": readability,
         "dana_review": dana_review, "review_vs_previous": review_vs_previous, "review_provenance": provenance,
+        "mix": res.get("mix"), "project_type": options.get("project_type") or "interview",
+        "source_map": [{k: v for k, v in m.items()} for m in getattr(j, "source_map", None) or []] or None,
         "skill_report": skill_report, "skill_choice": skill_choice, "final_review": final_review, "timeline": timeline,
         "review_compact": review_rubric.compact(dana_review), "owner_resolved_checks": owner_resolved,
         "target": {"key": tg, "label": tspec["label"], "publish": tspec["publish"], "cover_text": tspec["cover_text"], "post_caption": tspec["post_caption"],

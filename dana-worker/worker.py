@@ -36,6 +36,8 @@ from dana_pipeline.core import (FAILURE, REVIEW_REQUIRED, STATE_BY_EXIT, SUCCESS
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{4,80}$")
 SAFE_EXT = {"mp4", "mov", "m4v", "webm", "avi", "mkv"}
+SAFE_JOBDIR = re.compile(r"^job_[a-z0-9]{6,40}_a\d{1,2}$")
+AUDIO_EXT = {"mp3", "wav", "m4a", "aac", "ogg", "flac"}
 UPLOAD_ORDER = ["package.json", "checks.json", "captions.json", "editorial.json", "transcript_source.json", "transcript_final.json",
                 "cover.jpg", "compare_frames.jpg", "compare_clip.mp4", "readable_compare.mp4", "story_part_1.mp4", "story_part_2.mp4", "story_part_3.mp4", "story_part_4.mp4", "final.mp4"]
 TRANSFER_ATTEMPTS = 3
@@ -64,13 +66,14 @@ class Api:
             except ValueError:
                 return e.code, {"error": raw[:200].decode("utf-8", "replace")}
 
-    def download(self, job_id, lease, dest, want_sha):
-        """Download to a temp file, verify the hash, then move into place."""
+    def download(self, job_id, lease, dest, want_sha, what="source"):
+        """Download to a temp file, verify the hash, then move into place. `what`: "source" (the project's first file) or
+        "files/<sha>" (any other file of the project: a further source, the music, the narration)."""
         tmp = dest.with_suffix(dest.suffix + ".part")
         for attempt in range(1, TRANSFER_ATTEMPTS + 1):
             try:
                 h = hashlib.sha256()
-                with self._req("GET", f"/api/dana/worker/jobs/{job_id}/source", headers={"X-Lease-Token": lease}, timeout=120) as r, \
+                with self._req("GET", f"/api/dana/worker/jobs/{job_id}/{what}", headers={"X-Lease-Token": lease}, timeout=120) as r, \
                         open(tmp, "wb") as f:
                     for chunk in iter(lambda: r.read(1 << 20), b""):
                         f.write(chunk)
@@ -138,7 +141,8 @@ def run_pipeline(cfg, cfg_path, job_dir, source, on_stage, module="dana_pipeline
     return state, result
 
 
-STAGE_HE = {"choose_skill": "דנה בוחרת סקילים מתאימים מהספרייה", "animation": "מרנדר קטע אנימציה (HyperFrames)",
+STAGE_HE = {"join": "מאחד את קובצי המקור לקובץ עבודה אחד", "measure_sources": "מודד תנועה, חדות ושוטים בכל המקורות", "mix": "מערבב קול, קריינות ומוזיקה", "beats": "מזהה פעימות במוזיקה", "readable": "בונה חלופה קריאה לכתוביות להשוואה",
+            "choose_skill": "דנה בוחרת סקילים מתאימים מהספרייה", "animation": "מרנדר קטע אנימציה (HyperFrames)",
             "interpret": "דנה קוראת את הבקשה שלך", "graphics": "מרנדר מואושן גרפיק (HyperFrames)", "compare": "מכין לפני/אחרי",
             "transcribe_check": "האזנה שנייה לבדיקת התמלול", "assemble": "מחבר את החלקים שנבחרו", "measure_picture": "מודד מיקום פנים לכתוביות ולזומים",
             "source": "בודק את קובץ המקור", "transcribe_source": "מתמלל", "judgement": "בוחר קטע וכתוביות",
@@ -190,6 +194,25 @@ def handle(api, cfg, cfg_path, leased):
             api.call("POST", f"/api/dana/worker/jobs/{jid}/progress", {"stage": "download", "note": "מוריד את קובץ המקור"},
                      {"X-Lease-Token": lease})
             api.download(jid, lease, source, src["sha256"])
+        # every other file the job names: further source videos, the uploaded music and narration. Checked like the source.
+        local = {src["sha256"]: str(source)}
+        au = options.get("audio") or {}
+        more = [(s.get("sha256"), s.get("ext"), SAFE_EXT) for s in options.get("sources") or []] + \
+               [((au.get(k) or {}).get("file") or {}).get("sha256") and (au[k]["file"]["sha256"], au[k]["file"].get("ext"), AUDIO_EXT) for k in ("music", "narration")]
+        for item in more:
+            if not item:
+                continue
+            sha, ext, allowed = item
+            if sha in local:
+                continue
+            if ext not in allowed or not re.fullmatch(r"[0-9a-f]{64}", sha or ""):
+                raise PipelineError("job_invalid", "a file named by the job failed validation on the worker", False)
+            dest = stage_dir / f"{sha}.{ext}"
+            if not (dest.is_file() and sha256_file(dest) == sha):
+                api.call("POST", f"/api/dana/worker/jobs/{jid}/progress", {"stage": "download", "note": "מוריד קבצים נוספים של הפרויקט"}, {"X-Lease-Token": lease})
+                api.download(jid, lease, dest, sha, f"files/{sha}")
+            local[sha] = str(dest)
+        (job_dir / "files.json").write_text(json.dumps(local), encoding="utf-8")
         state, result = run_pipeline(cfg, cfg_path, job_dir, source, stage, module)
         log(f"job {jid}: pipeline → {state} {result.get('code') or ''} {result.get('failed_checks') or ''}")
         if state in (SUCCESS, REVIEW_REQUIRED):
@@ -218,6 +241,33 @@ def handle(api, cfg, cfg_path, leased):
         stop.set()
 
 
+def housekeeping(cfg):
+    """Working copies only. A job's folder (cut pieces, frames, intermediate renders) is removed `keep_job_dirs_days` days
+    after it was last touched; everything a job DELIVERED is on the server and is never touched from here. Sources and
+    audio files cached for the worker are kept. Returns what was removed, for the log."""
+    root, days = Path(cfg["paths"]["work_root"]) / "jobs", float(cfg.get("keep_job_dirs_days", 5))
+    removed, freed = 0, 0
+    if not root.is_dir() or days <= 0:
+        return removed, freed
+    limit = time.time() - days * 86400
+    for d in root.iterdir():
+        try:
+            if d.is_dir() and SAFE_JOBDIR.match(d.name) and d.stat().st_mtime < limit:
+                size = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+                shutil.rmtree(d)
+                removed, freed = removed + 1, freed + size
+        except OSError:
+            continue
+    return removed, freed
+
+
+def disk_state(cfg):
+    """Free space where the worker works. Below `min_free_gb` no new job is taken (a render that runs out of disk loses the job)."""
+    free = shutil.disk_usage(cfg["paths"]["work_root"]).free / 1e9
+    need = float(cfg.get("min_free_gb", 8))
+    return {"free_gb": round(free, 1), "min_free_gb": need, "ok": free >= need}
+
+
 def capabilities(cfg):
     """What this machine can really do right now. Reported to the server at start and shown to the owner as is."""
     paths = cfg.get("paths") or {}
@@ -225,6 +275,10 @@ def capabilities(cfg):
     return {"content_model": {"enabled": bool(cfg["judgement"]["claude"].get("enabled")) and cfg["judgement"]["adapter"] == "claude", "model": cfg["judgement"]["claude"].get("model")},
             "transcription": {"model": cfg["asr"]["model"], "device": cfg["asr"]["device"], "second_pass": bool(cfg["judgement"].get("second_pass"))},
             "face_detection": bool(paths.get("face_model") and Path(paths["face_model"]).is_file()),
+            # prepared, not active: whether the connection is switched on and whether a key is PRESENT on this machine - never the key itself
+            "narration_tts": __import__("dana_pipeline.tts", fromlist=["status"]).status(cfg),
+            "beat_detection": __import__("importlib.util", fromlist=["find_spec"]).find_spec("librosa") is not None,
+            "disk": disk_state(cfg), "keep_job_dirs_days": float(cfg.get("keep_job_dirs_days", 5)),
             "hyperframes": bool(hf), "caption_renderer": bool(paths.get("caption_renderer") and Path(paths["caption_renderer"]).is_file()),
             "max_review_rounds": cfg["editorial"]["max_cycles"], "max_cost_usd": cfg["editorial"]["max_total_cost_usd"], "max_seconds": cfg["editorial"]["max_total_s"]}
 
@@ -322,10 +376,27 @@ def main():
         return 1
     log(f"worker {api.worker_id} online, pipeline {PIPELINE_VERSION}, server {cfg['server_url']}")
     stop_file = Path(cfg["paths"]["work_root"]) / "STOP"
+    last_housekeeping = 0.0
     while True:
         if stop_file.exists():                      # kill switch: finish nothing new, exit cleanly
             log(f"STOP file present ({stop_file}) — worker exits")
             return 0
+        if time.time() - last_housekeeping > 3600:
+            last_housekeeping = time.time()
+            n_removed, freed = housekeeping(cfg)
+            if n_removed:
+                log(f"housekeeping: removed {n_removed} job work folders older than {cfg.get('keep_job_dirs_days', 5)} days ({freed / 1e9:.1f} GB); delivered files are on the server and untouched")
+        disk = disk_state(cfg)
+        if not disk["ok"]:                         # no job is taken while there is no room to finish it; the panel shows why
+            log(f"low disk: {disk['free_gb']} GB free, {disk['min_free_gb']} GB needed — not taking jobs")
+            try:
+                api.call("POST", "/api/dana/worker/heartbeat", {"workerId": api.worker_id, "state": "low_disk", "pipelineVersion": PIPELINE_VERSION, "disk": disk})
+            except (urllib.error.URLError, OSError):
+                pass
+            if a.once:
+                return 0
+            time.sleep(60)
+            continue
         try:
             code, body = api.call("POST", "/api/dana/worker/lease", {"workerId": api.worker_id, "pipelineVersion": PIPELINE_VERSION})
             if code == 200 and body and body.get("job"):

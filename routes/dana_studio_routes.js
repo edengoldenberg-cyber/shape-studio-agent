@@ -120,6 +120,7 @@ panelRouter.get('/status', wrap((_req, res) => res.json({ ok: true, worker: stud
   notifications: require('../services/dana_notify').realEnabled() ? 'real' : 'mock', maxUploadMb: maxUploadMb(), brandMissing: brand.missing(),
   instagramAccount: brand.get().instagram_account.value ?? null, defaultProfile: refs.defaultProfile(), styleLimits: studio.STYLE_OVERRIDABLE,
   accounts: brand.accounts(), adjustmentKinds: studio.ADJUSTMENT_KINDS, phases: studio.PHASES, targets: studio.TARGETS,
+  connectors: connectors(),
   // Set only on a preview that shows test material: the page then marks everything as test data and synthetic approvals.
   dataBanner: process.env.DANA_DATA_BANNER ? String(process.env.DANA_DATA_BANNER).slice(0, 300) : null })));
 // ── Notification: configuration check and ONE explicit test (real mode only) ──
@@ -140,6 +141,40 @@ panelRouter.post('/upload', upload, wrap(async (req, res) => {
     const r = await studio.registerUpload({ tmpPath: req.file.path, originalName: req.file.originalname, options });
     res.status(r.duplicate ? 200 : 201).json({ ok: true, duplicate: r.duplicate, project: studio.view(r.project) });
   } catch (e) { fs.rmSync(req.file.path, { force: true }); throw e; }
+}));
+
+// ── external connections: what is prepared, what is active, and the ONE action that is still needed ──
+// Nothing here calls a provider. The narration key lives only on the editing computer; the panel learns only whether it is present.
+const TTS_RATES = { eleven_v3: 0.08, eleven_v4: 0.08, eleven_v4_turbo: 0.04 }, TTS_READ_ON = '2026-11-16';
+function connectors() {
+  const tts = studio.workerStatus()?.capabilities?.narration_tts ?? null;
+  return {
+    narration_tts: { provider: 'ElevenLabs', state: tts?.active ? 'active' : 'prepared_not_active', key_present: tts?.key_present ?? null, enabled: tts?.enabled ?? null,
+      what: 'קריינות מטקסט מאושר (תסריט, לא ציטוט). דיבוב אודיו קיים הוא יכולת נפרדת של אותו ספק, עם שכפול קול כבוי כברירת מחדל.',
+      never_called: !tts?.active, rates_usd_per_1000_chars: TTS_RATES, rates_read_on: TTS_READ_ON, dubbing_usd_per_minute: { v1: 0.5, v2: 2.2 },
+      needs: tts?.active ? [] : ['חשבון ElevenLabs במסלול בתשלום (המסלול החינמי אסור לשימוש מסחרי; המינימום שנקרא: Starter, 6$ לחודש)',
+        'בהגדרות החשבון: ביטול השימוש בתוכן לאימון, לפני השליחה הראשונה', 'מפתח API, שיוגדר במחשב העריכה בלבד (לא בפאנל)', 'אישור שלך לטקסט ולתקרת עלות לפני כל יצירה'],
+      next_action: tts?.active ? null : 'לפתוח חשבון בתשלום ב-ElevenLabs ולמסור לי שהמפתח מוכן להגדרה במחשב העריכה. עד אז: העלאת קריינות מוכנה עובדת.' },
+    music_library: { state: 'manual_upload_only', what: 'מוזיקה נכנסת בהעלאה ידנית בלבד. לכל רצועה נשמרים המקור והרישיון שרשמת; קובץ שהועלה אינו מסומן כמורשה מעצמו.',
+      options: [{ name: 'ספרייה מקומית מרצועות שהורדת בעצמך (למשל Jamendo Licensing או Pixabay)', state: 'עובד היום דרך ההעלאה', needs: 'לאשר מול הספק שהרישיון מכסה חשבון עסקי ופוסטים ממומנים' },
+        { name: 'Epidemic Sound (חיפוש לפי סגנון, מצב רוח וקצב)', state: 'לא מחובר', needs: 'מנוי, אישור שלהם לשימוש בכלי אוטומטי משלנו, ומחיר — לא אומתו' },
+        { name: 'CapCut', state: 'לא אפשרי', needs: 'אין API, והתנאים אוסרים שימוש מחוץ לאפליקציה' }],
+      next_action: 'להחליט אם להסתפק בספרייה מקומית, או לברר מול Epidemic Sound מחיר ותנאי שימוש בכלי אוטומטי.' },
+    publishing: { state: 'off', what: 'פרסום והתראות אמיתיות כבויים. פרסום סטורי לא נוסה מעולם.' } };
+}
+/** What is stored, how much room is left, and the one cleanup the owner may ask for (leftovers of interrupted uploads). */
+panelRouter.get('/storage', wrap((_req, res) => res.json({ ok: true, storage: studio.storage() })));
+panelRouter.post('/storage/cleanup-upload-leftovers', json, wrap((req, res) => {
+  if (!String(req.body?.by ?? '').trim()) throw new studio.StudioError(400, 'by_required', 'נדרש שם מי שמבקש/ת');
+  res.json({ ok: true, storage: studio.storage({ cleanup: true }) });
+}));
+/** How much a narration of this text would cost. Arithmetic only: no request leaves the computer. The text is a SCRIPT. */
+panelRouter.post('/narration/estimate', json, wrap((req, res) => {
+  const text = String(req.body?.text ?? '').slice(0, 20000), model = TTS_RATES[req.body?.model] ? req.body.model : 'eleven_v3', takes = Math.min(10, Math.max(1, Number(req.body?.takes) || 1));
+  if (text.trim().length < 2) throw new studio.StudioError(400, 'text_required', 'נדרש טקסט התסריט');
+  res.json({ ok: true, estimate: { characters: text.length, model, usd_per_1000_chars: TTS_RATES[model], takes, estimated_usd: Math.round(text.length / 1000 * TTS_RATES[model] * takes * 10000) / 10000,
+    within_request_limit: text.length <= 5000, text_is: 'script',
+    basis: `מחירון ה-API של ElevenLabs כפי שנקרא ב-${TTS_READ_ON}; יש לאמת מול הדף העדכני לפני אישור. לא נשלח דבר לספק.` }, connector: connectors().narration_tts });
 }));
 
 // ── more files in a project: further source videos, music, narration; marks and mix settings ──

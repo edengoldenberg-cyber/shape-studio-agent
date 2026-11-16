@@ -73,6 +73,7 @@ def mix(cfg, video_in, out, audio, dur, speech_spans, mute_spans=(), work=None):
     a_cfg = cfg["audio"]
     sc = {**SC, **(a_cfg.get("sidechain") or {})}
     work = Path(work or Path(out).parent)
+    work.mkdir(parents=True, exist_ok=True)
     music, nar, orig = audio.get("music"), audio.get("narration"), audio.get("original") or {"mode": "keep", "level_db": 0}
     ff = tool(cfg, "ffmpeg")
     inputs, n = ["-i", str(video_in)], 1
@@ -88,7 +89,8 @@ def mix(cfg, video_in, out, audio, dur, speech_spans, mute_spans=(), work=None):
                       f"volume={10 ** (float(nar.get('volume_db', 0)) / 20):.4f},adelay={d}|{d},apad,atrim=0:{dur:.3f}[nar]")
         speech_in.append("[nar]")
         n += 1
-    chains.append("".join(speech_in) + f"amix=inputs={len(speech_in)}:normalize=0:duration=first,aformat=channel_layouts=stereo[speech]")
+    # the speech bus (original sound and / or narration) is also written out, so the music can be MEASURED against it
+    chains.append("".join(speech_in) + f"amix=inputs={len(speech_in)}:normalize=0:duration=first,aformat=channel_layouts=stereo,asplit=2[speech][spstem]")
     if music:
         inputs += ["-ss", f"{float(music.get('start_s', 0)):.3f}", "-i", str(music["path"])]
         fo = max(0.0, dur - float(music.get("fade_out_s", 1.5)))
@@ -109,7 +111,7 @@ def mix(cfg, video_in, out, audio, dur, speech_spans, mute_spans=(), work=None):
     # pass 1: measure the pre-master, pass 2: normalise to the target with the measured values
     target, peak = a_cfg["target_lufs"], a_cfg["target_peak_db"]
     r = run([ff, "-hide_banner", "-nostats", "-y", *inputs, "-filter_complex", graph + f";[pre]loudnorm=I={target}:TP={peak}:LRA=11:print_format=json[o]",
-             "-map", "[o]", "-f", "null", "-"] + (["-map", "[mstem]", "-f", "null", "-"] if music else []), "mix_failed", timeout=900)
+             "-map", "[o]", "-f", "null", "-", "-map", "[spstem]", "-f", "null", "-"] + (["-map", "[mstem]", "-f", "null", "-"] if music else []), "mix_failed", timeout=900)
     m = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", (r.stderr or b"").decode("utf-8", errors="replace"))
     if not m:
         raise PipelineError("mix_failed", "the loudness of the mix could not be measured")
@@ -119,6 +121,8 @@ def mix(cfg, video_in, out, audio, dur, speech_spans, mute_spans=(), work=None):
     stem = work / "mix_music_stem.wav"
     cmd = [ff, "-y", "-v", "error", *inputs, "-filter_complex", graph + ";" + norm, "-map", "0:v", "-map", "[o]", "-c:v", "copy", "-c:a", "aac", "-b:a", cfg["render"]["audio_bitrate"],
            "-ar", "48000", "-movflags", "+faststart", "-t", f"{dur:.3f}", str(out)]
+    sp_stem = work / "mix_speech_stem.wav"
+    cmd += ["-map", "[spstem]", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-t", f"{dur:.3f}", str(sp_stem)]
     if music:
         cmd += ["-map", "[mstem]", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-t", f"{dur:.3f}", str(stem)]
     run(cmd, "mix_failed", timeout=900)
@@ -145,7 +149,9 @@ def mix(cfg, video_in, out, audio, dur, speech_spans, mute_spans=(), work=None):
         if dur - t >= 0.6:
             gaps.append((t + 0.2, dur - 0.2))
         under, free = _rms(mus, sr, spans), _rms(mus, sr, gaps)
-        sp_level = _rms(_wav(cfg, video_in, work / "mix_voice_16k.wav")[0], sr, spans) if spans and orig.get("mode") != "mute" else None
+        sp_level = _rms(_wav(cfg, sp_stem, work / "mix_speech_16k.wav")[0], sr, spans) if spans else None
+        if sp_level is not None and sp_level < -70:          # the "speech" spans are silent (original sound muted and no narration there)
+            sp_level = None
         rec["measured"].update(music_under_speech_db=None if under is None else round(under, 1), music_between_speech_db=None if free is None else round(free, 1),
                                ducking_db=None if under is None or free is None else round(free - under, 1),
                                speech_over_music_db=None if under is None or sp_level is None else round(sp_level - under, 1),

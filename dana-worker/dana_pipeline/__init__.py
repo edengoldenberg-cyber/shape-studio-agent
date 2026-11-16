@@ -3,4 +3,4 @@
 ONE versioned pipeline. It is never copied into a project folder and never edits
 historical projects or source footage.
 """
-PIPELINE_VERSION = "1.3.0"
+PIPELINE_VERSION = "1.4.0"
