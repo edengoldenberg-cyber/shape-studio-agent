@@ -35,28 +35,49 @@ You do NOT see motion and you do NOT hear anything. So:
   (form, technique, effort, progress). Do not state results, benefits, prices, offers or any fact about the studio.
 - a candidate marked "must" was required by the owner: it is always included.
 
+THINK AS A VIDEO EDITOR AND A CONTENT CREATOR. A compilation is not a pile of usable shots. It has ONE message and a line:
+an OPENING that catches the eye and shows where we are, a DEVELOPMENT that builds (each shot adds something: another person,
+another angle, more movement), and an ENDING that closes it (a strong or a calm last image that the message can rest on).
+Choose shots that connect to each other and to the message - the same place, person, equipment or direction of movement
+carries a cut; a shot that is merely available and connects to nothing is left out.
+
+THE GOAL comes from the owner (<owner_brief>). When a goal is given, the message and every choice serve it. When a reference
+is attached (<reference>), it is a DIRECTION for pace, structure and feeling - take from it what the owner asked to take and
+leave what the owner asked to leave; never copy its content. When no goal is given, propose one yourself in "direction" and
+build to it: it will be shown to the owner as YOUR proposal, not as a style the owner approved.
+
 THE JOB
 1. "message": one sentence saying what this compilation shows a viewer (what is seen, not a promise).
+   "direction": the editing idea in one or two Hebrew sentences - what the video is going for and how it gets there.
 2. "order": the candidates you use, in playing order, each with "seconds" (how long to show it, within the limits given),
-   "seen" (what the still shows) and "why" (its job in the sequence). Choose by what is going on, by picture quality and
-   by the message - not by how many candidates a file has. Leave out near-identical shots; keep variety (people, angles,
-   equipment); keep the sequence easy to follow (do not jump back and forth between unrelated settings without reason).
+   "seen" (what the still shows), "role" (opening / build / peak / close) and "why" (its job in the sequence and what
+   connects it to the shot before it). Choose by what is going on, by picture quality and by the message - not by how many
+   candidates a file has. Leave out near-identical shots; keep variety (people, angles, equipment); keep the sequence easy
+   to follow (do not jump back and forth between unrelated settings without reason).
 3. "opening_why": why the first shot opens the video. 4. "sequence_why": the logic of the order in one sentence.
+   "closing_why": why the last shot ends the video.
+   "material_fit": does the uploaded material let you make what was asked? {"fits": true/false, "why": one Hebrew sentence}.
+   Say false when it does not - for example a training compilation was asked for and the stills show people sitting and
+   talking. A video is still planned from the best there is, and the owner is told plainly that this is not what was asked.
 5. "title": an OPTIONAL editorial title of 2-6 Hebrew words shown in the first seconds, in your own words, describing what
    the video shows; null when the picture speaks for itself. No number, price, offer, name or claim.
-6. "unused_files": the owner uploaded every file in order to use it. Take at least one moment from EVERY file unless a file has
-   nothing usable; for each file you leave out entirely give {"file", "why"} (for example: it repeats another file, nothing happens
-   in it, it is out of focus).
+6. "unused_files": for each file you leave out entirely give {"file", "why"} (for example: it repeats another file, nothing
+   happens in it, it is out of focus, it does not serve the message). How many different files MUST be used is stated in the
+   request ("SOURCES"). When a number is required it is a requirement, not a preference: meet it, and if the material truly
+   cannot carry it say so in "material_fit" - do not quietly use fewer.
 7. "doubts": anything you could not tell from stills and the owner should look at (people who may not have agreed to be
    filmed, a shot that may be out of focus in motion, and so on).
 """
-SCHEMA = {"type": "object", "additionalProperties": False, "required": ["message", "order", "opening_why", "sequence_why", "title", "doubts"],
-          "properties": {"message": {"type": "string"}, "unused_files": {"type": "array", "maxItems": 12, "items": {"type": "object", "additionalProperties": False, "required": ["file", "why"],
+SCHEMA = {"type": "object", "additionalProperties": False, "required": ["message", "direction", "order", "opening_why", "sequence_why", "closing_why", "material_fit", "title", "doubts"],
+          "properties": {"message": {"type": "string"}, "direction": {"type": "string"}, "closing_why": {"type": "string"},
+                         "material_fit": {"type": "object", "additionalProperties": False, "required": ["fits", "why"], "properties": {"fits": {"type": "boolean"}, "why": {"type": "string"}}}, "unused_files": {"type": "array", "maxItems": 12, "items": {"type": "object", "additionalProperties": False, "required": ["file", "why"],
                                                                                            "properties": {"file": {"type": "string"}, "why": {"type": "string"}}}},
                          "opening_why": {"type": "string"}, "sequence_why": {"type": "string"}, "title": {"type": ["string", "null"]},
                          "doubts": {"type": "array", "maxItems": 6, "items": {"type": "string"}},
-                         "order": {"type": "array", "minItems": 2, "maxItems": 14, "items": {"type": "object", "additionalProperties": False, "required": ["candidate", "seconds", "seen", "why"],
-                                   "properties": {"candidate": {"type": "integer"}, "seconds": {"type": "number"}, "seen": {"type": "string"}, "why": {"type": "string"}}}}}}
+                         "order": {"type": "array", "minItems": 2, "maxItems": 14, "items": {"type": "object", "additionalProperties": False, "required": ["candidate", "seconds", "seen", "role", "why"],
+                                   "properties": {"candidate": {"type": "integer"}, "seconds": {"type": "number"}, "seen": {"type": "string"},
+                                                  "role": {"type": "string", "enum": ["opening", "build", "peak", "close"]}, "why": {"type": "string"}}}}}}
+ROLE_HE = {"opening": "פתיחה", "build": "התפתחות", "peak": "שיא", "close": "סיום", "body": "התפתחות", "closing": "סיום"}
 REVIEW_SYSTEM = """You review ONE finished compilation video from still frames (one per part, in playing order) and return ONE JSON object.
 You have no tools. You do not see motion and do not hear anything: say nothing about sound, rhythm, smoothness or performance.
 For each criterion id say whether it is met, with a one-sentence Hebrew note naming the stills you looked at. List findings only
@@ -68,7 +89,54 @@ REVIEW_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["
                                              "properties": {"part": {"type": ["integer", "null"]}, "problem": {"type": "string"}, "evidence": {"type": "string"}}}}}}
 MODEL_CRITERIA = [("M1", "structure", "הרצף מובן: אין קפיצה מבלבלת בין מקומות או אנשים"), ("M2", "message", "הקטעים מתאימים למסר שהוגדר"),
                   ("M3", "structure", "אין שני קטעים שנראים כמעט זהים"), ("M4", "opening", "השוט הפותח ברור ומושך את העין"),
-                  ("M5", "message", "הכותרת מתארת את מה שרואים ואינה מוסיפה טענה או מידע עסקי")]
+                  ("M5", "message", "הכותרת מתארת את מה שרואים ואינה מוסיפה טענה או מידע עסקי"),
+                  ("M6", "structure", "ללקט יש קו: פתיחה, התפתחות וסיום שנראים בפריימים"), ("M7", "message", "הלקט משרת את המטרה שהגדיר הבעלים")]
+
+
+def brief_of(options):
+    """The owner's direction for a compilation: goal, what to take from a reference and what not to, how many different
+    source files must appear, whether the material is a demonstration. Data, never instructions to the planner's rules."""
+    b = options.get("brief") if isinstance(options.get("brief"), dict) else {}
+    ref = b.get("reference") if isinstance(b.get("reference"), dict) else None
+    try:
+        need = max(0, min(12, int(b.get("min_sources") or 0)))
+    except (TypeError, ValueError):
+        need = 0
+    return {"goal": str(b.get("goal") or "").strip()[:600], "take": str(b.get("take") or "").strip()[:600], "avoid": str(b.get("avoid") or "").strip()[:600],
+            "min_sources": need if need >= 2 else 0, "demo": b.get("demo") is True,
+            "reference": ({"id": ref.get("id"), "title": str(ref.get("title") or "")[:200], "summary": str(ref.get("summary") or "")[:1500],
+                           "owner_note": str(ref.get("owner_note") or "")[:600]} if ref else None)}
+
+
+def brief_text(brief, n_files):
+    """The part of the request that carries the owner's direction (or says that there is none)."""
+    out = []
+    if brief["goal"] or brief["take"] or brief["avoid"]:
+        out.append("<owner_brief>\n" + json.dumps({k: brief[k] for k in ("goal", "take", "avoid") if brief[k]}, ensure_ascii=False, indent=1)
+                   + "\ngoal = what the video is for; take = what to take from the reference; avoid = what NOT to take or do.\n</owner_brief>")
+    else:
+        out.append("<owner_brief>\nnone: the owner gave no goal. Propose a direction yourself and say so in \"direction\".\n</owner_brief>")
+    if brief["reference"]:
+        out.append("<reference>\n" + json.dumps(brief["reference"], ensure_ascii=False, indent=1)
+                   + "\nAn analysis of a reference video the owner attached. A direction for style, never content to copy.\n</reference>")
+    else:
+        out.append("No reference video was attached: there is no approved style to follow. Do not present your direction as the owner's.")
+    if brief["min_sources"]:
+        out.append(f"SOURCES: REQUIRED - the video must use moments from at least {min(brief['min_sources'], n_files)} DIFFERENT files (of {n_files}).")
+    else:
+        out.append(f"SOURCES: no number of files is required ({n_files} uploaded). Using one file is allowed when the others do not serve the message; say why for each file left out.")
+    return out
+
+
+def diversity(segs, need, smap):
+    """How many different source files the video really uses, against what the owner required. -> (used ids, check record | None)."""
+    used = sorted({s["source_id"] for s in segs})
+    if not need:
+        return used, None
+    need = min(need, len(smap))
+    names = [m["name"] for m in smap if m["id"] in used]
+    return used, checks.rec("sources_diversity", "pass" if len(used) >= need else "fail",
+                            f"הלקט משתמש ב-{len(used)} קובצי מקור ({', '.join(names)}); נדרשו לפחות {need}", used=used, required=need)
 
 
 # ── measuring the picture ───────────────────────────────────────────────────
@@ -166,7 +234,8 @@ def validate(raw, cands, lo, hi):
         used.add(c["n"])
         d = (c["out_s"] - c["in_s"]) if c["must"] else min(max(float(o.get("seconds") or WINDOW), SEG_MIN), c["out_s"] - c["in_s"], SEG_MAX)
         segs.append({"candidate": c["n"], "source_in_s": c["in_s"], "source_out_s": round(c["in_s"] + d, 2), "window_out_s": c["out_s"], "must": c["must"],
-                     "seen": str(o.get("seen") or "")[:200], "why": str(o.get("why") or "")[:240]})
+                     "seen": str(o.get("seen") or "")[:200], "why": str(o.get("why") or "")[:240],
+                     "plan_role": o.get("role") if o.get("role") in ("opening", "build", "peak", "close") else None})
     for c in cands:                              # required by the owner and left out by the model: added, and said
         if c["must"] and c["n"] not in used:
             segs.append({"candidate": c["n"], "source_in_s": c["in_s"], "source_out_s": c["out_s"], "window_out_s": c["out_s"], "must": True, "seen": "", "why": "סומן על ידך כקטע שחייב להיכלל"})
@@ -275,8 +344,12 @@ def produce(j, video, smap, sp, sha_before, tg, tspec, zone_used):
     lo, hi = limits(tg, tspec)
     prev = options.get("previous") if isinstance(options.get("previous"), dict) else None
     prev_segs = [s for s in ((prev or {}).get("plan") or {}).get("segments") or [] if s.get("source_id")] if ((prev or {}).get("plan") or {}).get("kind") == "montage" else []
-    locked = bool(prev_segs)
-    plan_meta = {"message": "", "opening_why": "", "sequence_why": "", "doubts": [], "title": None, "unused_why": {}}
+    brief = brief_of(options)
+    # a correction keeps the previous parts. A written request from the owner is NOT a correction of one part: the cut is
+    # planned again with the request in front of the planner (before, the request was silently ignored here).
+    asked = str(options.get("change_request") or "").strip()
+    locked = bool(prev_segs) and not asked
+    plan_meta = {"message": "", "opening_why": "", "sequence_why": "", "closing_why": "", "direction": "", "material_fit": None, "doubts": [], "title": None, "unused_why": {}}
     cands, judgement_mode, model_error = [], "model", None
 
     if locked:                                   # a correction: the previous parts are kept; only what was asked for changes
@@ -305,7 +378,11 @@ def produce(j, video, smap, sp, sha_before, tg, tspec, zone_used):
             if len(segs) < 1:
                 raise PipelineError("montage_plan_invalid", "לא נשאר אף קטע בלקט אחרי השינויים שביקשת", False)
             pp = (prev or {}).get("plan") or {}
-            plan_meta.update(message=pp.get("message") or "", opening_why=pp.get("opening_why") or "", sequence_why=pp.get("rationale") or "", title=pp.get("title"))
+            plan_meta.update(message=pp.get("message") or "", opening_why=pp.get("opening_why") or "", sequence_why=pp.get("rationale") or "", title=pp.get("title"),
+                             closing_why=pp.get("closing_why") or "", direction=pp.get("direction") or "", material_fit=pp.get("material_fit"))
+            for s, ps in zip(segs, [x for x in prev_segs]):
+                if s.get("kept_from_previous") and s.get("n_prev") == ps.get("n"):
+                    s["plan_role"] = ps.get("plan_role")
             judgement_mode = (prev or {}).get("judgement_mode") or "model"
     else:
         with j.stage("measure_sources"):
@@ -327,6 +404,11 @@ def produce(j, video, smap, sp, sha_before, tg, tspec, zone_used):
                     ("<owner_rules>\n" + "\n".join(f"- {str(r.get('text'))[:300]}" for r in options.get("rules") or [] if isinstance(r, dict) and r.get("text"))
                      + "\nApproved style rules; follow them where they apply to a compilation.\n</owner_rules>") if options.get("rules") else "",
                     ("<owner_request>\n" + str(options.get("change_request"))[:1500] + "\n</owner_request>") if options.get("change_request") else "",
+                    *brief_text(brief, len(smap)),
+                    ("<previous_version>\n" + json.dumps({"message": ((prev or {}).get("plan") or {}).get("message"), "direction": ((prev or {}).get("plan") or {}).get("direction"),
+                                                          "parts": [{"file": x.get("source_name"), "at_s": x.get("file_in_s"), "seconds": round(x.get("file_out_s", 0) - x.get("file_in_s", 0), 1),
+                                                                     "seen": x.get("seen")} for x in prev_segs]}, ensure_ascii=False, indent=1)
+                     + "\nThe version the owner's request is about. Address the request; keep what it does not ask to change.\n</previous_version>") if prev_segs else "",
                     "Music: " + ("a music track was uploaded; cuts may be moved slightly onto its beats." if music else "none."),
                     "KIND OF PROJECT: " + ("a TRAINING COMPILATION - it is meant to show people training and the studio in use. Prefer shots where something is being done. "
                                            "A person only talking to the camera says nothing here unless the sound is kept; use such a shot briefly, if at all."
@@ -345,6 +427,9 @@ def produce(j, video, smap, sp, sha_before, tg, tspec, zone_used):
                     title, refused = motion.editorial_title(raw.get("title"))
                     if refused:
                         notes.append(f"הכותרת שהוצעה לא נכנסה: {refused}")
+                    mf = raw.get("material_fit") if isinstance(raw.get("material_fit"), dict) else None
+                    plan_meta.update(closing_why=str(raw.get("closing_why") or "")[:300], direction=str(raw.get("direction") or "")[:400],
+                                     material_fit={"fits": mf.get("fits") is not False, "why": str(mf.get("why") or "")[:300]} if mf else None)
                     plan_meta.update(message=str(raw.get("message") or "")[:300], opening_why=str(raw.get("opening_why") or "")[:300], sequence_why=str(raw.get("sequence_why") or "")[:300],
                                      doubts=[str(d)[:240] for d in raw.get("doubts") or []], title=title,
                                      unused_why={str(u.get("file")): str(u.get("why") or "")[:240] for u in raw.get("unused_files") or [] if isinstance(u, dict)})
@@ -376,6 +461,21 @@ def produce(j, video, smap, sp, sha_before, tg, tspec, zone_used):
     unused = [{"id": m["id"], "name": m["name"], "why": plan_meta["unused_why"].get(m["name"]) or ("נשאר מחוץ לגרסה הקודמת" if locked else "לא נבחר ממנו אף רגע")} for m in smap if m["id"] not in used_ids]
     for u in unused:
         issues.append(judgement.issue("source_not_used", "warn", f"הקובץ \"{u['name']}\" אינו בסרטון: {u['why']}"))
+    _, div_rec = diversity(segs, brief["min_sources"], smap)
+    if div_rec:
+        records.append(div_rec)
+        if div_rec["status"] == "fail":
+            issues.append(judgement.issue("sources_requirement_not_met", "blocker",
+                                          div_rec["summary"] + ". " + ("; ".join(f"{u['name']}: {u['why']}" for u in unused) or "לא ניתן נימוק")
+                                          + ". זו אינה הגרסה שביקשת: נדרש חומר מתאים נוסף, או שינוי של הדרישה"))
+    fit = plan_meta.get("material_fit")
+    if fit and fit.get("fits") is False:
+        records.append(checks.rec("material_fit", "fail", f"החומר שהועלה אינו מתאים למה שהתבקש: {fit['why']}"))
+        issues.append(judgement.issue("material_not_suitable", "blocker", f"החומר שהועלה אינו מתאים למה שהתבקש ({fit['why']}). הסרטון הופק ממה שיש, אבל הוא אינו הלקט שביקשת — נדרש חומר מתאים"))
+    if brief["demo"]:
+        issues.append(judgement.issue("infrastructure_demo", "warn", "זו בדיקת תשתית על חומר הדגמה, לא לקט אימונים: היא מראה שהמסלול עובד ואינה מעידה על איכות לקט מחומר אמיתי"))
+    if not (brief["goal"] or brief["reference"]) and plan_meta.get("direction"):
+        issues.append(judgement.issue("direction_is_proposal", "info", f"לא הוגדרו מטרה או רפרנס. כיוון העריכה הוא הצעה של דנה ולא סגנון שאישרת: {plan_meta['direction']}"))
 
     # ── an editorial title over the first seconds (the only graphic a compilation carries for now) ──
     graphics, graphics_dropped = [], []
@@ -401,28 +501,31 @@ def produce(j, video, smap, sp, sha_before, tg, tspec, zone_used):
                 picture = j.work / "titled.mp4"
 
     # ── captions of the NARRATION: the words of the uploaded narration, timed by transcribing it; marked as narration, unverified ──
-    cards, nar_words = [], []
+    cards, nar_words, nar_applied, nar_off = [], [], [], float((nar or {}).get("start_s", 0) or 0)
     if nar and st.get("captions_enabled", True):
         with j.stage("render_cards"):
             try:
                 wav = j.work / "narration_16k.wav"
                 run([tool(cfg, "ffmpeg"), "-y", "-v", "error", "-i", nar["path"], "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav], "narration_unreadable", timeout=300)
                 off = float(nar.get("start_s", 0))
-                nar_words = [dict(w, start=round(w["start"] + off, 3), end=round(w["end"] + off, 3)) for w in checks.transcribe(cfg, wav)["words"] if w["start"] + off < dur - 0.2]
+                heard, nar_applied = story.apply_caption_edits(checks.transcribe(cfg, wav)["words"], [e for e in options.get("caption_edits") or [] if isinstance(e, dict)])
+                nar_words = [dict(w, start=round(w["start"] + off, 3), end=round(w["end"] + off, 3)) for w in heard if w["start"] + off < dur - 0.2]
                 if nar_words:
                     line_px = captions.max_line_px(zone_used, st["width"])
                     fits = lambda t: len(t) <= cfg["cards"]["merge_max_chars"] and captions.text_px(cfg, st, t) <= line_px
-                    one = [{"text": judgement.BIDI.sub("", w["word"]).strip(), "highlight": []} for w in nar_words]
+                    # a stretch the owner corrected by ear stays ONE card with exactly the owner's words; the rest is divided word by word
+                    one, one_spans = owner_units(nar_words)
                     measured_wide = set()          # texts whose RENDERED card was measured outside the frame or the safe zone
 
                     def divide():
                         """The words divided into cards by captions.regroup (fewest cards that flash by), never using a text that was measured too wide."""
-                        g, _ = captions.regroup(one, [[w] for w in nar_words], lambda t: t not in measured_wide and fits(t), cfg["cards"]["min_on_screen_s"],
+                        g, _ = captions.regroup(one, one_spans, lambda t: t not in measured_wide and fits(t), cfg["cards"]["min_on_screen_s"],
                                                 cfg["cards"]["max_chars_per_s"], 3, cfg["cards"]["hold_after_s"])
+                        flat = [w for sp_ in one_spans for w in sp_]          # one word per token, also inside a corrected stretch
                         sps, k = [], 0
                         for c in g:
                             n_w = len(c["text"].split())
-                            sps.append(nar_words[k:k + n_w])
+                            sps.append(flat[k:k + n_w])
                             k += n_w
                         return g, sps
 
@@ -458,7 +561,9 @@ def produce(j, video, smap, sp, sha_before, tg, tspec, zone_used):
                         issues.append(judgement.issue("narration_cards_short", "warn", f"{len(quick)} כתוביות קריינות מוצגות פחות מ-{cfg['cards']['min_on_screen_s']} שניות (כרטיסים {quick}): בגודל הכתובית הזה ובשורה אחת אין חלוקה אחרת של המילים שנכנסת לאזור הבטוח. להכרעתך: גודל קטן יותר, שתי שורות, או לקבל"))
                     captions.composite(cfg, picture, picture, cards, png_dir, j.work / "captioned.mp4", dur, animation=None, graphics=None, fps=st["fps"])
                     picture = j.work / "captioned.mp4"
-                    issues.append(judgement.issue("narration_captions_unverified", "warn", f"הכתוביות ({len(cards)}) נוצרו מתמלול אוטומטי של הקריינות ולא אומתו. הן מציגות קריינות, לא ציטוט של המצולמים — לקרוא ולבדוק לפני אישור"))
+                    issues.append(judgement.issue("narration_captions_unverified", "warn", f"הכתוביות ({len(cards)}) נוצרו מתמלול אוטומטי של הקריינות"
+                                                  + (f"; {len(nar_applied)} תיקונים שלך הוחלו עליהן" if nar_applied else " ולא אומתו")
+                                                  + ". הן מציגות קריינות, לא ציטוט של המצולמים — לקרוא, להאזין ולתקן במסך התמלול לפני אישור"))
             except PipelineError as e:
                 cards = []
                 issues.append(judgement.issue("narration_captions_failed", "warn", f"לא נוצרו כתוביות לקריינות ({e.code}); הקריינות עצמה נכנסה למיקס"))
@@ -558,12 +663,23 @@ def produce(j, video, smap, sp, sha_before, tg, tspec, zone_used):
     rows += [from_rec("G1", "graphics", "הכותרת נמצאת בסרטון, באזור הבטוח ולא על הפנים", "graphics_rendered"),
              from_rec("A1", "sound", "עוצמת הקול הכוללת ביעד", "loudness"), from_rec("A2", "sound", "אין עיוות מקטימה במיקס", "mix_clipping"),
              from_rec("A4", "sound", "בזמן דיבור המוזיקה נמוכה ממנו ב-10 dB לפחות", "mix_speech_over_music"),
+             from_rec("A5", "sound", "כשנבחרה מוזיקה: היא בקובץ הסופי ונשמעת", "mix_music_audible"),
+             from_rec("S4", "structure", "הלקט משתמש במספר קובצי המקור שנדרש", "sources_diversity"),
+             from_rec("M8", "message", "החומר שהועלה מתאים למה שהתבקש", "material_fit"),
              _row("A3", "sound", "המיקס נשמע טוב ומתאים לתוכן", "not_checked", "human", "דורש האזנה שלך"),
              (_row("K1", "captions", "כתוביות הקריינות בתוך הפריים ובאזור הבטוח", "met" if all((rec_by.get(i) or {}).get("status") in ("pass", "warn") for i in ("caption_width", "safe_zone")) else "not_met",
                    "measured", f"{len(cards)} כתוביות מתמלול אוטומטי של הקריינות") if cards else _row("K1", "captions", "כתוביות", "na", "measured", "אין קריינות, ולכן אין כתוביות בגרסה הזו")),
              (_row("K2", "captions", "הכתוביות תואמות את מה שנאמר בקריינות", "not_checked", "human", "נוצרו מתמלול אוטומטי ולא אומתו; דורש קריאה והאזנה שלך") if cards
               else _row("K2", "captions", "הכתוביות תואמות את הקריינות", "na", "measured", "אין כתוביות"))]
-    dana_review = {"rubric_version": RUBRIC, "kind": "montage", "categories": _categories(rows), "improvements": [],
+    for r in rows:
+        r.setdefault("time_s", None)
+    imps = review.improvements([dict(r, status="met") if r["id"] in ("S4", "M8") else r for r in rows], {"findings": [], "kind": "montage"})
+    for i in imps:                                # in a compilation a content miss is fixed by planning the cut again, with the same material
+        if i.get("criterion_id") in ("M1", "M2", "M3", "M4", "M6", "M7"):
+            i.update(can_apply=True, how="תכנון הלקט מחדש עם ההערה הזו", correction="תכנון הלקט מחדש עם ההערה הזו")
+        elif i.get("criterion_id") == "A5":
+            i.update(can_apply=True, how="העלאת המוזיקה והפקת מיקס חדש בלי לשנות את התמונה", correction="העלאת המוזיקה והפקת מיקס חדש בלי לשנות את התמונה")
+    dana_review = {"rubric_version": RUBRIC, "kind": "montage", "categories": _categories(rows), "improvements": imps,
                    "legend": {"basis": review.BASIS_HE, "levels": [n for _, n in review.LEVELS] + ["לא נבדק"]},
                    "note": "הדירוג סופר כמה מהקריטריונים שנבדקו מתקיימים. קריטריון שלא נבדק מסומן כך ואינו נספר. הדירוג אינו אישור לפרסום.",
                    "perception": "מדידות על הקובץ; הערכת מודל על פריים אחד לכל קטע — המודל לא צפה בתנועה ולא שמע את האודיו."}
@@ -583,7 +699,14 @@ def produce(j, video, smap, sp, sha_before, tg, tspec, zone_used):
     provenance = {"reviewed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "final_sha256": final_sha, "reviewed_sha256": final_sha, "on_delivered_file": True, "review_rounds": 1,
                   "delivered_round": 0, "model_review_ran": reviewed, "basis": "הבדיקות נמדדו על הקובץ הסופי. הערכת המודל נעשתה על פריים אחד לכל קטע מאותו קובץ — לא צפייה בתנועה ולא האזנה."}
     prev_review = options.get("previous_review") if isinstance(options.get("previous_review"), dict) else None
-    final_review = review.final(dana_review, None, provenance, review_items, records, prev_review, tg, None)
+    extra = [{"rank": 0, "blocks": True, "title": i["message"][:220], "why": "", "action": "להעלות חומר מתאים, או לשנות את הדרישה ולתכנן מחדש", "time_s": None, "who": "owner",
+              "category": "חומר", "basis": "measured" if i["code"] == "sources_requirement_not_met" else "model", "id": "i:" + i["code"]}
+             for i in issues if i["code"] in ("sources_requirement_not_met", "material_not_suitable")]
+    final_review = review.final(dana_review, None, provenance, review_items, records, prev_review, tg, None, extra_improvements=extra,
+                                note=("בדיקת תשתית על חומר הדגמה — לא לקט אימונים שהושלם." if brief["demo"] else None))
+    final_review["skills"].append({"name": "dana-montage", "version": RUBRIC, "role": "כללי הלקט הבסיסיים"})
+    final_review["direction"] = {"text": plan_meta.get("direction") or "", "source": "owner_brief" if (brief["goal"] or brief["reference"]) else "dana_proposal",
+                                 "label": "לפי המטרה / הרפרנס שהגדרת" if (brief["goal"] or brief["reference"]) else "הצעה של דנה — לא סגנון שאישרת"}
     final_review["limits"] = ["המודל ראה פריים אחד לכל קטע: הוא לא צפה בתנועה ולא שמע דבר", "דנה אינה מזהה תרגילים ואינה שופטת איכות ביצוע",
                               "איש לא האזין למיקס", "הדירוג אינו אישור פרסום", "כל שינוי בסרטון הופך את הביקורת הזו ללא עדכנית"]
 
@@ -598,7 +721,8 @@ def produce(j, video, smap, sp, sha_before, tg, tspec, zone_used):
                           for s in segs],
                 "events": [{"t0": g["tl_start_s"], "t1": g["tl_end_s"], "kind": g["kind"], "label": f"{g['label']}: {g['text']}", "layer": "over_picture", "skill": "דנה", "why": g["reason"]} for g in graphics]}
     outputs = [{"name": "final.mp4", "what": "הלקט", "seconds": dur}]
-    for name, payload in (("captions.json", [{k: c[k] for k in ("i", "start", "dur", "plain")} for c in cards]), ("transcript_source.json", {"words": [], "note": "לקט: לא בוצע תמלול"}), ("transcript_final.json", {"words": [], "note": "לקט: לא בוצע תמלול"})):
+    for name, payload in (("captions.json", [{k: c[k] for k in ("i", "start", "dur", "plain")} for c in cards]), ("transcript_source.json", {"words": [], "note": "לקט: לא בוצע תמלול של המקורות"}),
+                          ("transcript_final.json", {"words": nar_words, "of": "narration", "note": "תמלול אוטומטי של הקריינות שהועלתה, עם התיקונים שלך" if nar_words else "לקט: לא בוצע תמלול"})):
         write_json(j.out / name, payload)
     write_json(j.out / "checks.json", {"pipeline_version": PIPELINE_VERSION, "records": records})
     ed = {"status": "ready_for_owner_review" if not failed else "stopped_with_issues", "stop_reason": "montage_single_pass", "revisions": 0, "cycles": [], "delivered_cycle": 0,
@@ -614,13 +738,18 @@ def produce(j, video, smap, sp, sha_before, tg, tspec, zone_used):
         "segment": {"in_s": segs[0]["source_in_s"], "out_s": segs[-1]["source_out_s"]}, "duration": dur, "adapter": "claude" if judgement_mode == "model" else "heuristic",
         "judgement_usage": {"calls": usages, "cost_usd_reported": cost},
         "plan": {"kind": "montage", "message": plan_meta["message"], "hook": plan_meta["opening_why"], "rationale": plan_meta["sequence_why"], "opening_why": plan_meta["opening_why"], "title": plan_meta["title"],
+                 "direction": plan_meta.get("direction") or "", "closing_why": plan_meta.get("closing_why") or "", "material_fit": plan_meta.get("material_fit"),
+                 "direction_source": "owner_brief" if (brief["goal"] or brief["reference"]) else "dana_proposal", "owner_brief": brief, "owner_request": asked[:1500] or None,
                  "content_judgement": "model" if judgement_mode == "model" else "none", "segments": [{k: v for k, v in s.items() if k not in ("window_out_s", "candidate", "n_prev")} for s in segs],
                  "brief": [], "model_error": model_error, "candidates_considered": len(cands),
                  "basis": "מדידת תנועה, חדות ובהירות בכל המקורות, ופריים אחד לכל רגע מועמד. המודל לא צפה בתנועה ולא שמע את האודיו; הוא אינו מזהה תרגילים ואינו שופט איכות ביצוע."},
         "montage": {"candidates": [{k: c[k] for k in ("n", "name", "in_s", "out_s", "movement", "sharpness", "must")} for c in cands], "limits_s": [lo, hi], "notes": notes, "unused_sources": unused, "doubts": plan_meta["doubts"]},
         "zooms": [], "graphics": [{k: v for k, v in g.items() if k != "frames"} for g in graphics], "graphics_dropped": graphics_dropped, "spoken_text": " ".join(w["word"] for w in nar_words),
-        "cards": [{"i": c["i"], "text": c["plain"], "lines": [c["plain"]], "highlight": [], "start": c["start"], "dur": c["dur"], "source_start_s": c["start"], "source_end_s": round(c["start"] + c["dur"], 3),
-                   "of": "narration"} for c in cards],
+        # the "source" of a narration caption is the NARRATION FILE: its times do not move when the narration is placed elsewhere in the video
+        "cards": [{"i": c["i"], "text": c["plain"], "lines": [c["plain"]], "highlight": [], "start": c["start"], "dur": c["dur"],
+                   "source_start_s": round(max(0.0, c["first_word_audio_s"] - nar_off - 0.01), 3), "source_end_s": round(c["last_word_end_audio_s"] - nar_off + 0.01, 3),
+                   "of": "narration", "owner_corrected": any(a["source_start_s"] < c["last_word_end_audio_s"] - nar_off and a["source_end_s"] > c["first_word_audio_s"] - nar_off for a in nar_applied)} for c in cards],
+        "transcript": {"status": "owner_corrected_partial" if nar_applied else "automatic_unverified", "of": "narration", "corrections_applied": nar_applied} if cards else None,
         "adjustments": {"color": {"enabled": False, "applied": False, "note": "תיקון צבע לא מופעל בלקט בגרסה הזו"}, "audio_cleanup": {"enabled": False, "applied": False},
                         "zooms": {"enabled": False, "count": 0}, "caption_animation": {"enabled": False, "applied": "none"},
                         "graphics": {"enabled": True, "applied": bool(graphics), "count": len(graphics), "engine": "HyperFrames"}, "animation": {"enabled": False, "allowed": False, "applied": False, "count": 0}},
@@ -634,6 +763,27 @@ def produce(j, video, smap, sp, sha_before, tg, tspec, zone_used):
         "tools": {"ffmpeg": tool(cfg, "ffmpeg"), "motion_graphics": "HyperFrames"}, "timings_s": j.timings, "total_s": round(time.time() - j.t0, 1)}
     write_json(j.out / "package.json", package)
     return package["status"], package
+
+
+def owner_units(words):
+    """Words -> (cards of one unit each, their word spans) for captions.regroup. A stretch the owner corrected stays one unit
+    with exactly the owner's words (marked so that it is never split or joined); every other word is its own unit."""
+    one, spans, k = [], [], 0
+    while k < len(words):
+        w = words[k]
+        if w.get("owner"):
+            e = k
+            while e + 1 < len(words) and words[e + 1].get("owner") and words[e + 1].get("owner_edit") == w.get("owner_edit"):
+                e += 1
+            grp = [dict(x, synthetic=True) for x in words[k:e + 1]]
+            one.append({"text": " ".join(judgement.BIDI.sub("", x["word"]).strip() for x in grp), "highlight": []})
+            spans.append(grp)
+            k = e + 1
+        else:
+            one.append({"text": judgement.BIDI.sub("", w["word"]).strip(), "highlight": []})
+            spans.append([w])
+            k += 1
+    return one, spans
 
 
 def mixer_probe(cfg, path):

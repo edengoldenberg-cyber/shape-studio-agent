@@ -19,6 +19,31 @@ import numpy as np
 from .core import PipelineError, run, tool
 
 SC = {"threshold": 0.05, "ratio": 4.0, "attack": 15, "release": 350}       # side-chain defaults; overridden by cfg["audio"]["sidechain"]
+# The level of the music is set AGAINST THE SPEECH, not as a gain on the file: "volume_db" = how far under the speech the
+# music sits while somebody speaks. Tracks differ by 20 dB and more in how loud they were mastered, so a fixed gain put
+# the music 23-30 dB under the speech (owner, 2026-11-16: "I heard no music in any video").
+MUSIC_UNDER_SPEECH = {"default": -14.0, "loudest": -6.0, "quietest": -20.0}
+MUSIC_INAUDIBLE_DB = 22.0          # music further than this under the speech is reported as probably not heard
+_GAIN = "@@MUSIC_GAIN@@"
+
+
+def music_under_speech(music):
+    """The owner's setting, inside the range in which music is neither covering the speech nor lost under it."""
+    v = float((music or {}).get("volume_db", MUSIC_UNDER_SPEECH["default"]))
+    return max(MUSIC_UNDER_SPEECH["quietest"], min(MUSIC_UNDER_SPEECH["loudest"], v))
+
+
+def speech_gaps(speech_spans, dur):
+    """-> (spans with speech, gaps between them): where the music is measured under the speech and free of it."""
+    spans = [(a, b) for a, b in speech_spans or [] if b - a >= 0.15]
+    gaps, t = [], 0.0
+    for a, b in sorted(spans):
+        if a - t >= 0.6:
+            gaps.append((t + 0.2, a - 0.2))
+        t = max(t, b)
+    if dur - t >= 0.6:
+        gaps.append((t + 0.2, dur - 0.2))
+    return spans, gaps
 
 
 def _db(x):
@@ -94,7 +119,7 @@ def mix(cfg, video_in, out, audio, dur, speech_spans, mute_spans=(), work=None):
     if music:
         inputs += ["-ss", f"{float(music.get('start_s', 0)):.3f}", "-i", str(music["path"])]
         fo = max(0.0, dur - float(music.get("fade_out_s", 1.5)))
-        chains.append(f"[{n}:a]aresample=48000,aformat=channel_layouts=stereo,atrim=0:{dur:.3f},apad,atrim=0:{dur:.3f},volume={10 ** (float(music.get('volume_db', -18)) / 20):.4f},"
+        chains.append(f"[{n}:a]aresample=48000,aformat=channel_layouts=stereo,atrim=0:{dur:.3f},apad,atrim=0:{dur:.3f},volume={_GAIN},"
                       f"afade=t=in:st=0:d={float(music.get('fade_in_s', 0.5)):.3f},afade=t=out:st={fo:.3f}:d={float(music.get('fade_out_s', 1.5)):.3f}[mus]")
         if music.get("duck", True):
             chains.append("[speech]asplit=2[sp1][sp2]")
@@ -108,6 +133,23 @@ def mix(cfg, video_in, out, audio, dur, speech_spans, mute_spans=(), work=None):
     else:
         chains.append("[speech]anull[pre]")
     graph = ";".join(chains)
+    spans, gaps = speech_gaps(speech_spans, dur)
+    stem, sp_stem = work / "mix_music_stem.wav", work / "mix_speech_stem.wav"
+    gain_db, level_mode, want = MUSIC_UNDER_SPEECH["default"], "no_music", None
+    if music:
+        # pass 0: the stems at a trial gain. Where the music really sits under the speech is MEASURED, and the gain is moved by
+        # the difference (the ducking depends on the speech, not on the music, so the shift carries over one to one).
+        want, level_mode = music_under_speech(music), "no_speech_to_measure_against"
+        run([ff, "-y", "-v", "error", *inputs, "-filter_complex", graph.replace(_GAIN, f"{10 ** (gain_db / 20):.5f}"), "-map", "[pre]", "-f", "null", "-",
+             "-map", "[spstem]", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-t", f"{dur:.3f}", str(sp_stem),
+             "-map", "[mstem]", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-t", f"{dur:.3f}", str(stem)], "mix_failed", timeout=900)
+        m0, sr0 = _wav(cfg, stem, work / "mix_stem0_16k.wav")
+        s0 = _rms(_wav(cfg, sp_stem, work / "mix_speech0_16k.wav")[0], sr0, spans) if spans else None
+        u0 = _rms(m0, sr0, spans) if spans else None
+        if s0 is not None and s0 > -70 and u0 is not None and u0 > -110:
+            gain_db = max(-60.0, min(24.0, gain_db + (s0 + want) - u0))
+            level_mode = "relative_to_speech"
+    graph = graph.replace(_GAIN, f"{10 ** (gain_db / 20):.5f}")
     # pass 1: measure the pre-master, pass 2: normalise to the target with the measured values
     target, peak = a_cfg["target_lufs"], a_cfg["target_peak_db"]
     r = run([ff, "-hide_banner", "-nostats", "-y", *inputs, "-filter_complex", graph + f";[pre]loudnorm=I={target}:TP={peak}:LRA=11:print_format=json[o]",
@@ -118,10 +160,8 @@ def mix(cfg, video_in, out, audio, dur, speech_spans, mute_spans=(), work=None):
     meas = json.loads(m.group(0))
     norm = (f"[pre]loudnorm=I={target}:TP={peak}:LRA=11:measured_I={meas['input_i']}:measured_TP={meas['input_tp']}:measured_LRA={meas['input_lra']}:"
             f"measured_thresh={meas['input_thresh']}:offset={meas['target_offset']}:linear=true[o]")
-    stem = work / "mix_music_stem.wav"
     cmd = [ff, "-y", "-v", "error", *inputs, "-filter_complex", graph + ";" + norm, "-map", "0:v", "-map", "[o]", "-c:v", "copy", "-c:a", "aac", "-b:a", cfg["render"]["audio_bitrate"],
            "-ar", "48000", "-movflags", "+faststart", "-t", f"{dur:.3f}", str(out)]
-    sp_stem = work / "mix_speech_stem.wav"
     cmd += ["-map", "[spstem]", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-t", f"{dur:.3f}", str(sp_stem)]
     if music:
         cmd += ["-map", "[mstem]", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-t", f"{dur:.3f}", str(stem)]
@@ -133,21 +173,14 @@ def mix(cfg, video_in, out, audio, dur, speech_spans, mute_spans=(), work=None):
     rec = {"applied": True, "structure": "דיבור → מוזיקה (עוצמה, נקודת התחלה, כניסה ויציאה) → הנמכה מתחת לדיבור (sidechain) → איחוד → נרמול עוצמה",
            "params": {"target_lufs": target, "target_peak_db": peak,
                       "original": {"mode": orig.get("mode", "keep"), "level_db": orig.get("level_db", 0), "muted_spans_s": [[round(a, 2), round(b, 2)] for a, b in mute_spans or []]},
-                      "music": ({k: music.get(k) for k in ("start_s", "volume_db", "fade_in_s", "fade_out_s", "duck")} | {"file": music.get("name"), "sidechain": sc if music.get("duck", True) else None}) if music else None,
+                      "music": ({k: music.get(k) for k in ("start_s", "volume_db", "fade_in_s", "fade_out_s", "duck")} | {"file": music.get("name"), "under_speech_db_asked": want, "level": level_mode,
+                                 "gain_db_applied": round(gain_db, 1), "sidechain": sc if music.get("duck", True) else None}) if music else None,
                       "narration": ({k: nar.get(k) for k in ("start_s", "volume_db")} | {"file": nar.get("name")}) if nar else None},
            "measured": {"pre_master_lufs": float(meas["input_i"]), "pre_master_true_peak_db": float(meas["input_tp"]), "clipped_samples": clipped,
                         "peak_dbfs": round(_db(np.max(np.abs(mixed)) if len(mixed) else 0), 2)},
            "not_checked": "איך המיקס נשמע (איזון, אופי, התאמת המוזיקה לתוכן) — דורש האזנה שלך"}
     if music:
         mus, _ = _wav(cfg, stem, work / "mix_stem_16k.wav")
-        spans = [(a, b) for a, b in speech_spans or [] if b - a >= 0.15]
-        gaps, t = [], 0.0
-        for a, b in sorted(spans):
-            if a - t >= 0.6:
-                gaps.append((t + 0.2, a - 0.2))
-            t = max(t, b)
-        if dur - t >= 0.6:
-            gaps.append((t + 0.2, dur - 0.2))
         under, free = _rms(mus, sr, spans), _rms(mus, sr, gaps)
         sp_level = _rms(_wav(cfg, sp_stem, work / "mix_speech_16k.wav")[0], sr, spans) if spans else None
         if sp_level is not None and sp_level < -70:          # the "speech" spans are silent (original sound muted and no narration there)
@@ -155,7 +188,9 @@ def mix(cfg, video_in, out, audio, dur, speech_spans, mute_spans=(), work=None):
         rec["measured"].update(music_under_speech_db=None if under is None else round(under, 1), music_between_speech_db=None if free is None else round(free, 1),
                                ducking_db=None if under is None or free is None else round(free - under, 1),
                                speech_over_music_db=None if under is None or sp_level is None else round(sp_level - under, 1),
-                               speech_seconds=round(sum(b - a for a, b in spans), 1))
+                               speech_seconds=round(sum(b - a for a, b in spans), 1),
+                               music_level_db=round(_db(np.sqrt(np.mean(mus ** 2))) if len(mus) else -120.0, 1),
+                               music_first_second_db=round(_db(np.sqrt(np.mean(mus[:sr] ** 2))) if len(mus) >= sr else -120.0, 1))
     return rec
 
 
@@ -173,5 +208,15 @@ def checks(cfg, rec, loudness_record):
             out.append(R("mix_speech_over_music", "pass" if s >= 10 else "review",
                          f"בזמן דיבור המוזיקה נמוכה מהדיבור ב-{s} dB" + ("" if s >= 10 else " — פחות מ-10 dB: המוזיקה עלולה להפריע להבנת הדיבור; להאזנה שלך")
                          + (f" · ההנמכה שנמדדה: {m['ducking_db']} dB" if m.get("ducking_db") is not None else "")))
+    if rec["params"]["music"]:
+        s, lvl = m.get("speech_over_music_db"), m.get("music_level_db")
+        if lvl is not None and lvl < -60:
+            out.append(R("mix_music_audible", "fail", f"הרצועה שנבחרה כמעט שקטה בקובץ הסופי ({lvl} dB) — המוזיקה לא נשמעת. לבדוק את הרצועה ואת נקודת ההתחלה שלה"))
+        elif s is not None and s > MUSIC_INAUDIBLE_DB:
+            out.append(R("mix_music_audible", "fail", f"המוזיקה נמוכה מהדיבור ב-{s} dB — כנראה לא נשמעת (מעל {MUSIC_INAUDIBLE_DB:.0f} dB היא נבלעת)"))
+        elif s is not None:
+            out.append(R("mix_music_audible", "pass", f"המוזיקה בקובץ הסופי, {s} dB מתחת לדיבור (התבקש {abs(rec['params']['music'].get('under_speech_db_asked') or 0):.0f}); בין משפטים עוצמתה {m.get('music_between_speech_db')} dB"))
+        else:
+            out.append(R("mix_music_audible", "pass", f"המוזיקה בקובץ הסופי ({lvl} dB לפני הנרמול); אין דיבור למדוד מולו"))
     out.append(R("mix_listen", "human_required", "איך המיקס נשמע — איזון, אופי והתאמה לתוכן — לא נבדק. דורש האזנה שלך"))
     return out

@@ -14,7 +14,7 @@ rating predicts how a video will perform on Instagram.
 Improvements are listed by importance and split into technical defects and creative preferences;
 `can_apply` says whether Dana can make the change herself inside the approved rules.
 """
-RUBRIC_VERSION = "dana-review-2026-11-16.1"
+RUBRIC_VERSION = "dana-review-2026-11-16.2"
 
 CATEGORIES = [("message", "מסר"), ("opening", "פתיחה"), ("structure", "מבנה"), ("pace", "קצב"), ("captions", "כתוביות"),
               ("sync", "סנכרון"), ("framing", "פריימינג"), ("zooms", "זומים"), ("graphics", "גרפיקה"), ("color", "צבע"),
@@ -34,6 +34,7 @@ CRITERIA = [
     ("S4", "structure", "תחילת הסרטון וסופו לא חותכים מילה", ("record", "clip_boundary")),
     ("P1", "pace", "אין חלק שחוזר על עצמו או שאינו משרת את המסר", ("criterion", "A18")),
     ("P2", "pace", "אין שתיקה ארוכה מ-1.2 שניות בתוך הסרטון", ("fact", "longest_pause")),
+    ("P3", "pace", "מילות מילוי (כאילו, כזה, אממ) אינן מכבידות על הדיבור", ("fact", "filler_share")),
     ("K1", "captions", "הכתוביות הן המילים שנאמרו, באותו סדר", ("criterion", "A1")),
     ("K2", "captions", "כל כתובית בתוך הפריים ובתוך האזור הבטוח", ("fact", "caption_geometry")),
     ("K3", "captions", "הכתוביות לא מכסות את הפנים", ("record", "caption_face_overlap")),
@@ -60,6 +61,7 @@ CRITERIA = [
     ("A1", "sound", "עוצמה ביעד (‎-14 LUFS ±0.5) בלי חריגת פיק", ("record", "loudness")),
     ("A2", "sound", "יחס דיבור/רעש רקע מספק", ("fact", "sound_snr")),
     ("A3", "sound", "הקול נשמע טבעי ונקי בהאזנה", ("human",)),
+    ("A4", "sound", "כשנבחרה מוזיקה: היא בקובץ הסופי ונשמעת מתחת לדיבור", ("record", "mix_music_audible")),
     ("V1", "cover", "טקסט הקאבר הוא ציטוט מדויק מהסרטון", ("fact", "cover_quote")),
     ("V2", "cover", "הקאבר מייצג את המסר", ("criterion", "A9")),
     ("V3", "cover", "הקאבר והקפשן לא נוקבים בשם של אדם פרטי", ("criterion", "A14")),
@@ -80,8 +82,32 @@ def _from_record(r):
     return st, "measured", r["summary"]
 
 
+FILLERS = {"כאילו", "כזה", "כזאת", "אממ", "אמ", "אהה", "אה", "כאלה", "בעצם", "נגיד"}
+FILLER_SHARE_MAX = 0.07
+
+
+def filler_share(text):
+    """Filler words in what is said in the video: counted in the caption text, nothing is heard. None for a text with no words."""
+    words = [clean_word(w) for w in str(text or "").split()]
+    words = [w for w in words if w]
+    if len(words) < 8:
+        return None
+    hits = [w for w in words if w in FILLERS]
+    return {"count": len(hits), "words": len(words), "share": round(len(hits) / len(words), 3), "which": sorted(set(hits))}
+
+
+def clean_word(w):
+    return "".join(ch for ch in w if ch.isalpha())
+
+
 def _fact(name, f):
     """Facts measured by the pipeline (f) → (status, basis, note, time_s)."""
+    if name == "filler_share":
+        fs = filler_share(f.get("spoken_text"))
+        if fs is None:
+            return "na", "measured", "אין מספיק דיבור בסרטון למדוד", None
+        return ("met" if fs["share"] <= FILLER_SHARE_MAX else "not_met", "measured",
+                f"{fs['count']} מילות מילוי מתוך {fs['words']} מילים ({fs['share'] * 100:.0f}%)" + (f": {', '.join(fs['which'])}" if fs["which"] else "") + " — נספר בטקסט הכתוביות", None)
     if name == "first_word":
         t = f.get("first_word_s")
         return ("not_checked", "measured", "לא נמדד", None) if t is None else \
@@ -177,6 +203,8 @@ def build(f):
                 st, note = "na", "הסרטון נערך בלי זומים"
             if src[1] == "graphics_rendered" and f.get("graphics") == []:
                 st, note = "na", "הסרטון נערך בלי מואושן גרפיק"
+            if src[1] == "mix_music_audible" and f["records"].get(src[1]) is None:
+                st, note = "na", "לא נבחרה מוזיקה לסרטון הזה"
             if src[1] in ("caption_face_overlap", "sync_lead", "sync_not_found", "sync_tail", "cards_in_motion") and f.get("captions_added") is False:
                 st, note = "na", f.get("captions_note") or "הכתוביות צרובות במקור — אין שכבת כתוביות של דנה למדוד"
             rows.append(_row(cid, cat, text, st, basis, note))
@@ -251,7 +279,71 @@ APPLY = {
     "K2": (True, "חלוקה מחדש של הכתובית או שתי שורות"), "K3": (True, "הזזת הכתוביות מהפנים"), "K4": (True, "איחוד כרטיסים קצרים"),
     "Y1": (True, "יישור הכתוביות למילים באודיו הסופי"), "Y3": (True, "הארכת הכתובית עד סוף המילה"), "Z1": (True, "הקטנת הזום או ביטולו"),
     "G1": (True, "הזזת הגרפיקה או הסרתה"), "O3": (True, "קיצור השקט בתחילת הסרטון"), "P2": (False, "קיצור שתיקה משנה את החיתוך — דורש אישור שלך"),
+    "A4": (True, "העלאת המוזיקה ביחס לדיבור שנמדד, והפקת מיקס חדש בלי לשנות את התמונה"),
+    "M1": (True, "תכנון החיתוך מחדש סביב מסר אחד"), "M2": (True, "תכנון החיתוך מחדש כך שהסרטון יובן בלי שאר ההקלטה"),
+    "O1": (True, "פתיחה בתחילת משפט"), "O2": (True, "תכנון החיתוך מחדש: פתיחה במשפט החזק ביותר שיש בחומר"),
+    "S4": (True, "תכנון קצוות הסרטון מחדש, כך שלא ייחתכו באמצע מילה"),
+    "S1": (True, "סיום במשפט שסוגר את המסר"), "S2": (True, "סידור החלקים מחדש: פתיחה, גוף וסיום"),
+    "P1": (True, "הוצאת חזרות וחלקים שאינם משרתים את המסר"), "P3": (True, "תכנון החיתוך מחדש: העדפת משפטים עם פחות מילות מילוי"),
 }
+REPLAN = {"M1", "M2", "O1", "O2", "S1", "S2", "S4", "P1", "P3"}          # applied by planning the cut again (the owner's rules and the transcript stay in force)
+CONTENT_FIRST = {"message", "opening", "structure", "pace"}
+# a failed check in the owner's words: (what is wrong, what to do about it, who can do it)
+PLAIN = {
+    "sync_lead": ("יש כתוביות שאולי לא מופיעות בדיוק עם המילה", "להאזין לקטעים המסומנים ולהכריע; אם כתובית באמת מאחרת, דנה תיישר אותה", "owner"),
+    "sync_not_found": ("יש כתובית למילה שלא זוהתה בקובץ הסופי", "להאזין ולהחליט אם המילה נאמרה", "owner"),
+    "sync_tail": ("כתובית נעלמת לפני שהמילה מסתיימת", "דנה תאריך את הכתובית עד סוף המילה", "dana"),
+    "energy_gate": ("יש בכתוביות מילים שאולי לא נאמרו", "להאזין למילים המסומנות, ולאשר או לתקן אותן במסך התמלול", "owner"),
+    "caption_text": ("הכתוביות שונות ממה שזוהה בקובץ הסופי", "להאזין לקטע ולתקן את המלל במסך התמלול", "owner"),
+    "safe_zone": ("כתובית יוצאת מהאזור הבטוח", "דנה תחלק את הכתובית מחדש", "dana"),
+    "caption_width": ("כתובית נחתכת בקצה הפריים", "דנה תחלק את הכתובית מחדש", "dana"),
+    "caption_face_overlap": ("כתובית מכסה פנים", "דנה תזיז את הכתוביות", "dana"),
+    "mix_music_audible": ("המוזיקה כנראה לא נשמעת", "דנה תעלה את המוזיקה ביחס לדיבור ותפיק מיקס חדש", "dana"),
+    "mix_speech_over_music": ("המוזיקה קרובה מדי לדיבור", "להאזין ולהחליט; אפשר להנמיך אותה במסך המיקס", "owner"),
+    "mix_clipping": ("יש עיוות במיקס", "דנה תפיק מיקס חדש בעוצמה נמוכה יותר", "dana"),
+    "loudness": ("העוצמה הכוללת אינה ביעד", "דנה תנרמל את העוצמה", "dana"),
+    "output_file": ("קובץ הווידאו אינו בפורמט הנדרש", "דנה תפיק את הקובץ מחדש", "dana"),
+    "sources_diversity": ("הלקט לא משתמש במספר המקורות שדרשת", "להעלות חומר מתאים נוסף או לשנות את הדרישה", "owner"),
+    "material_fit": ("החומר שהועלה אינו מתאים למטרה שהוגדרה", "להעלות חומר מתאים; עד אז זה אינו הלקט שביקשת", "owner"),
+    "marks_must": ("קטע שסימנת כחובה אינו בסרטון", "להחזיר את הקטע או להסיר את הסימון", "owner"),
+    "marks_never": ("נעשה שימוש בקטע שסימנת כאסור", "דנה תפיק גרסה בלי הקטע", "dana"),
+}
+WHO = {"dana": "דנה יכולה ליישם בעצמה", "owner": "דורש אותך"}
+
+
+def top_improvements(dana_review, records, broken, owner_resolved=(), extra=(), limit=3):
+    """The most important things to improve, in the owner's words: what, why (the evidence), where in the video, what to do
+    and who can do it. Built only from what was measured or assessed - nothing is added here. -> (the first `limit`, all)."""
+    labels = {c["key"]: c["label"] for c in dana_review["categories"]}
+    crit_of = {src[1]: cid for cid, _, _, src in CRITERIA if src[0] == "record"}
+    out = [{"rank": 0, "title": f"כלל מחייב של הסקיל לא יושם: {b['text']}"[:200], "why": str(b.get("evidence") or "")[:300], "action": "לתקן לפי הכלל, או לשנות את הכלל בסקיל",
+            "time_s": None, "who": "owner", "category": "כללי הסקיל", "basis": "measured", "id": "rule"} for b in broken or []]
+    out += [dict(x, rank=x.get("rank", 1)) for x in extra or []]
+    covered = set()
+    for i in dana_review.get("improvements") or []:
+        cid = i.get("criterion_id")
+        covered.add(cid)
+        content = i.get("category") in CONTENT_FIRST
+        t = i.get("time_s")
+        if t is None and i.get("category") == "opening":
+            t = 0.0
+        out.append({"rank": 1 if content and cid else 2 if i.get("can_apply") else 3 if i.get("importance", 3) <= 2 else 4,
+                    "title": str(i.get("problem") or "").replace(" — לא מתקיים", "")[:220], "why": str(i.get("evidence") or "")[:320],
+                    "action": str(i.get("correction") or i.get("how") or "")[:320], "time_s": t, "who": "dana" if i.get("can_apply") else "owner",
+                    "category": labels.get(i.get("category"), i.get("category")), "basis": "measured" if i.get("kind") == "technical_defect" else "model",
+                    "id": i.get("id"), "replan": cid in REPLAN})
+    for r in records or []:
+        if r["status"] not in ("fail", "review") or r["id"] in (owner_resolved or ()) or crit_of.get(r["id"]) in covered or r["id"] not in PLAIN:
+            continue
+        what, action, who = PLAIN[r["id"]]
+        out.append({"rank": 2 if who == "dana" else 3, "title": what, "why": str(r.get("summary") or "")[:320], "action": action, "time_s": None, "who": who,
+                    "category": "בדיקה אוטומטית", "basis": "measured", "id": "r:" + r["id"]})
+    out.sort(key=lambda x: x["rank"])
+    for x in out:
+        x["who_label"] = WHO[x["who"]]
+        x["basis_label"] = BASIS_HE.get(x["basis"], x["basis"])
+    return out[:limit], out
+
 BURNED_LOCKED = {"K2", "K3", "K4", "K5", "K6", "Y1", "Y2", "Y3", "Y4"}
 
 
@@ -268,7 +360,7 @@ def compare(prev, cur):
 REVIEW_SKILL = {"name": "dana-review", "version": RUBRIC_VERSION, "what": "הקריטריונים הקבועים של הביקורת (12 קטגוריות)"}
 
 
-def final(dana_review, skill_report, provenance, review_items, records, previous, target, base_skill, owner_resolved=None):
+def final(dana_review, skill_report, provenance, review_items, records, previous, target, base_skill, owner_resolved=None, extra_improvements=None, note=None):
     """Built AFTER the last correction round, from what was measured and assessed on the delivered file.
 
     It never adds a judgement of its own: it gathers the category review, the compliance with the skills that were
@@ -289,7 +381,7 @@ def final(dana_review, skill_report, provenance, review_items, records, previous
     failed = [r for r in records if r["status"] in ("fail", "review") and r["id"] not in (owner_resolved or [])]
     review_items = [i for i in review_items or [] if not i.get("owner_decision")]
     imps = dana_review.get("improvements") or []
-    fixable = [i for i in imps if i.get("can_apply") and i.get("importance") == 1]
+    fixable = [i for i in imps if i.get("can_apply") and (i.get("importance") == 1 or i.get("criterion_id") in REPLAN)]
     sk = (skill_report or {}).get("summary")
     broken = (skill_report or {}).get("mandatory_violations") or []          # measured, not assessed
     if failed or fixable or broken:
@@ -300,7 +392,7 @@ def final(dana_review, skill_report, provenance, review_items, records, previous
         verdict, vtext = "ready_for_viewing", "מוכן לצפייה שלך"
     reasons = ([f"כלל מחייב של הסקיל הופר (נמדד): {b['text']} — {b['evidence']}"[:260] for b in broken[:4]]
                + [f"בדיקה אוטומטית נכשלה: {r['id']} — {r['summary']}"[:260] for r in failed[:6]]
-               + [f"שיפור טכני שדנה עוד יכולה ליישם: {i['problem']}"[:260] for i in fixable[:4]]
+               + [f"שיפור שדנה עוד יכולה ליישם: {i['problem']}"[:260] for i in fixable[:4]]
                + ([f"{len(review_items)} פריטים פתוחים שדורשים צפייה או האזנה שלך"] if review_items else [])
                + ([f"{len(settled)} בדיקות שנכשלו במדידה הוכרעו בהאזנה שלך בגרסה קודמת: {', '.join(r['id'] for r in settled)}"] if settled else []))
     if sk and not sk["fully_applied"]:
@@ -313,6 +405,16 @@ def final(dana_review, skill_report, provenance, review_items, records, previous
               for x in (skill_report or {}).get("rules") or [] if x["status"] == "not_followed"]
     unchecked = [{"criterion": r["criterion"], "why": "דורש צפייה או האזנה שלך" if r["basis"] == "human" else r["note"]} for r in rows if r["status"] == "not_checked"]
     unchecked += [{"criterion": x["text"], "why": x["note"], "skill": x.get("skill")} for x in (skill_report or {}).get("rules") or [] if x["status"] == "not_checked"]
+    top, every = top_improvements(dana_review, records, broken, owner_resolved or (), extra_improvements or ())
+    if extra_improvements and verdict != "needs_fix" and any(x.get("blocks") for x in extra_improvements):
+        verdict, vtext = "needs_fix", "נדרש תיקון נוסף לפני צפייה"
+        reasons = [x["title"] for x in extra_improvements if x.get("blocks")] + reasons
+    weak_cats = [c for c in dana_review["categories"] if c["decided"] and c["met"] < c["decided"]]
+    plain = {"status": {"needs_fix": "נדרש תיקון", "needs_owner": "נדרשת החלטה שלך", "ready_for_viewing": "מוכן לצפייה"}[verdict],
+             "works": "מה עובד: " + (", ".join(c["label"] for c in dana_review["categories"] if c["decided"] and c["met"] == c["decided"]) or "אין קטגוריה שכל הקריטריונים שנבדקו בה מתקיימים") + ".",
+             "weak": ("מה עדיין חלש: " + "; ".join(f"{c['label']} ({c['met']} מתוך {c['decided']})" for c in weak_cats) + ".") if weak_cats else "בקריטריונים שנבדקו לא נמצא דבר חלש.",
+             "not_checked": f"{coverage['not_checked']} קריטריונים לא נבדקו, מהם {len(coverage['human_only'])} שרק צפייה או האזנה שלך יכולה להכריע.",
+             "can_apply": sum(1 for x in every if x["who"] == "dana"), "needs_owner": sum(1 for x in every if x["who"] == "owner"), "note": note}
     skills = [dict(REVIEW_SKILL, role="סקיל הביקורת")]
     if base_skill:
         skills.append({"name": base_skill.get("name"), "version": base_skill.get("version"), "role": "כללי העריכה הבסיסיים"})
@@ -327,6 +429,7 @@ def final(dana_review, skill_report, provenance, review_items, records, previous
             "coverage": coverage, "summary": f"{coverage['met']} מתוך {coverage['decided']} קריטריונים שנבדקו מתקיימים; {coverage['not_checked']} לא נבדקו"
                                               + (f"; מכללי הסקילים יושמו {sk['applied']} מתוך {sk['applied'] + sk['not_followed'] + sk['not_applicable'] + sk['not_checked']} שנתמכים" if sk else ""),
             "worked": worked, "needs_improvement": needs, "not_checked": unchecked, "verdict": verdict, "verdict_text": vtext, "verdict_reasons": reasons,
+            "plain": plain, "top_improvements": top, "improvements_total": len(every),
             "verdict_basis": "נקבע לפי בדיקות אוטומטיות שנכשלו ופריטים פתוחים — לא לפי הדירוג לבדו.",
             "mandatory_violations": broken, "settled_by_owner": [r["id"] for r in settled],
             "changes": changes(previous, dana_review),

@@ -233,6 +233,18 @@ THE PLAN
    - parts must not overlap; "left_out" lists what was dropped and why;
    - total length inside the limits given.
    "role" is hook / body / close. "why" is one short Hebrew sentence per part.
+   SHARPEN - this is an edit, not a transcript. Read the WHOLE transcript before choosing:
+   - ONE message. A part that is true but about something else is left out and listed in "left_out";
+   - open with a line that already says something concrete (a feeling, a change, a fact of the speaker's own
+     experience). The strongest opening is often not at the start of the recording. Leave out greetings,
+     "okay so", a repeated question and warming up;
+   - leave out repetition (the same point said twice: keep the clearer telling), an introduction that only
+     announces what will be said, filler at the start or the end of a part, and a sentence that trails off;
+   - a pause of a second or more is a place to cut: do not carry it inside a part when the words around it
+     can stand without it;
+   - the order must be understood: what the place or the problem is, what changed, what it means to the speaker;
+   - close on a sentence that completes the message - not in the middle of a list and not on a filler;
+   - short and clear is better than long and complete, inside the length limits. Do not pad to reach the maximum.
 3. "hook": the exact opening words as they are spoken in the first part (copy them from the transcript).
 4. "rationale": two or three Hebrew sentences: why this message, why this opening, what was left out.
 5. "brief": up to 8 short, checkable instructions for the edit (opening, emphasis words, cover, caption limits).
@@ -326,7 +338,19 @@ def validate_story(raw, words, duration, cfg, profile, exclude=None, target="ree
         # cuts sit in the gap between words: a little before the first word, a little after the last
         # (when speech is continuous there is no gap: the cut then sits exactly on the word boundary)
         in_s = round(min(words[i0]["start"], max(prev_end + 0.01 if i0 else 0.0, words[i0]["start"] - 0.12)), 3)
-        out_s = round(max(words[i1]["end"], min(next_start - 0.02 if i1 + 1 < len(words) else duration, words[i1]["end"] + 0.22)), 3)
+        room = next_start - 0.02 if i1 + 1 < len(words) else duration
+        if i1 + 1 < len(words) and next_start - words[i1]["end"] < 0.05:
+            # The stamps touch, but a stamp that is far too long for its word holds a pause at its start (Whisper gives the
+            # silence to the next word). The last word's own tail lies there: the cut moves a little into that pause, never
+            # further than the pause can hold. Without this the part ended ON the stamp and clipped the word (2026-11-16: "ביחד").
+            nw = words[i1 + 1]
+            slack = (nw["end"] - nw["start"]) - (0.10 + 0.09 * len(judgement.BIDI.sub("", nw["word"]).strip(" ,.?!")))
+            if slack > 0.15:
+                room = words[i1]["end"] + min(0.16, slack - 0.05)
+        out_s = round(max(words[i1]["end"], min(room, words[i1]["end"] + 0.22)), 3)
+        keep = s.get("_keep")                    # a locked revision: the edges of the version being revised, exactly as they were
+        if keep and abs(keep[0] - in_s) <= 0.3 and abs(keep[1] - out_s) <= 0.3:
+            in_s, out_s = round(float(keep[0]), 3), round(float(keep[1]), 3)
         if out_s - in_s < 1.0:
             raise PipelineError("story_invalid", f"segment {n} is shorter than one second")
         segs.append({"n": n, "source_in_s": in_s, "source_out_s": out_s, "i0": i0, "i1": i1,
@@ -690,7 +714,7 @@ def plan_from_previous(prev, words, cfg, profile, target="reel"):
     pp = prev.get("plan") or {}
     if pp.get("content_judgement") != "model" or not pp.get("segments"):
         raise PipelineError("story_invalid", "the previous version has no model plan to keep")
-    raw = {"segments": [{"in_s": s["source_in_s"] + 0.13, "out_s": s["source_out_s"] - 0.23, "role": s.get("role"), "why": s.get("why")}
+    raw = {"segments": [{"in_s": s["source_in_s"] + 0.13, "out_s": s["source_out_s"] - 0.23, "role": s.get("role"), "why": s.get("why"), "_keep": (s["source_in_s"], s["source_out_s"])}
                         for s in pp["segments"]], "zooms": [], "cover": {}, "transcript_doubts": []}
     pl = validate_story(raw, words, max(w["end"] for w in words) + 1.0, cfg, profile, target=target)
     for a, b in zip(pl["segments"], pp["segments"]):
@@ -794,3 +818,71 @@ def polish_plan(words, duration, burned):
             "graphics": [], "graphics_dropped": [], "cover": {"quote": "", "quote_is_exact": False, "tl_s": None, "why": ""}, "doubts": [],
             "burned_in_text": {"present": bool(burned), "examples": [], "basis": "לפי הביקורת של הסרטון שהועלה"}, "revision_note": "",
             "content_judgement": "owner_edit"}
+
+
+def plan_diff(prev_plan, plan, words, tol=0.35):
+    """What changed in the CUT between the previous version and this one, in the source's own time and words.
+
+    Measured from the two plans, nothing is judged: which stretches of the recording were taken out, which came in, whether
+    the opening is another sentence, whether the order changed, and the two lengths. The reasons are the planner's own
+    ("why" of a part, "left_out"). None when the two plans cannot be compared."""
+    def segs(p):
+        out = []
+        for s in (p or {}).get("segments") or []:
+            if s.get("source_in_s") is None or s.get("source_out_s") is None:
+                return []
+            out.append((float(s["source_in_s"]), float(s["source_out_s"]), s))
+        return out
+
+    a, b = segs(prev_plan), segs(plan)
+    if not a or not b:
+        return None
+
+    def text(t0, t1):
+        return " ".join(judgement.BIDI.sub("", w["word"]).strip() for w in words if t0 - 0.05 <= (w["start"] + w["end"]) / 2 <= t1 + 0.05)
+
+    def minus(xs, ys):
+        """The stretches of xs that no part of ys covers."""
+        out = []
+        for x0, x1, s in xs:
+            cur = [(x0, x1)]
+            for y0, y1, _ in ys:
+                cur = [p for c0, c1 in cur for p in ((c0, min(c1, y0)), (max(c0, y1), c1)) if p[1] - p[0] > tol]
+            out += [(c0, c1, s) for c0, c1 in cur]
+        return out
+
+    def why_out(t0, t1):
+        for x in (plan or {}).get("left_out") or []:
+            try:
+                if float(x.get("source_in_s", x.get("in_s"))) < t1 and float(x.get("source_out_s", x.get("out_s"))) > t0:
+                    return str(x.get("why") or "")
+            except (KeyError, TypeError, ValueError):
+                continue
+        return ""
+
+    removed = [{"in_s": round(t0, 2), "out_s": round(t1, 2), "seconds": round(t1 - t0, 1), "text": text(t0, t1), "why": why_out(t0, t1)} for t0, t1, _ in minus(a, b)]
+    added = [{"in_s": round(t0, 2), "out_s": round(t1, 2), "seconds": round(t1 - t0, 1), "text": text(t0, t1), "why": str(s.get("why") or "")} for t0, t1, s in minus(b, a)]
+    removed, added = [x for x in removed if x["text"]], [x for x in added if x["text"]]
+    # the order of what both versions keep: a part that plays earlier or later than it did
+    kept = lambda xs, ys: [x for x in xs if any(x[0] < y[1] - tol and x[1] > y[0] + tol for y in ys)]
+    ka, kb = kept(a, b), kept(b, a)
+    rank = lambda xs: [sorted(xs, key=lambda x: x[0]).index(x) for x in xs]
+    moved = []
+    if len(ka) == len(kb) and rank(ka) != rank(kb):
+        for pos, x in enumerate(kb):
+            was = next((i for i, y in enumerate(ka) if x[0] < y[1] - tol and x[1] > y[0] + tol), None)
+            if was is not None and was != pos:
+                moved.append({"in_s": round(x[0], 2), "out_s": round(x[1], 2), "text": text(x[0], x[1])[:160], "from_position": was + 1, "to_position": pos + 1,
+                              "why": str(x[2].get("why") or "")})
+    total = lambda xs: round(sum(x1 - x0 for x0, x1, _ in xs), 1)
+    open_a, open_b = text(a[0][0], min(a[0][1], a[0][0] + 4.0)), text(b[0][0], min(b[0][1], b[0][0] + 4.0))
+    opening_changed = abs(a[0][0] - b[0][0]) > tol
+    return {"before_s": total(a), "after_s": total(b), "parts_before": len(a), "parts_after": len(b),
+            "opening_changed": opening_changed, "opening_before": open_a, "opening_after": open_b,
+            "opening_why": str(b[0][2].get("why") or "") if opening_changed else "",
+            "ending_changed": abs(a[-1][1] - b[-1][1]) > tol, "ending_before": text(max(a[-1][0], a[-1][1] - 4.0), a[-1][1]), "ending_after": text(max(b[-1][0], b[-1][1] - 4.0), b[-1][1]),
+            "removed": removed, "added": added, "moved": moved,
+            "removed_s": round(sum(x["seconds"] for x in removed), 1), "added_s": round(sum(x["seconds"] for x in added), 1),
+            "message_before": str((prev_plan or {}).get("message") or ""), "message_after": str((plan or {}).get("message") or ""),
+            "same_cut": not removed and not added and not moved,
+            "basis": "הושוו שתי תוכניות החיתוך לפי זמני המקור. הטקסט הוא התמלול האוטומטי של אותם קטעים; הנימוקים הם של דנה (מודל). איש לא צפה בשתי הגרסאות."}

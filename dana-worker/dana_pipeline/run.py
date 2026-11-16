@@ -1117,6 +1117,7 @@ def pipeline(j):
                      "cover_why": pl["cover"]["why"], "burned_in_text": pl["burned_in_text"], "revision_note": pl["revision_note"],
                      "graphics_not_used": (pl.get("graphics_dropped") or []) + (res.get("graphics_dropped") or []),
                      "basis": "תמלול אוטומטי עם זמני מילים, עוצמת קול שנמדדה לכל מילה ופריימים בודדים מהמקור. המודל לא שמע את האודיו ולא צפה בתנועה."}
+        story_pkg["changes_vs_previous"] = story.plan_diff((options.get("previous") or {}).get("plan"), story_pkg, source_words)
     else:
         story_pkg = {"message": "", "hook": "", "rationale": "", "content_judgement": "none", "segments": [
             {"n": 1, "source_in_s": in0, "source_out_s": dec["segment"]["out_s"], "tl_in_s": 0.0, "tl_out_s": res["dur"], "role": "body",
@@ -1126,7 +1127,7 @@ def pipeline(j):
         res["facts"], kind="polish" if polish else "edit", records={r["id"]: r for r in records}, criteria={c["id"]: c for c in crit},
         findings=final_findings, zooms=res.get("zooms") or [], graphics=res.get("graphics") or [], color=res["color"], audio=res["audio_clean"],
         cover_text=dec["cover"]["text"], captions_added=bool(st["captions_enabled"]), cut_joins=getattr(j, "cut_joins", None),
-        burned_in_text=bool(pl and pl["burned_in_text"]["present"])))
+        burned_in_text=bool(pl and pl["burned_in_text"]["present"]), spoken_text=" ".join(c["plain"] for c in cards)))
     review_vs_previous = review_rubric.compare(prev.get("dana_review"), dana_review)
     # ── was the review made on the file that is delivered, after every change? ──
     final_sha = sha256_file(j.out / "final.mp4")
