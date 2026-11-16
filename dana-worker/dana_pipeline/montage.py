@@ -699,11 +699,9 @@ def produce(j, video, smap, sp, sha_before, tg, tspec, zone_used):
     provenance = {"reviewed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "final_sha256": final_sha, "reviewed_sha256": final_sha, "on_delivered_file": True, "review_rounds": 1,
                   "delivered_round": 0, "model_review_ran": reviewed, "basis": "הבדיקות נמדדו על הקובץ הסופי. הערכת המודל נעשתה על פריים אחד לכל קטע מאותו קובץ — לא צפייה בתנועה ולא האזנה."}
     prev_review = options.get("previous_review") if isinstance(options.get("previous_review"), dict) else None
-    extra = [{"rank": 0, "blocks": True, "title": i["message"][:220], "why": "", "action": "להעלות חומר מתאים, או לשנות את הדרישה ולתכנן מחדש", "time_s": None, "who": "owner",
-              "category": "חומר", "basis": "measured" if i["code"] == "sources_requirement_not_met" else "model", "id": "i:" + i["code"]}
-             for i in issues if i["code"] in ("sources_requirement_not_met", "material_not_suitable")]
+    extra = review.material_blocks(issues)
     final_review = review.final(dana_review, None, provenance, review_items, records, prev_review, tg, None, extra_improvements=extra,
-                                note=("בדיקת תשתית על חומר הדגמה — לא לקט אימונים שהושלם." if brief["demo"] else None))
+                                note=("בדיקת תשתית על חומר הדגמה — לא לקט אימונים שהושלם." if brief["demo"] else None), issues=issues)
     final_review["skills"].append({"name": "dana-montage", "version": RUBRIC, "role": "כללי הלקט הבסיסיים"})
     final_review["direction"] = {"text": plan_meta.get("direction") or "", "source": "owner_brief" if (brief["goal"] or brief["reference"]) else "dana_proposal",
                                  "label": "לפי המטרה / הרפרנס שהגדרת" if (brief["goal"] or brief["reference"]) else "הצעה של דנה — לא סגנון שאישרת"}

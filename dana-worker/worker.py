@@ -166,9 +166,52 @@ def keep_awake(on):
         return False
 
 
+def handle_rereview(api, cfg, leased):
+    """Rate an EXISTING final file again (dana_pipeline.rereview): the version's stored package and check records are fetched,
+    the rating is computed locally and posted back. No source is downloaded, nothing is rendered and no tool is started."""
+    job, h = leased["job"], {"X-Lease-Token": leased["leaseToken"]}
+    jid, of = job["id"], (job.get("options") or {}).get("review_of") or {}
+    if not SAFE_ID.match(jid) or not re.fullmatch(r"[0-9a-f]{64}", str(of.get("file_sha256") or "")) or not isinstance(of.get("version"), int):
+        api.call("POST", f"/api/dana/worker/jobs/{jid}/fail", {"status": "failure", "code": "job_invalid", "message": "job fields failed validation on the worker", "retryable": False}, h)
+        return
+    job_dir = Path(cfg["paths"]["work_root"]) / "jobs" / f"{jid}_a{int(job.get('attempt', 1))}"
+    if job_dir.exists():
+        shutil.rmtree(job_dir)
+    (job_dir / "in").mkdir(parents=True)
+    (job_dir / "job.json").write_text(json.dumps({"jobId": jid, "projectId": job.get("projectId"), "version": of["version"], "type": "rereview", "options": {"review_of": of}},
+                                                 ensure_ascii=False), encoding="utf-8")
+    try:
+        api.call("POST", f"/api/dana/worker/jobs/{jid}/progress", {"stage": "rate", "note": "מדרג את הקובץ הקיים — בלי רינדור"}, h)
+        for name in ("package.json", "checks.json"):
+            with api._req("GET", f"/api/dana/worker/jobs/{jid}/review-input/{name}", headers=h, timeout=120) as r:
+                (job_dir / "in" / name).write_bytes(r.read())
+        proc = subprocess.run([sys.executable, "-X", "utf8", "-m", "dana_pipeline.rereview", "--job-dir", str(job_dir)], cwd=str(HERE), capture_output=True, timeout=300)
+        if (job_dir / "result.json").is_file():
+            result = json.loads((job_dir / "result.json").read_text(encoding="utf-8"))
+        else:
+            result = {"status": FAILURE, "code": "pipeline_no_result", "message": f"rating exited {proc.returncode} without a result", "retryable": True}
+        log(f"job {jid}: rating of the existing file → {result.get('status')} {result.get('code') or ''} {result.get('mode') or ''} {result.get('overall')}")
+        if result.get("status") == SUCCESS and proc.returncode == 0:
+            code, body = api.call("POST", f"/api/dana/worker/jobs/{jid}/review-result",
+                                  {"status": "success", "review": json.loads((job_dir / "out" / "review.json").read_text(encoding="utf-8"))}, h)
+            if code != 200:
+                raise PipelineError("complete_rejected", f"server refused the rating: {code} {body}", code >= 500)
+        else:
+            api.call("POST", f"/api/dana/worker/jobs/{jid}/fail", {"status": "failure", "code": result.get("code"), "message": result.get("message"),
+                                                                    "retryable": bool(result.get("retryable"))}, h)
+    except (PipelineError, urllib.error.URLError, OSError, ValueError, subprocess.TimeoutExpired) as e:
+        code_, msg = (e.code, e.message) if isinstance(e, PipelineError) else ("rating_failed", str(e)[:300])
+        log(f"job {jid}: {code_}: {msg}")
+        if code_ != "lease_lost":
+            api.call("POST", f"/api/dana/worker/jobs/{jid}/fail", {"status": "failure", "code": code_, "message": msg,
+                                                                    "retryable": bool(getattr(e, "retryable", not isinstance(e, PipelineError)))}, h)
+
+
 def handle(api, cfg, cfg_path, leased):
     job, lease = leased["job"], leased["leaseToken"]
     jid = job["id"]
+    if job.get("type") == "rereview":
+        return handle_rereview(api, cfg, leased)
     src = job.get("source") or {}
     if not SAFE_ID.match(jid) or src.get("ext") not in SAFE_EXT or not re.fullmatch(r"[0-9a-f]{64}", src.get("sha256", "")):
         api.call("POST", f"/api/dana/worker/jobs/{jid}/fail", {"status": "failure", "code": "job_invalid",

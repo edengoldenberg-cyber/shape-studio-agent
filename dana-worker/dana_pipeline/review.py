@@ -193,6 +193,20 @@ def _fact(name, f):
 LEVELS = [(1.0, "תקין"), (0.5, "דורש שיפור"), (0.0, "בעייתי")]   # share of the decided criteria that are met
 
 
+def categorize(rows):
+    """Criterion rows -> the categories with their levels. A category's level counts only the criteria that were decided."""
+    cats = []
+    for key, label in CATEGORIES:
+        mine = [r for r in rows if r["category"] == key]
+        met, miss = sum(r["status"] == "met" for r in mine), sum(r["status"] == "not_met" for r in mine)
+        decided = met + miss
+        level = "לא נבדק" if not decided else next(name for th, name in LEVELS if met / decided >= th)
+        cats.append({"key": key, "label": label, "level": level, "met": met, "decided": decided,
+                     "not_checked": sum(r["status"] == "not_checked" for r in mine), "not_applicable": sum(r["status"] == "na" for r in mine),
+                     "criteria": mine})
+    return cats
+
+
 def build(f):
     """f: {"kind", "records": {id: rec}, "criteria": {acceptance id: row}, "findings": [...], facts…} → the review."""
     rows = []
@@ -225,16 +239,7 @@ def build(f):
             rows.append(_row(cid, cat, text, st, basis, note, t))
         else:
             rows.append(_row(cid, cat, text, "not_checked", "human", "רק צפייה או האזנה שלך יכולה להכריע"))
-    cats = []
-    for key, label in CATEGORIES:
-        mine = [r for r in rows if r["category"] == key]
-        met, miss = sum(r["status"] == "met" for r in mine), sum(r["status"] == "not_met" for r in mine)
-        decided = met + miss
-        level = "לא נבדק" if not decided else next(name for th, name in LEVELS if met / decided >= th)
-        cats.append({"key": key, "label": label, "level": level, "met": met, "decided": decided,
-                     "not_checked": sum(r["status"] == "not_checked" for r in mine), "not_applicable": sum(r["status"] == "na" for r in mine),
-                     "criteria": mine})
-    return {"rubric_version": RUBRIC_VERSION, "kind": f.get("kind") or "edit", "categories": cats,
+    return {"rubric_version": RUBRIC_VERSION, "kind": f.get("kind") or "edit", "categories": categorize(rows),
             "improvements": improvements(rows, f),
             "legend": {"basis": BASIS_HE, "levels": [n for _, n in LEVELS] + ["לא נבדק"]},
             "note": "הדירוג סופר כמה מהקריטריונים הקבועים שנבדקו מתקיימים. קריטריון שלא נבדק מסומן כך ואינו נספר. "
@@ -360,7 +365,8 @@ def compare(prev, cur):
 REVIEW_SKILL = {"name": "dana-review", "version": RUBRIC_VERSION, "what": "הקריטריונים הקבועים של הביקורת (12 קטגוריות)"}
 
 
-def final(dana_review, skill_report, provenance, review_items, records, previous, target, base_skill, owner_resolved=None, extra_improvements=None, note=None):
+def final(dana_review, skill_report, provenance, review_items, records, previous, target, base_skill, owner_resolved=None, extra_improvements=None, note=None,
+          issues=None):
     """Built AFTER the last correction round, from what was measured and assessed on the delivered file.
 
     It never adds a judgement of its own: it gathers the category review, the compliance with the skills that were
@@ -420,7 +426,9 @@ def final(dana_review, skill_report, provenance, review_items, records, previous
         skills.append({"name": base_skill.get("name"), "version": base_skill.get("version"), "role": "כללי העריכה הבסיסיים"})
     for x in ((skill_report or {}).get("skill") or {}).get("skills") or []:
         skills.append({"name": x.get("name"), "version": x.get("version"), "role": "סקיל מהספרייה" + (" (טיוטה בבדיקה)" if x.get("status") == "draft_test" else ""), "id": x.get("id")})
-    return {"title": "הביקורת הסופית של דנה", "target": target, "reviewed_at": (provenance or {}).get("reviewed_at"), "file_sha256": (provenance or {}).get("final_sha256"),
+    return {"score": score(dana_review, blocking_of(failed, broken, extra_improvements)), "all_improvements": every[:24],
+            "next_steps": next_steps(every, review_items, issues or [], skill_report),
+            "title": "הביקורת הסופית של דנה", "target": target, "reviewed_at": (provenance or {}).get("reviewed_at"), "file_sha256": (provenance or {}).get("final_sha256"),
             "on_delivered_file": (provenance or {}).get("on_delivered_file"), "rounds": (provenance or {}).get("review_rounds"),
             "skills": skills, "rubric_version": dana_review["rubric_version"],
             "categories": [{k: c[k] for k in ("key", "label", "level", "met", "decided", "not_checked")} for c in dana_review["categories"]],
@@ -435,6 +443,134 @@ def final(dana_review, skill_report, provenance, review_items, records, previous
             "changes": changes(previous, dana_review),
             "limits": ["הערכת מודל נעשתה על תמלול ופריימים בודדים ויכולה להשתנות בין הרצות", "איש לא האזין לאודיו ולא צפה בתנועה",
                        "הדירוג אינו אישור פרסום ואינו מבטיח ביצועים באינסטגרם", "כל שינוי בסרטון הופך את הביקורת הזו ללא עדכנית"]}
+
+
+# ── "הדירוג הסופי של דנה": one number out of 100, only from what was checked ───────────────────────────
+# The number is arithmetic on the fixed criteria, nothing else: a group's mark is the share of its DECIDED criteria that
+# are met, and the total is the plain average of the groups that have a mark. A criterion that was not checked, or that
+# does not apply to this video (a rule the skill switched off, a component the target does not have), is not counted and
+# gets no mark. The number is not an approval and does not cancel a failed mandatory check: those are listed beside it.
+SCORE_VERSION = "dana-score-2026-11-16.1"
+SCORE_GROUPS = [("message_opening", "מסר ופתיחה", ("message", "opening")), ("structure_pace", "מבנה וקצב", ("structure", "pace")),
+                ("captions_sync", "כתוביות וסנכרון", ("captions", "sync")), ("visual", "עריכה חזותית וגרפיקה", ("framing", "zooms", "graphics", "cover")),
+                ("color_sound", "צבע וסאונד", ("color", "sound"))]
+SCORE_LEVELS = [(85, "טוב"), (60, "דורש שיפור"), (0, "חלש")]
+
+
+def _half_up(x):
+    """62.5 -> 63. Python's round() gives 62 and the server (JavaScript) gives 63; a mark must be the same number on both sides."""
+    return int(x + 0.5)
+
+
+def _tally(rows):
+    met, miss = sum(r["status"] == "met" for r in rows), sum(r["status"] == "not_met" for r in rows)
+    decided = met + miss
+    by = {b: {"met": sum(r["status"] == "met" and r["basis"] == b for r in rows), "decided": sum(r["status"] in ("met", "not_met") and r["basis"] == b for r in rows)}
+          for b in ("measured", "frames", "model")}
+    return {"score": _half_up(100 * met / decided) if decided else None, "met": met, "decided": decided, "by_basis": by,
+            "not_checked": sum(r["status"] == "not_checked" for r in rows), "not_applicable": sum(r["status"] == "na" for r in rows),
+            "human_only": sum(r["status"] == "not_checked" and r["basis"] == "human" for r in rows)}
+
+
+def blocking_of(failed_records, broken_rules, extra):
+    """The mandatory failures of a review, in the owner's words. The mark never cancels them."""
+    blocks = [x["title"][:160] for x in extra or [] if x.get("blocks")]
+    same = {"material_fit", "sources_diversity"} if blocks else set()          # the block already says it, in the owner's words
+    return ([f"כלל מחייב של הסקיל: {x['text']}"[:160] for x in broken_rules or []]
+            + [PLAIN.get(r["id"], (r["id"],))[0] for r in failed_records or [] if r["id"] not in same] + blocks)
+
+
+def score(dana_review, blocking=()):
+    """The summary mark of ONE review. `overall` is None when nothing was decided - no number is made up."""
+    by_cat = {c["key"]: c for c in dana_review["categories"]}
+    groups, every = [], []
+    for key, label, cats in SCORE_GROUPS:
+        rows = [r for c in cats for r in (by_cat.get(c) or {}).get("criteria") or []]
+        every += rows
+        g = dict(_tally(rows), key=key, label=label, categories=[by_cat[c]["label"] for c in cats if c in by_cat])
+        g["level"] = "לא נבדק" if g["score"] is None else next(name for th, name in SCORE_LEVELS if g["score"] >= th)
+        groups.append(g)
+    marked = [g["score"] for g in groups if g["score"] is not None]
+    t = _tally(every)
+    applicable = len(every) - t["not_applicable"]
+    cov = {"criteria": len(every), "applicable": applicable, "decided": t["decided"], "not_checked": t["not_checked"], "not_applicable": t["not_applicable"],
+           "human_only": t["human_only"], "percent": _half_up(100 * t["decided"] / applicable) if applicable else 0, "by_basis": t["by_basis"],
+           "groups_marked": len(marked), "groups": len(groups)}
+    cov["text"] = (f"הציון מבוסס על {t['decided']} מתוך {applicable} הקריטריונים שרלוונטיים לסרטון הזה ({cov['percent']}%): "
+                   f"{t['by_basis']['measured']['decided']} נמדדו בקוד על הקובץ, {t['by_basis']['model']['decided']} הם הערכת מודל על תמלול ופריימים בודדים"
+                   + (f", {t['by_basis']['frames']['decided']} נבדקו בפריימים שנדגמו" if t["by_basis"]["frames"]["decided"] else "")
+                   + f". {t['not_checked']} לא נבדקו ואינם בציון" + (f", מהם {t['human_only']} שרק צפייה או האזנה שלך יכולה להכריע" if t["human_only"] else "")
+                   + (f". {t['not_applicable']} אינם רלוונטיים לסרטון הזה ולא נדרשו" if t["not_applicable"] else "") + ".")
+    blocking = [str(x) for x in blocking or ()]
+    return {"version": SCORE_VERSION, "rubric_version": dana_review.get("rubric_version"), "out_of": 100,
+            "overall": _half_up(sum(marked) / len(marked)) if marked else None, "groups": groups, "coverage": cov,
+            "how": "ציון של תחום הוא אחוז הקריטריונים שנבדקו בו ומתקיימים. הציון המסכם הוא הממוצע של התחומים שיש להם ציון, במשקל שווה. "
+                   "קריטריון שלא נבדק, או שאינו רלוונטי לסרטון, אינו נספר.",
+            "levels": "85 ומעלה: טוב · 60 עד 84: דורש שיפור · מתחת ל-60: חלש",
+            "blocking": {"count": len(blocking), "items": blocking[:8],
+                         "text": (f"יש {len(blocking)} כשלים מחייבים. הציון אינו מבטל אותם." if blocking else "לא נמצא כשל מחייב בבדיקות שרצו.")},
+            "limits": ["המודל קרא תמלול וראה פריימים בודדים: הוא לא שמע את האודיו ולא צפה בתנועה", "הציון אינו אישור לפרסום ואינו תחזית לביצועים"]}
+
+
+# What an issue of the package means for the next step: (kind - "owner" or the kind of blocker, what to do)
+ISSUE_STEP = {
+    "material_not_suitable": ("חומר", "להעלות חומר שמתאים למטרה, או לשנות את המטרה"),
+    "sources_requirement_not_met": ("חומר", "להעלות חומר מתאים נוסף, או לשנות את מספר המקורות הנדרש"),
+    "infrastructure_demo": ("חומר", "זו בדיקת תשתית על חומר הדגמה; לתוצר אמיתי נדרש חומר אמיתי"),
+    "music_license_not_confirmed": ("רישיון", "לאשר שיש רישיון לרצועה, או להחליף אותה ברצועה מורשית"),
+    "cta_missing": ("מידע עסקי", "להגדיר בהגדרות המותג קריאה לפעולה מאושרת, או להחליט שהסרטון יוצא בלעדיה"),
+    "caption_rule_conflict": ("יכולת", "לבחור: גודל כתובית קטן יותר, שתי שורות, או לקבל את הכרטיסים הקצרים"),
+    "narration_cards_short": ("יכולת", "לבחור: גודל כתובית קטן יותר או שתי שורות"),
+    "animation_scene_not_rendered": ("יכולת", "הרינדור של קטע האנימציה נכשל; אפשר לנסות שוב או לוותר עליו"),
+    "graphic_not_rendered": ("יכולת", "הרינדור של הגרפיקה נכשל; אפשר לנסות שוב או לוותר עליה"),
+    "review_model_failed": ("יכולת", "הערכת התוכן של המודל לא רצה; להריץ ביקורת שוב"),
+    "direction_is_proposal": ("owner", "להגדיר מטרה או רפרנס, או לאשר את הכיוון שדנה הציעה"),
+    "narration_captions_unverified": ("owner", "לקרוא ולהאזין לכתוביות הקריינות במסך התמלול, ולאמת או לתקן"),
+    "caption_is_draft": ("owner", "לקרוא את קפשן הפוסט ולאשר או לערוך אותו"),
+}
+
+
+def material_blocks(issues):
+    """Issues that mean the material itself cannot give what was asked: shown first, and they keep the status at "needs a fix"."""
+    return [{"rank": 0, "blocks": True, "title": i["message"][:220], "why": "", "action": "להעלות חומר מתאים, או לשנות את הדרישה ולתכנן מחדש", "time_s": None, "who": "owner",
+             "category": "חומר", "basis": "measured" if i["code"] == "sources_requirement_not_met" else "model", "id": "i:" + i["code"]}
+            for i in issues or [] if i["code"] in ("sources_requirement_not_met", "material_not_suitable")]
+
+
+def next_steps(every, review_items, issues, skill_report=None):
+    """Where to go from this review, in three separate lists: what Dana and the worker can do by themselves, what needs the
+    owner's decision or the owner's ears and eyes, and what is blocked by material, capability, business information or a
+    licence. Built from the review's own improvements and the package's issues - nothing is added."""
+    def pick(x):
+        return {k: x.get(k) for k in ("id", "title", "why", "action", "time_s", "category")}
+    dana = [dict(pick(x), replan=bool(x.get("replan")),
+                 how="בתכנון מחדש של החיתוך, מאותו חומר" if x.get("replan") else "תיקון ממוקד; שאר העריכה לא משתנה") for x in every if x["who"] == "dana"]
+    owner = [pick(x) for x in every if x["who"] == "owner" and not str(x.get("id") or "").startswith("i:")]
+    blockers = []
+    for i in issues or []:
+        step = ISSUE_STEP.get(i.get("code"))
+        if step is None:
+            if i.get("severity") == "blocker":
+                blockers.append({"id": "i:" + str(i.get("code")), "kind": "אחר", "title": str(i.get("message") or "")[:260], "action": "נדרשת החלטה שלך"})
+            continue
+        row = {"id": "i:" + i["code"], "title": str(i.get("message") or "")[:260], "action": step[1]}
+        if step[0] == "owner":
+            owner.append(dict(row, why="", time_s=None, category="החלטה"))
+        else:
+            blockers.append(dict(row, kind=step[0]))
+    for r in (skill_report or {}).get("rules") or []:
+        if r.get("status") == "unsupported":
+            blockers.append({"id": "rule:" + str(r.get("text"))[:40], "kind": "יכולת", "title": f"כלל בסקיל שהמערכת אינה יודעת לבצע: {r.get('text')}"[:260],
+                             "action": "לשנות את הכלל בסקיל, או לקבל שהוא אינו מיושם"})
+    open_items = [i for i in review_items or [] if not i.get("owner_decision")]
+    replan = sum(1 for x in dana if x["replan"])
+    if not dana:
+        text = "אין כרגע שיפור שדנה יכולה לבצע בעצמה."
+    else:
+        text = (f"הפעולה \"יישם את השיפורים והפק גרסה חדשה\" תבצע רק את {len(dana)} השיפורים שברשימה הזו. "
+                + (f"{replan} מהם משנים את החיתוך (תכנון מחדש מאותו חומר). " if replan else "אף אחד מהם אינו משנה את החיתוך. ")
+                + "מה שדורש אותך ומה שחסום נשאר כמו שהוא.")
+    return {"dana": dana, "owner": owner, "blockers": blockers, "open_items": len(open_items), "apply": {"count": len(dana), "replan": replan, "text": text}}
 
 
 def changes(previous, current):

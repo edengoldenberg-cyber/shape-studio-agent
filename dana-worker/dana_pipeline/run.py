@@ -1166,7 +1166,7 @@ def pipeline(j):
     still_open = {it["kind"] for it in review_items if it.get("kind") in REC_KIND.values() and not it.get("owner_decision")}
     was_decided = {it["kind"] for it in review_items if it.get("owner_decision")}
     owner_resolved = sorted(r["id"] for r in records if r["status"] in ("fail", "review") and REC_KIND.get(r["id"]) in was_decided and REC_KIND.get(r["id"]) not in still_open)
-    final_review = review_rubric.final(dana_review, skill_report, provenance, review_items, records, prev_review, tg, skill_info, owner_resolved=owner_resolved)
+    final_review = review_rubric.final(dana_review, skill_report, provenance, review_items, records, prev_review, tg, skill_info, owner_resolved=owner_resolved, issues=issues)
     timeline = review_rubric.timeline(pl["segments"], res["dur"], res.get("shift", 0.0), cards, res.get("zooms") or [], res.get("graphics") or [], skill, res["audio_clean"], tg) if pl else None
     adjustments = {
         "color": res["color"], "audio_cleanup": res["audio_clean"],
