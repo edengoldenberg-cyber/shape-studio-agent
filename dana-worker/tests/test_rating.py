@@ -47,7 +47,9 @@ class Score(unittest.TestCase):
         sc = review.score({"rubric_version": "x", "categories": [{"key": "structure", "label": "מבנה", "criteria": rows}]})
         g = next(x for x in sc["groups"] if x["key"] == "structure_pace")
         self.assertEqual((g["met"], g["decided"], g["score"]), (5, 8, 63))          # 62.5: not 62
-        self.assertEqual(sc["overall"], 63)
+        self.assertIsNone(sc["overall"])                                            # one area of five: not enough for one number about the whole video
+        self.assertEqual(sc["evidence"]["state"], "insufficient")
+        self.assertIn("אין מספיק ראיות", sc["evidence"]["label"])
 
     def test_what_was_not_checked_gets_no_mark_and_is_not_counted(self):
         sc = review.score(review.build(facts(criteria={}, records={}, cut_joins=None, first_word_s=None, longest_pause=None, face_inside=None, color=None, audio=None,
@@ -110,6 +112,70 @@ class NextSteps(unittest.TestCase):
         self.assertNotIn("cards_regrouped", str(ns))                                               # an informational note is not a step
 
 
+REC = lambda rid, status, summary="s": {"id": rid, "status": status, "summary": summary}
+TIMING = {"id": "timing:9", "kind": "timing", "card": 9, "original": "בדיקת הסנכרון הנעולה: drift +380ms", "verdict": "suspected_false_positive", "hearing_key": "timing|54.0|timing"}
+HEARD = {"id": "acoustic:4:פשוט", "kind": "acoustic", "card": 4, "original": "prob=0.714", "verdict": "needs_listening", "hearing_key": "acoustic|12.0|פשוט"}
+READ = {"id": "text:7:x", "kind": "text", "card": 7, "original": "מוצג 'ברגע' / נשמע 'ברגל'", "verdict": "needs_listening", "hearing_key": "text|20.0|x"}
+
+
+class ProvenUncertainOrNotRelevant(unittest.TestCase):
+    def build(self, records, items):
+        f = facts(spoken_text=SPOKEN, review_items=items)
+        f["records"].update({r["id"]: r for r in records})
+        return review.build(f), records
+
+    def test_a_doubt_that_needs_listening_is_not_a_proven_failure_and_gets_no_mark(self):
+        rv, recs = self.build([REC("sync_lead", "fail"), REC("energy_gate", "fail"), REC("caption_text", "review"), REC("source_unchanged", "pass")], [TIMING, HEARD, READ])
+        rows = rows_of(rv)
+        self.assertEqual([rows[k]["status"] for k in ("Y1", "K7", "K8")], ["uncertain"] * 3)
+        fin = review.final(rv, None, PROV, [TIMING, HEARD, READ], recs, None, "reel", None, issues=[])
+        sc = fin["score"]
+        g = group(sc, "captions_sync")
+        self.assertEqual((g["uncertain"], g["score"], g["low"]), (3, 100, 75))        # nothing is deducted for a doubt; the bound says what is at stake
+        self.assertEqual(sc["evidence"]["state"], "provisional")
+        self.assertEqual((sc["range"]["low"], sc["range"]["high"], sc["overall"]), (95, 100, 100))
+        self.assertEqual((sc["blocking"]["count"], sc["uncertain"]["count"]), (0, 3))
+        self.assertEqual(fin["verdict"], "needs_owner")                              # not ready, and not "needs a fix" either
+        self.assertEqual(fin["uncertain_checks"], ["sync_lead", "energy_gate", "caption_text"])
+        self.assertEqual(fin["next_steps"]["dana"], [])                              # nothing is fixed automatically before the owner listens
+        self.assertEqual({x["id"] for x in fin["next_steps"]["owner"]}, {"c:Y1", "c:K7", "c:K8"})
+        self.assertEqual(fin["source"]["kind"], "fresh_review")
+
+    def test_a_confirmed_failure_and_a_word_not_found_in_the_audio_are_proven(self):
+        confirmed = dict(TIMING, verdict="confirmed")
+        nf = {"id": "timing:37", "kind": "timing", "card": 37, "original": "NOT_FOUND", "verdict": "suspected_false_positive", "hearing_key": "timing|80.0|timing"}
+        rv, recs = self.build([REC("sync_lead", "fail"), REC("sync_not_found", "fail")], [confirmed, nf])
+        rows = rows_of(rv)
+        self.assertEqual((rows["Y1"]["status"], rows["Y2"]["status"]), ("not_met", "not_met"))     # a caption for a word that is not said is never "a doubt"
+        fin = review.final(rv, None, PROV, [confirmed, nf], recs, None, "reel", None, issues=[])
+        self.assertEqual(fin["verdict"], "needs_fix")
+        self.assertEqual(fin["score"]["blocking"]["count"], 2)
+        self.assertEqual(group(fin["score"], "captions_sync")["score"], 80)           # 8 of 10 decided
+        self.assertEqual(fin["score"]["evidence"]["state"], "sufficient")
+
+    def test_what_the_owner_settled_by_listening_is_met_on_the_owners_own_basis(self):
+        items = [dict(TIMING, owner_decision="ok"), dict(HEARD, owner_decision="ok")]
+        rv, recs = self.build([REC("sync_lead", "fail"), REC("energy_gate", "fail")], items)
+        rows = rows_of(rv)
+        self.assertEqual([(rows[k]["status"], rows[k]["basis"]) for k in ("Y1", "K7")], [("met", "human")] * 2)
+        fin = review.final(rv, None, PROV, items, recs, None, "reel", None, issues=[])
+        self.assertEqual(fin["verdict"], "ready_for_viewing")
+        self.assertEqual(sorted(fin["settled_by_owner"]), ["energy_gate", "sync_lead"])
+        self.assertEqual(fin["score"]["coverage"]["by_basis"]["human"], {"met": 2, "decided": 2})
+        self.assertIn("הוכרעו בהאזנה שלך", fin["score"]["coverage"]["text"])
+
+    def test_every_mandatory_check_of_an_edit_is_a_criterion_and_a_missing_component_is_not_relevant(self):
+        used = {src[1] for _, _, _, src in review.CRITERIA if src[0] == "record"}
+        for rid in ("energy_gate", "caption_text", "source_unchanged", "mix_clipping", "mix_speech_over_music", "speech_after_mix", "animation_scene_rendered",
+                    "sync_lead", "sync_not_found", "sync_tail", "clip_boundary", "output_file", "loudness", "caption_face_overlap", "zoom_face_inside", "graphics_rendered"):
+            self.assertIn(rid, used)
+        rows = rows_of(review.build(facts(spoken_text=SPOKEN)))                       # no mix and no animation scene in this video
+        self.assertEqual([rows[k]["status"] for k in ("A4", "A5", "A6", "A7", "G5")], ["na"] * 5)
+        self.assertEqual(rows["K7"]["status"], "not_checked")                        # a check that did not run is not counted, for or against
+        bad = review.build(facts(spoken_text=SPOKEN, records=dict(facts()["records"], mix_clipping=REC("fail", "fail"), source_unchanged=REC("x", "fail"))))
+        self.assertEqual([rows_of(bad)[k]["status"] for k in ("A5", "F4")], ["not_met"] * 2)
+
+
 def package(rubric="dana-review-2026-11-16.1", music=False):
     """A delivered package as the worker stored it under the previous rubric: no filler-words and no audible-music criterion."""
     rv = review.build(facts(spoken_text=SPOKEN))
@@ -138,7 +204,8 @@ class RatingOfAnExistingFile(unittest.TestCase):
         self.assertEqual(after["P3"]["status"], "met")                  # counted in the caption text of this file
         self.assertEqual(after["P3"]["basis"], "measured")
         self.assertEqual(after["A4"]["status"], "na")                   # no music was chosen: not required
-        self.assertEqual({c["id"] for c in r["final_review"]["same_file"]["criteria"]}, {"P3", "A4"})
+        self.assertTrue({"P3", "A4"} <= {c["id"] for c in r["final_review"]["same_file"]["criteria"]})
+        self.assertEqual(r["final_review"]["source"]["kind"], "stored_results")
         self.assertEqual([s["name"] for s in r["skills"]], ["dana-review", "dana-editing"])
         self.assertEqual(r["skills"][0]["version"], review.RUBRIC_VERSION)
         self.assertEqual(r["final_review"]["score"]["overall"], 100)
@@ -163,6 +230,19 @@ class RatingOfAnExistingFile(unittest.TestCase):
         self.assertIn("מילות מילוי", sf["text"])
         self.assertEqual([g["label"] for g in sf["groups"]], ["מבנה וקצב"])
 
+    def test_hearing_decisions_made_after_the_version_was_delivered_are_taken_into_the_rating(self):
+        pkg = package()
+        pkg["review_items"] = [dict(HEARD), dict(READ)]
+        recs = {"records": [REC("energy_gate", "fail"), REC("caption_text", "review")]}
+        first = rereview.rate(pkg, recs, SHA, 3)
+        self.assertEqual([rows_of(first["dana_review"])[k]["status"] for k in ("K7", "K8")], ["uncertain", "uncertain"])
+        self.assertEqual(first["final_review"]["score"]["evidence"]["state"], "provisional")
+        after = rereview.rate(pkg, recs, SHA, 3, hearing=[{"key": HEARD["hearing_key"], "decision": "ok"}])
+        rows = rows_of(after["dana_review"])
+        self.assertEqual((rows["K7"]["status"], rows["K7"]["basis"], rows["K8"]["status"]), ("met", "human", "uncertain"))
+        self.assertEqual(after["final_review"]["uncertain_checks"], ["caption_text"])
+        self.assertEqual(pkg["review_items"][0].get("owner_decision"), None)          # the stored package is not written to
+
     def test_it_refuses_measurements_of_another_file(self):
         with self.assertRaises(PipelineError) as e:
             rereview.rate(package(), {"records": []}, "b" * 64, 1)
@@ -179,8 +259,8 @@ class RatingOfAnExistingFile(unittest.TestCase):
             stored.pop(k)
         pkg = {"dana_review": rv, "final_review": stored, "review_provenance": dict(PROV), "review_items": [], "issues": [{"code": "cta_missing", "severity": "warn", "message": "אין CTA"}]}
         r = rereview.rate(pkg, {"records": []}, SHA, 7)
-        self.assertEqual(r["mode"], "rating_added")
-        self.assertEqual(r["dana_review"], rv)
+        self.assertEqual(r["mode"], "recomputed")
+        self.assertEqual(rows_of(r["dana_review"]), rows_of(rv))
         self.assertEqual(r["final_review"]["score"], fin["score"])
         self.assertEqual(r["final_review"]["verdict"], stored["verdict"])
         self.assertEqual([x["kind"] for x in r["final_review"]["next_steps"]["blockers"]], ["מידע עסקי"])

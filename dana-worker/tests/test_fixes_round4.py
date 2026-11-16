@@ -255,7 +255,9 @@ class SettledByListening(unittest.TestCase):
         prov = {"reviewed_at": "t", "final_sha256": "f", "on_delivered_file": True, "review_rounds": 1}
         recs = [{"id": "energy_gate", "status": "fail", "summary": "מילים חשודות"}]
         items = [{"id": "acoustic:5:זה", "kind": "acoustic", "owner_decision": "ok"}]
-        self.assertEqual(review.final(clean, None, prov, [dict(items[0], owner_decision=None)], recs, None, "reel", None)["verdict"], "needs_fix")
+        # an open doubt of the energy gate is for the owner's ears: it keeps the video from being ready, but it is not a proven defect to fix
+        self.assertEqual(review.final(clean, None, prov, [dict(items[0], owner_decision=None)], recs, None, "reel", None)["verdict"], "needs_owner")
+        self.assertEqual(review.final(clean, None, prov, [dict(items[0], owner_decision=None, verdict="confirmed")], recs, None, "reel", None)["verdict"], "needs_fix")
         f = review.final(clean, None, prov, items, recs, None, "reel", None, owner_resolved=["energy_gate"])
         self.assertEqual((f["verdict"], f["settled_by_owner"]), ("ready_for_viewing", ["energy_gate"]))
         self.assertTrue(any("הוכרעו בהאזנה שלך" in r for r in f["verdict_reasons"]))

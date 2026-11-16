@@ -178,7 +178,8 @@ def handle_rereview(api, cfg, leased):
     if job_dir.exists():
         shutil.rmtree(job_dir)
     (job_dir / "in").mkdir(parents=True)
-    (job_dir / "job.json").write_text(json.dumps({"jobId": jid, "projectId": job.get("projectId"), "version": of["version"], "type": "rereview", "options": {"review_of": of}},
+    (job_dir / "job.json").write_text(json.dumps({"jobId": jid, "projectId": job.get("projectId"), "version": of["version"], "type": "rereview",
+                                                  "options": {"review_of": of, "hearing_decisions": (job.get("options") or {}).get("hearing_decisions") or []}},
                                                  ensure_ascii=False), encoding="utf-8")
     try:
         api.call("POST", f"/api/dana/worker/jobs/{jid}/progress", {"stage": "rate", "note": "מדרג את הקובץ הקיים — בלי רינדור"}, h)

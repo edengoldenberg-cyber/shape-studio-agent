@@ -1122,12 +1122,26 @@ def pipeline(j):
         story_pkg = {"message": "", "hook": "", "rationale": "", "content_judgement": "none", "segments": [
             {"n": 1, "source_in_s": in0, "source_out_s": dec["segment"]["out_s"], "tl_in_s": 0.0, "tl_out_s": res["dur"], "role": "body",
              "why": "כלל אוטומטי — לא שיפוט תוכן" if mode == "fallback_heuristic" else "הוגדר ידנית"}], "brief": [], "model_error": model_error}
+    # ── what the owner already decided BY LISTENING is not asked again, in any later version ──
+    # The key is the place in the SOURCE recording and what was doubted, so it survives a new cut and new card numbers.
+    card_by_i = {c["i"]: c for c in cards}
+    heard_ok = {d.get("key") for d in options.get("hearing_decisions") or [] if isinstance(d, dict) and d.get("decision") == "ok"}
+    for it in review_items:
+        if it.get("kind") in ("timing", "text", "acoustic") and it.get("card") in card_by_i:
+            doubt = it["id"].split(":", 2)[2] if it["id"].count(":") >= 2 else it["kind"]
+            it["hearing_key"] = f"{it['kind']}|{round(src_time(card_by_i[it['card']]['start'] + 0.02) * 2) / 2}|{doubt}"
+            if it["hearing_key"] in heard_ok:
+                it["owner_decision"] = "ok"
+    REC_KIND = {"sync_lead": "timing", "sync_not_found": "timing", "sync_tail": "timing", "energy_gate": "acoustic", "caption_text": "text"}
+    still_open = {it["kind"] for it in review_items if it.get("kind") in REC_KIND.values() and not it.get("owner_decision")}
+    was_decided = {it["kind"] for it in review_items if it.get("owner_decision")}
+    owner_resolved = sorted(r["id"] for r in records if r["status"] in ("fail", "review") and REC_KIND.get(r["id"]) in was_decided and REC_KIND.get(r["id"]) not in still_open)
     crit = cycles[final_cycle]["criteria"]
     dana_review = review_rubric.build(dict(
         res["facts"], kind="polish" if polish else "edit", records={r["id"]: r for r in records}, criteria={c["id"]: c for c in crit},
         findings=final_findings, zooms=res.get("zooms") or [], graphics=res.get("graphics") or [], color=res["color"], audio=res["audio_clean"],
         cover_text=dec["cover"]["text"], captions_added=bool(st["captions_enabled"]), cut_joins=getattr(j, "cut_joins", None),
-        burned_in_text=bool(pl and pl["burned_in_text"]["present"]), spoken_text=" ".join(c["plain"] for c in cards)))
+        burned_in_text=bool(pl and pl["burned_in_text"]["present"]), spoken_text=" ".join(c["plain"] for c in cards), review_items=review_items))
     review_vs_previous = review_rubric.compare(prev.get("dana_review"), dana_review)
     # ── was the review made on the file that is delivered, after every change? ──
     final_sha = sha256_file(j.out / "final.mp4")
@@ -1152,20 +1166,6 @@ def pipeline(j):
                 "render_failed", timeout=cfg["timeouts"]["ffmpeg_s"])
             outputs.append({"name": name, "what": f"כרטיס סטורי {sg['n']}", "seconds": round(b - a, 2), "tl_in_s": round(a, 3), "tl_out_s": round(b, 3)})
     prev_review = options.get("previous_review") if isinstance(options.get("previous_review"), dict) else prev.get("dana_review")
-    # ── what the owner already decided BY LISTENING is not asked again, in any later version ──
-    # The key is the place in the SOURCE recording and what was doubted, so it survives a new cut and new card numbers.
-    card_by_i = {c["i"]: c for c in cards}
-    heard_ok = {d.get("key") for d in options.get("hearing_decisions") or [] if isinstance(d, dict) and d.get("decision") == "ok"}
-    for it in review_items:
-        if it.get("kind") in ("timing", "text", "acoustic") and it.get("card") in card_by_i:
-            doubt = it["id"].split(":", 2)[2] if it["id"].count(":") >= 2 else it["kind"]
-            it["hearing_key"] = f"{it['kind']}|{round(src_time(card_by_i[it['card']]['start'] + 0.02) * 2) / 2}|{doubt}"
-            if it["hearing_key"] in heard_ok:
-                it["owner_decision"] = "ok"
-    REC_KIND = {"sync_lead": "timing", "sync_not_found": "timing", "sync_tail": "timing", "energy_gate": "acoustic", "caption_text": "text"}
-    still_open = {it["kind"] for it in review_items if it.get("kind") in REC_KIND.values() and not it.get("owner_decision")}
-    was_decided = {it["kind"] for it in review_items if it.get("owner_decision")}
-    owner_resolved = sorted(r["id"] for r in records if r["status"] in ("fail", "review") and REC_KIND.get(r["id"]) in was_decided and REC_KIND.get(r["id"]) not in still_open)
     final_review = review_rubric.final(dana_review, skill_report, provenance, review_items, records, prev_review, tg, skill_info, owner_resolved=owner_resolved, issues=issues)
     timeline = review_rubric.timeline(pl["segments"], res["dur"], res.get("shift", 0.0), cards, res.get("zooms") or [], res.get("graphics") or [], skill, res["audio_clean"], tg) if pl else None
     adjustments = {

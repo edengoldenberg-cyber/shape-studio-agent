@@ -14,7 +14,7 @@ rating predicts how a video will perform on Instagram.
 Improvements are listed by importance and split into technical defects and creative preferences;
 `can_apply` says whether Dana can make the change herself inside the approved rules.
 """
-RUBRIC_VERSION = "dana-review-2026-11-16.2"
+RUBRIC_VERSION = "dana-review-2026-11-16.3"
 
 CATEGORIES = [("message", "מסר"), ("opening", "פתיחה"), ("structure", "מבנה"), ("pace", "קצב"), ("captions", "כתוביות"),
               ("sync", "סנכרון"), ("framing", "פריימינג"), ("zooms", "זומים"), ("graphics", "גרפיקה"), ("color", "צבע"),
@@ -41,6 +41,8 @@ CRITERIA = [
     ("K4", "captions", "כל כתובית על המסך מספיק זמן לקריאה", ("criterion", "A13")),
     ("K5", "captions", "ההדגשה סלקטיבית ועל המילים שנושאות את המסר", ("criterion", "A10")),
     ("K6", "captions", "בפריימים שנבדקו הכתובית קריאה", ("criterion", "A11")),
+    ("K7", "captions", "אין בכתוביות מילה שספק אם נאמרה", ("record", "energy_gate")),
+    ("K8", "captions", "תמלול חוזר של הקובץ הסופי תואם את מילות הכתוביות", ("record", "caption_text")),
     ("Y1", "sync", "כל כתובית מופיעה עם המילה שלה (עד 120ms)", ("record", "sync_lead")),
     ("Y2", "sync", "אין כתובית למילה שלא נשמעת", ("record", "sync_not_found")),
     ("Y3", "sync", "אף כתובית לא נעלמת לפני סוף המילה", ("record", "sync_tail")),
@@ -48,12 +50,14 @@ CRITERIA = [
     ("F1", "framing", "הקובץ אנכי 1080×1920 ותקין טכנית", ("record", "output_file")),
     ("F2", "framing", "הפנים בתוך הפריים בכל הפריימים שנדגמו", ("fact", "face_inside")),
     ("F3", "framing", "הקומפוזיציה נעימה לעין בתנועה", ("human",)),
+    ("F4", "framing", "קובץ המקור לא השתנה במהלך העריכה", ("record", "source_unchanged")),
     ("Z1", "zooms", "הפנים לא נחתכות בזמן אף זום", ("record", "zoom_face_inside")),
     ("Z2", "zooms", "לכל זום יש רגע מפתח ונימוק רשום (לא במרווחים קבועים)", ("fact", "zoom_reasons")),
     ("Z3", "zooms", "תחושת התנועה של הזום טבעית", ("human",)),
     ("G1", "graphics", "כל רכיב גרפי נמצא בסרטון, באזור הבטוח ולא על הפנים", ("record", "graphics_rendered")),
     ("G2", "graphics", "טקסט שמוצג כציטוט הוא ציטוט מדויק ממה שנאמר", ("fact", "graphics_exact")),
     ("G4", "graphics", "כותרת עריכתית אינה משנה משמעות, אינה מיוחסת לדוברת ואינה כוללת מידע עסקי", ("criterion", "A19")),
+    ("G5", "graphics", "קטע האנימציה נמצא בקובץ הסופי בזמן שנקבע", ("record", "animation_scene_rendered")),
     ("C1", "color", "בהירות הפנים / הפריים בטווח העבודה", ("fact", "color_exposure")),
     ("C2", "color", "אין סטיית צבע באזורים הניטרליים", ("fact", "color_cast")),
     ("C3", "color", "גוון העור נשמר אחרי התיקון", ("fact", "color_skin")),
@@ -62,11 +66,68 @@ CRITERIA = [
     ("A2", "sound", "יחס דיבור/רעש רקע מספק", ("fact", "sound_snr")),
     ("A3", "sound", "הקול נשמע טבעי ונקי בהאזנה", ("human",)),
     ("A4", "sound", "כשנבחרה מוזיקה: היא בקובץ הסופי ונשמעת מתחת לדיבור", ("record", "mix_music_audible")),
+    ("A5", "sound", "אין עיוות מקטימה במיקס", ("record", "mix_clipping")),
+    ("A6", "sound", "בזמן דיבור המוזיקה נמוכה ממנו מספיק", ("record", "mix_speech_over_music")),
+    ("A7", "sound", "הדיבור נשאר מובן אחרי המיקס (תמלול חוזר)", ("record", "speech_after_mix")),
     ("V1", "cover", "טקסט הקאבר הוא ציטוט מדויק מהסרטון", ("fact", "cover_quote")),
     ("V2", "cover", "הקאבר מייצג את המסר", ("criterion", "A9")),
     ("V3", "cover", "הקאבר והקפשן לא נוקבים בשם של אדם פרטי", ("criterion", "A14")),
 ]
 BASIS_HE = {"measured": "נמדד", "frames": "פריימים בודדים", "model": "הערכת מודל", "human": "דורש אותך", "none": "—"}
+# A criterion row has one of five states. They are never merged:
+#   met / not_met   decided - by measurement, by the model, or (met only) by the owner's own listening
+#   uncertain       a mandatory check raised a doubt that only listening can settle; it is not a proven failure and gets no mark
+#   not_checked     nobody and nothing decided it
+#   na              it does not apply to this video (a component the skill switched off, or that the target does not have)
+STATUS_HE = {"met": "מתקיים", "not_met": "לא מתקיים", "uncertain": "דורש האזנה שלך", "not_checked": "לא נבדק", "na": "לא רלוונטי"}
+# a check that did not run because its component is not in this video: the criterion does not apply
+NA_WHEN_MISSING = {"mix_music_audible": "לא נבחרה מוזיקה לסרטון הזה", "mix_clipping": "לא נעשה מיקס בגרסה הזו", "mix_speech_over_music": "לא נעשה מיקס בגרסה הזו",
+                   "speech_after_mix": "לא נעשה מיקס בגרסה הזו", "animation_scene_rendered": "אין קטע אנימציה בגרסה הזו"}
+# which of the owner's listening items belong to which mandatory check
+REC_KIND = {"sync_lead": "timing", "sync_not_found": "timing", "sync_tail": "timing", "energy_gate": "acoustic", "caption_text": "text"}
+
+
+def _mine(rid, items):
+    kind = REC_KIND.get(rid)
+    out = [i for i in items or [] if i.get("kind") == kind]
+    if kind == "timing":
+        want = {"sync_lead": "lead", "sync_not_found": "not_found", "sync_tail": "tail"}[rid]
+        tag = lambda i: "not_found" if "NOT_FOUND" in str(i.get("original")) else "tail" if "tail" in str(i.get("original")) else "lead"
+        out = [i for i in out if tag(i) == want]
+    return out
+
+
+def record_state(r, review_items):
+    """A mandatory check that did not pass: is it a PROVEN failure, a doubt that needs the owner's ears, or settled by them?
+
+    proven     the check failed and nothing says the measurement itself is in doubt
+    uncertain  every open item of the check is a doubt (the timestamp is suspected, the word may or may not have been said)
+    settled    the owner listened to every item of the check and decided it is fine
+    A caption for a word that was NOT FOUND in the final audio stays a proven failure until the owner settles it: a caption
+    for a word that is not said is a false caption, and no automatic adjudication downgrades that."""
+    rid = r["id"]
+    if rid not in REC_KIND:
+        return "proven"
+    mine = _mine(rid, review_items)
+    if not mine:        # no item of its own: the doubt was folded into a caption-text item (the word heard differs from the spelling shown)
+        text = [i for i in review_items or [] if i.get("kind") == "text"]
+        if rid == "sync_not_found" or not text:
+            return "proven"
+        mine = text
+    still = [i for i in mine if i.get("owner_decision") != "ok"]
+    if not still:
+        return "settled"
+    if rid == "sync_not_found" or any(i.get("verdict") == "confirmed" for i in still):
+        return "proven"
+    return "uncertain"
+
+
+def weigh(r, review_items, note):
+    """(status, basis, note) of a criterion whose check did not pass, by what is known about the check."""
+    state = record_state(r, review_items)
+    if state == "settled":
+        return "met", "human", ("נכשל במדידה והוכרע בהאזנה שלך: תקין. " + str(note or ""))[:400]
+    return ("uncertain" if state == "uncertain" else "not_met"), "measured", note
 TECHNICAL = {"sync", "framing", "sound", "color"}          # a miss here is a technical defect; elsewhere it is content / style
 
 
@@ -203,7 +264,7 @@ def categorize(rows):
         level = "לא נבדק" if not decided else next(name for th, name in LEVELS if met / decided >= th)
         cats.append({"key": key, "label": label, "level": level, "met": met, "decided": decided,
                      "not_checked": sum(r["status"] == "not_checked" for r in mine), "not_applicable": sum(r["status"] == "na" for r in mine),
-                     "criteria": mine})
+                     "uncertain": sum(r["status"] == "uncertain" for r in mine), "criteria": mine})
     return cats
 
 
@@ -217,10 +278,12 @@ def build(f):
                 st, note = "na", "הסרטון נערך בלי זומים"
             if src[1] == "graphics_rendered" and f.get("graphics") == []:
                 st, note = "na", "הסרטון נערך בלי מואושן גרפיק"
-            if src[1] == "mix_music_audible" and f["records"].get(src[1]) is None:
-                st, note = "na", "לא נבחרה מוזיקה לסרטון הזה"
+            if src[1] in NA_WHEN_MISSING and f["records"].get(src[1]) is None:
+                st, note = "na", NA_WHEN_MISSING[src[1]]
             if src[1] in ("caption_face_overlap", "sync_lead", "sync_not_found", "sync_tail", "cards_in_motion") and f.get("captions_added") is False:
                 st, note = "na", f.get("captions_note") or "הכתוביות צרובות במקור — אין שכבת כתוביות של דנה למדוד"
+            if st == "not_met" and f.get("review_items") is not None:
+                st, basis, note = weigh(f["records"][src[1]], f["review_items"], note)
             rows.append(_row(cid, cat, text, st, basis, note))
         elif src[0] == "criterion":
             c = f["criteria"].get(src[1])
@@ -263,7 +326,14 @@ def improvements(rows, f):
                                  "segment_end": "structure", "frame": "framing"}.get(x.get("asset"), "message"),
                     "problem": x.get("problem"), "correction": x.get("correction"), "evidence": x.get("evidence"), "time_s": x.get("time_s"),
                     "card": x.get("card"), "can_apply": can, "how": "דנה תתקן בגרסה הבאה" if can else "דורש החלטה שלך"})
+    rec_of = {cid: src[1] for cid, _, _, src in CRITERIA if src[0] == "record"}
     for r in rows:
+        if r["status"] == "uncertain":              # a doubt, not a defect: nothing is fixed automatically before the owner listens
+            how = PLAIN.get(rec_of.get(r["id"]), ("", "להאזין לקטעים המסומנים ולהכריע", "owner"))[1]
+            out.append({"id": "c:" + r["id"], "criterion_id": r["id"], "importance": 2, "kind": "needs_listening", "category": r["category"],
+                        "problem": r["criterion"] + " — דורש האזנה שלך", "correction": how, "evidence": r["note"], "time_s": r["time_s"], "card": None,
+                        "can_apply": False, "how": how})
+            continue
         if r["status"] != "not_met" or any(o.get("criterion_id") == r["id"] for o in out):
             continue
         tech = r["category"] in TECHNICAL or r["basis"] == "measured"
@@ -289,6 +359,10 @@ APPLY = {
     "O1": (True, "פתיחה בתחילת משפט"), "O2": (True, "תכנון החיתוך מחדש: פתיחה במשפט החזק ביותר שיש בחומר"),
     "S4": (True, "תכנון קצוות הסרטון מחדש, כך שלא ייחתכו באמצע מילה"),
     "S1": (True, "סיום במשפט שסוגר את המסר"), "S2": (True, "סידור החלקים מחדש: פתיחה, גוף וסיום"),
+    "K7": (False, "להאזין למילים המסומנות, ולאשר או לתקן אותן במסך התמלול"), "K8": (False, "להאזין לקטע ולתקן את המלל במסך התמלול"),
+    "Y2": (False, "להאזין ולהחליט אם המילה נאמרה; כתובית למילה שלא נאמרה חייבת לרדת"),
+    "A5": (True, "הפקת מיקס חדש בעוצמה נמוכה יותר, בלי לשנות את התמונה"), "A6": (True, "הנמכת המוזיקה מתחת לדיבור והפקת מיקס חדש, בלי לשנות את התמונה"),
+    "A7": (True, "הנמכת המוזיקה והפקת מיקס חדש, בלי לשנות את התמונה"), "G5": (True, "רינדור קטע האנימציה מחדש, או הסרתו"),
     "P1": (True, "הוצאת חזרות וחלקים שאינם משרתים את המסר"), "P3": (True, "תכנון החיתוך מחדש: העדפת משפטים עם פחות מילות מילוי"),
 }
 REPLAN = {"M1", "M2", "O1", "O2", "S1", "S2", "S4", "P1", "P3"}          # applied by planning the cut again (the owner's rules and the transcript stay in force)
@@ -335,7 +409,7 @@ def top_improvements(dana_review, records, broken, owner_resolved=(), extra=(), 
         out.append({"rank": 1 if content and cid else 2 if i.get("can_apply") else 3 if i.get("importance", 3) <= 2 else 4,
                     "title": str(i.get("problem") or "").replace(" — לא מתקיים", "")[:220], "why": str(i.get("evidence") or "")[:320],
                     "action": str(i.get("correction") or i.get("how") or "")[:320], "time_s": t, "who": "dana" if i.get("can_apply") else "owner",
-                    "category": labels.get(i.get("category"), i.get("category")), "basis": "measured" if i.get("kind") == "technical_defect" else "model",
+                    "category": labels.get(i.get("category"), i.get("category")), "basis": "measured" if i.get("kind") in ("technical_defect", "needs_listening") else "model",
                     "id": i.get("id"), "replan": cid in REPLAN})
     for r in records or []:
         if r["status"] not in ("fail", "review") or r["id"] in (owner_resolved or ()) or crit_of.get(r["id"]) in covered or r["id"] not in PLAIN:
@@ -383,21 +457,26 @@ def final(dana_review, skill_report, provenance, review_items, records, previous
                 "note": "הסיכום סופר רק קריטריונים שנבדקו. מה שדורש האזנה או צפייה בתנועה אינו נספר ואין לו ציון."}
     # A check whose every doubt the owner settled by listening (in an earlier version) no longer asks for another fix. It
     # is still listed - as settled, with who decided - never as passed.
-    settled = [r for r in records if r["status"] in ("fail", "review") and r["id"] in (owner_resolved or [])]
-    failed = [r for r in records if r["status"] in ("fail", "review") and r["id"] not in (owner_resolved or [])]
-    review_items = [i for i in review_items or [] if not i.get("owner_decision")]
+    every_item = review_items or []
+    bad = [r for r in records if r["status"] in ("fail", "review")]
+    state = {r["id"]: ("settled" if r["id"] in (owner_resolved or []) else record_state(r, every_item)) for r in bad}
+    settled = [r for r in bad if state[r["id"]] == "settled"]
+    unsure = [r for r in bad if state[r["id"]] == "uncertain"]          # a doubt that needs listening: not a proven failure
+    failed = [r for r in bad if state[r["id"]] == "proven"]
+    review_items = [i for i in every_item if not i.get("owner_decision")]
     imps = dana_review.get("improvements") or []
     fixable = [i for i in imps if i.get("can_apply") and (i.get("importance") == 1 or i.get("criterion_id") in REPLAN)]
     sk = (skill_report or {}).get("summary")
     broken = (skill_report or {}).get("mandatory_violations") or []          # measured, not assessed
     if failed or fixable or broken:
         verdict, vtext = "needs_fix", "נדרש תיקון נוסף לפני צפייה"
-    elif review_items:
+    elif unsure or review_items:
         verdict, vtext = "needs_owner", "מוכן לצפייה שלך — עם פריטים שרק את/ה יכול/ה להכריע"
     else:
         verdict, vtext = "ready_for_viewing", "מוכן לצפייה שלך"
     reasons = ([f"כלל מחייב של הסקיל הופר (נמדד): {b['text']} — {b['evidence']}"[:260] for b in broken[:4]]
                + [f"בדיקה אוטומטית נכשלה: {r['id']} — {r['summary']}"[:260] for r in failed[:6]]
+               + [f"אי-ודאות שרק האזנה שלך תכריע: {r['id']} — {r['summary']}"[:260] for r in unsure[:6]]
                + [f"שיפור שדנה עוד יכולה ליישם: {i['problem']}"[:260] for i in fixable[:4]]
                + ([f"{len(review_items)} פריטים פתוחים שדורשים צפייה או האזנה שלך"] if review_items else [])
                + ([f"{len(settled)} בדיקות שנכשלו במדידה הוכרעו בהאזנה שלך בגרסה קודמת: {', '.join(r['id'] for r in settled)}"] if settled else []))
@@ -411,7 +490,7 @@ def final(dana_review, skill_report, provenance, review_items, records, previous
               for x in (skill_report or {}).get("rules") or [] if x["status"] == "not_followed"]
     unchecked = [{"criterion": r["criterion"], "why": "דורש צפייה או האזנה שלך" if r["basis"] == "human" else r["note"]} for r in rows if r["status"] == "not_checked"]
     unchecked += [{"criterion": x["text"], "why": x["note"], "skill": x.get("skill")} for x in (skill_report or {}).get("rules") or [] if x["status"] == "not_checked"]
-    top, every = top_improvements(dana_review, records, broken, owner_resolved or (), extra_improvements or ())
+    top, every = top_improvements(dana_review, records, broken, [r["id"] for r in settled], extra_improvements or ())
     if extra_improvements and verdict != "needs_fix" and any(x.get("blocks") for x in extra_improvements):
         verdict, vtext = "needs_fix", "נדרש תיקון נוסף לפני צפייה"
         reasons = [x["title"] for x in extra_improvements if x.get("blocks")] + reasons
@@ -426,7 +505,9 @@ def final(dana_review, skill_report, provenance, review_items, records, previous
         skills.append({"name": base_skill.get("name"), "version": base_skill.get("version"), "role": "כללי העריכה הבסיסיים"})
     for x in ((skill_report or {}).get("skill") or {}).get("skills") or []:
         skills.append({"name": x.get("name"), "version": x.get("version"), "role": "סקיל מהספרייה" + (" (טיוטה בבדיקה)" if x.get("status") == "draft_test" else ""), "id": x.get("id")})
-    return {"score": score(dana_review, blocking_of(failed, broken, extra_improvements)), "all_improvements": every[:24],
+    return {"score": score(dana_review, blocking_of(failed, broken, extra_improvements), [PLAIN.get(r["id"], (r["id"],))[0] for r in unsure]),
+            "all_improvements": every[:24], "uncertain_checks": [r["id"] for r in unsure],
+            "source": {"kind": "fresh_review", "label": "ביקורת חדשה: נמדדה והוערכה על הקובץ בזמן הפקת הגרסה"},
             "next_steps": next_steps(every, review_items, issues or [], skill_report),
             "title": "הביקורת הסופית של דנה", "target": target, "reviewed_at": (provenance or {}).get("reviewed_at"), "file_sha256": (provenance or {}).get("final_sha256"),
             "on_delivered_file": (provenance or {}).get("on_delivered_file"), "rounds": (provenance or {}).get("review_rounds"),
@@ -450,7 +531,7 @@ def final(dana_review, skill_report, provenance, review_items, records, previous
 # are met, and the total is the plain average of the groups that have a mark. A criterion that was not checked, or that
 # does not apply to this video (a rule the skill switched off, a component the target does not have), is not counted and
 # gets no mark. The number is not an approval and does not cancel a failed mandatory check: those are listed beside it.
-SCORE_VERSION = "dana-score-2026-11-16.1"
+SCORE_VERSION = "dana-score-2026-11-16.2"
 SCORE_GROUPS = [("message_opening", "מסר ופתיחה", ("message", "opening")), ("structure_pace", "מבנה וקצב", ("structure", "pace")),
                 ("captions_sync", "כתוביות וסנכרון", ("captions", "sync")), ("visual", "עריכה חזותית וגרפיקה", ("framing", "zooms", "graphics", "cover")),
                 ("color_sound", "צבע וסאונד", ("color", "sound"))]
@@ -466,8 +547,9 @@ def _tally(rows):
     met, miss = sum(r["status"] == "met" for r in rows), sum(r["status"] == "not_met" for r in rows)
     decided = met + miss
     by = {b: {"met": sum(r["status"] == "met" and r["basis"] == b for r in rows), "decided": sum(r["status"] in ("met", "not_met") and r["basis"] == b for r in rows)}
-          for b in ("measured", "frames", "model")}
+          for b in ("measured", "frames", "model", "human")}
     return {"score": _half_up(100 * met / decided) if decided else None, "met": met, "decided": decided, "by_basis": by,
+            "uncertain": sum(r["status"] == "uncertain" for r in rows),
             "not_checked": sum(r["status"] == "not_checked" for r in rows), "not_applicable": sum(r["status"] == "na" for r in rows),
             "human_only": sum(r["status"] == "not_checked" and r["basis"] == "human" for r in rows)}
 
@@ -480,8 +562,13 @@ def blocking_of(failed_records, broken_rules, extra):
             + [PLAIN.get(r["id"], (r["id"],))[0] for r in failed_records or [] if r["id"] not in same] + blocks)
 
 
-def score(dana_review, blocking=()):
-    """The summary mark of ONE review. `overall` is None when nothing was decided - no number is made up."""
+MIN_COVERAGE, MIN_AREAS = 0.6, 3          # below this there is not enough evidence for ONE number about the whole video
+
+
+def score(dana_review, blocking=(), uncertain=()):
+    """The summary mark of ONE review. `overall` is None when too little was decided for one number about the whole video
+    (the areas that were checked still show their own marks) - no number is made up, and nothing is deducted for what
+    was not checked or for a doubt that nobody settled yet."""
     by_cat = {c["key"]: c for c in dana_review["categories"]}
     groups, every = [], []
     for key, label, cats in SCORE_GROUPS:
@@ -489,26 +576,47 @@ def score(dana_review, blocking=()):
         every += rows
         g = dict(_tally(rows), key=key, label=label, categories=[by_cat[c]["label"] for c in cats if c in by_cat])
         g["level"] = "לא נבדק" if g["score"] is None else next(name for th, name in SCORE_LEVELS if g["score"] >= th)
+        # what the mark of the area would be if every open doubt turned out to be a real failure (not a deduction: a bound)
+        g["low"] = _half_up(100 * g["met"] / (g["decided"] + g["uncertain"])) if g["decided"] + g["uncertain"] else None
         groups.append(g)
     marked = [g["score"] for g in groups if g["score"] is not None]
     t = _tally(every)
     applicable = len(every) - t["not_applicable"]
     cov = {"criteria": len(every), "applicable": applicable, "decided": t["decided"], "not_checked": t["not_checked"], "not_applicable": t["not_applicable"],
            "human_only": t["human_only"], "percent": _half_up(100 * t["decided"] / applicable) if applicable else 0, "by_basis": t["by_basis"],
+           "uncertain": t["uncertain"],
            "groups_marked": len(marked), "groups": len(groups)}
     cov["text"] = (f"הציון מבוסס על {t['decided']} מתוך {applicable} הקריטריונים שרלוונטיים לסרטון הזה ({cov['percent']}%): "
                    f"{t['by_basis']['measured']['decided']} נמדדו בקוד על הקובץ, {t['by_basis']['model']['decided']} הם הערכת מודל על תמלול ופריימים בודדים"
                    + (f", {t['by_basis']['frames']['decided']} נבדקו בפריימים שנדגמו" if t["by_basis"]["frames"]["decided"] else "")
+                   + (f", {t['by_basis']['human']['decided']} הוכרעו בהאזנה שלך" if t["by_basis"]["human"]["decided"] else "")
+                   + (f". {t['uncertain']} בדיקות חובה העלו ספק שרק האזנה שלך תכריע; הן אינן בציון, לא לטובה ולא לרעה" if t["uncertain"] else "")
                    + f". {t['not_checked']} לא נבדקו ואינם בציון" + (f", מהם {t['human_only']} שרק צפייה או האזנה שלך יכולה להכריע" if t["human_only"] else "")
                    + (f". {t['not_applicable']} אינם רלוונטיים לסרטון הזה ולא נדרשו" if t["not_applicable"] else "") + ".")
-    blocking = [str(x) for x in blocking or ()]
+    blocking, uncertain = [str(x) for x in blocking or ()], [str(x) for x in uncertain or ()]
+    enough = bool(applicable) and t["decided"] / applicable >= MIN_COVERAGE and len(marked) >= MIN_AREAS
+    if not enough:
+        ev = {"state": "insufficient", "label": "אין מספיק ראיות לציון כולל",
+              "text": f"נבדקו {t['decided']} מתוך {applicable} הקריטריונים הרלוונטיים, ב-{len(marked)} מתוך {len(groups)} התחומים. "
+                      f"ציון כולל מוצג רק כשנבדקו לפחות {int(MIN_COVERAGE * 100)}% מהקריטריונים ולפחות {MIN_AREAS} תחומים; לתחומים שנבדקו מוצג ציון משלהם."}
+    elif t["uncertain"]:
+        ev = {"state": "provisional", "label": "ציון זמני",
+              "text": f"{t['uncertain']} בדיקות חובה ממתינות להאזנה שלך. הן לא נספרו; אחרי שתכריע/י, הציון יכול לעלות או לרדת."}
+    else:
+        ev = {"state": "sufficient", "label": "ציון מבוסס", "text": "כל בדיקות החובה שרלוונטיות לסרטון הוכרעו."}
     return {"version": SCORE_VERSION, "rubric_version": dana_review.get("rubric_version"), "out_of": 100,
-            "overall": _half_up(sum(marked) / len(marked)) if marked else None, "groups": groups, "coverage": cov,
+            "overall": _half_up(sum(marked) / len(marked)) if marked and enough else None, "groups": groups, "coverage": cov, "evidence": ev,
+            # while doubts are open the total is a range: from "every doubt is a real failure" to "every doubt is fine"
+            "range": ({"low": _half_up(sum(g["low"] for g in groups if g["low"] is not None) / sum(1 for g in groups if g["low"] is not None)),
+                       "high": _half_up(sum(marked) / len(marked)),
+                       "text": "הגבול התחתון: אם כל הספקות יתבררו ככשלים. הגבול העליון: אם כולם יתבררו כתקינים."} if ev["state"] == "provisional" else None),
+            "uncertain": {"count": len(uncertain), "items": uncertain[:8],
+                          "text": (f"{len(uncertain)} בדיקות חובה דורשות האזנה שלך: אי-ודאות, לא כשל מוכח." if uncertain else "")},
             "how": "ציון של תחום הוא אחוז הקריטריונים שנבדקו בו ומתקיימים. הציון המסכם הוא הממוצע של התחומים שיש להם ציון, במשקל שווה. "
                    "קריטריון שלא נבדק, או שאינו רלוונטי לסרטון, אינו נספר.",
             "levels": "85 ומעלה: טוב · 60 עד 84: דורש שיפור · מתחת ל-60: חלש",
             "blocking": {"count": len(blocking), "items": blocking[:8],
-                         "text": (f"יש {len(blocking)} כשלים מחייבים. הציון אינו מבטל אותם." if blocking else "לא נמצא כשל מחייב בבדיקות שרצו.")},
+                         "text": (f"יש {len(blocking)} כשלים מוכחים בבדיקות חובה. הציון אינו מבטל אותם." if blocking else "לא נמצא כשל מוכח בבדיקות החובה שרצו.")},
             "limits": ["המודל קרא תמלול וראה פריימים בודדים: הוא לא שמע את האודיו ולא צפה בתנועה", "הציון אינו אישור לפרסום ואינו תחזית לביצועים"]}
 
 
@@ -578,7 +686,7 @@ def changes(previous, current):
     if not previous or previous.get("rubric_version") != current["rubric_version"]:
         return None
     before = {c["id"]: c["status"] for c in previous.get("criteria") or []}
-    HE = {"met": "מתקיים", "not_met": "לא מתקיים", "not_checked": "לא נבדק", "na": "לא רלוונטי"}
+    HE = STATUS_HE
     out = []
     for cat in current["categories"]:
         for c in cat["criteria"]:
