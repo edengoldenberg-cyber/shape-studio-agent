@@ -307,3 +307,37 @@ describe('a prohibition is a rule that is kept, not an unsupported capability', 
     expect(sk.unsupported.map(r => r.text)).toEqual(['מוזיקה קצבית לאורך כל הסרטון']);
   });
 });
+
+describe('a doubt that only listening can settle', () => {
+  const ITEMS = [{ id: 'acoustic:5:זה', kind: 'acoustic', card: 5, t0: 1.04, t1: 3.36, text: 'זה גם לפי', original: "ודאות אקוסטית נמוכה למילה 'זה'", verdict: 'needs_listening', ask: "האם שומעים את המילה 'זה'?", hearing_key: 'acoustic|12.5|זה' },
+                 { id: 'technical:x', kind: 'technical', original: 'בדיקה טכנית', verdict: 'confirmed' }];
+  test('is decided once after listening, belongs to the place in the recording, and is not asked again in the next version', async () => {
+    const up = await upload({}); const l = await lease();
+    await finish(l, up.body.project.source.sha256, pkgFor(up.body.project.source.sha256, { review_items: ITEMS }));
+    const id = up.body.project.id;
+    expect((await get(id)).version.unresolved.map(u => u.id)).toEqual(['acoustic:5:זה', 'technical:x']);
+    expect((await post(`/projects/${id}/hearing`, { id: 'acoustic:5:זה', decision: 'ok', by: 'עדן' })).body.error).toBe('listen_required');
+    expect((await post(`/projects/${id}/hearing`, { id: 'technical:x', decision: 'ok', by: 'עדן', listened: true })).body.error).toBe('not_a_hearing_item');
+    expect((await post(`/projects/${id}/hearing`, { id: 'acoustic:5:זה', decision: 'maybe', by: 'עדן', listened: true })).body.error).toBe('decision_invalid');
+    const ok = await post(`/projects/${id}/hearing`, { id: 'acoustic:5:זה', decision: 'ok', by: 'עדן', listened: true });
+    expect(ok.body.project.version.unresolved.map(u => u.id)).toEqual(['technical:x']);
+    expect(ok.body.project.status).not.toBe('approved');                // a decision about one word approves nothing
+    // the next version: the worker is told, and the same doubt arrives already settled - with who decided and when
+    await post(`/projects/${id}/revise`, { by: 'עדן', note: 'להגדיל כתוביות', note_scope: 'project' });
+    const j = await lease();
+    expect(j.job.options.hearing_decisions).toEqual([{ key: 'acoustic|12.5|זה', decision: 'ok' }]);
+    await finish(j, up.body.project.source.sha256, pkgFor(up.body.project.source.sha256, { review_items: [{ ...ITEMS[0], id: 'acoustic:7:זה', card: 7, owner_decision: 'ok' }, ITEMS[1]] }));
+    const v2 = (await get(id)).version;
+    expect(v2.n).toBe(2);
+    expect(v2.unresolved.map(u => u.id)).toEqual(['technical:x']);
+    expect(v2.exceptions).toEqual([expect.objectContaining({ id: 'acoustic:7:זה', carried: true, by: 'עדן', reason: 'הוכרע בהאזנה בגרסה 1: תקין' })]);
+  });
+
+  test('"not correct" keeps the item open and is not carried as settled', async () => {
+    const up = await upload({}); const l = await lease();
+    await finish(l, up.body.project.source.sha256, pkgFor(up.body.project.source.sha256, { review_items: ITEMS }));
+    const r = await post(`/projects/${up.body.project.id}/hearing`, { id: 'acoustic:5:זה', decision: 'wrong', by: 'עדן', listened: true });
+    expect(r.body.project.version.unresolved.map(u => u.id)).toEqual(['acoustic:5:זה', 'technical:x']);
+    expect(studio.state().projects[up.body.project.id].hearing['acoustic|12.5|זה'].decision).toBe('wrong');
+  });
+});

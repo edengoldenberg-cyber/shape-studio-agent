@@ -69,6 +69,13 @@ workerRouter.get('/jobs/:id/source', wrap((req, res) => {
   const p = studio.getProject(j.projectId);
   sendRange(req, res, studio.sourcePath(p.source), 'application/octet-stream', { 'X-Content-SHA256': p.source.sha256 });
 }));
+/** Any other file of the project that the job needs: a further source video, the music, the narration. By content hash. */
+workerRouter.get('/jobs/:id/files/:sha', wrap((req, res) => {
+  const j = studio.leasedJob(req.params.id, leaseOf(req));
+  const f = media_.fileFor(studio.getProject(j.projectId), String(req.params.sha));
+  if (!f) throw new studio.StudioError(404, 'file_not_found', 'the file does not belong to this project');
+  sendRange(req, res, media_.filePath(f), 'application/octet-stream', { 'X-Content-SHA256': f.sha256 });
+}));
 workerRouter.post('/jobs/:id/progress', json, wrap((req, res) => { studio.progress(req.params.id, leaseOf(req), req.body ?? {}); res.json({ ok: true }); }));
 workerRouter.put('/jobs/:id/artifacts/:name', wrap(async (req, res) => {
   studio.leasedJob(req.params.id, leaseOf(req));                       // reject before reading the body
@@ -97,6 +104,7 @@ workerRouter.post('/skills/:id/draft', json, wrap((req, res) => { const k = skil
 workerRouter.use((_req, res) => res.status(404).json({ ok: false, error: 'not_found' }));
 
 // ── Panel API ─────────────────────────────────────────────────────────────────
+const media_ = require('../services/dana_media');
 const panelRouter = express.Router();
 const maxUploadMb = () => { const n = Number(process.env.DANA_UPLOAD_MAX_MB); return Number.isFinite(n) && n > 0 ? n : 2048; };
 const upload = (req, res, next) => multer({
@@ -134,6 +142,40 @@ panelRouter.post('/upload', upload, wrap(async (req, res) => {
   } catch (e) { fs.rmSync(req.file.path, { force: true }); throw e; }
 }));
 
+// ── more files in a project: further source videos, music, narration; marks and mix settings ──
+const oneFile = (field, mb) => (req, res, next) => multer({
+  storage: multer.diskStorage({ destination: (_r, _f, cb) => cb(null, tmpDir()), filename: (_r, _f, cb) => cb(null, `up_${crypto.randomBytes(8).toString('hex')}`) }),
+  limits: { fileSize: mb() * 1024 * 1024, files: 1 },
+}).single(field)(req, res, err => {
+  if (err) return res.status(err.code === 'LIMIT_FILE_SIZE' ? 413 : 400).json({ ok: false, error: err.code ?? 'upload_failed', message: err.code === 'LIMIT_FILE_SIZE' ? `הקובץ גדול מהמותר (${mb()}MB)` : err.message });
+  next();
+});
+panelRouter.post('/projects/:id/sources', oneFile('video', maxUploadMb), wrap(async (req, res) => {
+  if (!req.file) throw new studio.StudioError(400, 'file_missing', 'לא נבחר קובץ וידאו (שדה: video)');
+  const r = await media_.addSource(req.params.id, { tmpPath: req.file.path, originalName: req.file.originalname, by: req.body?.by });
+  res.status(r.duplicate ? 200 : 201).json({ ok: true, duplicate: r.duplicate, project: r.project });
+}));
+panelRouter.patch('/projects/:id/sources/:sid/marks', json, wrap((req, res) => res.json({ ok: true, project: media_.setMarks(req.params.id, req.params.sid, req.body ?? {}) })));
+panelRouter.delete('/projects/:id/sources/:sid', json, wrap((req, res) => res.json({ ok: true, project: media_.removeSource(req.params.id, req.params.sid, req.body ?? {}) })));
+panelRouter.get('/projects/:id/sources/:sid/video', wrap((req, res) => {
+  const s = media_.sourcesOf(studio.getProject(req.params.id)).find(x => x.id === req.params.sid);
+  if (!s) throw new studio.StudioError(404, 'source_not_found', 'קובץ המקור לא נמצא');
+  sendRange(req, res, media_.filePath(s), 'video/mp4', { ETag: `"${s.sha256}"` });
+}));
+panelRouter.post('/projects/:id/assets', oneFile('file', () => Math.min(maxUploadMb(), 300)), wrap(async (req, res) => {
+  if (!req.file) throw new studio.StudioError(400, 'file_missing', 'לא נבחר קובץ אודיו (שדה: file)');
+  const r = await media_.addAsset(req.params.id, { tmpPath: req.file.path, originalName: req.file.originalname, kind: req.body?.kind, by: req.body?.by });
+  res.status(r.duplicate ? 200 : 201).json({ ok: true, duplicate: r.duplicate, asset: r.asset, project: r.project });
+}));
+panelRouter.get('/projects/:id/assets/:aid/audio', wrap((req, res) => {
+  const a = (studio.getProject(req.params.id).assets ?? []).find(x => x.id === req.params.aid);
+  if (!a) throw new studio.StudioError(404, 'asset_not_found', 'קובץ האודיו לא נמצא');
+  sendRange(req, res, media_.filePath(a), media_.AUDIO_MIME[a.ext] ?? 'application/octet-stream', { ETag: `"${a.sha256}"` });
+}));
+panelRouter.post('/projects/:id/assets/:aid/license', json, wrap((req, res) => res.json({ ok: true, project: media_.setLicense(req.params.id, req.params.aid, req.body ?? {}) })));
+panelRouter.post('/projects/:id/assets/:aid/narration-info', json, wrap((req, res) => res.json({ ok: true, project: media_.setNarrationInfo(req.params.id, req.params.aid, req.body ?? {}) })));
+panelRouter.patch('/projects/:id/audio', json, wrap((req, res) => res.json({ ok: true, project: media_.setAudio(req.params.id, req.body ?? {}) })));
+
 const media = (name) => wrap((req, res) => {
   const p = studio.getProject(req.params.id);
   const n = Number(req.params.n);
@@ -151,6 +193,7 @@ panelRouter.get('/projects/:id/versions/:n/video', wrap((req, res) => {
 panelRouter.get('/projects/:id/versions/:n/compare-frames', media('compare_frames.jpg'));
 for (const k of [1, 2, 3, 4]) panelRouter.get(`/projects/:id/versions/:n/story-part-${k}`, media(`story_part_${k}.mp4`));
 panelRouter.get('/projects/:id/versions/:n/compare-clip',   media('compare_clip.mp4'));
+panelRouter.get('/projects/:id/versions/:n/readable-compare', media('readable_compare.mp4'));
 panelRouter.get('/projects/:id/versions/:n/cover',  media('cover.jpg'));
 panelRouter.get('/projects/:id/versions/:n/checks', media('checks.json'));
 panelRouter.get('/projects/:id/versions/:n/editorial', media('editorial.json'));
@@ -159,6 +202,9 @@ const act = fn => [json, wrap((req, res) => res.json({ ok: true, project: fn(req
 panelRouter.patch('/projects/:id/package',        ...act(studio.editPackage));
 panelRouter.post('/projects/:id/exceptions',      ...act(studio.recordException));
 panelRouter.post('/projects/:id/review-confirm',  ...act(studio.confirmReview));
+panelRouter.post('/projects/:id/hearing',         ...act(studio.decideHearing));
+panelRouter.post('/projects/:id/start',           ...act(studio.start));
+panelRouter.post('/projects/:id/replan',          ...act(studio.replan));
 panelRouter.post('/projects/:id/approve',         ...act(studio.approve));
 panelRouter.post('/projects/:id/request-changes', ...act(studio.requestChanges));
 /** "הפק גרסה מתוקנת": caption corrections + style + zoom changes + an optional note (project-only or standing rule) → the next version. */

@@ -909,6 +909,18 @@
 
   // ── Edit: plan, zooms, graphics, adjustments, before/after, one "produce" action ──
   const ADJ_ORDER = ['color', 'audio_cleanup', 'zooms', 'caption_animation', 'graphics', 'animation'];
+  /** Captions that flash by under the style in force: the numbers, a clip of the same seconds with a readable alternative, and a button to ask for it. */
+  function readabilityCard(pkg) {
+    const r = pkg.readability; if (!r || !r.current) return '';
+    return `<div class="card" id="readability" style="border-color:var(--warn)"><h2>קריאות הכתוביות: חלופה להשוואה</h2>
+      <div class="small">${esc(r.problem || '')}</div>
+      <ul class="plain small"><li><b>עכשיו</b> (גודל ${esc(r.current.caption_size)}, ${r.current.max_lines < 2 ? 'שורה אחת' : r.current.max_lines + ' שורות'}): ${esc(r.current.short_cards)} כרטיסים שחולפים מהר מדי</li>
+        ${(r.alternatives || []).map(a => `<li><b>${esc(a.label)}</b>: ${esc(a.short_cards)} כרטיסים שחולפים מהר מדי ${a.key === r.shown ? '<span class="pill info">מוצגת בקטע למטה</span>' : ''}
+          <button class="sm" data-do="usealt" data-alt="${esc(a.key)}" ${busy() ? 'disabled' : ''}>הפק גרסה עם החלופה הזו</button></li>`).join('')}</ul>
+      ${r.clip ? `<label>אותן שניות זו לצד זו (${esc((r.clip_s || []).join('–'))} שנ׳): משמאל כפי שהוא עכשיו, מימין החלופה</label><video controls playsinline preload="metadata" src="${base()}/readable-compare" style="max-height:46vh"></video>` : ''}
+      ${r.error ? `<div class="small bad">ההשוואה לא הופקה: ${esc(r.error)}</div>` : ''}
+      <div class="small mute">${esc(r.basis || '')}. ${esc(r.note || '')} הסקיל עצמו לא משתנה.</div></div>`;
+  }
   /** What the target changed in THIS output - from the package, not from a label. */
   function targetCard(p, v, pkg) {
     const t = pkg.target; if (!t) return '';
@@ -967,6 +979,7 @@
       <details><summary><b>מה לא נבדק (${f.not_checked.length})</b></summary><ul class="plain small">${f.not_checked.map(x => `<li>${esc(x.criterion)} <span class="mute">— ${esc(x.why)}</span></li>`).join('')}</ul></details>
       ${f.changes ? `<details ${f.changes.criteria.length ? 'open' : ''}><summary><b>מה השתנה בדירוג מול הגרסה הקודמת (${f.changes.criteria.length})</b></summary><ul class="plain small">${f.changes.criteria.map(x => `<li><span class="pill mute">${esc(x.category)}</span> ${esc(x.criterion)}: ${esc(x.before)} → <b>${esc(x.after)}</b> <span class="pill mute">${esc(B[x.basis] || x.basis)}</span><div class="mute">${esc(x.why)}</div></li>`).join('')}
         ${f.changes.categories.map(x => `<li>${esc(x.label)}: ${esc(x.before)} → <b>${esc(x.after)}</b></li>`).join('')}</ul><div class="small mute">${esc(f.changes.note)}</div></details>` : '<div class="small mute">אין גרסה קודמת עם אותם קריטריונים להשוואה.</div>'}
+      ${(f.settled_by_owner || []).length ? `<div class="small">בדיקות שנכשלו במדידה והוכרעו בהאזנה שלך: ${f.settled_by_owner.map(esc).join(', ')}. הן אינן מסומנות כ"עבר".</div>` : ''}
       ${(f.mandatory_violations || []).length ? `<div class="bad"><b>כלל מחייב הופר (נמדד):</b><ul class="plain small">${f.mandatory_violations.map(x => `<li>${esc(x.text)} — ${esc(x.evidence)}</li>`).join('')}</ul></div>` : ''}
       ${loopNotes(pkg)}
       <details class="small"><summary>מגבלות הביקורת</summary><ul class="plain">${f.limits.map(x => `<li>${esc(x)}</li>`).join('')}</ul></details></div>`;
@@ -984,6 +997,7 @@
         ${(ri.not_applied || []).length ? `<ul class="plain small">${ri.not_applied.map(x => `<li class="warn">לא יושם: ${esc(x)}</li>`).join('')}</ul>` : ''}` : ''}
       ${pkg.revisionNote ? `<div class="quote">${esc(pkg.revisionNote)}</div>` : ''}</div>`);
     h.push(targetCard(p, v, pkg));
+    h.push(readabilityCard(pkg));
     h.push(skillReportCard(pkg));
     h.push(timelineCard(pkg, v));
     if (pl) h.push(`<div class="card" id="plan"><h2>התוכנית של דנה</h2>
@@ -999,8 +1013,12 @@
         : `<div class="mute">הגרסה הזו נערכה בלי זומים${adj && adj.zooms && adj.zooms.enabled === false ? ' (כובו לפרויקט)' : ''}.</div>`}
       ${pl && (pl.zooms_not_used || []).length ? `<details class="small"><summary>זומים שלא נכנסו (${pl.zooms_not_used.length})</summary><ul class="plain">${pl.zooms_not_used.map(z => `<li>${tfmt(z.at_s)}: ${esc(z.why)}</li>`).join('')}</ul></details>` : ''}</div>`);
     if (Array.isArray(pkg.graphics)) { const over = pkg.graphics.filter(g => g.layer !== 'replaces_picture'), scenes = pkg.graphics.filter(g => g.layer === 'replaces_picture');
-      const item = g => `<li><div class="row"><button class="sm" data-play="${Math.max(0, g.tl_start_s - 0.5).toFixed(2)},${(g.tl_end_s + 0.5).toFixed(2)}">▶ ${tfmt(g.tl_start_s)}–${tfmt(g.tl_end_s)}</button><span class="pill info">${esc(g.label)}</span><span class="pill ok">ציטוט מדויק</span></div>
+      const item = g => `<li><div class="row"><button class="sm" data-play="${Math.max(0, g.tl_start_s - 0.5).toFixed(2)},${(g.tl_end_s + 0.5).toFixed(2)}">▶ ${tfmt(g.tl_start_s)}–${tfmt(g.tl_end_s)}</button><span class="pill info">${esc(g.label)}</span><span class="pill ${g.text_class === 'editorial' ? 'warn' : 'ok'}">${g.text_class === 'editorial' ? 'כותרת עריכתית — לא ציטוט' : 'ציטוט מדויק'}</span></div>
         <div><b>${esc(g.text)}</b></div><div class="small">התפקיד: ${esc(g.reason || '—')}</div>
+        ${g.design ? `<details class="small"><summary>תדריך הרכיב</summary><ul class="plain">
+          <li>מקור הטקסט: ${esc(g.text_source || '—')}</li><li>זמן: ${tfmt(g.tl_start_s)}–${tfmt(g.tl_end_s)} (${(g.tl_end_s - g.tl_start_s).toFixed(1)} שנ׳)${isNum(g.y_px) ? ` · מיקום: ${g.y_px}px מלמעלה${g.scale && g.scale < 1 ? `, מוקטן ל-${Math.round(g.scale * 100)}%` : ''}` : g.layer === 'replaces_picture' ? ' · מסך מלא' : ''}</li>
+          <li>עיצוב והנפשה: ${esc(g.design)}</li><li>כלי: ${esc(g.tool || '—')}</li><li>איך נבדק: ${esc(g.check || '—')}</li>
+          <li class="mute">מי קבע: מטרה, טקסט ותזמון — ${esc((g.decided_by || {}).purpose_text_timing || '—')}; עיצוב, כלי ובדיקה — ${esc((g.decided_by || {}).design_tool_check || '—')}</li></ul></details>` : ''}
         <label class="chk small"><input type="checkbox" data-grm="${esc(g.id)}" ${draft.graphics && draft.graphics[g.id] ? 'checked' : ''}> להסיר רק את זה בגרסה הבאה (שאר הסרטון לא משתנה)</label></li>`;
       h.push(`<div class="card" id="graphics"><h2>גרפיקה ואנימציה</h2>
       <h3>א. גרפיקה מונפשת מעל הצילום (${over.length})</h3>
@@ -1092,8 +1110,11 @@
     const VERD = { suspected_false_positive: ['כנראה אזעקת שווא', 'info'], confirmed: ['כשל מאומת', 'bad'], needs_reading: ['לקרוא', 'warn'], needs_listening: ['להאזין', 'warn'], needs_decision: ['להחליט', 'warn'] };
     return `<div class="card" id="review"><h2>${open.length ? `<span class="bad">ספקות והחלטות שדנה מעבירה אלייך: ${open.length}</span>` : '<span class="ok">אין פריטים פתוחים שדורשים אותך</span>'}</h2>
       <ul class="plain">${open.map(u => { const vd = VERD[u.verdict] || ['לבדוק', 'warn']; return `<li><div class="row"><span class="pill mute">${esc(KIND[u.kind] || 'בדיקה')}</span><span class="pill ${vd[1]}">${vd[0]}</span>
-        ${u.t0 != null ? `<button class="sm" data-play="${u.t0},${u.t1}" style="margin-inline-start:auto">▶ ${u.t0}s</button>` : ''}</div>
+        ${u.t0 != null ? `<button class="sm" data-play="${u.t0},${u.t1}" data-listen="h:${esc(u.id)}" style="margin-inline-start:auto">▶ להאזין ${Math.max(0.1, u.t1 - u.t0).toFixed(1)} שנ׳</button>` : ''}</div>
         <div><b>${esc(u.ask || '')}</b>${u.text ? ` <span class="mute">"${esc(u.text)}"</span>` : ''}</div><div class="small">${esc(u.original || u.summary || '')}</div>
+        ${u.hearing_key ? `<div class="row" style="margin-top:6px"><button class="sm" data-hear="ok" data-id="${esc(u.id)}" ${listened['h:' + u.id] ? '' : 'disabled'}>שמעתי — תקין</button>
+          <button class="sm" data-hear="wrong" data-id="${esc(u.id)}" ${listened['h:' + u.id] ? '' : 'disabled'}>שמעתי — לא תקין</button>
+          <span class="small mute">${listened['h:' + u.id] ? 'ההכרעה נשמרת למקום הזה בהקלטה, ולא תישאל שוב בגרסה הבאה.' : 'קודם להאזין לקטע.'}</span></div>` : ''}
         ${u.explanation ? `<details class="small mute"><summary>ראיות</summary>${esc(u.explanation)}</details>` : ''}</li>`; }).join('')}</ul>
       ${open.length ? `<label class="chk"><input type="checkbox" id="watched"> צפיתי והקשבתי לכל הקטעים</label><input type="text" id="rnote" placeholder="הערה (לא חובה)" style="margin-top:8px">
         <button class="primary" data-do="confirm" style="margin-top:8px;width:100%">אישור כל הפריטים יחד</button>` : ''}
@@ -1213,12 +1234,20 @@
     if (d.cat) { selCat = selCat === d.cat ? null : d.cat; ui.cat[current.id] = selCat; remember(); renderPanel(); return; }
     if (d.view) { if (d.view === 'current') delete ui.view[current.id]; else ui.view[current.id] = Number(d.view); remember(); cmpN = null; return open(current.id); }
     if (d.do === 'goskills') { back(); showHome('skills'); return; }
+    if (d.do === 'usealt') { const by = who(); if (!by) return; const a = ((current.version.package.readability || {}).alternatives || []).find(x => x.key === d.alt); if (!a) return;
+      if (!confirm('להפיק גרסה חדשה עם "' + a.label + '"? זה שינוי לפרויקט הזה בלבד; הגרסה הנוכחית נשמרת להשוואה והסקיל לא משתנה.')) return;
+      return act('/revise', { by, style_overrides: a.overrides }, 'גרסה עם החלופה הקריאה נכנסה לתור. הגרסה הנוכחית נשמרה.'); }
     if (d.do === 'applyskill') { const by = who(); if (!by) return;
       if (!confirm('להפיק גרסה חדשה של הפרויקט לפי הסקיל שנבחר? הגרסה הנוכחית נשמרת להשוואה, ואישור קודם מתבטל.')) return;
       const hard = (current.skillConflicts || []).some(c => c.kind === 'parameter');
       if (hard && !($('#pconfok') && $('#pconfok').checked)) return notice('יש סתירה בין הסקילים שנבחרו. יש לסמן שההכרעה המוצגת מקובלת, או לשנות את הבחירה.', 'warn');
       return act('/apply-skill', { by, confirm_conflicts: hard }, 'גרסה חדשה לפי הסקילים נכנסה לתור.'); }
-    if (d.play) { const [t0, t1] = d.play.split(',').map(Number); if (d.listen) listened[d.listen] = true; return play(t0, t1); }
+    if (d.play) { const [t0, t1] = d.play.split(',').map(Number); const first = d.listen && !listened[d.listen]; if (d.listen) listened[d.listen] = true;
+      if (first && d.listen.startsWith('h:')) { $('#panel').__html = null; renderPanel(); }
+      return play(t0, t1); }
+    if (d.hear) { const by = who(); if (!by) return;
+      if (d.hear === 'wrong') return Promise.resolve(act('/hearing', { id: d.id, decision: 'wrong', by, listened: true }, 'נרשם שהכתובית אינה תואמת. הפריט נשאר פתוח — אפשר לתקן את המילים בשלב "תמלול".')).then(() => goStep('transcript'));
+      return act('/hearing', { id: d.id, decision: 'ok', by, listened: true }, 'ההכרעה נשמרה. הפריט לא יישאל שוב בגרסה הבאה.'); }
     if (d.cmp) return showCompare(Number(d.cmp));
     if (d.do === 'cmpclose') { cmpN = null; $('#cmpbox').innerHTML = ''; return; }
     if (d.do === 'cmpsync') { const a = $('#mainvid'), b = $('#cmp'); if (a && b) { a.currentTime = 0; b.currentTime = 0; b.muted = true; a.play().catch(() => {}); b.play().catch(() => {}); } return; }

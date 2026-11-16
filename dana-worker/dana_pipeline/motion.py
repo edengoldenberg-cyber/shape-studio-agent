@@ -40,7 +40,33 @@ SIZE, LINE_H, PAD_Y, MAX_W = 62, 1.16, 24, 620          # px on the 1080x1920 fr
 
 SCHEMA_ITEM = {"type": "object", "additionalProperties": False, "required": ["kind", "quote", "at_s", "why"],
                "properties": {"kind": {"type": "string", "enum": sorted(KINDS)}, "quote": {"type": "string"},
-                              "at_s": {"type": "number"}, "why": {"type": "string"}}}
+                              "at_s": {"type": "number"}, "why": {"type": "string"}, "title": {"type": ["string", "null"]}}}
+
+# Three kinds of on-screen text, never mixed up (the owner's rule, 2026-11-16):
+#   quote     - the speaker's words, exactly;
+#   editorial - Dana's wording of the message: may rephrase, may not change the meaning, is never presented as the speaker's words;
+#   business  - facts / CTA: only from information the owner approved, with its source. No graphic of this class exists yet.
+TEXT_CLASS = {"quote": "ציטוט מדויק מהדוברת", "editorial": "כותרת עריכתית — ניסוח של דנה, לא ציטוט"}
+DESIGN = {"hook_title": "לוחית כהה חצי-שקופה במרכז, טקסט לבן מודגש וקו בצבע ההדגשה; נכנסת ויוצאת בהנפשה קצרה. מוקטנת עד 72% כשאין מקום פנוי מהפנים",
+          "key_phrase": "לוחית כהה חצי-שקופה במרכז, טקסט לבן מודגש וקו בצבע ההדגשה; מופיעה ברגע שהמשפט נאמר",
+          "animation_scene": "מסך מלא כהה; המילים נבנות אחת אחרי השנייה והמילים האחרונות בצבע ההדגשה. מחליף את הצילום, הקול ממשיך"}
+CHECK = {"over_picture": "נמדד בקובץ הסופי: בפריים האמצעי הגרפיקה נמצאת, בתוך האזור הבטוח ולא על הפנים. תחושת התנועה לא נבדקת",
+         "replaces_picture": "נמדד בקובץ הסופי: בפריים האמצעי התמונה היא הסצנה ולא הצילום. תחושת התנועה לא נבדקת"}
+FORBIDDEN_IN_TITLE = __import__("re").compile(r"[0-9₪%$€]|ש\"ח|שקל|מבצע|הנחה|חינם|מחיר|הטבה")
+
+
+def editorial_title(raw_title):
+    """Dana's own wording for an opening title -> (text, None) or (None, why it is refused). Checked by code: length, and
+    nothing that could be a business fact (number, price, offer). That it keeps the MEANING is judged by the reviewer."""
+    t = " ".join(judgement.BIDI.sub("", str(raw_title or "")).split())[:60]
+    if not t:
+        return None, None
+    n = len(t.split())
+    if not 2 <= n <= 6:
+        return None, "כותרת עריכתית חייבת להיות 2–6 מילים"
+    if FORBIDDEN_IN_TITLE.search(t):
+        return None, "כותרת עריכתית אינה יכולה לכלול מספר, מחיר או הצעה — מידע עסקי מגיע רק ממה שאישרת"
+    return t, None
 
 PROMPT = """11. "graphics": motion graphics drawn over the picture. NONE is a valid and common answer: add one only when it
    has a job in this video, never for decoration. At most two, never two of the same kind:
@@ -49,7 +75,12 @@ PROMPT = """11. "graphics": motion graphics drawn over the picture. NONE is a va
    - "key_phrase": the one sentence that carries the message, emphasised at the moment it is said.
    "quote" is 2-6 consecutive words copied EXACTLY from a chosen part (never a paraphrase, a summary, a name, a price
    or a claim). "at_s" is the SOURCE time when those words are said. "why" is one short Hebrew sentence naming the
-   job the graphic does. Do not repeat the cover quote as a key_phrase unless it is the message itself."""
+   job the graphic does. Do not repeat the cover quote as a key_phrase unless it is the message itself.
+   A "hook_title" ONLY may also carry "title": an EDITORIAL title in your own words (2-6 Hebrew words) that says what the
+   video is about more clearly than any exact quote would. It is shown as an editorial title, not as the speaker's
+   words, so: do not change the meaning of what she says, do not put words in her mouth (no first person that she did
+   not say), and no number, price, offer, name or business fact. "quote" stays the exact words the title is based on.
+   Leave "title" null when an exact quote does the job. key_phrase and animation_scene are always exact quotes."""
 
 
 def _norm(t):
@@ -106,9 +137,21 @@ def validate(raw, words, segments, to_tl, total_s, allow_scene=False):
             dropped.append({"kind": kind, "quote": quote, "why": "חופף לגרפיקה אחרת"})
             continue
         seen.add(kind)
+        text, text_class, based_on = quote, "quote", None
+        if kind == "hook_title" and g.get("title"):
+            title, refused = editorial_title(g["title"])
+            if title and _norm(title) != _norm(quote):
+                text, text_class, based_on = title, "editorial", quote
+            elif refused:
+                dropped.append({"kind": kind, "quote": str(g["title"])[:60], "why": refused + " — הוצג הציטוט המדויק במקומה"})
         # the id is stable across versions (kind + source time), so the owner can remove ONE graphic and nothing else moves
-        items.append({"id": f"{kind}@{words[i0]['start']:.1f}", "kind": kind, "label": spec["label"], "layer": spec["layer"], "text": quote, "source_t_s": round(words[i0]["start"], 3),
-                      "tl_start_s": round(start, 3), "tl_end_s": round(end, 3), "reason": why, "quote_is_exact": True})
+        items.append({"id": f"{kind}@{words[i0]['start']:.1f}", "kind": kind, "label": spec["label"], "layer": spec["layer"], "text": text, "source_t_s": round(words[i0]["start"], 3),
+                      "tl_start_s": round(start, 3), "tl_end_s": round(end, 3), "reason": why, "quote_is_exact": text_class == "quote",
+                      # the design brief of this element: what kind of text it is and where it comes from, how it looks, what makes it, how it is checked
+                      "text_class": text_class, "text_class_label": TEXT_CLASS[text_class], "based_on": based_on,
+                      "text_source": (f"נאמר במקור ב-{words[i0]['start']:.1f}s" if text_class == "quote" else f"ניסוח של דנה, מבוסס על הנאמר ב-{words[i0]['start']:.1f}s: \"{quote}\""),
+                      "design": DESIGN[kind], "tool": "HyperFrames (HTML + GSAP), רינדור מקומי", "check": CHECK[spec["layer"]],
+                      "decided_by": {"purpose_text_timing": "דנה (מודל)", "design_tool_check": "תבנית קבועה של המערכת — לא בחירה של דנה"}})
     return items, dropped
 
 

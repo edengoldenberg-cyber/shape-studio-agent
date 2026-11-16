@@ -39,6 +39,7 @@ const ARTIFACTS = {            // name → { mime, required }
   'transcript_final.json':  { mime: 'application/json', required: false },
   'compare_frames.jpg':     { mime: 'image/jpeg',       required: false },   // before / after stills (same moments)
   'compare_clip.mp4':       { mime: 'video/mp4',        required: false },   // before / after clip, side by side
+  'readable_compare.mp4':   { mime: 'video/mp4',        required: false },   // current captions (left) next to a readable alternative (right)
   // a story is also delivered card by card (cut from the reviewed final.mp4)
   'story_part_1.mp4': { mime: 'video/mp4', required: false }, 'story_part_2.mp4': { mime: 'video/mp4', required: false },
   'story_part_3.mp4': { mime: 'video/mp4', required: false }, 'story_part_4.mp4': { mime: 'video/mp4', required: false },
@@ -219,6 +220,17 @@ function sanitizeOptions(o = {}) {
     out.kind = o.kind;
   }
   if (o.account !== undefined) out.account = sanitizeAccount(o.account);
+  if (o.project_type !== undefined) {
+    if (!require('./dana_media').PROJECT_TYPES[o.project_type]) throw new StudioError(400, 'project_type_invalid', 'סוג הפרויקט אינו מוכר');
+    out.project_type = o.project_type;
+  }
+  if (o.more_files !== undefined) out.more_files = o.more_files === true;   // more source files follow: the edit waits for "start"
+  if (o.segment_edits !== undefined) {
+    if (!Array.isArray(o.segment_edits) || o.segment_edits.length > 20 || !o.segment_edits.every(e => e && Number.isInteger(e.n) && e.n > 0 && ['remove', 'replace'].includes(e.action)
+        && (e.action === 'remove' || (typeof e.source_id === 'string' && /^src\d{1,3}$/.test(e.source_id) && Number.isFinite(Number(e.from_s)) && Number.isFinite(Number(e.to_s)) && Number(e.to_s) - Number(e.from_s) >= 0.5))))
+      throw new StudioError(400, 'segment_edits_invalid', 'החלפת קטע חייבת מספר קטע ופעולה: הסרה, או החלפה עם קובץ מקור וזמני התחלה וסוף');
+    out.segment_edits = o.segment_edits.map(e => e.action === 'remove' ? { n: e.n, action: 'remove' } : { n: e.n, action: 'replace', source_id: e.source_id, from_s: Number(e.from_s), to_s: Number(e.to_s) });
+  }
   if (o.target !== undefined) {
     if (!['reel', 'story', 'both'].includes(o.target)) throw new StudioError(400, 'target_invalid', 'יעד חייב להיות ריל, סטורי או שתי גרסאות');
     out.target = o.target;
@@ -272,6 +284,7 @@ async function registerUpload({ tmpPath, originalName, options, actor = 'owner' 
     id: newId('prj'), title: String(originalName).replace(/\.[^.]+$/, '').slice(0, 120), createdAt: now(), target: tg, groupId,
     source, status: 'editing', adapter: opts.adapter ?? null, adapterExplicit: opts.adapter !== undefined,   // null → the worker's configuration decides
     kind: opts.kind ?? 'edit',                                         // 'review_only': a finished video uploaded for Dana's review; nothing is edited
+    projectType: opts.project_type ?? 'interview', sources: [{ id: 'src1', ...source, marks: [] }], assets: [], audio: null,
     account: opts.account ?? null,                                     // destination account chosen for this project (null → the brand default)
     adjustments: opts.adjustments ?? {},                               // kinds of adjustment switched off / on for this project
     captionVerifications: [], polish: null,
@@ -321,13 +334,20 @@ function enqueueEdit(project, options, actor) {
                ...(rules.length ? { rules } : {}), ...(profile ? { profile } : {}),
                ...(sk?.skill_set ? { skill_set: sk.skill_set } : {}), ...(sk?.candidates ? { skill_candidates: sk.candidates } : {}),
                target: project.target ?? 'reel',
+               // every source in use with the owner's marks, the audio files with the mix settings, the kind of project
+               ...require('./dana_media').forJob(project),
+               ...((project.segmentEdits ?? []).length ? { segment_edits: project.segmentEdits } : {}),
                ...((project.graphicEdits ?? []).length ? { graphic_edits: project.graphicEdits } : {}),
                ...(project.animationScene === true ? { animation_scene: true } : {}),
                // the previous review of this output, so the next one can explain what changed and why
-               ...(lastReviewed ? { previous_review: lastReviewed } : {}) },
+               ...(lastReviewed ? { previous_review: lastReviewed } : {}),
+               // what the owner settled by listening: not asked again in the next version
+               ...(Object.keys(project.hearing ?? {}).length ? { hearing_decisions: Object.entries(project.hearing).map(([key, d]) => ({ key, decision: d.decision })) } : {}) },
     skillTest: options.skill_test && sk?.skill_set ? { id: sk.skill_set[0].skill.id, version: sk.skill_set[0].skill.version } : null,
     stageLog: [], createdAt: now(), updatedAt: now(),
   };
+  // more source files are still being uploaded: the worker does not take the job until the owner presses "start" (or 15 minutes pass)
+  if (options.more_files) { job.notBefore = new Date(Date.now() + 15 * 60 * 1000).toISOString(); job.waitingForFiles = true; job.note = 'ממתין לקבצים נוספים — יתחיל כשתלחצ/י "התחל עריכה"'; }
   s.jobs[job.id] = job;
   project.versions.push({ n, jobId: job.id, createdAt: now(), status: 'editing', package: null, artifacts: {},
     caption: null, destination: null, scheduledAt: null, exceptions: [], approval: null, notifiedAt: null,
@@ -486,6 +506,10 @@ function complete(jobId, token, body) {
   if (pkg.source?.sha256 !== p.source.sha256) throw new StudioError(422, 'package_invalid', 'the package was built from a different source file');
   const brand = require('../utils/dana_brand').get();
   v.package = pkg; v.artifacts = { ...j.uploaded };
+  // doubts the owner already settled by listening are carried into this version as settled (with who and when)
+  for (const it of pkg.review_items ?? []) { const d = it.owner_decision === 'ok' ? (p.hearing ?? {})[it.hearing_key] : null;
+    if (d && !(v.exceptions ?? []).some(e => e.id === it.id)) (v.exceptions = v.exceptions ?? []).push({ id: it.id, kind: it.kind ?? null, original: it.original, verdict: it.verdict ?? null,
+      reason: `הוכרע בהאזנה בגרסה ${d.version}: תקין`, by: d.by, at: d.at, carried: true }); }
   if (j.type === 'review') {                         // a review: nothing to approve or publish; the uploaded file is the video
     v.status = 'reviewed'; v.videoIsSource = true;
     p.polish = pkg.polish_options && typeof pkg.polish_options === 'object'
@@ -772,8 +796,12 @@ function revise(projectId, body = {}, actor = 'owner') {
     throw new StudioError(400, 'note_scope_required', 'יש לבחור: "תיקון לפרויקט הזה" או "כלל קבוע"');
   const adjustments = body.adjustments !== undefined ? sanitizeAdjustments(body.adjustments) : null;
   const adjChanged = adjustments && Object.entries(adjustments).some(([k, val]) => (p.adjustments ?? {})[k] !== val && !(val === true && (p.adjustments ?? {})[k] === undefined));
+  // a change of the mix (another music file, level, start point, original sound) or of ONE segment: the rest of the edit is kept
+  const audioNew = body.audio !== undefined ? require('./dana_media').cleanAudio(p, body.audio) : null;
+  const audioChanged = audioNew !== null && JSON.stringify(audioNew) !== JSON.stringify(p.audio ?? null);
+  const segEdits = body.segment_edits !== undefined ? sanitizeOptions({ segment_edits: body.segment_edits }).segment_edits : [];
   const pending = pendingEdits(p, v).length;                           // corrections saved with "אמת ושמור תיקון" that are not in a rendered version yet
-  if (!edits.length && !zooms.length && !style && !note && !adjChanged && !pending && !(Array.isArray(body.graphic_edits) && body.graphic_edits.length)) throw new StudioError(400, 'nothing_to_revise', 'לא סומן שום תיקון');
+  if (!edits.length && !zooms.length && !style && !note && !adjChanged && !pending && !(Array.isArray(body.graphic_edits) && body.graphic_edits.length) && !audioChanged && !segEdits.length) throw new StudioError(400, 'nothing_to_revise', 'לא סומן שום תיקון');
   if (v.kind === 'review_only') throw new StudioError(409, 'review_only', 'זה סרטון שהועלה לביקורת בלבד — אפשר להפיק ממנו גרסה משופרת דרך "יישם שיפורים"');
   const open = Object.values(state().jobs).find(j => j.projectId === p.id && ['queued', 'leased'].includes(j.status));
   if (open) throw new StudioError(409, 'job_in_progress', 'כבר יש עריכה פעילה לפרויקט הזה');
@@ -792,6 +820,8 @@ function revise(projectId, body = {}, actor = 'owner') {
   p.captionEdits.sort((a, b2) => a.source_start_s - b2.source_start_s);
   for (const z of zooms) { p.zoomEdits = p.zoomEdits.filter(x => x.id !== z.id); p.zoomEdits.push({ ...z, by, at }); }
   if (adjustments) p.adjustments = { ...(p.adjustments ?? {}), ...adjustments };
+  if (audioChanged) p.audio = audioNew;
+  for (const e of segEdits) { p.segmentEdits = (p.segmentEdits ?? []).filter(x => x.n !== e.n); p.segmentEdits.push({ ...e, by, at: now() }); }
   // remove ONE graphic or animation scene by its id; the rest of the edit is kept (locked revision)
   const gEdits = body.graphic_edits !== undefined ? sanitizeOptions({ graphic_edits: body.graphic_edits }).graphic_edits : [];
   for (const g of gEdits) { p.graphicEdits = (p.graphicEdits ?? []).filter(x => x.id !== g.id); p.graphicEdits.push({ ...g, by, at }); }
@@ -804,7 +834,7 @@ function revise(projectId, body = {}, actor = 'owner') {
   dropApproval(p, v, actor, 'revision_requested');
   hist(p, actor, 'revision_requested', { version: v.n, by, captionEdits: edits.length, zoomEdits: zooms.length, style: style ?? null,
     note: note || null, noteScope: note ? body.note_scope : null, ruleId: rule?.id ?? null, adjustments: adjustments ?? null, pendingCorrections: pending });
-  return queueChange(p, v, opts, note, actor, { hasEdits: edits.length > 0 || zooms.length > 0 || !!rule || adjChanged || pending > 0 || gEdits.length > 0 });
+  return queueChange(p, v, opts, note, actor, { hasEdits: edits.length > 0 || zooms.length > 0 || !!rule || adjChanged || pending > 0 || gEdits.length > 0 || audioChanged || segEdits.length > 0 });
 }
 
 // ── Transcript: correct, listen, verify ───────────────────────────────────────
@@ -951,6 +981,54 @@ function testSkill(skillId, body = {}, actor = 'owner') {
   if (body.animation_scene !== undefined) p.animationScene = body.animation_scene === true;
   hist(p, actor, 'skill_test_requested', { version: v.n, by, skill: { id: payload.skill.id, version: payload.skill.version } });
   enqueueEdit(p, { skill_payload: payload, skill_test: true }, actor);
+  save();
+  return view(p);
+}
+
+/** All the files are in: the waiting edit may start now. */
+function start(projectId, body = {}, actor = 'owner') {
+  const p = getProject(projectId);
+  const j = Object.values(state().jobs).find(x => x.projectId === p.id && x.status === 'queued' && x.waitingForFiles);
+  if (!j) throw new StudioError(409, 'nothing_waiting', 'אין עריכה שממתינה לקבצים');
+  Object.assign(j.options, require('./dana_media').forJob(p));
+  j.notBefore = null; j.waitingForFiles = false; j.note = 'ממתין לעובד העריכה'; j.updatedAt = now();
+  hist(p, actor, 'edit_started_with_sources', { sources: (j.options.sources ?? []).length || 1, by: String(body.by || '').slice(0, 80) || null });
+  save();
+  return view(p);
+}
+/** A new version from ALL the sources and the audio settings as they are now ("הפק גרסה חדשה מכל המקורות"). Planned again. */
+function replan(projectId, body = {}, actor = 'owner') {
+  const { p, v } = idleProject(projectId);
+  const by = String(body.by || '').trim().slice(0, 80);
+  if (!by) throw new StudioError(400, 'by_required', 'נדרש שם מי שמבקש/ת');
+  if (body.project_type !== undefined) require('./dana_media').setType(p, body.project_type);
+  dropApproval(p, v, actor, 'replanned');
+  p.segmentEdits = [];
+  hist(p, actor, 'replan_requested', { version: v.n, by, project_type: p.projectType ?? 'interview' });
+  enqueueEdit(p, {}, actor);
+  save();
+  return view(p);
+}
+
+/**
+ * "שמעתי — תקין" / "שמעתי — לא תקין" on ONE doubt that only listening can settle. The decision belongs to the place in the
+ * recording, so the next version does not ask again. "Not correct" does not fix anything by itself: the item stays open
+ * and the owner corrects the words in the transcript step.
+ */
+function decideHearing(projectId, body = {}, actor = 'owner') {
+  const { p, v } = reviewable(projectId);
+  const by = String(body.by || '').trim().slice(0, 80);
+  if (!by) throw new StudioError(400, 'by_required', 'נדרש שם מי שהאזין/ה');
+  if (body.listened !== true) throw new StudioError(400, 'listen_required', 'ההכרעה נעשית אחרי האזנה לקטע — יש להשמיע אותו קודם');
+  if (!['ok', 'wrong'].includes(body.decision)) throw new StudioError(400, 'decision_invalid', 'ההכרעה חייבת להיות "תקין" או "לא תקין"');
+  const it = unresolved(v).find(u => u.id === String(body.id));
+  if (!it) throw new StudioError(400, 'exception_not_applicable', 'אין פריט פתוח עם המזהה הזה');
+  if (!it.hearing_key) throw new StudioError(409, 'not_a_hearing_item', 'הפריט הזה אינו ספק שמיעה');
+  const at = now();
+  p.hearing = p.hearing ?? {};
+  p.hearing[it.hearing_key] = { decision: body.decision, by, at, version: v.n, kind: it.kind, text: it.text ?? null, original: it.original ?? null };
+  if (body.decision === 'ok') v.exceptions.push({ id: it.id, kind: it.kind ?? null, original: it.original, verdict: it.verdict ?? null, reason: 'הוכרע בהאזנה: תקין', by, at, hearing: true });
+  hist(p, actor, 'hearing_decided', { version: v.n, id: it.id, key: it.hearing_key, decision: body.decision, by });
   save();
   return view(p);
 }
@@ -1150,6 +1228,8 @@ function view(p, viewN) {
     id: p.id, title: fixName(p.title), status: p.status, createdAt: p.createdAt, currentVersion: p.currentVersion,
     source: { sha256: p.source.sha256, bytes: p.source.bytes, originalName: fixName(p.source.originalName), ext: p.source.ext },
     kind: p.kind ?? 'edit', account: p.account ?? null, adjustments: p.adjustments ?? {}, adjustmentKinds: ADJUSTMENT_KINDS,
+    media: require('./dana_media').view(p), segmentEdits: p.segmentEdits ?? [],
+    waitingForFiles: Object.values(s.jobs).some(j => j.projectId === p.id && j.status === 'queued' && j.waitingForFiles),
     target: p.target ?? 'reel', targetLabel: TARGETS[p.target ?? 'reel'], animationScene: p.animationScene === true, graphicEdits: p.graphicEdits ?? [],
     // the other outputs made from the SAME source file (a reel and a story are separate outputs with their own versions and reviews)
     siblings: p.groupId ? Object.values(s.projects).filter(x => x.groupId === p.groupId && x.id !== p.id).map(x => ({ id: x.id, target: x.target ?? 'reel', targetLabel: TARGETS[x.target ?? 'reel'], status: x.status, currentVersion: x.currentVersion })) : [],
@@ -1181,7 +1261,7 @@ function view(p, viewN) {
         measured: v.package.measured ?? null, burnedInText: v.package.burned_in_text ?? v.package.plan?.burned_in_text ?? null,
         danaCanApply: v.package.dana_can_apply ?? null, graphicsSeen: v.package.graphics_seen ?? null, note: v.package.note ?? null,
         tools: v.package.tools ?? null, skillReport: v.package.skill_report ?? null, reviewProvenance: v.package.review_provenance ?? null,
-        finalReview: v.package.final_review ?? null, timeline: v.package.timeline ?? null, target: v.package.target ?? null, outputs: v.package.outputs ?? null,
+        readability: v.package.readability ?? null, sourceMap: v.package.source_map ?? null, mix: v.package.mix ?? null, montage: v.package.montage ?? null, finalReview: v.package.final_review ?? null, timeline: v.package.timeline ?? null, target: v.package.target ?? null, outputs: v.package.outputs ?? null,
         skillChoice: v.package.skill_choice ?? null,
         considered: v.package.considered ?? [], revisionNote: v.package.revision_note ?? '', spelling: v.package.spelling ?? [],
         usage: v.package.judgement_usage ?? null, bundle: v.package.instruction_bundle ?? null, editorial: v.package.editorial ?? null,
@@ -1218,5 +1298,5 @@ module.exports = {
   approve, confirmReview, requestChanges, revise, reject, setConsent, retry, sourcePath, artifactPath, dir, save, state, hist, _resetForTests,
   listRules, activeRules, addRule, editRule, retireRule, previousOf, fixName, projectAdapter, judgementMode, judgementMissing, STYLE_OVERRIDABLE,
   verifyCaption, setSettings, applyReview, progressOf, nextAction, cardStates, pendingEdits, ADJUSTMENT_KINDS, PHASES,
-  applySkill, testSkill, reviewInfo, TARGETS,
+  applySkill, testSkill, reviewInfo, TARGETS, decideHearing, start, replan, fixName,
 };

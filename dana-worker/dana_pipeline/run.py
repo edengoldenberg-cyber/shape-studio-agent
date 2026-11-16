@@ -26,7 +26,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import PIPELINE_VERSION, adjust, captions, checks, editorial, effective, interpret, judgement, motion, review
+from . import PIPELINE_VERSION, adjust, captions, checks, editorial, effective, interpret, judgement, motion, readable, review
 from . import review as review_rubric
 from . import skillgen
 from . import target as target_mod
@@ -375,6 +375,22 @@ def edit(j, dec, words, sp, sha_before, check, cache):
             ink = checks._ink_box(Path(png_dir) / f"c{c['i']:03d}.png")[1]
             if fb and ink and ink[1] < fb[1] + fb[3] and ink[3] > fb[1] and ink[0] < fb[0] + fb[2] and ink[2] > fb[0]:
                 hit.append(c["i"])
+        if hit and prof and "caption_y_px" not in j.style_overrides and not getattr(j, "_face_retry", None) == key:
+            # The position was chosen from 12 sampled frames; the speaker moved at these cards. Measure again with their
+            # frames included and move ALL the captions together (one position for the whole video), then draw them again.
+            j._face_retry = key
+            more = [fb for c, fb in zip(cards, cbx) if c["i"] in hit and fb]
+            y2, pos2 = story.caption_position(prof, st, read_json(cfg["paths"]["safe_zone"]), list(face_boxes) + more, st["caption_max_lines"])
+            if y2 != st["caption_y_px"]:
+                issues.append(judgement.issue("captions_moved_off_face", "info", f"הכתוביות הוזזו מ-{st['caption_y_px']}px ל-{y2}px: בכרטיסים {hit} הן כיסו את הפנים (נמדד שוב עם הפריימים של הכרטיסים האלה)"))
+                st["caption_y_px"], cap_pos = y2, dict(pos2, note=pos2["note"] + " · נמדד שוב אחרי שכתובית כיסתה את הפנים")
+                png_dir = captions.render_png(cfg, st, [{"name": f"c{c['i']:03d}", "text": layouts.get(c["plain"], c["plain"]), "highlight": c["highlight"]} for c in cards], j.work / "caps")
+                records[:] = [r for r in records if r["id"] not in ("caption_width", "safe_zone")] + [checks.check_width(png_dir, cards, st["width"]), checks.check_safe_zone(cfg, png_dir, cards)]
+                hit = []
+                for c, fb in zip(cards, cbx):
+                    ink = checks._ink_box(Path(png_dir) / f"c{c['i']:03d}.png")[1]
+                    if fb and ink and ink[1] < fb[1] + fb[3] and ink[3] > fb[1] and ink[0] < fb[0] + fb[2] and ink[2] > fb[0]:
+                        hit.append(c["i"])
         records.append(checks.rec("caption_face_overlap", "fail" if hit else "pass",
                                   (f"כתוביות שמכסות את אזור הפנים שנמדד: {hit}" if hit else f"אף אחת מ-{len(cards)} הכתוביות אינה מכסה את אזור הפנים שנמדד")
                                   + " (פריים אחד לכל כתובית)", cards=hit))
@@ -514,7 +530,7 @@ def edit(j, dec, words, sp, sha_before, check, cache):
            "captions_added": bool(st["captions_enabled"]), "zooms": zooms, "caption_position": cap_pos, "shift": shift, "key": key, "cards": cards, "records": records, "sync": sync, "adjudications": adjudications, "odiffs": odiffs,
            "heard": heard, "dur": dur, "final": final, "base": base, "cover": cover, "png_dir": png_dir, "attempts": attempts,
            "timing_source": timing_source, "audio_src": audio_src, "motion_rows": motion_rec["data"].get("rows") or [],
-           "comfort_rows": comfort_rows, "caption_fit": {k: v for k, v in (fit or {}).items() if k != "fits"} or None, "source_text": " ".join(w["word"] for w in seg_words), "issues": issues,
+           "spans": tspans, "voice": voice, "voice_words": voice_words, "comfort_rows": comfort_rows, "caption_fit": {k: v for k, v in (fit or {}).items() if k != "fits"} or None, "source_text": " ".join(w["word"] for w in seg_words), "issues": issues,
            "reused_render": False}
     cache.update(key=key, res=res)
     return res
@@ -932,6 +948,26 @@ def pipeline(j):
                 break
             dec, j_issues, sent_prev = new_dec, new_issues, actionable
 
+    # ── when the style in force leaves captions that flash by: a readable alternative, shown next to the result ──
+    # Nothing is applied. The owner gets the numbers and a short clip of the same seconds, and may ask for it.
+    readability = None
+    blocked = [r for r in res.get("comfort_rows") or [] if r.get("cannot")]
+    fit_now = res.get("caption_fit") or {}
+    if len(blocked) >= 2 and st["captions_enabled"] and fit_now.get("line_px"):
+        with j.stage("readable"):
+            try:
+                alt = readable.alternatives(cfg, st, dec["cards"], res["spans"], fit_now["line_px"], int(pp.get("max_words_per_line", 3)))
+                best = alt["alternatives"][0] if alt["alternatives"] else None
+                readability = {"problem": next((i["message"] for i in res["issues"] if i["code"] == "caption_rule_conflict"), None), "current": alt["current"],
+                               "alternatives": [{k: a[k] for k in ("key", "label", "overrides", "short_cards")} for a in alt["alternatives"]], "basis": alt["basis"],
+                               "note": "החלופה אינה מיושמת ואינה נשמרת כהעדפה. היא תיושם רק אם תבקש/י, ורק בפרויקט הזה."}
+                if best and best["short_cards"] < alt["current"]["short_cards"]:
+                    readability["clip_s"] = readable.preview(cfg, st, best, res["voice_words"], cfg["language"]["homophone_groups"], res["base"], res["voice"], j.out / "final.mp4",
+                                                             res["dur"], blocked, fit_now["line_px"], j.work / "readable", j.out / "readable_compare.mp4", st["fps"])
+                    readability.update(shown=best["key"], clip="readable_compare.mp4")
+            except PipelineError as e:
+                readability = dict(readability or {}, error=f"{e.code}: {e.message}")
+
     # ── PACKAGE ─────────────────────────────────────────────────────────────
     issues, records, cards = res["issues"], res["records"], res["cards"]
     chosen = [f"'{x['heard']}' → '{x['shown']}'" for x in dec["spelling"]]
@@ -1045,7 +1081,21 @@ def pipeline(j):
                 "render_failed", timeout=cfg["timeouts"]["ffmpeg_s"])
             outputs.append({"name": name, "what": f"כרטיס סטורי {sg['n']}", "seconds": round(b - a, 2), "tl_in_s": round(a, 3), "tl_out_s": round(b, 3)})
     prev_review = options.get("previous_review") if isinstance(options.get("previous_review"), dict) else prev.get("dana_review")
-    final_review = review_rubric.final(dana_review, skill_report, provenance, review_items, records, prev_review, tg, skill_info)
+    # ── what the owner already decided BY LISTENING is not asked again, in any later version ──
+    # The key is the place in the SOURCE recording and what was doubted, so it survives a new cut and new card numbers.
+    card_by_i = {c["i"]: c for c in cards}
+    heard_ok = {d.get("key") for d in options.get("hearing_decisions") or [] if isinstance(d, dict) and d.get("decision") == "ok"}
+    for it in review_items:
+        if it.get("kind") in ("timing", "text", "acoustic") and it.get("card") in card_by_i:
+            doubt = it["id"].split(":", 2)[2] if it["id"].count(":") >= 2 else it["kind"]
+            it["hearing_key"] = f"{it['kind']}|{round(src_time(card_by_i[it['card']]['start'] + 0.02) * 2) / 2}|{doubt}"
+            if it["hearing_key"] in heard_ok:
+                it["owner_decision"] = "ok"
+    REC_KIND = {"sync_lead": "timing", "sync_not_found": "timing", "sync_tail": "timing", "energy_gate": "acoustic", "caption_text": "text"}
+    still_open = {it["kind"] for it in review_items if it.get("kind") in REC_KIND.values() and not it.get("owner_decision")}
+    was_decided = {it["kind"] for it in review_items if it.get("owner_decision")}
+    owner_resolved = sorted(r["id"] for r in records if r["status"] in ("fail", "review") and REC_KIND.get(r["id"]) in was_decided and REC_KIND.get(r["id"]) not in still_open)
+    final_review = review_rubric.final(dana_review, skill_report, provenance, review_items, records, prev_review, tg, skill_info, owner_resolved=owner_resolved)
     timeline = review_rubric.timeline(pl["segments"], res["dur"], res.get("shift", 0.0), cards, res.get("zooms") or [], res.get("graphics") or [], skill, res["audio_clean"], tg) if pl else None
     adjustments = {
         "color": res["color"], "audio_cleanup": res["audio_clean"],
@@ -1080,10 +1130,10 @@ def pipeline(j):
         "zooms": [{k: z.get(k) for k in ("id", "source_t_s", "tl_t_s", "scale", "strength", "ease_s", "hold_until_s", "reason", "evidence", "focus", "focus_source")}
                   for z in res.get("zooms") or []],
         "zoom_edits_applied": zoom_log,
-        "graphics": res.get("graphics") or [], "adjustments": adjustments, "compare": res.get("compare"),
+        "graphics": res.get("graphics") or [], "adjustments": adjustments, "compare": res.get("compare"), "readability": readability,
         "dana_review": dana_review, "review_vs_previous": review_vs_previous, "review_provenance": provenance,
         "skill_report": skill_report, "skill_choice": skill_choice, "final_review": final_review, "timeline": timeline,
-        "review_compact": review_rubric.compact(dana_review),
+        "review_compact": review_rubric.compact(dana_review), "owner_resolved_checks": owner_resolved,
         "target": {"key": tg, "label": tspec["label"], "publish": tspec["publish"], "cover_text": tspec["cover_text"], "post_caption": tspec["post_caption"],
                    "part_max_s": tspec["part_max_s"], "safe_zone": {k: v for k, v in zone_used.items() if not k.startswith("_")}, "safe_zone_source": zone_used.get("_source")},
         "outputs": outputs,

@@ -37,7 +37,7 @@ from dana_pipeline.core import (FAILURE, REVIEW_REQUIRED, STATE_BY_EXIT, SUCCESS
 SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{4,80}$")
 SAFE_EXT = {"mp4", "mov", "m4v", "webm", "avi", "mkv"}
 UPLOAD_ORDER = ["package.json", "checks.json", "captions.json", "editorial.json", "transcript_source.json", "transcript_final.json",
-                "cover.jpg", "compare_frames.jpg", "compare_clip.mp4", "story_part_1.mp4", "story_part_2.mp4", "story_part_3.mp4", "story_part_4.mp4", "final.mp4"]
+                "cover.jpg", "compare_frames.jpg", "compare_clip.mp4", "readable_compare.mp4", "story_part_1.mp4", "story_part_2.mp4", "story_part_3.mp4", "story_part_4.mp4", "final.mp4"]
 TRANSFER_ATTEMPTS = 3
 
 

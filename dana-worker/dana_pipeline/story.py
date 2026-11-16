@@ -709,7 +709,8 @@ def plan_from_previous(prev, words, cfg, profile, target="reel"):
     for g in prev.get("graphics") or []:
         seg = next((s for s in pl["segments"] if s["source_in_s"] - 0.05 <= g.get("source_t_s", -1) <= s["source_out_s"] + 0.05), None)
         if seg is not None and g.get("kind") in motion.KINDS:
-            graphics.append(dict({k: g.get(k) for k in ("id", "kind", "label", "text", "source_t_s", "tl_start_s", "tl_end_s", "reason", "quote_is_exact")},
+            graphics.append(dict({k: g.get(k) for k in ("id", "kind", "label", "layer", "text", "source_t_s", "tl_start_s", "tl_end_s", "reason", "quote_is_exact",
+                                                         "text_class", "text_class_label", "based_on", "text_source", "design", "tool", "check", "decided_by") if k in g},
                                  layer=g.get("layer") or motion.KINDS[g["kind"]]["layer"]))
     pl.update(graphics=graphics, graphics_dropped=list(pp.get("graphics_not_used") or []))
     pl.update(message=str(pp.get("message") or ""), hook=str(pp.get("hook") or ""), rationale=str(pp.get("rationale") or ""),

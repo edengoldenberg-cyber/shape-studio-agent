@@ -210,6 +210,82 @@ class Division(unittest.TestCase):
         self.assertIn("להכרעתך", det[0]["correction"])
 
 
+class EditorialTitle(unittest.TestCase):
+    W = [{"word": w, "start": 1.0 + 0.4 * n, "end": 1.3 + 0.4 * n, "probability": 0.9} for n, w in enumerate("אני ממש מרגישה שהתחזקתי מאז שהתחלתי להתאמן כאן".split())]
+    SEG = {"n": 1, "i0": 0, "i1": 7, "source_in_s": 0.0, "source_out_s": 9.0, "tl_in_s": 0.0, "tl_out_s": 9.0}
+
+    def run_(self, g):
+        return motion.validate([g], self.W, [self.SEG], lambda t: (self.SEG, round(t, 3)), 9.0)
+
+    def test_a_title_in_danas_words_is_marked_as_editorial_and_tied_to_what_was_said(self):
+        items, dropped = self.run_({"kind": "hook_title", "quote": "מרגישה שהתחזקתי", "at_s": 1.8, "why": "מבהיר את הנושא", "title": "מה השתנה אצלה באימונים"})
+        g = items[0]
+        self.assertEqual((g["text"], g["text_class"], g["based_on"], g["quote_is_exact"], dropped), ("מה השתנה אצלה באימונים", "editorial", "מרגישה שהתחזקתי", False, []))
+        self.assertIn("ניסוח של דנה", g["text_source"])
+        self.assertTrue(all(g.get(k) for k in ("design", "tool", "check", "reason", "decided_by")))      # the brief of the element is complete
+
+    def test_a_title_with_a_number_a_price_or_an_offer_is_refused_and_the_exact_quote_is_shown(self):
+        for bad in ("רק 99 שקל לחודש", "מבצע הצטרפות חדש", "50% יותר כוח"):
+            items, dropped = self.run_({"kind": "hook_title", "quote": "מרגישה שהתחזקתי", "at_s": 1.8, "why": "w", "title": bad})
+            self.assertEqual((items[0]["text"], items[0]["text_class"]), ("מרגישה שהתחזקתי", "quote"))
+            self.assertIn("מידע עסקי", dropped[0]["why"])
+
+    def test_only_an_opening_title_may_be_editorial_and_a_quote_is_still_a_quote(self):
+        items, _ = self.run_({"kind": "key_phrase", "quote": "מרגישה שהתחזקתי", "at_s": 1.8, "why": "w", "title": "כותרת אחרת לגמרי"})
+        self.assertEqual((items[0]["text"], items[0]["text_class"]), ("מרגישה שהתחזקתי", "quote"))
+        g = self.run_({"kind": "hook_title", "quote": "מרגישה שהתחזקתי", "at_s": 1.8, "why": "w"})[0][0]
+        self.assertEqual((g["text_class"], g["text_class_label"]), ("quote", "ציטוט מדויק מהדוברת"))
+
+    def test_the_review_judges_an_editorial_title_separately_and_never_as_a_misquotation(self):
+        g = [{"text_class": "editorial", "quote_is_exact": False, "tl_start_s": 0.3}, {"text_class": "quote", "quote_is_exact": True, "tl_start_s": 5}]
+        res = {"issues": [], "graphics": g}
+        rows = {r["id"]: r for r in editorial.criteria_table({}, res, [], {}, {"criteria": [{"id": "A19", "met": True, "note": "שומר על המשמעות"}]})}
+        self.assertEqual((rows["A19"]["met"], rows["A19"]["decided_by"]), (True, "reviewer"))
+        rv = review.build({"kind": "edit", "records": {"graphics_rendered": {"id": "graphics_rendered", "status": "pass", "summary": "s"}}, "criteria": rows, "findings": [],
+                           "cover_text": "x", "captions_added": True, "zooms": [], "graphics": g})
+        st = {c["id"]: c["status"] for cat in rv["categories"] for c in cat["criteria"]}
+        self.assertEqual((st["G2"], st["G4"]), ("met", "met"))
+        none = {r["id"]: r for r in editorial.criteria_table({}, {"issues": [], "graphics": g[1:]}, [], {}, None)}
+        self.assertEqual(none["A19"]["decided_by"], "not_applicable")
+
+
+class SettledByListening(unittest.TestCase):
+    def test_a_failed_check_the_owner_settled_by_listening_no_longer_asks_for_a_fix_and_is_not_called_passed(self):
+        clean = review.build({"kind": "edit", "records": {}, "criteria": {}, "findings": [], "cover_text": "x", "captions_added": True, "zooms": [], "graphics": []})
+        prov = {"reviewed_at": "t", "final_sha256": "f", "on_delivered_file": True, "review_rounds": 1}
+        recs = [{"id": "energy_gate", "status": "fail", "summary": "מילים חשודות"}]
+        items = [{"id": "acoustic:5:זה", "kind": "acoustic", "owner_decision": "ok"}]
+        self.assertEqual(review.final(clean, None, prov, [dict(items[0], owner_decision=None)], recs, None, "reel", None)["verdict"], "needs_fix")
+        f = review.final(clean, None, prov, items, recs, None, "reel", None, owner_resolved=["energy_gate"])
+        self.assertEqual((f["verdict"], f["settled_by_owner"]), ("ready_for_viewing", ["energy_gate"]))
+        self.assertTrue(any("הוכרעו בהאזנה שלך" in r for r in f["verdict_reasons"]))
+
+
+class ReadableAlternative(unittest.TestCase):
+    def test_alternatives_change_one_thing_each_and_are_counted_not_applied(self):
+        from dana_pipeline import readable
+        from dana_pipeline.core import DEFAULTS, deep_merge
+        cfg = deep_merge(DEFAULTS, {})
+        real = captions.text_px
+        captions.text_px = lambda cfg_, st, t: len(t) * st["caption_size"] * 0.56          # a stand-in for the font: no font file in a unit test
+        try:
+            ws = words(("אני", 0.25), ("ממש", 0.23), ("מרגישה", 0.4), ("שהתחזקתי,", 0.6), ("אני", 0.2), ("רואה", 0.16), ("את", 0.1), ("זה", 0.1), ("גם", 0.1))
+            cards, spans, k = [], [], 0
+            for g in (2, 1, 1, 2, 3):
+                cards.append({"text": " ".join(w["word"] for w in ws[k:k + g]), "highlight": []})
+                spans.append(ws[k:k + g])
+                k += g
+            out = readable.alternatives(cfg, {"caption_size": 100, "caption_max_lines": 1}, cards, spans, 620)
+        finally:
+            captions.text_px = real
+        self.assertEqual(out["current"]["short_cards"], 3)          # "אני ממש" 0.48s, "מרגישה" 0.40s, "אני רואה" 0.36s
+        self.assertEqual({a["key"] for a in out["alternatives"]}, {"two_lines", "size_85", "size_75"})
+        self.assertEqual(out["alternatives"][0]["short_cards"], min(a["short_cards"] for a in out["alternatives"]))
+        self.assertLess(out["alternatives"][0]["short_cards"], out["current"]["short_cards"])
+        self.assertTrue(all(len(a["overrides"]) == 1 for a in out["alternatives"]))                 # one change each
+        self.assertTrue(all(" ".join(c["text"] for c in a["cards"]) == " ".join(c["text"] for c in cards) for a in out["alternatives"]))
+
+
 def finding(id_, source, asset, fix, key=None):
     return {"id": id_, "source": source, "asset": asset, "fix": fix, "key": key or f"reviewer:{id_}", "problem": "p", "severity": "blocking"}
 

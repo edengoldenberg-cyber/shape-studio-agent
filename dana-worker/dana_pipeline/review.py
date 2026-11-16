@@ -14,7 +14,7 @@ rating predicts how a video will perform on Instagram.
 Improvements are listed by importance and split into technical defects and creative preferences;
 `can_apply` says whether Dana can make the change herself inside the approved rules.
 """
-RUBRIC_VERSION = "dana-review-2026-11-15.1"
+RUBRIC_VERSION = "dana-review-2026-11-16.1"
 
 CATEGORIES = [("message", "מסר"), ("opening", "פתיחה"), ("structure", "מבנה"), ("pace", "קצב"), ("captions", "כתוביות"),
               ("sync", "סנכרון"), ("framing", "פריימינג"), ("zooms", "זומים"), ("graphics", "גרפיקה"), ("color", "צבע"),
@@ -51,7 +51,8 @@ CRITERIA = [
     ("Z2", "zooms", "לכל זום יש רגע מפתח ונימוק רשום (לא במרווחים קבועים)", ("fact", "zoom_reasons")),
     ("Z3", "zooms", "תחושת התנועה של הזום טבעית", ("human",)),
     ("G1", "graphics", "כל רכיב גרפי נמצא בסרטון, באזור הבטוח ולא על הפנים", ("record", "graphics_rendered")),
-    ("G2", "graphics", "טקסט הגרפיקה הוא ציטוט מדויק ממה שנאמר", ("fact", "graphics_exact")),
+    ("G2", "graphics", "טקסט שמוצג כציטוט הוא ציטוט מדויק ממה שנאמר", ("fact", "graphics_exact")),
+    ("G4", "graphics", "כותרת עריכתית אינה משנה משמעות, אינה מיוחסת לדוברת ואינה כוללת מידע עסקי", ("criterion", "A19")),
     ("C1", "color", "בהירות הפנים / הפריים בטווח העבודה", ("fact", "color_exposure")),
     ("C2", "color", "אין סטיית צבע באזורים הניטרליים", ("fact", "color_cast")),
     ("C3", "color", "גוון העור נשמר אחרי התיקון", ("fact", "color_skin")),
@@ -121,7 +122,7 @@ def _fact(name, f):
             return "not_checked", "measured", "לא נמדד", None
         if not g:
             return "na", "measured", "הסרטון נערך בלי מואושן גרפיק", None
-        bad = [x for x in g if not x.get("quote_is_exact")]
+        bad = [x for x in g if not x.get("quote_is_exact") and x.get("text_class") != "editorial"]      # an editorial title is not a quotation and is judged separately (G4)
         return ("not_met" if bad else "met", "measured", "כל טקסט גרפי אומת מול התמלול של הקטעים שנבחרו", g[0].get("tl_start_s"))
     if name.startswith("color_"):
         c = f.get("color")
@@ -267,7 +268,7 @@ def compare(prev, cur):
 REVIEW_SKILL = {"name": "dana-review", "version": RUBRIC_VERSION, "what": "הקריטריונים הקבועים של הביקורת (12 קטגוריות)"}
 
 
-def final(dana_review, skill_report, provenance, review_items, records, previous, target, base_skill):
+def final(dana_review, skill_report, provenance, review_items, records, previous, target, base_skill, owner_resolved=None):
     """Built AFTER the last correction round, from what was measured and assessed on the delivered file.
 
     It never adds a judgement of its own: it gathers the category review, the compliance with the skills that were
@@ -282,7 +283,11 @@ def final(dana_review, skill_report, provenance, review_items, records, previous
                 "measured": by("measured"), "frames": by("frames"), "model": by("model"),
                 "human_only": [r["criterion"] for r in rows if r["basis"] == "human"],
                 "note": "הסיכום סופר רק קריטריונים שנבדקו. מה שדורש האזנה או צפייה בתנועה אינו נספר ואין לו ציון."}
-    failed = [r for r in records if r["status"] in ("fail", "review")]
+    # A check whose every doubt the owner settled by listening (in an earlier version) no longer asks for another fix. It
+    # is still listed - as settled, with who decided - never as passed.
+    settled = [r for r in records if r["status"] in ("fail", "review") and r["id"] in (owner_resolved or [])]
+    failed = [r for r in records if r["status"] in ("fail", "review") and r["id"] not in (owner_resolved or [])]
+    review_items = [i for i in review_items or [] if not i.get("owner_decision")]
     imps = dana_review.get("improvements") or []
     fixable = [i for i in imps if i.get("can_apply") and i.get("importance") == 1]
     sk = (skill_report or {}).get("summary")
@@ -296,7 +301,8 @@ def final(dana_review, skill_report, provenance, review_items, records, previous
     reasons = ([f"כלל מחייב של הסקיל הופר (נמדד): {b['text']} — {b['evidence']}"[:260] for b in broken[:4]]
                + [f"בדיקה אוטומטית נכשלה: {r['id']} — {r['summary']}"[:260] for r in failed[:6]]
                + [f"שיפור טכני שדנה עוד יכולה ליישם: {i['problem']}"[:260] for i in fixable[:4]]
-               + ([f"{len(review_items)} פריטים פתוחים שדורשים צפייה או האזנה שלך"] if review_items else []))
+               + ([f"{len(review_items)} פריטים פתוחים שדורשים צפייה או האזנה שלך"] if review_items else [])
+               + ([f"{len(settled)} בדיקות שנכשלו במדידה הוכרעו בהאזנה שלך בגרסה קודמת: {', '.join(r['id'] for r in settled)}"] if settled else []))
     if sk and not sk["fully_applied"]:
         reasons.append(f"הסקילים לא יושמו במלואם: {sk['applied']} כללים יושמו, {sk['not_followed']} לא יושמו, {sk['unsupported']} לא נתמכים, {sk['not_checked']} לא נבדקו")
     worked = [{"category": c["label"], "what": f"{c['met']} מתוך {c['decided']} קריטריונים שנבדקו מתקיימים"} for c in dana_review["categories"] if c["decided"] and c["met"] == c["decided"]]
@@ -322,7 +328,7 @@ def final(dana_review, skill_report, provenance, review_items, records, previous
                                               + (f"; מכללי הסקילים יושמו {sk['applied']} מתוך {sk['applied'] + sk['not_followed'] + sk['not_applicable'] + sk['not_checked']} שנתמכים" if sk else ""),
             "worked": worked, "needs_improvement": needs, "not_checked": unchecked, "verdict": verdict, "verdict_text": vtext, "verdict_reasons": reasons,
             "verdict_basis": "נקבע לפי בדיקות אוטומטיות שנכשלו ופריטים פתוחים — לא לפי הדירוג לבדו.",
-            "mandatory_violations": broken,
+            "mandatory_violations": broken, "settled_by_owner": [r["id"] for r in settled],
             "changes": changes(previous, dana_review),
             "limits": ["הערכת מודל נעשתה על תמלול ופריימים בודדים ויכולה להשתנות בין הרצות", "איש לא האזין לאודיו ולא צפה בתנועה",
                        "הדירוג אינו אישור פרסום ואינו מבטיח ביצועים באינסטגרם", "כל שינוי בסרטון הופך את הביקורת הזו ללא עדכנית"]}

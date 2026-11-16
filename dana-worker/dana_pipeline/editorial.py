@@ -59,6 +59,8 @@ ACCEPTANCE = [
     ("A16", "המילים שנאמרות בשלוש השניות הראשונות נותנות לצופה זר סיבה להמשיך לצפות", "reviewer"),
     ("A17", "סדר החלקים הגיוני: פתיחה, גוף וסיום, בלי קפיצה שמבלבלת", "reviewer"),
     ("A18", "אין חלק שחוזר על מה שכבר נאמר או שאינו משרת את המסר", "reviewer"),
+    # asked only when the edit carries an editorial title (Dana's wording, not a quotation)
+    ("A19", "כותרת עריכתית אינה משנה את משמעות דברי הדוברת, אינה מייחסת לה מילים שלא אמרה ואינה כוללת מידע עסקי", "reviewer"),
 ]
 EDITOR_FIXES = {"caption", "cover", "cards", "highlight", "spelling", "segment"}
 
@@ -244,7 +246,9 @@ def model_review(cfg, job_dir, dec, res, previous, tag, work):
     cards = [dict({"n": c["i"], "text": c["plain"], "highlight": c["highlight"],
                    "on_screen_s": [by_i[c["i"]]["t0"], by_i[c["i"]]["t1"]] if c["i"] in by_i else None},
                   **({"not_drawn": "its words are shown by the full-frame animation scene at that moment"} if c.get("in_scene") else {})) for c in res["cards"]]
-    asked = [{"id": i, "criterion": t} for i, t, who in ACCEPTANCE if who == "reviewer" and i not in (eff.get("na") or {})]
+    gfx = res.get("graphics") or []
+    has_editorial = any(g.get("text_class") == "editorial" for g in gfx)
+    asked = [{"id": i, "criterion": t} for i, t, who in ACCEPTANCE if who == "reviewer" and i not in (eff.get("na") or {}) and (i != "A19" or has_editorial)]
     text = "\n\n".join([
         "<criteria>\n" + json.dumps(asked, ensure_ascii=False, indent=1) + "\n</criteria>",
         "<plan>\n" + json.dumps({"objective": dec["plan"]["objective"], "message": dec["segment"]["complete_thought"],
@@ -269,6 +273,9 @@ def model_review(cfg, job_dir, dec, res, previous, tag, work):
         ("<zooms>\n" + json.dumps([{k: z.get(k) for k in ("tl_t_s", "hold_until_s", "scale", "reason")} for z in res.get("zooms") or []],
                                    ensure_ascii=False) + "\nEach zoom eases in at tl_t_s and holds until hold_until_s, then cuts back to the wide "
          "frame. You see stills only; judge framing in the stills, not the feel of the motion.\n</zooms>") if res.get("zooms") else "",
+        ("<graphics>\n" + json.dumps([{k: g.get(k) for k in ("kind", "layer", "text", "text_class", "based_on", "tl_start_s", "tl_end_s", "reason")} for g in gfx], ensure_ascii=False)
+         + "\ntext_class \"quote\" = the speaker's exact words. text_class \"editorial\" = a title in the editor's own words, shown as an editorial title "
+         "(it is NOT a quotation and must not be reported as a misquotation); judge it only by criterion A19, against \"based_on\" and the transcript.\n</graphics>") if gfx else "",
         skill_block(res.get("skill")),
         ("<rules_in_force>\n" + "\n".join(f"- {x}" for x in eff["lines"]) + "\nThese are decisions already made for this job by the approved "
          "style and the target. They are facts about the job, not preferences: a finding that asks for the opposite is wrong.\n</rules_in_force>") if eff.get("lines") else "",
@@ -339,6 +346,8 @@ def criteria_table(dec, res, det, tools, review):
     for cid, text, who in ACCEPTANCE:
         if cid in na:                              # a rule in force makes the criterion meaningless for this job: neither met nor failed
             rows.append({"id": cid, "criterion": text, "decided_by": "not_applicable", "met": None, "note": na[cid]})
+        elif cid == "A19" and not any(g.get("text_class") == "editorial" for g in res.get("graphics") or []):
+            rows.append({"id": cid, "criterion": text, "decided_by": "not_applicable", "met": None, "note": "אין כותרת עריכתית בגרסה הזו"})
         elif cid in table:
             w, met, note = table[cid]
             rows.append({"id": cid, "criterion": text, "decided_by": w, "met": met, "note": note})
