@@ -54,7 +54,7 @@
 
   async function loadHome() {
     const [{ projects, worker }, st] = await Promise.all([api('/projects'), api('/status')]);
-    status = st; workerPill(worker);
+    status = st; workerPill(worker); showBanner();
     $('#projects').innerHTML = projects.length ? projects.map(p => { const pr = p.progress;
       return `<li><button class="proj" data-id="${esc(p.id)}">
       <div class="row"><b class="grow">${esc(p.title)}</b>${p.kind === 'review_only' ? '<span class="pill mute">הועלה לביקורת</span>' : ''}${pill(p.status)}</div>
@@ -64,10 +64,13 @@
     $('#upacct').innerHTML = accts.map(a => `<option value="${esc(a.username)}">@${esc(a.username)} — מחובר, אומת ${esc(a.verifiedAt)}</option>`).join('') + '<option value="">בלי חשבון יעד כרגע</option>';
     $('#accounts').innerHTML = accts.length ? accts.map(a => `<li><div class="row"><b class="grow" dir="ltr" style="text-align:right">@${esc(a.username)}</b><span class="pill ok">מחובר ✓ אומת ${esc(a.verifiedAt)}</span></div>
       <div class="small mute">${esc(a.platform)} · ${esc(a.how)}</div></li>`).join('') : '<li class="mute">אין חשבון מחובר.</li>';
-    $('#profnow').textContent = st.defaultProfile ? `${st.defaultProfile.id} · גרסה ${st.defaultProfile.version} (אושר על ידך)` : 'לא אושר פרופיל — העובד משתמש בפרופיל המובנה שלו, שאינו מאושר';
+    $('#profnow').textContent = st.defaultProfile ? `${st.defaultProfile.id} · גרסה ${st.defaultProfile.version} (${st.dataBanner ? 'אישור בדיקה סינתטי — לא אישור שלך' : 'אושר על ידך'})` : 'לא אושר פרופיל — העובד משתמש בפרופיל המובנה שלו, שאינו מאושר';
     if (!worker.online && projects.some(p => p.status === 'editing')) notice('עובד העריכה במחשב לא מחובר. העבודות ממתינות בתור וימשיכו כשהוא יחזור.', 'warn');
     loadBrand().catch(() => {}); loadRules().catch(() => {}); loadRefs().catch(() => {});
   }
+  /** A preview of test material says so on every screen; an approval made there is synthetic, never the owner's. */
+  function showBanner() { const b = $('#banner'), t = status && status.dataBanner; b.textContent = t || ''; b.classList.toggle('hidden', !t); }
+  const approvedPill = () => status && status.dataBanner ? '<span class="pill bad">אישור בדיקה סינתטי — לא אישור שלך</span>' : '<span class="pill ok">אושר על ידך</span>';
   const phaseLabel = k => ((status && status.phases) || []).reduce((a, [key, l]) => key === k ? l : a, k);
 
   // ── Brand settings: edit, never invent ──
@@ -297,6 +300,7 @@
     try {
       const { project, worker } = await api('/projects/' + id);
       if (!status) status = await api('/status');
+      showBanner();
       const changed = !current || current.id !== project.id || current.currentVersion !== project.currentVersion || current.status !== project.status
         || current.pendingCorrections !== project.pendingCorrections || JSON.stringify(current.cardStates) !== JSON.stringify(project.cardStates);
       const typing = document.activeElement && ['TEXTAREA', 'INPUT', 'SELECT'].includes(document.activeElement.tagName) && $('#panel').contains(document.activeElement);
@@ -481,7 +485,7 @@
     const ru = pkg.rulesUsed, st = pkg.style || {}, sv = k => draft.style[k] !== undefined ? draft.style[k] : st[k], burned = pkg.burnedInText && pkg.burnedInText.present;
     return `<div class="card" id="rulesused"><h2>לפי מה נערכה הגרסה הזו</h2>
         ${ru ? `<ul class="plain small">
-          <li>פרופיל: <b>${esc(ru.profile.id)}</b> · גרסה ${esc(ru.profile.version)} · ${ru.profile.status === 'owner_approved' ? '<span class="pill ok">אושר על ידך</span>' : '<span class="pill warn">מובנה — לא אושר</span>'} · <code>${esc(String(ru.profile.sha256 || '').slice(0, 12))}</code></li>
+          <li>פרופיל: <b>${esc(ru.profile.id)}</b> · גרסה ${esc(ru.profile.version)} · ${ru.profile.status === 'owner_approved' ? approvedPill() : '<span class="pill warn">מובנה — לא אושר</span>'} · <code>${esc(String(ru.profile.sha256 || '').slice(0, 12))}</code></li>
           <li>רפרנסים שהפרופיל נגזר מהם: ${(ru.references || []).length ? ru.references.map(x => `<code>${esc(x)}</code>`).join(' · ') : 'אין'}</li>
           <li>כללי סגנון מהפרופיל: ${(ru.profile_rules || []).length ? ru.profile_rules.map(x => esc(x)).join(' · ') : 'אין'}</li>
           <li>כללים קבועים שלך: ${(ru.standing_rules || []).length ? ru.standing_rules.map(x => `<code>${esc(x.id)}</code> גרסה ${esc(x.version ?? '—')}`).join(' · ') : 'אין'}</li>

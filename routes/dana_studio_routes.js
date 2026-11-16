@@ -107,7 +107,9 @@ const upload = (req, res, next) => multer({
 panelRouter.get('/status', wrap((_req, res) => res.json({ ok: true, worker: studio.workerStatus(), publishingEnabled: publisher.enabled(),
   notifications: require('../services/dana_notify').realEnabled() ? 'real' : 'mock', maxUploadMb: maxUploadMb(), brandMissing: brand.missing(),
   instagramAccount: brand.get().instagram_account.value ?? null, defaultProfile: refs.defaultProfile(), styleLimits: studio.STYLE_OVERRIDABLE,
-  accounts: brand.accounts(), adjustmentKinds: studio.ADJUSTMENT_KINDS, phases: studio.PHASES })));
+  accounts: brand.accounts(), adjustmentKinds: studio.ADJUSTMENT_KINDS, phases: studio.PHASES,
+  // Set only on a preview that shows test material: the page then marks everything as test data and synthetic approvals.
+  dataBanner: process.env.DANA_DATA_BANNER ? String(process.env.DANA_DATA_BANNER).slice(0, 300) : null })));
 // ── Notification: configuration check and ONE explicit test (real mode only) ──
 panelRouter.get('/notify/status', wrap((_req, res) => res.json({ ok: true, notify: require('../services/dana_notify').status() })));
 panelRouter.post('/notify/test', json, wrap(async (req, res) => res.json({ ok: true, ...(await require('../services/dana_notify').sendTest(req.body ?? {})) })));

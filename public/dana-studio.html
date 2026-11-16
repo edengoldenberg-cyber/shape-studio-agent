@@ -67,6 +67,7 @@
   .ba { display:grid; grid-template-columns:1fr 1fr; gap:6px; font-size:12px; text-align:center; color:var(--mute); }
   .actions { position:fixed; bottom:0; inset-inline:0; z-index:7; background:var(--card); border-top:1px solid var(--line); padding:8px 12px calc(8px + env(safe-area-inset-bottom)); display:flex; gap:8px; justify-content:center; }
   .actions button { flex:1; max-width:360px; padding:10px 6px; font-size:15px; }
+  #banner { position:sticky; top:50px; z-index:6; background:#7a1f00; color:#fff; font-weight:600; font-size:14px; padding:8px 14px; text-align:center; border-bottom:2px solid #ffb300; }
   .embed header a { display:none; } .embed body { background:transparent; }
 </style>
 </head>
@@ -77,6 +78,7 @@
   <span id="worker" class="pill mute">בודק עובד…</span>
   <a href="/">פאנל</a>
 </header>
+<div id="banner" class="hidden" role="note"></div>
 <main>
   <div id="notice" class="card hidden" role="status"></div>
 
