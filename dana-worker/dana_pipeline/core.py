@@ -39,11 +39,13 @@ DEFAULT_STYLE = {
     "highlight_enabled": True,      # yellow is AVAILABLE; a card is highlighted only when the decisions name words
     "caption_max_lines": 1,          # a card may be laid out on this many lines before it is split
     "captions_enabled": True,        # False when the source already carries burned-in captions
+    "caption_animation": "none",     # none | fade | rise — how a card enters (captions.ANIMATIONS)
     "direction": "rtl",
     "cover_size": 112, "cover_y_px": 960,
 }
 # Keys a job (per-project override) may change. Anything else in a job is ignored.
-STYLE_OVERRIDABLE = {"caption_size", "caption_y_px", "caption_max_lines", "backing", "highlight_enabled", "cover_size", "cover_y_px"}
+STYLE_OVERRIDABLE = {"caption_size", "caption_y_px", "caption_max_lines", "backing", "highlight_enabled", "cover_size", "cover_y_px",
+                     "caption_animation", "caption_ink", "caption_highlight"}
 DEFAULTS = {
     "style": DEFAULT_STYLE,
     "asr": {"model": "large-v3", "device": "cuda", "compute_type": "float16", "language": "he"},
@@ -66,7 +68,7 @@ DEFAULTS = {
     "alignment": {"vad_min_silence_ms": 100, "agree_ms": 80, "lead_fail_ms": 120},
     # Dana's plan → edit → review loop: at most this many automatic revisions, inside a total budget.
     "editorial": {"max_cycles": 3, "max_total_cost_usd": 2.0, "max_total_s": 1500},
-    "timeouts": {"ffmpeg_s": 1800, "chrome_s": 60},
+    "timeouts": {"ffmpeg_s": 1800, "chrome_s": 60, "hyperframes_s": 420},
 }
 REQUIRED_PATHS = ["work_root", "chrome", "caption_renderer", "font_dir", "safe_zone"]
 

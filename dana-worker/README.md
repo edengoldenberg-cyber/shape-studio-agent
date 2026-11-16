@@ -13,7 +13,16 @@ dana-worker/
     align.py                reference onset of each card from the final audio (Whisper + VAD + envelope)
     captions.py             match cards to the transcript, timing, PNG render, composite
     checks.py               structured checks (sync gate, width, safe zone, pixels, loudness…)
+    story.py                content plan (message, parts, zooms, cover, graphics), assembly, owner corrections
+    adjust.py               measured colour and sound adjustments (skin / speech guards), before-after material
+    motion.py               motion graphics: writes a HyperFrames project per graphic, renders RGBA frames, checks them
+    interpret.py            what a free-text request asks to change (targeted revision vs. re-plan)
+    review.py               Dana's review by category from a fixed, versioned rubric
+    review_only.py          review of a finished video the owner uploaded (edits nothing)
+    reference.py            style analysis of a reference video → a proposed profile
+    editorial.py            plan → edit → review → revise loop
     run.py                  orchestrator
+  motion/gsap.min.js        GSAP 3.15.0, vendored so a graphic renders without network access (gsap.com/standard-license)
   instructions/             versioned instruction bundle built from the installed ig-* skills
   autostart/                optional Windows auto-start (not installed)
   vendor/                   byte-exact backup of the customized caption renderer
@@ -34,6 +43,28 @@ It never copies scripts into a project folder and never touches
 
 Local preview without the production server: `node scripts/dana_studio_preview.cjs`
 (see the script header), or a full local run: `node scripts/dana_e2e_local.cjs dryrun <source>`.
+
+## What an edit applies, and how to switch it off
+
+Every adjustment starts from a measurement of the video and is recorded in the package (`adjustments`). The owner can
+switch each kind off per project (`options.adjustments`): `color`, `audio_cleanup`, `zooms`, `caption_animation`,
+`graphics`.
+
+- **Colour** (`adjust.plan_color`): exposure, contrast, white balance and saturation, only when the measurement is outside
+  the working ranges in `adjust.LIMITS`; the correction is re-measured on the face area and halved or dropped when the skin
+  tone moves. It is computed against the source, so a later version never corrects a corrected picture. A source that
+  already carries burned-in captions is treated as already graded and left alone (except in a requested polish).
+- **Sound** (`adjust.plan_audio`): background noise is measured only between the spoken words. High-pass and at most 6 dB
+  of FFT noise reduction, only when measured, with a check that the speech level did not move. Loudness is normalised to
+  the target as before. Nobody listens: whether it sounds natural is the owner's check.
+- **Caption animation**: `none | fade | rise` from the profile or the project style.
+- **Motion graphics** (`motion.py`): at most two, only exact quotations, only when the content plan gives one a job.
+  Needs the `hyperframes` CLI (found on PATH, or `paths.hyperframes`). A graphic that cannot be rendered is reported as
+  not added; the edit still completes.
+- **Before / after**: `compare_frames.jpg` and `compare_clip.mp4` in every package.
+
+Job kinds: an edit (`dana_pipeline.run`) or a review of an uploaded finished video (`dana_pipeline.review_only`).
+`options.polish` (set by the server after such a review) keeps the owner's cut and applies technical improvements only.
 
 ## States and exit codes
 
@@ -153,5 +184,7 @@ registered with `install.ps1 -WhatIf`.
 
 ```
 python -X utf8 -m unittest discover -s dana-worker/tests -v
-npx jest --runInBand tests/dana_studio.test.js
+npx jest --runInBand tests/dana_studio.test.js tests/dana_round2.test.js tests/dana_references.test.js tests/dana_feedback.test.js
+node scripts/dana_e2e_round2.cjs <raw> <edited> <ref1> <ref2>        # the five owner-path checks, real worker, local only
+node tests/dana_studio_page_check.mjs http://127.0.0.1:<port>        # the page in a headless browser, desktop + phone
 ```

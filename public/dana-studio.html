@@ -5,97 +5,160 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>דנה סטודיו</title>
 <style>
-  :root { --bg:#f6f5f2; --card:#fff; --ink:#1c1b1a; --mute:#6b6862; --line:#e4e1da; --accent:#c2186a; --ok:#1d7a46; --warn:#a15c00; --bad:#b3261e; --info:#2b5fb3; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#151413; --card:#201f1d; --ink:#f1efea; --mute:#a39f96; --line:#35332f; --accent:#f06aa9; --ok:#62c98f; --warn:#e5a84a; --bad:#f2837b; --info:#8ab4f8; } }
+  :root { --bg:#f6f5f2; --card:#fff; --ink:#1c1b1a; --mute:#6b6862; --line:#e4e1da; --accent:#c2186a; --accent-soft:#fbe9f2; --ok:#1d7a46; --warn:#a15c00; --bad:#b3261e; --info:#2b5fb3; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#151413; --card:#201f1d; --ink:#f1efea; --mute:#a39f96; --line:#35332f; --accent:#f06aa9; --accent-soft:#3a2230; --ok:#62c98f; --warn:#e5a84a; --bad:#f2837b; --info:#8ab4f8; } }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.5 system-ui,-apple-system,"Segoe UI",Heebo,Arial,sans-serif; }
-  header { position:sticky; top:0; z-index:5; background:var(--card); border-bottom:1px solid var(--line); padding:10px 16px; display:flex; align-items:center; gap:10px; }
-  header h1 { font-size:18px; margin:0; flex:1; }
+  header { position:sticky; top:0; z-index:6; background:var(--card); border-bottom:1px solid var(--line); padding:8px 14px; display:flex; align-items:center; gap:10px; }
+  header h1 { font-size:17px; margin:0; flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   header a { color:var(--mute); text-decoration:none; font-size:14px; }
-  main { max-width:640px; margin:0 auto; padding:12px 16px 96px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; margin:12px 0; }
-  .card h2 { font-size:16px; margin:0 0 8px; }
+  main { max-width:1180px; margin:0 auto; padding:10px 14px 110px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; margin:10px 0; }
+  .card h2 { font-size:16px; margin:0 0 8px; } .card h3 { font-size:14px; margin:12px 0 6px; }
   .pill { display:inline-block; font-size:12px; padding:2px 9px; border-radius:99px; border:1px solid currentColor; white-space:nowrap; }
   .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); } .info { color:var(--info); } .mute { color:var(--mute); }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
   .grow { flex:1; min-width:0; }
-  button, .btn { font:inherit; border:1px solid var(--line); background:var(--card); color:var(--ink); border-radius:10px; padding:10px 14px; cursor:pointer; min-height:44px; }
+  button, .btn { font:inherit; border:1px solid var(--line); background:var(--card); color:var(--ink); border-radius:10px; padding:9px 13px; cursor:pointer; min-height:44px; }
   button.primary { background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600; }
-  button.danger { color:var(--bad); }
+  button.danger { color:var(--bad); } button.sm { min-height:34px; padding:4px 10px; font-size:14px; }
   button:disabled { opacity:.45; cursor:not-allowed; }
-  input[type=text], input[type=datetime-local], textarea, select { font:inherit; width:100%; padding:10px; border:1px solid var(--line); border-radius:10px; background:var(--bg); color:var(--ink); }
-  textarea { min-height:120px; resize:vertical; }
+  input[type=text], input[type=datetime-local], input[type=number], textarea, select { font:inherit; width:100%; padding:10px; border:1px solid var(--line); border-radius:10px; background:var(--bg); color:var(--ink); }
+  input[type=color] { width:48px; height:40px; padding:2px; border:1px solid var(--line); border-radius:8px; background:var(--bg); }
+  input[type=checkbox], input[type=radio] { width:20px; height:20px; flex:none; }
+  textarea { min-height:90px; resize:vertical; }
   label { display:block; font-size:13px; color:var(--mute); margin:10px 0 4px; }
-  video, img.cover { width:100%; max-height:70vh; background:#000; border-radius:12px; display:block; object-fit:contain; }
+  label.chk { display:flex; gap:8px; align-items:center; color:var(--ink); font-size:15px; }
+  video, img.cover, img.wide { width:100%; max-height:62vh; background:#000; border-radius:12px; display:block; object-fit:contain; }
   ul.plain { list-style:none; margin:0; padding:0; }
   ul.plain li { padding:8px 0; border-top:1px solid var(--line); font-size:14px; overflow-wrap:anywhere; }
   ul.plain li:first-child { border-top:0; }
   .proj { display:block; width:100%; text-align:start; }
-  .bar { height:6px; border-radius:6px; background:var(--line); overflow:hidden; margin-top:8px; }
+  .bar { height:8px; border-radius:8px; background:var(--line); overflow:hidden; margin-top:8px; }
   .bar i { display:block; height:100%; width:0; background:var(--accent); transition:width .3s; }
-  .actions { position:fixed; bottom:0; inset-inline:0; background:var(--card); border-top:1px solid var(--line); padding:10px 12px calc(10px + env(safe-area-inset-bottom)); display:grid; grid-template-columns:1.4fr 1fr 1fr 1fr; gap:8px; }
-  .actions button { padding:10px 4px; font-size:14px; }
   .quote { border-inline-start:3px solid var(--line); padding-inline-start:10px; color:var(--mute); font-size:14px; }
   .small { font-size:13px; } .hidden { display:none !important; }
   details summary { cursor:pointer; padding:6px 0; }
   code { font-size:12px; overflow-wrap:anywhere; }
-  .qblock { border-top:1px solid var(--line); padding:10px 0 4px; } .qblock h3 { font-size:14px; margin:0 0 6px; }
-  .refan { border-top:1px solid var(--line); margin-top:8px; padding-top:4px; } .refparams .row { margin:4px 0; }
-  .embed header a { display:none; }                       /* inside the panel tab the panel is already around it */
-  .embed body { background:transparent; }
+  /* top tabs (home) and the workflow stepper (project) */
+  .tabs { display:flex; gap:6px; overflow-x:auto; padding:2px 0 6px; scrollbar-width:none; } .tabs::-webkit-scrollbar { display:none; }
+  .tabs button { white-space:nowrap; border-radius:99px; min-height:40px; padding:6px 14px; font-size:14px; }
+  .tabs button.on { background:var(--accent-soft); border-color:var(--accent); color:var(--accent); font-weight:600; }
+  .steps button .n { display:inline-block; width:20px; height:20px; line-height:20px; border-radius:50%; background:var(--line); color:var(--ink); font-size:12px; text-align:center; margin-inline-end:6px; }
+  .steps button.on .n { background:var(--accent); color:#fff; }
+  .steps button .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--warn); margin-inline-start:6px; }
+  /* project layout: player + status beside the step content on wide screens */
+  .layout { display:grid; gap:0 14px; grid-template-columns:minmax(0,1fr); }
+  .layout > * { min-width:0; }                     /* a grid child must be allowed to shrink, or the step tabs widen the whole page */
+  /* phone: the player stays on screen (small, sticky) while the step content scrolls under it, so listening to a caption never loses your place */
+  @media (max-width: 979px) { .side { display:contents; } #playerbox { position:sticky; top:52px; z-index:5; padding:8px; margin:6px 0; box-shadow:0 2px 10px rgba(0,0,0,.12); } #playerbox video { max-height:30vh; } }
+  @media (min-width: 980px) { .layout { grid-template-columns:380px minmax(0,1fr); align-items:start; } .side { position:sticky; top:58px; max-height:calc(100vh - 70px); overflow:auto; } .side video { max-height:52vh; } }
+  .phases { display:flex; gap:4px; flex-wrap:wrap; margin:6px 0; }
+  .phases span { font-size:12px; padding:3px 8px; border-radius:8px; border:1px solid var(--line); color:var(--mute); }
+  .phases span.done { color:var(--ok); border-color:var(--ok); } .phases span.current { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+  .next { border-color:var(--accent); background:var(--accent-soft); }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:8px; }
+  .cat { border:1px solid var(--line); border-radius:12px; padding:10px; text-align:start; min-height:0; display:block; width:100%; }
+  .cat b { display:block; } .cat.sel { border-color:var(--accent); background:var(--accent-soft); }
+  .lv-ok { color:var(--ok); } .lv-mid { color:var(--warn); } .lv-bad { color:var(--bad); } .lv-none { color:var(--mute); }
+  table.cmp { width:100%; border-collapse:collapse; font-size:13px; } table.cmp th, table.cmp td { border-top:1px solid var(--line); padding:6px 4px; text-align:start; vertical-align:top; }
+  .capline { display:grid; grid-template-columns:auto 1fr; gap:6px 8px; align-items:center; }
+  .capline .full { grid-column:1 / -1; }
+  .ba { display:grid; grid-template-columns:1fr 1fr; gap:6px; font-size:12px; text-align:center; color:var(--mute); }
+  .actions { position:fixed; bottom:0; inset-inline:0; z-index:7; background:var(--card); border-top:1px solid var(--line); padding:8px 12px calc(8px + env(safe-area-inset-bottom)); display:flex; gap:8px; justify-content:center; }
+  .actions button { flex:1; max-width:360px; padding:10px 6px; font-size:15px; }
+  .embed header a { display:none; } .embed body { background:transparent; }
 </style>
 </head>
 <body>
 <header>
-  <button id="back" class="hidden" aria-label="חזרה לרשימה">→</button>
-  <h1>🎬 דנה סטודיו</h1>
+  <button id="back" class="hidden sm" aria-label="חזרה לרשימה">→ פרויקטים</button>
+  <h1 id="title">🎬 דנה סטודיו</h1>
   <span id="worker" class="pill mute">בודק עובד…</span>
   <a href="/">פאנל</a>
 </header>
 <main>
-  <div id="notice" class="card hidden"></div>
-  <section id="list">
-    <div class="card">
-      <h2>העלאת חומר גלם</h2>
-      <p class="small mute">קליפ מקור אחד → ריל אנכי אחד עם כתוביות. המקור נשמר כמו שהוא ולא משתנה.</p>
-      <input type="file" id="file" accept="video/*,.mp4,.mov,.m4v,.webm,.mkv,.avi" class="hidden">
-      <button class="primary" id="pick" style="width:100%">בחירת סרטון מהטלפון</button>
-      <div id="upstate" class="small mute" style="margin-top:8px"></div>
-      <div class="bar hidden" id="upbar"><i></i></div>
+  <div id="notice" class="card hidden" role="status"></div>
+
+  <section id="home">
+    <nav class="tabs" id="hometabs" aria-label="אזורים">
+      <button data-home="projects" class="on">פרויקטים</button>
+      <button data-home="refs">רפרנסים וסגנון עריכה</button>
+      <button data-home="brand">מותג וחשבון</button>
+      <button data-home="rules">כללים קבועים</button>
+    </nav>
+
+    <div data-pane="projects">
+      <div class="card">
+        <h2>פרויקט חדש</h2>
+        <p class="small mute">המסלול: פרויקט ← תמלול ← סגנון ורפרנסים ← עריכה ← ביקורת דנה ← צפייה ואישור. קובץ המקור נשמר כמו שהוא.</p>
+        <input type="file" id="file" accept="video/*,.mp4,.mov,.m4v,.webm,.mkv,.avi" class="hidden">
+        <label for="upacct">חשבון יעד לפרויקט</label>
+        <select id="upacct"></select>
+        <div class="row" style="margin-top:10px">
+          <button class="primary grow" id="pickraw">העלאת חומר גלם לעריכה</button>
+          <button class="grow" id="pickreview">העלאת סרטון ערוך — הגש לביקורת דנה</button>
+        </div>
+        <div id="upbox" class="hidden" style="margin-top:10px">
+          <div class="row"><b id="uppct">0%</b><span id="upstate" class="small mute grow"></span><button id="upcancel" class="sm danger">ביטול</button></div>
+          <div class="bar"><i id="upbar"></i></div>
+          <div class="small mute">אחוז ההעלאה נמדד לפי הבתים שהועברו בפועל.</div>
+        </div>
+      </div>
+      <div class="card"><h2>פרויקטים</h2><ul class="plain" id="projects"><li class="mute">טוען…</li></ul></div>
     </div>
-    <div class="card"><h2>פרויקטים</h2><ul class="plain" id="projects"><li class="mute">טוען…</li></ul></div>
-    <div class="card"><h2>חשבון יעד ופרופיל עריכה</h2>
-      <div class="row"><span class="grow">חשבון האינסטגרם ליעד הפרסום: <b id="acctnow">—</b></span><button id="acctset">עדכון</button></div>
-      <div class="small mute" style="margin-top:8px">פרופיל עריכה מאושר: <span id="profnow">—</span></div>
-      <p class="small mute">פרופיל מאשרים מתוך חבילה שנערכה לפיו ("התוכנית של דנה" ← "לפי אילו כללים נערך"), או מתוך הצעה שדנה גזרה מרפרנס (למטה). שום פרופיל לא מאושר אוטומטית.</p></div>
-    <div class="card"><h2>כללים קבועים</h2><ul class="plain small" id="rules"><li class="mute">טוען…</li></ul>
-      <p class="small mute">כללים שאישרת נשלחים עם כל עריכה, בכל הפרויקטים, עם מספר הגרסה שלהם. הערה שסומנה "תיקון לפרויקט הזה" לא הופכת לכלל.</p></div>
-    <div class="card"><h2>רפרנסים לעריכה</h2>
-      <p class="small mute">מעלים קובץ וידאו עם הערה מה אהבת בו. עובד העריכה מנתח אותו ומציע פרופיל; רק אישור שלך הופך הצעה לפרופיל. דנה לא מורידה קישורים — קישור בלי קובץ נשמר לתיעוד בלבד.</p>
-      <video id="refvid" class="hidden" controls playsinline preload="metadata" style="max-height:46vh;margin-bottom:8px"></video>
-      <ul class="plain small" id="refs"><li class="mute">טוען…</li></ul>
-      <details class="small"><summary>הוספת רפרנס</summary>
-        <label for="ref_title">שם</label><input type="text" id="ref_title" maxlength="120">
-        <label for="ref_source_url">קישור (או קובץ למטה)</label><input type="text" id="ref_source_url" inputmode="url" placeholder="https://…" dir="ltr">
-        <label for="ref_file">קובץ וידאו (נדרש לניתוח)</label><input type="file" id="ref_file" accept="video/*,image/*">
-        <label for="ref_origin">מקור — מי יצר / איפה נמצא</label><input type="text" id="ref_origin" maxlength="200">
-        <label for="ref_usage_permission">הרשאת שימוש</label><select id="ref_usage_permission"><option value="unknown">לא ידועה</option><option value="inspiration_only">להשראה בלבד</option><option value="own">חומר שלי</option><option value="licensed">ברישיון</option></select>
-        <label for="ref_content_type">סוג התוכן</label><input type="text" id="ref_content_type" maxlength="120">
-        <label for="ref_fits_message">לאיזה מסר הוא מתאים</label><input type="text" id="ref_fits_message" maxlength="300">
-        <label for="ref_owner_note">מה אהבתי בו</label><textarea id="ref_owner_note" style="min-height:70px" maxlength="2000"></textarea>
-        <button id="refadd" style="margin-top:10px">שמירת הרפרנס</button>
-        <p class="small mute">רפרנס משמש ללמידה בלבד. תוכן, מוזיקה ונכסים ממנו לא מועתקים לעריכה בלי הרשאה.</p></details></div>
-    <div class="card"><h2>הגדרות מותג חסרות</h2><ul class="plain small" id="brand"></ul>
-      <p class="small mute">פרטים חסרים לא חוסמים עריכה. דנה לא ממציאה אותם — הם מסומנים כחסרים עד שתגדיר/י.</p></div>
+
+    <div data-pane="refs" class="hidden">
+      <div class="card">
+        <h2>רפרנסים וסגנון עריכה</h2>
+        <p class="small mute">מעלים סרטוני ראיון ערוכים (אפשר כמה יחד), כותבים מה אהבת בכל אחד, ומשווים ביניהם. עובד העריכה מנתח כל קובץ ומציע פרופיל; רק אישור שלך הופך הצעה לפרופיל. דנה לא מורידה קישורים, ולא מעתיקה תוכן, מוזיקה או נכסים מרפרנס.</p>
+        <div class="small">פרופיל העריכה שבתוקף: <b id="profnow">—</b></div>
+        <video id="refvid" class="hidden" controls playsinline preload="metadata" style="max-height:46vh;margin-top:8px"></video>
+      </div>
+      <div class="card">
+        <h2>הוספת רפרנסים</h2>
+        <input type="file" id="ref_files" accept="video/*" multiple class="hidden">
+        <button id="refpick" class="primary">בחירת סרטונים (אפשר שניים ויותר יחד)</button>
+        <div id="refnew"></div>
+        <details class="small" style="margin-top:8px"><summary>רפרנס מקישור בלבד (לתיעוד — לא ניתן לניתוח)</summary>
+          <label for="ref_title">שם</label><input type="text" id="ref_title" maxlength="120">
+          <label for="ref_source_url">קישור</label><input type="text" id="ref_source_url" inputmode="url" placeholder="https://…" dir="ltr">
+          <label for="ref_owner_note">מה אהבתי בו</label><textarea id="ref_owner_note" maxlength="2000"></textarea>
+          <button id="reflink" style="margin-top:8px">שמירת הקישור</button></details>
+      </div>
+      <div class="card"><h2>הרפרנסים שלי</h2>
+        <p class="small mute">סמנו שניים או יותר שכבר נותחו כדי להשוות ולהרכיב פרופיל משולב.</p>
+        <ul class="plain small" id="refs"><li class="mute">טוען…</li></ul>
+        <button id="refcompare" class="primary" style="margin-top:8px" disabled>השוואה ופרופיל משולב</button>
+      </div>
+      <div class="card hidden" id="cmpcard"></div>
+    </div>
+
+    <div data-pane="brand" class="hidden">
+      <div class="card"><h2>חשבונות מחוברים</h2><ul class="plain" id="accounts"></ul>
+        <p class="small mute">חיבור מאומת אינו הרשאת פרסום. פרסום והתראות אמיתיות כבויים, ונשארים מאחורי אישור נפרד שלך.</p></div>
+      <div class="card"><h2>הגדרות מותג</h2>
+        <p class="small mute">דנה משתמשת רק במה שמוגדר כאן. שדה ריק מסומן "חסר" ודנה לא ממלאת אותו בעצמה: בלי קול, קהל, מחיר, הצעה או CTA שלא כתבת.</p>
+        <ul class="plain" id="brand"></ul></div>
+    </div>
+
+    <div data-pane="rules" class="hidden">
+      <div class="card"><h2>כללים קבועים</h2><ul class="plain small" id="rules"><li class="mute">טוען…</li></ul>
+        <p class="small mute">כלל נוצר רק כשמסמנים הערה כ"כלל קבוע" בבקשת תיקון. הוא נשמר עם מקור וגרסה ונשלח לכל העריכות הבאות. הערה שסומנה "תיקון לפרויקט הזה" לא הופכת לכלל.</p></div>
+    </div>
   </section>
-  <section id="detail" class="hidden"></section>
+
+  <section id="detail" class="hidden">
+    <div class="layout">
+      <div class="side" id="side"></div>
+      <div>
+        <nav class="tabs steps" id="steps" aria-label="שלבי העבודה"></nav>
+        <div id="panel"></div>
+      </div>
+    </div>
+  </section>
 </main>
-<div class="actions hidden" id="actions">
-  <button class="primary" data-act="approve">אשר</button>
-  <button data-act="changes">בקש שינויים</button>
-  <button data-act="reschedule">דחה מועד</button>
-  <button class="danger" data-act="reject">דחה</button>
-</div>
+<div class="actions hidden" id="actions"></div>
 <script src="/dana-studio.js"></script>
 </body>
 </html>

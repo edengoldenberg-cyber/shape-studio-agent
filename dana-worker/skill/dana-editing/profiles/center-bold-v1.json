@@ -1,6 +1,6 @@
 {
   "id": "center-bold-v1",
-  "version": "1",
+  "version": "2",
   "status": "unapproved",
   "_about": "Built-in profile for the owner's stated test style (2026-11-15): Heebo Bold, large and prominent, horizontally centred, centre area of the frame, not hiding the face. The words of that sentence are the owner's; every NUMBER below is a working value chosen to implement it and is not approved until the owner approves this profile.",
   "params": {
@@ -25,7 +25,9 @@
     "zoom_min_gap_s": 4.0,
     "zoom_min_hold_s": 1.2,
     "zoom_face_margin": 0.04,
-    "caption_shadow": "0 0 3px #000, 3px 3px 0 #000, -3px -3px 0 #000, 3px -3px 0 #000, -3px 3px 0 #000, 0 3px 0 #000, 0 -3px 0 #000, 3px 0 0 #000, -3px 0 0 #000, 0 6px 16px rgba(0,0,0,0.85)"
+    "caption_shadow": "0 0 3px #000, 3px 3px 0 #000, -3px -3px 0 #000, 3px -3px 0 #000, -3px 3px 0 #000, 0 3px 0 #000, 0 -3px 0 #000, 3px 0 0 #000, -3px 0 0 #000, 0 6px 16px rgba(0,0,0,0.85)",
+    "caption_animation": "rise"
   },
-  "_legibility": "White text gets a solid dark outline (text-shadow) so it stays readable over light clothing or background; found necessary on the first raw test (white text on a white shirt)."
+  "_legibility": "White text gets a solid dark outline (text-shadow) so it stays readable over light clothing or background; found necessary on the first raw test (white text on a white shirt).",
+  "_animation": "Version 2 adds caption_animation 'rise': each card fades in over 0.12 s and rises 16 px. A working value, not approved; the owner can set none / fade / rise per project or in an approved profile."
 }

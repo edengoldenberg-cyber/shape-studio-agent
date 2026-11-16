@@ -212,18 +212,38 @@ def render_png(cfg, style, items, out_dir, size_key="caption_size", y_key="capti
     return png_dir
 
 
-def composite(cfg, base, voice, cards, png_dir, out, dur):
-    """One encode: base picture + PNG cards (enable windows from the card times) + voice."""
+ANIMATIONS = {"none": None, "fade": {"in_s": 0.12, "rise_px": 0}, "rise": {"in_s": 0.12, "rise_px": 16}}
+
+
+def composite(cfg, base, voice, cards, png_dir, out, dur, animation=None, graphics=None, fps=25):
+    """One encode: base picture + PNG cards (enable windows from the card times) + motion graphics + voice.
+
+    animation: None (cards cut in, as before) or an ANIMATIONS entry: every card fades in over `in_s`
+    (its first frame is already 25% visible, so it still appears with its word) and may rise `rise_px`.
+    graphics: [{'frames': dir of frame_%06d.png (RGBA), 'tl_start_s', 'tl_end_s'}] rendered by HyperFrames."""
     r = cfg["render"]
-    inputs, parts, prev = [], [], "0:v"
+    inputs, parts, prev, k = [], [], "0:v", 2
+    frame = 1.0 / fps
     for idx, c in enumerate(cards):
         png = Path(png_dir) / f"c{c['i']:03d}.png"
         if not png.is_file():
             raise PipelineError("caption_render", f"missing card image {png.name}")
-        inputs += ["-i", png]
         t0, t1 = c["start"], round(c["start"] + c["dur"], 4)
-        parts.append(f"[{prev}][{idx + 2}:v]overlay=format=auto:enable='between(t,{t0},{t1})'[v{idx + 1}]")
-        prev = f"v{idx + 1}"
+        if animation:
+            d, rise = animation["in_s"], animation.get("rise_px", 0)
+            inputs += ["-loop", "1", "-framerate", str(fps), "-t", f"{c['dur'] + 0.2:.3f}", "-i", png]
+            parts.append(f"[{k}:v]format=rgba,setpts=PTS+{frame}/TB,fade=t=in:st=0:d={d + frame:.3f}:alpha=1,setpts=PTS+({t0}-{frame})/TB[c{idx}]")
+            y = f"'if(lt(t-{t0},{d}),{rise}*(1-(t-{t0})/{d}),0)'" if rise else "0"
+            parts.append(f"[{prev}][c{idx}]overlay=x=0:y={y}:format=auto:eof_action=pass:enable='between(t,{t0},{t1})'[v{idx + 1}]")
+        else:
+            inputs += ["-i", png]
+            parts.append(f"[{prev}][{k}:v]overlay=format=auto:enable='between(t,{t0},{t1})'[v{idx + 1}]")
+        prev, k = f"v{idx + 1}", k + 1
+    for n, g in enumerate(graphics or []):
+        inputs += ["-framerate", str(fps), "-start_number", "1", "-i", Path(g["frames"]) / "frame_%06d.png"]
+        parts.append(f"[{k}:v]format=rgba,setpts=PTS+{g['tl_start_s']}/TB[g{n}]")
+        parts.append(f"[{prev}][g{n}]overlay=format=auto:eof_action=pass:enable='between(t,{g['tl_start_s']},{g['tl_end_s']})'[vg{n}]")
+        prev, k = f"vg{n}", k + 1
     if not parts:                                    # no caption layer (the source already carries captions)
         parts, prev = ["[0:v]null[v0]"], "v0"
     script = Path(out).with_suffix(".filter.txt")

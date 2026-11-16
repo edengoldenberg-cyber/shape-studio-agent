@@ -106,7 +106,8 @@ const upload = (req, res, next) => multer({
 
 panelRouter.get('/status', wrap((_req, res) => res.json({ ok: true, worker: studio.workerStatus(), publishingEnabled: publisher.enabled(),
   notifications: require('../services/dana_notify').realEnabled() ? 'real' : 'mock', maxUploadMb: maxUploadMb(), brandMissing: brand.missing(),
-  instagramAccount: brand.get().instagram_account.value ?? null, defaultProfile: refs.defaultProfile(), styleLimits: studio.STYLE_OVERRIDABLE })));
+  instagramAccount: brand.get().instagram_account.value ?? null, defaultProfile: refs.defaultProfile(), styleLimits: studio.STYLE_OVERRIDABLE,
+  accounts: brand.accounts(), adjustmentKinds: studio.ADJUSTMENT_KINDS, phases: studio.PHASES })));
 // ── Notification: configuration check and ONE explicit test (real mode only) ──
 panelRouter.get('/notify/status', wrap((_req, res) => res.json({ ok: true, notify: require('../services/dana_notify').status() })));
 panelRouter.post('/notify/test', json, wrap(async (req, res) => res.json({ ok: true, ...(await require('../services/dana_notify').sendTest(req.body ?? {})) })));
@@ -131,7 +132,15 @@ const media = (name) => wrap((req, res) => {
   if (!v || !v.artifacts[name]) throw new studio.StudioError(404, 'artifact_not_found', 'הקובץ לא קיים בגרסה הזו');
   sendRange(req, res, studio.artifactPath(p.id, n, name), studio.ARTIFACTS[name].mime, { ETag: `"${v.artifacts[name].sha256}"` });
 });
-panelRouter.get('/projects/:id/versions/:n/video',  media('final.mp4'));
+/** The video of a version. For a review-only version it is the file the owner uploaded (nothing was rendered). */
+panelRouter.get('/projects/:id/versions/:n/video', wrap((req, res) => {
+  const p = studio.getProject(req.params.id), n = Number(req.params.n), v = p.versions.find(x => x.n === n);
+  if (v?.videoIsSource) return sendRange(req, res, studio.sourcePath(p.source), 'video/mp4', { ETag: `"${p.source.sha256}"` });
+  if (!v || !v.artifacts['final.mp4']) throw new studio.StudioError(404, 'artifact_not_found', 'הקובץ לא קיים בגרסה הזו');
+  sendRange(req, res, studio.artifactPath(p.id, n, 'final.mp4'), 'video/mp4', { ETag: `"${v.artifacts['final.mp4'].sha256}"` });
+}));
+panelRouter.get('/projects/:id/versions/:n/compare-frames', media('compare_frames.jpg'));
+panelRouter.get('/projects/:id/versions/:n/compare-clip',   media('compare_clip.mp4'));
 panelRouter.get('/projects/:id/versions/:n/cover',  media('cover.jpg'));
 panelRouter.get('/projects/:id/versions/:n/checks', media('checks.json'));
 panelRouter.get('/projects/:id/versions/:n/editorial', media('editorial.json'));
@@ -145,6 +154,12 @@ panelRouter.post('/projects/:id/request-changes', ...act(studio.requestChanges))
 /** "הפק גרסה מתוקנת": caption corrections + style + zoom changes + an optional note (project-only or standing rule) → the next version. */
 panelRouter.post('/projects/:id/revise',          ...act(studio.revise));
 panelRouter.post('/projects/:id/reject',          ...act(studio.reject));
+/** "אמת ושמור תיקון": one caption, after listening. Stored on the project; not an approval to publish. */
+panelRouter.post('/projects/:id/captions/verify', ...act(studio.verifyCaption));
+/** Destination account (one of the connected accounts) and which kinds of adjustment are on for this project. */
+panelRouter.patch('/projects/:id/settings',       ...act(studio.setSettings));
+/** "יישם שיפורים והפק גרסה חדשה": Dana applies what her review found and she may change by herself. */
+panelRouter.post('/projects/:id/apply-review',    ...act(studio.applyReview));
 panelRouter.post('/projects/:id/consent',         ...act(studio.setConsent));
 panelRouter.post('/projects/:id/retry',           ...act((id) => studio.retry(id)));
 /** RESCHEDULE: a new time for content that is already approved is a re-approval of the same content. */
@@ -223,6 +238,13 @@ panelRouter.post('/references/:id/approve-profile', json, wrap((req, res) => {
 panelRouter.post('/references/:id/reject-profile', json, wrap((req, res) => { const reference = refs.rejectReferenceProfile(req.params.id, req.body ?? {}); res.json({ ...refsOut(), reference }); }));
 panelRouter.get('/references/:id/file', wrap((req, res) => { const f = refs.filePath(req.params.id); sendRange(req, res, f.path, REF_MIME[f.ext] ?? 'application/octet-stream'); }));
 
+/** Two or more analysed references side by side + a proposed combined profile (a proposal only). */
+panelRouter.post('/references/compare', json, wrap((req, res) => res.json({ ok: true, comparison: refs.compare(req.body?.ids) })));
+/** The owner approves a combined profile: per number, which reference it is taken from. */
+panelRouter.post('/profiles/combined', json, wrap((req, res) => {
+  const out = refs.approveCombined({ by: req.body?.by, ids: req.body?.ids, picks: req.body?.picks, rules: req.body?.rules, make_default: req.body?.make_default === true });
+  res.status(201).json({ ok: true, profile: out.profile, profiles: out.profiles, default: refs.defaultProfile() });
+}));
 panelRouter.get('/profiles', wrap((_req, res) => res.json({ ok: true, profiles: refs.profiles(), default: refs.defaultProfile() })));
 /** Approve the profile that a finished version was actually edited with as the default for future projects. */
 panelRouter.post('/profiles/:id/approve', json, wrap((req, res) => {

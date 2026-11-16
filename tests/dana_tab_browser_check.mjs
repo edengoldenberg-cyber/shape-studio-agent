@@ -38,7 +38,11 @@ const profileDir = mkdtempSync(path.join(tmpdir(), 'shape-danatab-chrome-'));
 let mock, ws;
 
 try {
-  const seeded = !!(seed && existsSync(path.join(seed, 'dana')));
+  // Round 2 rebuilt the studio page around six workflow steps. The page itself (steps, transcript verification, review, references)
+  // is now checked by tests/dana_studio_page_check.mjs; this script keeps checking the Dana TAB of the panel that embeds it.
+  // The sections below that walked the old single-page layout are switched off rather than silently rewritten.
+  const LEGACY_LAYOUT = false;
+  const seeded = LEGACY_LAYOUT && !!(seed && existsSync(path.join(seed, 'dana')));
   let oldId = null; const NEW_ID = 'prj_newstylepackage01';
   if (seeded) {
     cpSync(path.join(seed, 'dana'), path.join(dataDir, 'dana'), { recursive: true });
@@ -112,8 +116,8 @@ try {
     await evalJs(`document.querySelector('.tab-btn[data-tab="dana"]').click()`);
     check('Dana tab opens the editing studio view', await until(`document.getElementById('tab-dana').classList.contains('active') && !document.getElementById('dana-view-studio').hidden && ${F}.getAttribute('src') === '/dana-studio.html?embed=1'`));
     check('previous tools are hidden while the studio is shown', await evalJs(`document.getElementById('dana-view-tools').hidden && !${visible('.dana-layout')}`));
-    check('studio page loaded inside the tab', await until(`${D} && ${D}.readyState === 'complete' && !!${D}.getElementById('pick')`));
-    check('upload control is present and usable', await evalJs(`(() => { const b = ${D}.getElementById('pick'), r = b.getBoundingClientRect(); return !b.disabled && r.width > 100 && r.height >= 44 && !!${D}.getElementById('file'); })()`));
+    check('studio page loaded inside the tab', await until(`${D} && ${D}.readyState === 'complete' && !!${D}.getElementById('pickraw')`));
+    check('upload control is present and usable', await evalJs(`(() => { const b = ${D}.getElementById('pickraw'), r = b.getBoundingClientRect(); return !b.disabled && r.width > 100 && r.height >= 44 && !!${D}.getElementById('file'); })()`));
     check('worker status is shown', await until(`!!${D}.getElementById('worker') && !/בודק/.test(${D}.getElementById('worker').textContent)`), await evalJs(`${D}.getElementById('worker')?.textContent`));
     check('embedded mode hides the redundant "panel" link', await evalJs(`${D}.documentElement.classList.contains('embed') && getComputedStyle(${D}.querySelector('header a')).display === 'none'`));
     check('the Dana tab adds no horizontal overflow of its own', await evalJs(`[...document.querySelectorAll('#tab-dana, #tab-dana *')].every(e => e.offsetParent === null || e.getBoundingClientRect().width <= window.visualViewport.width + 1)`));
@@ -164,7 +168,7 @@ try {
     check('previous tools fit the visible screen width', await evalJs(`[...document.querySelectorAll('#dana-view-tools, #dana-view-tools *')].every(e => e.offsetParent === null || e.getBoundingClientRect().width <= window.visualViewport.width + 1)`));
     await shot(`${vp.name}-3-tools`);
     await evalJs(`document.querySelector('.dana-switch-btn[data-dana-view="studio"]').click()`);
-    check('switching back shows the studio again without reloading it', await evalJs(`!document.getElementById('dana-view-studio').hidden && !!${D}.getElementById('pick')`));
+    check('switching back shows the studio again without reloading it', await evalJs(`!document.getElementById('dana-view-studio').hidden && !!${D}.getElementById('pickraw')`));
     await evalJs(`document.querySelector('.tab-btn[data-tab="barak"]').click()`);
     check('other tabs still switch (Barak)', await evalJs(`document.getElementById('tab-barak').classList.contains('active') && !document.getElementById('tab-dana').classList.contains('active')`));
   }
@@ -194,7 +198,7 @@ try {
     check('the job carries the caption correction with its source time and original text', o.caption_edits?.length === 1 && o.caption_edits[0].text === 'כתובית מתוקנת' && o.caption_edits[0].original === original && o.caption_edits[0].source_end_s > o.caption_edits[0].source_start_s, JSON.stringify(o.caption_edits));
     check('the job carries the style change, the zoom removal and the project note; no adapter is forced', o.style_overrides?.caption_size === 110 && o.zoom_edits?.[0]?.id === 'z@152.0' && o.zoom_edits[0].action === 'remove' && o.change_request === 'הערת בדיקה לפרויקט' && (o.adapter === undefined || o.adapter === 'claude'), JSON.stringify({ s: o.style_overrides, z: o.zoom_edits, c: o.change_request, a: o.adapter }));
   }
-  {
+  if (LEGACY_LAYOUT) {
     // ── Reference: owner uploads a file + note → the worker analyses → the page shows it → the owner approves ──
     console.log('\n── reference analysis flow');
     const base = `http://127.0.0.1:${appPort}`, WH = { Authorization: `Bearer ${WORKER_TOKEN}`, 'Content-Type': 'application/json' };

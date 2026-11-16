@@ -20,7 +20,7 @@ import re
 import wave
 from pathlib import Path
 
-from . import judgement
+from . import judgement, motion
 from .core import PipelineError, run, tool
 
 HERE = Path(__file__).resolve().parent
@@ -197,6 +197,7 @@ STORY_SCHEMA = {
                            "properties": {"present": {"type": "boolean"}, "examples": {"type": "array", "maxItems": 8, "items": {
                                "type": "object", "additionalProperties": False, "required": ["at_s", "text"],
                                "properties": {"at_s": {"type": "number"}, "text": {"type": "string"}}}}}},
+        "graphics": {"type": "array", "maxItems": 2, "items": motion.SCHEMA_ITEM},
         "revision_note": {"type": "string"},
     },
 }
@@ -253,6 +254,7 @@ THE PLAN
    transcript, mention that in the note of a transcript doubt ("בכתובית הצרובה נראה: ...") - still without replacing it.
 10. If <owner_change_request> or <previous_plan> is present this is a revision: address the request, keep what
    it does not ask to change, and say what changed in "revision_note".
+""" + motion.PROMPT + """
 
 Never invent brand facts, prices, offers, audiences or results. Do not predict performance. Do not score."""
 
@@ -424,7 +426,10 @@ def validate_story(raw, words, duration, cfg, profile, exclude=None):
         doubts.append({"word_index": wi, "word": words[wi]["word"], "source_start_s": words[wi]["start"], "source_end_s": words[wi]["end"],
                        "kind": "context", "note": str(d.get("note") or "")[:200]})
 
-    return {"message": str(raw.get("message") or "")[:300], "hook": str(raw.get("hook") or "")[:200],
+    graphics, graphics_dropped = motion.validate(raw.get("graphics"), words, merged, to_tl, total)
+
+    return {"graphics": graphics, "graphics_dropped": graphics_dropped,
+            "message": str(raw.get("message") or "")[:300], "hook": str(raw.get("hook") or "")[:200],
             "rationale": str(raw.get("rationale") or "")[:900], "brief": [str(b)[:240] for b in (raw.get("brief") or [])[:8]],
             "segments": merged, "total_s": total, "reordered": reordered, "notes": notes,
             "left_out": [{"source_in_s": float(x["in_s"]), "source_out_s": float(x["out_s"]), "why": str(x.get("why") or "")[:240]}
@@ -677,6 +682,12 @@ def plan_from_previous(prev, words, cfg, profile):
         zooms.append({"id": z["id"], "source_t_s": z["source_t_s"], "tl_t_s": tl, "scale": z["scale"], "strength": z.get("strength"),
                       "ease_s": z["ease_s"], "hold_until_s": round(min(tl + (z["hold_until_s"] - z["tl_t_s"]), seg["tl_out_s"]), 3),
                       "reason": z.get("reason") or "", "evidence": z.get("evidence") or ""})
+    graphics = []
+    for g in prev.get("graphics") or []:
+        seg = next((s for s in pl["segments"] if s["source_in_s"] - 0.05 <= g.get("source_t_s", -1) <= s["source_out_s"] + 0.05), None)
+        if seg is not None and g.get("kind") in motion.KINDS:
+            graphics.append({k: g.get(k) for k in ("id", "kind", "label", "text", "source_t_s", "tl_start_s", "tl_end_s", "reason", "quote_is_exact")})
+    pl.update(graphics=graphics, graphics_dropped=list(pp.get("graphics_not_used") or []))
     pl.update(message=str(pp.get("message") or ""), hook=str(pp.get("hook") or ""), rationale=str(pp.get("rationale") or ""),
               brief=list(pp.get("brief") or []), left_out=list(pp.get("left_out") or []), zooms=zooms,
               zooms_dropped=list(pp.get("zooms_not_used") or []), burned_in_text=pp.get("burned_in_text") or {"present": False, "examples": []},
@@ -685,8 +696,44 @@ def plan_from_previous(prev, words, cfg, profile):
     return pl
 
 
+def word_changes(edits):
+    """(old word, new word) pairs of the owner's corrections where a card kept its word count."""
+    out = []
+    for e in edits or []:
+        o, t = str(e.get("original") or "").split(), str(e.get("text") or "").split()
+        if len(o) == len(t):
+            out += [(a, b) for a, b in zip(o, t) if a != b]
+    return out
+
+
+def correct_derived(text, edits, quote=False):
+    """Carry the owner's transcript corrections into a text that was derived from the transcript (cover
+    quote, graphic text, caption draft). A whole corrected card is replaced where it appears; a single
+    corrected word is replaced only in a quotation, or when it is at least 4 letters long (a short word
+    like 'לא' is never replaced blindly in free text). Returns (text, [changes])."""
+    changes = []
+    if not text:
+        return text, changes
+    for e in edits or []:
+        o, t = " ".join(str(e.get("original") or "").split()), " ".join(str(e.get("text") or "").split())
+        if o and t and o != t and (quote or len(o) >= 4):
+            new = re.sub(r"(?<![\w\u0590-\u05ff])" + re.escape(o) + r"(?![\w\u0590-\u05ff])", t, text)
+            if new != text:
+                text = new
+                changes.append({"from": o, "to": t})
+    for a, b in word_changes(edits):
+        if not quote and len(a) < 4:
+            continue
+        new = re.sub(r"(?<![\w֐-׿])" + re.escape(a) + r"(?![\w֐-׿])", b, text)
+        if new != text:
+            text = new
+            changes.append({"from": a, "to": b})
+    return text, changes
+
+
 def decisions_from_previous(prev, edits):
-    """The previous cards, cover and caption as decisions. Only a card the owner corrected changes its text."""
+    """The previous cards, cover and caption as decisions. Only a card the owner corrected changes its text;
+    the cover quote and the caption draft follow the same corrections (they were derived from the transcript)."""
     cards = []
     for c in prev.get("cards") or []:
         text, hl = c["text"], list(c.get("highlight") or [])
@@ -701,7 +748,22 @@ def decisions_from_previous(prev, edits):
         cards.append({"text": text, "highlight": hl})
     pp = prev.get("plan") or {}
     cover = prev.get("cover") or {}
+    cover_text, c1 = correct_derived(cover.get("text") or "", edits, quote=True)
+    cap_text, c2 = correct_derived((prev.get("caption") or {}).get("text") or "", edits)
     return {"segment": {"in_s": 0.0, "out_s": 0.0, "message": pp.get("message") or "", "stands_alone": ""},
-            "cards": cards, "cover": {"text": cover.get("text") or "", "frame_s": cover.get("frame_s")},
-            "caption": {"text": (prev.get("caption") or {}).get("text") or "", "cta": (prev.get("caption") or {}).get("cta")},
-            "objective": "", "brief": list(pp.get("brief") or []), "facts_used": [], "missing_info": []}
+            "cards": cards, "cover": {"text": cover_text, "frame_s": cover.get("frame_s")},
+            "caption": {"text": cap_text, "cta": (prev.get("caption") or {}).get("cta")},
+            "objective": "", "brief": list(pp.get("brief") or []), "facts_used": [], "missing_info": [],
+            "_derived": [dict(x, where="קאבר") for x in c1] + [dict(x, where="קפשן הפוסט") for x in c2]}
+
+
+def polish_plan(words, duration, burned):
+    """The owner's OWN finished edit, kept as it is: one part, the whole file, no zoom, no graphic, no new cover text.
+    Dana chooses nothing about the content here; she only applies technical improvements."""
+    seg = {"n": 1, "source_in_s": 0.0, "source_out_s": round(duration, 3), "i0": 0, "i1": len(words) - 1, "role": "body",
+           "why": "הסרטון הערוך שהעלית — נשמר כמו שהוא", "tl_in_s": 0.0, "tl_out_s": round(duration, 3)}
+    return {"message": "", "hook": "", "rationale": "סרטון ערוך שהועלה לביקורת: דנה לא בחרה קטעים, מסר או סדר. הוחלו רק שיפורים טכניים.", "brief": [],
+            "segments": [seg], "total_s": round(duration, 3), "reordered": False, "notes": [], "left_out": [], "zooms": [], "zooms_dropped": [],
+            "graphics": [], "graphics_dropped": [], "cover": {"quote": "", "quote_is_exact": False, "tl_s": None, "why": ""}, "doubts": [],
+            "burned_in_text": {"present": bool(burned), "examples": [], "basis": "לפי הביקורת של הסרטון שהועלה"}, "revision_note": "",
+            "content_judgement": "owner_edit"}

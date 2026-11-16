@@ -26,7 +26,8 @@ import time
 import traceback
 from pathlib import Path
 
-from . import PIPELINE_VERSION, captions, checks, editorial, judgement
+from . import PIPELINE_VERSION, adjust, captions, checks, editorial, interpret, judgement, motion, review
+from . import review as review_rubric
 from . import story
 from .align import Alignment
 from .core import (EXIT, FAILURE, REVIEW_REQUIRED, STYLE_OVERRIDABLE, SUCCESS, WAITING, PipelineError, Waiting,
@@ -45,6 +46,7 @@ class Job:
                 if k in STYLE_OVERRIDABLE}
         self.style = dict(cfg["style"], **over)
         self.style_overrides = over
+        self.options = dict(self.job.get("options") or {})
 
     def stage(self, name):
         job = self
@@ -74,15 +76,37 @@ def to16k(cfg, src, dst):
     return dst
 
 
-def render_base_and_voice(j, src_probe, in_s, out_s, last_word_end_tl):
+def crop_fractions(sp, boxes):
+    """Face boxes in source pixels → fractions of the centred 9:16 crop the render uses."""
+    sw, sh = sp["display_width"], sp["display_height"]
+    cw, ch = min(sw, sh * 9 / 16), min(sh, sw * 16 / 9)
+    x0, y0 = (sw - cw) / 2, (sh - ch) / 2
+    return [None if b is None else ((b[0] - x0) / cw, (b[1] - y0) / ch, b[2] / cw, b[3] / ch) for b in boxes or []]
+
+
+def render_base_and_voice(j, src_probe, in_s, out_s, last_word_end_tl, seg_words):
     cfg, st = j.cfg, j.style
     dur = round(out_s - in_s, 3)
     W, H = st["width"], st["height"]
     rng = ":in_range=full:out_range=tv" if src_probe["full_range"] else ""
-    vf = f"scale={W}:{H}:force_original_aspect_ratio=increase{rng},crop={W}:{H},format=yuv420p"
+    plain = f"scale={W}:{H}:force_original_aspect_ratio=increase{rng},crop={W}:{H}"
+    measure_vf = plain
     zf = story.zoom_filter(getattr(j, "active_zooms", None), W, H)
     if zf:        # crop the source to 9:16 once, then scale straight to the zoom level (no second scaling of the picture)
-        vf = ("crop='min(iw,ih*9/16)':'min(ih,iw*16/9)'," + zf.replace(":eval=frame", f"{rng}:eval=frame") + ",format=yuv420p")
+        plain = "crop='min(iw,ih*9/16)':'min(ih,iw*16/9)'," + zf.replace(":eval=frame", f"{rng}:eval=frame")
+    # ── picture: measured on the SOURCE cut (so a later version never corrects a corrected picture) ──
+    if not adjust.enabled(j.options, "color"):
+        color = {"enabled": False, "applied": False, "decisions": ["תיקון הצבע כובה לפרויקט הזה"]}
+    elif not st["captions_enabled"] and not j.options.get("polish"):
+        color = {"enabled": True, "applied": False, "skipped": "edited_source",
+                 "decisions": ["המקור כבר ערוך (כתוביות צרובות) — לא מתקנת צבע של סרטון שכנראה כבר תוקן, כדי לא לתקן פעמיים"]}
+    else:
+        times = [round(in_s + dur * (k + 0.5) / 6, 2) for k in range(6)]
+        boxes = story.faces_at(cfg, j.source, times)
+        color = dict(adjust.plan_color(cfg, j.source, times, crop_fractions(src_probe, boxes) if boxes else None, measure_vf), enabled=True)
+        color["frames_s"] = [round(t - in_s, 2) for t in times]
+    j.plain_vf, j.color = plain, color
+    vf = plain + ("," + color["filter"] if color.get("filter") else "") + ",format=yuv420p"
     base = j.work / "base.mp4"
     run([tool(cfg, "ffmpeg"), "-y", "-v", "error", "-ss", f"{in_s}", "-t", f"{dur}", "-i", j.source,
          "-vf", vf, "-r", str(st["fps"]), "-an", "-c:v", "libx264", "-crf", "10", "-preset", "medium",
@@ -91,7 +115,14 @@ def render_base_and_voice(j, src_probe, in_s, out_s, last_word_end_tl):
     raw = j.work / "voice_raw.wav"
     run([tool(cfg, "ffmpeg"), "-y", "-v", "error", "-ss", f"{in_s}", "-t", f"{dur}", "-i", j.source,
          "-vn", "-ar", "48000", "-c:a", "pcm_s24le", raw], "render_failed", timeout=cfg["timeouts"]["ffmpeg_s"])
-    m = checks.measure_loudness(cfg, raw)
+    # ── sound: clean only what the measurement calls for, then normalise the level ──
+    if adjust.enabled(j.options, "audio_cleanup"):
+        audio, voice_in = adjust.plan_audio(cfg, raw, seg_words, j.work)
+        audio["enabled"] = True
+    else:
+        audio, voice_in = {"enabled": False, "applied": False, "decisions": ["ניקוי הסאונד כובה לפרויקט הזה"]}, raw
+    j.audio = audio
+    m = checks.measure_loudness(cfg, voice_in)
     fo_st = min(max(last_word_end_tl, dur - 0.20), dur - 0.03)
     fo_d = max(0.02, min(0.15, dur - fo_st))
     af = (f"loudnorm=I={a['target_lufs']}:TP={a['target_peak_db']}:LRA=11:measured_I={m['input_i']}:"
@@ -99,9 +130,28 @@ def render_base_and_voice(j, src_probe, in_s, out_s, last_word_end_tl):
           f"offset={m['target_offset']}:linear=true,aresample=48000,afade=t=in:st=0:d=0.02,"
           f"afade=t=out:st={fo_st:.3f}:d={fo_d:.3f},apad=whole_dur={dur}")
     voice = j.work / "voice.wav"
-    run([tool(cfg, "ffmpeg"), "-y", "-v", "error", "-i", raw, "-af", af, "-ar", "48000", "-c:a", "pcm_s24le",
+    run([tool(cfg, "ffmpeg"), "-y", "-v", "error", "-i", voice_in, "-af", af, "-ar", "48000", "-c:a", "pcm_s24le",
          "-t", f"{dur}", voice], "render_failed", timeout=cfg["timeouts"]["ffmpeg_s"])
     return base, voice, dur, {"source_lufs": float(m["input_i"]), "source_true_peak": float(m["input_tp"])}
+
+
+def make_compare(j, in_s, dur, final, graphics, zooms):
+    """Before / after material: the same moments of the cut without colour correction, graphics and captions
+    (left) and the finished file (right) - three stills and one short clip. Returns the record for the package."""
+    cfg, st = j.cfg, j.style
+    anchor = (graphics[0]["tl_start_s"] - 0.6) if graphics else (zooms[0]["tl_t_s"] - 1.0) if zooms else dur / 2 - 3
+    t0 = round(min(max(anchor, 0.0), max(0.0, dur - 6.0)), 2)
+    span = round(min(6.0, dur - t0), 2)
+    before = j.work / "before.mp4"
+    run([tool(cfg, "ffmpeg"), "-y", "-v", "error", "-ss", f"{in_s}", "-t", f"{dur}", "-i", j.source, "-vf", j.plain_vf + ",format=yuv420p",
+         "-r", str(st["fps"]), "-an", "-ss", f"{t0}", "-t", f"{span}", "-c:v", "libx264", "-crf", "16", "-preset", "veryfast", "-pix_fmt", "yuv420p", before],
+        "compare_failed", timeout=cfg["timeouts"]["ffmpeg_s"])
+    times = [round(t0 + span * k, 2) for k in (0.15, 0.5, 0.85)]
+    adjust.compare_frames(cfg, before, final, times, j.out / "compare_frames.jpg", before_offset=t0)
+    adjust.compare_clip(cfg, before, final, t0, span, j.out / "compare_clip.mp4")
+    return {"frames_s": times, "clip_s": [t0, round(t0 + span, 2)], "frames": "compare_frames.jpg", "clip": "compare_clip.mp4",
+            "left": "הקטע בלי תיקון צבע, בלי גרפיקה ובלי כתוביות", "right": "הסרטון הסופי",
+            "sound": "בקליפ נשמע הסאונד הסופי בלבד; ההבדל בסאונד מוצג כמספרים שנמדדו"}
 
 
 def make_cover(j, base, cover):
@@ -152,11 +202,16 @@ def edit(j, dec, words, sp, sha_before, check, cache):
     if zooms:
         zb = story.faces_at(cfg, j.source, [in_s + z["tl_t_s"] + z["ease_s"] for z in zooms])
         story.zoom_focus(zooms, [to_out(b) for b in zb] if zb else None, W, H)
+    if not adjust.enabled(j.options, "zooms"):
+        zooms = []
     j.active_zooms = zooms
+    anim_name = st.get("caption_animation") if adjust.enabled(j.options, "caption_animation") else "none"
+    animation = captions.ANIMATIONS.get(anim_name)
+    planned_graphics = motion.shift(getattr(j, "graphics", []), shift, round(out_s - in_s, 3)) if st["captions_enabled"] else []
     plan_cover = (getattr(j, "story", None) or {}).get("cover") or {}
     if plan_cover.get("tl_s") is not None:               # the cover frame is the moment the quoted words are said
         dec["cover"]["frame_s"] = round(min(max(plan_cover["tl_s"] + shift + 0.2, 0.0), out_s - in_s - 0.1), 3)
-    key = hashlib.sha1(json.dumps([in_s, out_s, dec["cards"], st, zooms], ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    key = hashlib.sha1(json.dumps([in_s, out_s, dec["cards"], st, zooms, j.options.get("adjustments"), anim_name, planned_graphics], ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
     spans, skipped = check(dec)
     inner = [s for s in skipped if s["before_card"] not in (1, None)]
     edge = [s for s in skipped if s["before_card"] in (1, None)]
@@ -180,7 +235,7 @@ def edit(j, dec, words, sp, sha_before, check, cache):
         return r
 
     with j.stage("render_base"):
-        base, voice, dur, audio_src = render_base_and_voice(j, sp, in_s, out_s, spans[-1][-1]["end"])
+        base, voice, dur, audio_src = render_base_and_voice(j, sp, in_s, out_s, spans[-1][-1]["end"], [w for g in spans for w in g])
         records.append(checks.check_boundary(words, in_s, out_s, checks.level_db(j.work / "voice_raw.wav", 0.0, 0.05),
                                               checks.room_tone_db(j.work / "voice_raw.wav"),
                                               checks.level_db(j.work / "voice_raw.wav", max(0.0, dur - 0.05), dur)))
@@ -287,11 +342,28 @@ def edit(j, dec, words, sp, sha_before, check, cache):
         records.append(checks.rec("caption_face_overlap", "fail" if hit else "pass",
                                   (f"כתוביות שמכסות את אזור הפנים שנמדד: {hit}" if hit else f"אף אחת מ-{len(cards)} הכתוביות אינה מכסה את אזור הפנים שנמדד")
                                   + " (פריים אחד לכל כתובית)", cards=hit))
+    # ── motion graphics (HyperFrames): placed clear of the face and of the captions, rendered, then overlaid ──
+    graphics, graphics_dropped, g_faces = [], [], {}
+    if planned_graphics:
+        with j.stage("graphics"):
+            zone = read_json(cfg["paths"]["safe_zone"])
+            for g in planned_graphics:
+                g_faces[g["id"]] = story.faces_at(cfg, base, [round(g["tl_start_s"] + 0.3, 2), round((g["tl_start_s"] + g["tl_end_s"]) / 2, 2), round(g["tl_end_s"] - 0.3, 2)]) or []
+            inks = [b for b in (checks._ink_box(Path(png_dir) / f"c{c['i']:03d}.png")[1] for c in cards) if b]
+            band = (min(b[1] for b in inks), max(b[3] for b in inks)) if inks else None
+            placed, graphics_dropped = motion.place(planned_graphics, zone, g_faces, band, st["height"])
+            for g in placed:
+                try:
+                    frames_dir, n = motion.render(cfg, st, g, j.work / "graphics")
+                    graphics.append(dict(g, frames=str(frames_dir), frames_n=n, ink_box=motion.ink_box(frames_dir, n)))
+                except PipelineError as e:        # a graphic that cannot be rendered is reported, never silently "planned only"
+                    graphics_dropped.append({"kind": g["kind"], "quote": g["text"], "why": f"הרינדור ב-HyperFrames נכשל ({e.code}) — הגרפיקה לא נוספה לסרטון"})
+                    issues.append(judgement.issue("graphic_not_rendered", "warn", f"{g['label']} '{g['text']}' לא נוספה: הרינדור ב-HyperFrames נכשל ({e.code})"))
     final = j.out / "final.mp4"
     attempts = []
     for attempt in range(cfg["sync"]["max_fix_attempts"] + 1):
         with j.stage("composite"):
-            captions.composite(cfg, base, voice, cards, png_dir, final, dur)
+            captions.composite(cfg, base, voice, cards, png_dir, final, dur, animation=animation if cards else None, graphics=graphics, fps=st["fps"])
         with j.stage("verify"):
             wav = to16k(cfg, final, j.work / "final_audio_16k.wav")            # the audio of the OUTPUT file
             heard, kept_notes = story.keep_owner_corrections(checks.transcribe(cfg, wav)["words"], own)
@@ -325,20 +397,35 @@ def edit(j, dec, words, sp, sha_before, check, cache):
 
     with j.stage("checks"):
         if cards:
-            motion, comfort = checks.cards_in_motion(cfg, final, base, png_dir, cards, st["fps"])
-            records += [motion, comfort]
+            motion_rec, comfort = checks.cards_in_motion(cfg, final, base, png_dir, cards, st["fps"], anim_s=animation["in_s"] if animation else 0.0)
+            records += [motion_rec, comfort]
         else:
-            motion = {"data": {}}
+            motion_rec = {"data": {}}
+        if graphics:
+            records.append(motion.check(cfg, final, base, graphics, read_json(cfg["paths"]["safe_zone"]), g_faces, st["width"]))
         records += [checks.check_output(cfg, final, dur), checks.check_loudness(cfg, final),
                     checks.check_source_unchanged(getattr(j, "orig_source", j.source), sha_before)]
         records += checks.HUMAN_CHECKS
 
     with j.stage("cover"):
         cover = make_cover(j, base, dec["cover"])
+    with j.stage("compare"):
+        try:
+            compare = make_compare(j, in_s, dur, final, graphics, zooms)
+        except PipelineError as e:
+            compare = {"error": f"{e.code}: {e.message}"}
+    gaps = [(b["start"] - a["end"], a["end"]) for a, b in zip(heard, heard[1:])]
+    facts = {"first_word_s": heard[0]["start"] if heard else None,
+             "longest_pause": {"s": round(max(gaps)[0], 2), "at_s": round(max(gaps)[1], 2)} if gaps else None,
+             "face_inside": None}
+    if face_boxes and any(face_boxes):
+        W_, H_ = st["width"], st["height"]
+        cut = [t for t, b in zip(sample_t, face_boxes) if b and (b[0] < 0 or b[0] + b[2] > W_ or b[1] < 0 or b[1] + b[3] > H_)]
+        facts["face_inside"] = {"frames": len(face_boxes), "found": sum(1 for b in face_boxes if b), "bad": cut}
 
     c_cfg, comfort_rows = cfg["cards"], []
     by_i = {c["i"]: c for c in cards}
-    for r in (motion["data"].get("rows") or []):
+    for r in (motion_rec["data"].get("rows") or []):
         why = []
         if r["seconds"] < c_cfg["min_on_screen_s"]:
             why.append(f"על המסך {r['seconds']:.2f}s")
@@ -354,10 +441,13 @@ def edit(j, dec, words, sp, sha_before, check, cache):
         issues.append(judgement.issue("cards_two_lines", "info", f"{len(two_lined)} כרטיסים הוצגו בשתי שורות כדי להיכנס לאזור הבטוח (אותן מילים, אותו סדר)"))
     for n in kept_notes:
         issues.append(judgement.issue("owner_correction_kept", "info",
-                                      f"ב-{n['t0']}s התמלול החוזר שמע '{n['heard']}' במקום שבו תיקנת ל-'{n['owner']}'. התיקון שלך נשמר; זה מידע בלבד."))
-    res = {"captions_added": bool(st["captions_enabled"]), "zooms": zooms, "caption_position": cap_pos, "shift": shift, "key": key, "cards": cards, "records": records, "sync": sync, "adjudications": adjudications, "odiffs": odiffs,
+                                      f"ב-{n['t0']}s התמלול החוזר שמע '{n['heard']}' במקום שבו תיקנת ל-'{n['owner']}'. התיקון שלך נשמר; זה מידע בלבד.",
+                                      t0=n["t0"], heard=n["heard"], owner=n["owner"]))
+    res = {"color": j.color, "audio_clean": j.audio, "graphics": [{k: v for k, v in g.items() if k != "frames"} for g in graphics],
+           "graphics_dropped": graphics_dropped, "compare": compare, "facts": facts, "animation": anim_name if cards and st["captions_enabled"] else "none",
+           "captions_added": bool(st["captions_enabled"]), "zooms": zooms, "caption_position": cap_pos, "shift": shift, "key": key, "cards": cards, "records": records, "sync": sync, "adjudications": adjudications, "odiffs": odiffs,
            "heard": heard, "dur": dur, "final": final, "base": base, "cover": cover, "png_dir": png_dir, "attempts": attempts,
-           "timing_source": timing_source, "audio_src": audio_src, "motion_rows": motion["data"].get("rows") or [],
+           "timing_source": timing_source, "audio_src": audio_src, "motion_rows": motion_rec["data"].get("rows") or [],
            "comfort_rows": comfort_rows, "source_text": " ".join(w["word"] for w in seg_words), "issues": issues,
            "reused_render": False}
     cache.update(key=key, res=res)
@@ -367,7 +457,7 @@ def edit(j, dec, words, sp, sha_before, check, cache):
 def pipeline(j):
     cfg, st = j.cfg, j.style
     groups = cfg["language"]["homophone_groups"]
-    options = dict(j.job.get("options") or {})
+    options = j.options                      # one object: what the request interpretation changes is what the edit stage reads
     ecfg = cfg["editorial"]
 
     with j.stage("source"):
@@ -428,12 +518,40 @@ def pipeline(j):
     def spent():
         return round(sum(u.get("cost_usd_reported") or 0 for u in usages), 4), round(time.time() - j.t0, 1)
 
+    # ── THE OWNER'S FREE-TEXT REQUEST: which areas does it ask to change? ───
+    # A request that names captions, style, zooms, colour, sound or graphics changes ONLY that; the rest of the
+    # previous version is kept exactly. Only a request about the content itself leads to a new plan, and says so.
+    interpretation, derived_updates = None, []
+    prev0 = options.get("previous") or {}
+    if (judgement.resolve_adapter(options, cfg) == "claude" and (prev0.get("plan") or {}).get("content_judgement") == "model"
+            and str(options.get("change_request") or "").strip() and not options.get("polish")):
+        with j.stage("interpret"):
+            try:
+                interpretation, u = interpret.interpret(cfg, j.dir, options["change_request"], prev0, prev0.get("style") or {}, options.get("adjustments") or {})
+                usages.append(u)
+            except PipelineError as e:
+                if getattr(e, "usage", None):
+                    usages.append(e.usage)
+                interpretation = {"needs_replan": True, "domains": [], "domain_labels": [], "not_applied": [], "changed": False,
+                                  "explanation": f"לא ניתן היה לפרש את הבקשה אוטומטית ({e.code}) — הגרסה תוכננה מחדש לפי ההערה"}
+        interpretation["request"] = str(options["change_request"])[:2000]
+        if interpretation["needs_replan"]:
+            interpretation["mode"] = "replan"
+        else:
+            interpretation["mode"] = "targeted" if interpretation.get("changed") else "nothing_applied"
+            options["caption_edits"] = (options.get("caption_edits") or []) + interpretation["caption_edits"]
+            options["zoom_edits"] = (options.get("zoom_edits") or []) + interpretation["zoom_edits"]
+            options["adjustments"] = {**(options.get("adjustments") or {}), **interpretation["adjustments"]}
+            j.style_overrides.update(interpretation["style"])
+            options.pop("change_request")          # no content request is left: the revision is locked to the previous plan
+
     # ── RULES + TRANSCRIPT STATE ────────────────────────────────────────────
     skill_text, skill_info, default_profile = story.load_skill()
     profile = j.profile = story.resolve_profile(options, default_profile)
     pp = profile["params"]
     # defaults < profile < the owner's overrides for this project
-    j.style = st = {**cfg["style"], **{k: pp[k] for k in ("caption_size", "caption_y_px", "caption_max_lines", "backing", "highlight_enabled", "font_family", "caption_shadow") if k in pp},
+    j.style = st = {**cfg["style"], **{k: pp[k] for k in ("caption_size", "caption_y_px", "caption_max_lines", "backing", "highlight_enabled", "font_family", "caption_shadow",
+                                                       "caption_animation", "caption_ink", "caption_highlight") if k in pp},
                     **j.style_overrides}
     cfg["cards"].update(min_on_screen_s=pp["min_on_screen_s"], max_chars_per_s=pp["max_chars_per_s"])
     standing_rules = [r for r in options.get("rules") or [] if isinstance(r, dict)]
@@ -454,12 +572,25 @@ def pipeline(j):
     mode = {"claude": "model", "scripted": "scripted"}.get(adapter, "fallback_heuristic")
     j.orig_source, j.zooms, j.story, pl, model_error, zoom_log = j.source, [], None, None, None, []
     prev, revision_mode, locked_raw = options.get("previous") or {}, None, None
-    if adapter == "claude" and prev.get("plan") and not str(options.get("change_request") or "").strip():
+    polish = options.get("polish") if isinstance(options.get("polish"), dict) else None
+    if polish and adapter == "claude":
+        # The owner's own finished edit: nothing about the content is chosen here. Only technical improvements are applied.
+        pl, mode, revision_mode = story.polish_plan(words, sp["duration"], polish.get("burned_in_text", True)), "polish", "polish"
+        if polish.get("add_captions") is not True:
+            st["captions_enabled"] = False
+    elif adapter == "claude" and prev.get("plan") and not str(options.get("change_request") or "").strip():
         # The owner asked only for caption / style / zoom changes: the previous plan is kept exactly, no re-planning.
         try:
             pl = story.plan_from_previous(prev, words, cfg, profile)
             locked_raw = story.decisions_from_previous(prev, options.get("caption_edits"))
-            revision_mode = "locked_to_previous_plan"
+            derived_updates = locked_raw.pop("_derived", [])
+            for g in pl.get("graphics") or []:          # a graphic quotes the transcript: it follows the owner's corrections too
+                g["text"], ch = story.correct_derived(g["text"], options.get("caption_edits"), quote=True)
+                derived_updates += [dict(x, where="גרפיקה") for x in ch]
+            if interpretation and interpretation.get("cover_quote"):
+                locked_raw["cover"]["text"] = interpretation["cover_quote"]
+            # "apply the review's improvements": same plan, but the editor may act on the reviewer's findings
+            revision_mode = "apply_review" if options.get("apply_review") else "locked_to_previous_plan"
         except PipelineError as e:
             pl, locked_raw = None, None
             base_issues.append(judgement.issue("revision_replanned", "warn",
@@ -486,6 +617,9 @@ def pipeline(j):
         doubts += pl["doubts"]
         if pl["burned_in_text"]["present"]:
             st["captions_enabled"] = False
+            pl["graphics_dropped"] = (pl.get("graphics_dropped") or []) + [
+                {"kind": g["kind"], "quote": g["text"], "why": "במקור יש כתוביות צרובות — גרפיקה נוספת הייתה מתנגשת בהן"} for g in pl.get("graphics") or []]
+            pl["graphics"] = []
             pl["zooms_dropped"] += [{"at_s": z["source_t_s"], "why": "במקור יש כתוביות צרובות — זום היה חותך אותן"} for z in pl["zooms"]]
             pl["zooms"] = []
             base_issues.append(judgement.issue(
@@ -509,6 +643,14 @@ def pipeline(j):
                                            ("חיתוך בין חלקים נופל בתוך מילה: " + " | ".join(bad_joins)) if bad_joins else
                                            f"{len(pl['segments'])} חלקים מהמקור; כל החיתוכים נופלים בין מילים"))
         j.zooms, j.story = pl["zooms"], pl
+        j.cut_joins = {"bad": bool(bad_joins), "note": ("חיתוך בתוך מילה: " + " | ".join(bad_joins)) if bad_joins else
+                       f"{len(pl['segments'])} חלקים; כל החיתוכים נופלים בין מילים"}
+        if adjust.enabled(options, "graphics"):
+            j.graphics = pl.get("graphics") or []
+        else:
+            j.graphics = []
+            pl["graphics_dropped"] = (pl.get("graphics_dropped") or []) + [
+                {"kind": g["kind"], "quote": g["text"], "why": "מואושן גרפיק כובה לפרויקט הזה"} for g in pl.get("graphics") or []]
         options["story"] = {"message": pl["message"], "hook": pl["hook"], "brief": pl["brief"],
                             "cover_quote": "" if not st["captions_enabled"] else pl["cover"]["quote"]}
         options["card_rules"] = (f"each card holds 1-{pp['max_words_per_line'] * pp['caption_max_lines']} words and is shown on at most "
@@ -609,7 +751,7 @@ def pipeline(j):
         if not use_model:
             stop = "no_editor_model"
             break
-        if revision_mode == "locked_to_previous_plan":       # nothing the owner did not ask for is changed by the editor
+        if revision_mode in ("locked_to_previous_plan", "polish"):   # nothing the owner did not ask for is changed by the editor
             stop = "locked_revision" if not blocking_left else "needs_owner"
             cycles[-1]["sent_to_editor"] = []
             write_json(j.ed / f"cycle_{n}.json", cycles[-1])
@@ -725,16 +867,30 @@ def pipeline(j):
     doubt_rows.sort(key=lambda r: r["tl_start_s"])
     story_pkg = None
     if pl:
-        story_pkg = {"message": pl["message"], "hook": pl["hook"], "rationale": pl["rationale"], "content_judgement": "model",
+        story_pkg = {"message": pl["message"], "hook": pl["hook"], "rationale": pl["rationale"], "content_judgement": pl.get("content_judgement") or "model",
                      "segments": [{k: s[k] for k in ("n", "source_in_s", "source_out_s", "tl_in_s", "tl_out_s", "role", "why")} for s in pl["segments"]],
                      "brief": pl["brief"], "left_out": pl["left_out"], "reordered": pl["reordered"], "zooms_not_used": pl["zooms_dropped"],
                      "cover_why": pl["cover"]["why"], "burned_in_text": pl["burned_in_text"], "revision_note": pl["revision_note"],
+                     "graphics_not_used": (pl.get("graphics_dropped") or []) + (res.get("graphics_dropped") or []),
                      "basis": "תמלול אוטומטי עם זמני מילים, עוצמת קול שנמדדה לכל מילה ופריימים בודדים מהמקור. המודל לא שמע את האודיו ולא צפה בתנועה."}
     else:
         story_pkg = {"message": "", "hook": "", "rationale": "", "content_judgement": "none", "segments": [
             {"n": 1, "source_in_s": in0, "source_out_s": dec["segment"]["out_s"], "tl_in_s": 0.0, "tl_out_s": res["dur"], "role": "body",
              "why": "כלל אוטומטי — לא שיפוט תוכן" if mode == "fallback_heuristic" else "הוגדר ידנית"}], "brief": [], "model_error": model_error}
     crit = cycles[final_cycle]["criteria"]
+    dana_review = review_rubric.build(dict(
+        res["facts"], kind="polish" if polish else "edit", records={r["id"]: r for r in records}, criteria={c["id"]: c for c in crit},
+        findings=final_findings, zooms=res.get("zooms") or [], graphics=res.get("graphics") or [], color=res["color"], audio=res["audio_clean"],
+        cover_text=dec["cover"]["text"], captions_added=bool(st["captions_enabled"]), cut_joins=getattr(j, "cut_joins", None),
+        burned_in_text=bool(pl and pl["burned_in_text"]["present"])))
+    review_vs_previous = review_rubric.compare(prev.get("dana_review"), dana_review)
+    adjustments = {
+        "color": res["color"], "audio_cleanup": res["audio_clean"],
+        "zooms": {"enabled": adjust.enabled(options, "zooms"), "applied": bool(res.get("zooms")), "count": len(res.get("zooms") or [])},
+        "caption_animation": {"enabled": adjust.enabled(options, "caption_animation"), "applied": res["animation"] != "none", "style": res["animation"]},
+        "graphics": {"enabled": adjust.enabled(options, "graphics"), "applied": bool(res.get("graphics")), "count": len(res.get("graphics") or []),
+                     "engine": "HyperFrames " + (motion.version(cfg) or "?") if res.get("graphics") else None},
+    }
     auto = [r for r in records if r["status"] not in ("human_required", "info")]
     quality = {
         "technical": {"passed": sum(1 for r in auto if r["status"] == "pass"), "failed": sum(1 for r in auto if r["status"] in ("fail", "review")),
@@ -756,6 +912,9 @@ def pipeline(j):
         "zooms": [{k: z.get(k) for k in ("id", "source_t_s", "tl_t_s", "scale", "strength", "ease_s", "hold_until_s", "reason", "evidence", "focus", "focus_source")}
                   for z in res.get("zooms") or []],
         "zoom_edits_applied": zoom_log,
+        "graphics": res.get("graphics") or [], "adjustments": adjustments, "compare": res.get("compare"),
+        "dana_review": dana_review, "review_vs_previous": review_vs_previous,
+        "request_interpretation": interpretation, "derived_text_updates": derived_updates,
         "transcript": {"status": "owner_corrected_partial" if corrections else "auto_unverified",
                        "note": "תמלול אוטומטי (Whisper). מילים בספק מסומנות להאזנה; דנה לא החליפה אף מילה בניחוש.",
                        "doubts": doubt_rows, "corrections_applied": corrections},
@@ -768,7 +927,7 @@ def pipeline(j):
         "segment": dec["segment"], "considered": dec["considered"], "duration": res["dur"], "adapter": dec["adapter"],
         "judgement_usage": {"calls": usages} if usages else None, "instruction_bundle": bundle_info, "revision_note": dec["revision_note"],
         "spelling": dec["spelling"], "timing_source": res["timing_source"],
-        "style": {k: st[k] for k in ("caption_size", "caption_y_px", "caption_max_lines", "backing", "highlight_enabled", "font_family", "captions_enabled")},
+        "style": {k: st[k] for k in ("caption_size", "caption_y_px", "caption_max_lines", "backing", "highlight_enabled", "font_family", "captions_enabled", "caption_animation", "caption_ink", "caption_highlight")},
         "style_overrides": j.style_overrides,
         "spoken_text": " ".join(c["plain"] for c in cards),
         "cards": [{"i": c["i"], "text": c["plain"], "lines": c.get("lines"), "highlight": c["highlight"], "start": c["start"], "dur": c["dur"],
@@ -786,7 +945,7 @@ def pipeline(j):
                                   "caption": c["caption"], "cover_text": c["cover_text"], "reused_render": c["reused_render"]} for c in cycles],
                       "budget": ed["budget"]},
         "tools": {"caption_renderer_sha256": cfg.get("caption_renderer_sha256"), "asr_model": cfg["asr"]["model"],
-                  "ffmpeg": tool(cfg, "ffmpeg")},
+                  "ffmpeg": tool(cfg, "ffmpeg"), "motion_graphics": adjustments["graphics"]["engine"]},
         "timings_s": j.timings, "total_s": round(time.time() - j.t0, 1),
     }
     write_json(j.out / "package.json", package)
@@ -810,8 +969,10 @@ def main(argv=None):
         status, package = pipeline(j)
         arts = []
         for name in ("final.mp4", "cover.jpg", "package.json", "checks.json", "captions.json", "editorial.json",
-                     "transcript_source.json", "transcript_final.json"):
+                     "transcript_source.json", "transcript_final.json", "compare_frames.jpg", "compare_clip.mp4"):
             p = j.out / name
+            if not p.is_file() and name.startswith("compare_"):
+                continue
             arts.append({"name": name, "sha256": sha256_file(p), "bytes": p.stat().st_size})
         result.update(status=status, artifacts=arts, failed_checks=package["failed_checks"],
                       review_items=[r["id"] for r in package["review_items"]], editorial=package["editorial"]["status"],

@@ -29,6 +29,15 @@ const FIELDS = {
   active_classes:    'רשימת שיעורים פעילים',
 };
 
+// Accounts whose CONNECTION was verified. pilates_barre_power: the read-only probe from the server on 2026-11-15 returned
+// this username with matchesConfiguredId = true (reported by the owner; docs/audits/DANA_CHECKPOINT_2026-11-15.md).
+// A verified connection is not a permission to publish: publishing stays behind its own switches and approval.
+const CONNECTED_ACCOUNTS = [
+  { username: 'pilates_barre_power', platform: 'instagram', verifiedAt: '2026-11-15',
+    how: 'בדיקת קריאה בלבד מהשרת: שם החשבון והמזהה תואמים. חיבור מאומת — לא הרשאת פרסום.' },
+];
+const accounts = () => CONNECTED_ACCOUNTS.map(a => ({ ...a }));
+
 const file = () => path.join((process.env.DATA_DIR ?? path.join(__dirname, '../data')).replace(/[/\\]$/, ''), 'dana', 'brand.json');
 
 function stored() {
@@ -75,4 +84,4 @@ function promptBlock() {
   ].join('\n');
 }
 
-module.exports = { get, set, missing, promptBlock, FIELDS };
+module.exports = { get, set, missing, promptBlock, FIELDS, accounts };

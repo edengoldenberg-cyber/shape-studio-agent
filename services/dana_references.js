@@ -279,5 +279,79 @@ function rejectReferenceProfile(id, { by, reason } = {}) {
   return view(r);
 }
 
+// ── Comparing references and a combined profile ─────────────────────────────
+// Which aspect of the analysis a profile number rests on (so the page can show how well founded each number is).
+const PARAM_ASPECT = { caption_size: 'captions', caption_y_px: 'captions', caption_max_lines: 'captions', max_words_per_line: 'captions',
+  max_chars_per_line: 'captions', backing: 'captions', highlight_enabled: 'emphasis', min_on_screen_s: 'pace', max_chars_per_s: 'pace',
+  zoom_scale_light: 'zooms', zoom_scale_medium: 'zooms', zoom_scale_strong: 'zooms', zoom_min_gap_s: 'zooms', zoom_min_hold_s: 'zooms' };
+const BASIS_RANK = { measured: 3, seen_in_stills: 2, model_assessment: 1, hypothesis: 0 };
+const basisOf = (r, key) => (r.analysis?.aspects ?? []).find(a => a.aspect === PARAM_ASPECT[key])?.basis ?? 'hypothesis';
+
+/**
+ * Two or more analysed references side by side, and a PROPOSED combined profile: for every number, what each reference
+ * suggests and on what basis. A number only one reference gives is suggested from it; where several give one, the better
+ * founded is suggested (measured > seen in stills > hypothesis) and a tie is left for the owner. Nothing is approved here.
+ */
+function compare(ids) {
+  if (!Array.isArray(ids) || ids.length < 2 || ids.length > 4) throw new RefError(400, 'compare_needs_two', 'להשוואה נדרשים 2–4 רפרנסים');
+  const s = settle(refsState());
+  const refs = [...new Set(ids.map(String))].map(id => find(s, id));
+  const notReady = refs.filter(r => !r.analysis);
+  if (notReady.length) throw new RefError(409, 'reference_not_analysed', `עדיין לא נותחו: ${notReady.map(r => r.title).join(', ')}`);
+  const aspects = [...new Set(refs.flatMap(r => (r.analysis.aspects ?? []).map(a => a.aspect)))];
+  const keys = [...new Set(refs.flatMap(r => Object.keys(r.proposed_profile?.params ?? {})))];
+  const params = {};
+  for (const k of keys) {
+    const options = refs.filter(r => r.proposed_profile?.params && k in r.proposed_profile.params)
+      .map(r => ({ ref: r.id, title: r.title, value: r.proposed_profile.params[k], basis: basisOf(r, k) }));
+    const best = [...options].sort((a, b) => BASIS_RANK[b.basis] - BASIS_RANK[a.basis]);
+    const same = options.every(o => o.value === options[0].value);
+    const tie = best.length > 1 && BASIS_RANK[best[0].basis] === BASIS_RANK[best[1].basis] && !same;
+    params[k] = { aspect: PARAM_ASPECT[k] ?? null, options, suggested: tie ? null : best[0].ref,
+      why: options.length === 1 ? 'רק רפרנס אחד נותן את המספר הזה' : same ? 'כל הרפרנסים מסכימים' : tie ? 'שני הרפרנסים מבוססים באותה מידה — הבחירה שלך' : 'הרפרנס שהמספר שלו מבוסס יותר' };
+  }
+  return {
+    references: refs.map(r => ({ id: r.id, title: r.title, owner_note: r.owner_note, summary: r.analysis.summary ?? '', measured: r.analysis.measured ?? null,
+      coverage: r.analysis.coverage ?? null, fits_us: r.analysis.fits_us ?? [], does_not_fit_us: r.analysis.does_not_fit_us ?? [],
+      do_not_imitate: r.analysis.do_not_imitate ?? [] })),
+    aspects: aspects.map(a => ({ aspect: a, by_reference: refs.map(r => { const x = (r.analysis.aspects ?? []).find(y => y.aspect === a);
+      return x ? { ref: r.id, observation: x.observation, rule: x.rule, basis: x.basis, example_times_s: x.example_times_s ?? [] } : { ref: r.id, observation: null }; }) })),
+    proposal: { params, rules: refs.flatMap(r => (r.proposed_profile?.rules ?? []).map((text, index) => ({ ref: r.id, title: r.title, index, text }))),
+      note: 'הצעה בלבד. שום דבר לא נכנס לשימוש בלי אישור שלך; אפשר לבחור לכל מספר מאיזה רפרנס לקחת, או לא לקחת בכלל.' },
+  };
+}
+
+/**
+ * The owner approves a profile combined from several references: for every number, which reference it is taken from
+ * (`picks`), and which of their style rules to keep (`rules`). Each approval is a new version of profile `combined`;
+ * the source of every number and rule is stored with it.
+ */
+function approveCombined({ by, ids, picks, rules, make_default } = {}) {
+  const who = str(by, 80);
+  if (!who) throw new RefError(400, 'by_required', 'נדרש שם המאשר/ת');
+  const cmp = compare(ids);
+  if (!picks || typeof picks !== 'object' || Array.isArray(picks) || !Object.keys(picks).length) throw new RefError(400, 'picks_required', 'יש לבחור לפחות מספר אחד לקחת מרפרנס');
+  const params = {}, sources = {};
+  for (const [k, refId] of Object.entries(picks)) {
+    const opt = cmp.proposal.params[k]?.options.find(o => o.ref === refId);
+    if (!opt) throw new RefError(400, 'picks_invalid', `אין לרפרנס הזה הצעה לפרמטר ${k}`);
+    params[k] = opt.value; sources[k] = { ref: opt.ref, title: opt.title, basis: opt.basis };
+  }
+  const kept = [];
+  for (const r of Array.isArray(rules) ? rules.slice(0, 20) : []) {
+    const hit = cmp.proposal.rules.find(x => x.ref === r?.ref && x.index === r?.index);
+    if (!hit) throw new RefError(400, 'rules_invalid', 'כלל שנבחר אינו מופיע בהצעה');
+    kept.push({ text: str(hit.text, 400), ref: hit.ref });
+  }
+  const ps = read(profilesFile(), { profiles: [] });
+  const version = ps.profiles.filter(p => p.id === 'combined').reduce((m, p) => Math.max(m, Number(p.version) || 0), 0) + 1;
+  const at = now(), used = [...new Set([...Object.values(sources).map(x => x.ref), ...kept.map(x => x.ref)])];
+  const rec = { id: 'combined', version, params, rules: kept.map(x => x.text), rule_sources: kept, param_sources: sources,
+                source_reference: used.join('+').slice(0, 80), source_references: used, approved_by: who, approved_at: at, approvedBy: who, approvedAt: at, default: false };
+  if (make_default === true) { for (const p of ps.profiles) p.default = false; rec.default = true; }
+  ps.profiles.push(rec); write(profilesFile(), ps);
+  return { profile: rec, profiles: ps.profiles };
+}
+
 module.exports = { RefError, PERMISSIONS, FILE_EXT, MAX_ATTEMPTS, list, add, get, remove, filePath, leaseNext, leasedFile, submitAnalysis, reanalyse,
-                   profiles, defaultProfile, approveProfile, clearDefaultProfile, approveReferenceProfile, rejectReferenceProfile };
+                   profiles, defaultProfile, approveProfile, clearDefaultProfile, approveReferenceProfile, rejectReferenceProfile, compare, approveCombined };

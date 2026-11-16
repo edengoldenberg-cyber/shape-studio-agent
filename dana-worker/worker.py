@@ -37,7 +37,7 @@ from dana_pipeline.core import (FAILURE, REVIEW_REQUIRED, STATE_BY_EXIT, SUCCESS
 SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{4,80}$")
 SAFE_EXT = {"mp4", "mov", "m4v", "webm", "avi", "mkv"}
 UPLOAD_ORDER = ["package.json", "checks.json", "captions.json", "editorial.json", "transcript_source.json", "transcript_final.json",
-                "cover.jpg", "final.mp4"]
+                "cover.jpg", "compare_frames.jpg", "compare_clip.mp4", "final.mp4"]
 TRANSFER_ATTEMPTS = 3
 
 
@@ -112,10 +112,10 @@ def log(msg):
     print(time.strftime("%H:%M:%S ") + msg, flush=True)
 
 
-def run_pipeline(cfg, cfg_path, job_dir, source, on_stage):
+def run_pipeline(cfg, cfg_path, job_dir, source, on_stage, module="dana_pipeline.run"):
     """Start the pipeline as a child process and return (state, result). The exit code and
     result.json must agree; anything else is a failure."""
-    cmd = [sys.executable, "-X", "utf8", "-m", "dana_pipeline.run", "--config", str(cfg_path),
+    cmd = [sys.executable, "-X", "utf8", "-m", module, "--config", str(cfg_path),
            "--job-dir", str(job_dir), "--source", str(source)]
     proc = subprocess.Popen(cmd, cwd=str(HERE), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     tail = []
@@ -138,7 +138,8 @@ def run_pipeline(cfg, cfg_path, job_dir, source, on_stage):
     return state, result
 
 
-STAGE_HE = {"transcribe_check": "האזנה שנייה לבדיקת התמלול", "assemble": "מחבר את החלקים שנבחרו", "measure_picture": "מודד מיקום פנים לכתוביות ולזומים",
+STAGE_HE = {"interpret": "דנה קוראת את הבקשה שלך", "graphics": "מרנדר מואושן גרפיק (HyperFrames)", "compare": "מכין לפני/אחרי",
+            "transcribe_check": "האזנה שנייה לבדיקת התמלול", "assemble": "מחבר את החלקים שנבחרו", "measure_picture": "מודד מיקום פנים לכתוביות ולזומים",
             "source": "בודק את קובץ המקור", "transcribe_source": "מתמלל", "judgement": "בוחר קטע וכתוביות",
             "plan": "דנה מתכננת: מסר, קטע ותדריך עריכה", "review": "דנה בודקת את התוצר", "revise": "העורך מתקן לפי הערות דנה",
             "match_cards": "מתאים כתוביות לדיבור", "align": "מיישר כתוביות למילים באודיו הסופי", "render_base": "חותך ומנרמל אודיו", "render_cards": "מרנדר כרטיסי כתוביות",
@@ -160,7 +161,9 @@ def handle(api, cfg, cfg_path, leased):
     job_dir.mkdir(parents=True)
     options = dict(job.get("options") or {})
     decisions = options.pop("decisions", None)
-    (job_dir / "job.json").write_text(json.dumps({"jobId": jid, "projectId": job.get("projectId"), "version": job.get("version"),
+    # A "review" job looks at a finished video the owner uploaded and edits nothing; anything else is an edit.
+    module = "dana_pipeline.review_only" if job.get("type") == "review" else "dana_pipeline.run"
+    (job_dir / "job.json").write_text(json.dumps({"jobId": jid, "projectId": job.get("projectId"), "version": job.get("version"), "type": job.get("type") or "edit",
                                                   "source": src, "options": options}, ensure_ascii=False), encoding="utf-8")
     if decisions is not None:           # data for the validator, never code
         (job_dir / "decisions.json").write_text(json.dumps(decisions, ensure_ascii=False), encoding="utf-8")
@@ -186,7 +189,7 @@ def handle(api, cfg, cfg_path, leased):
             api.call("POST", f"/api/dana/worker/jobs/{jid}/progress", {"stage": "download", "note": "מוריד את קובץ המקור"},
                      {"X-Lease-Token": lease})
             api.download(jid, lease, source, src["sha256"])
-        state, result = run_pipeline(cfg, cfg_path, job_dir, source, stage)
+        state, result = run_pipeline(cfg, cfg_path, job_dir, source, stage, module)
         log(f"job {jid}: pipeline → {state} {result.get('code') or ''} {result.get('failed_checks') or ''}")
         if state in (SUCCESS, REVIEW_REQUIRED):
             api.call("POST", f"/api/dana/worker/jobs/{jid}/progress", {"stage": "upload", "note": "מעלה את החבילה"},

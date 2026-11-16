@@ -37,13 +37,20 @@ const ARTIFACTS = {            // name → { mime, required }
   'editorial.json':         { mime: 'application/json', required: false },
   'transcript_source.json': { mime: 'application/json', required: false },
   'transcript_final.json':  { mime: 'application/json', required: false },
+  'compare_frames.jpg':     { mime: 'image/jpeg',       required: false },   // before / after stills (same moments)
+  'compare_clip.mp4':       { mime: 'video/mp4',        required: false },   // before / after clip, side by side
 };
+/** A review-only job looks at a finished video the owner uploaded; it produces no new video (the source IS the video). */
+const REVIEW_REQUIRED = ['package.json', 'checks.json', 'cover.jpg'];
+const ADJUSTMENT_KINDS = { color: 'תיקון צבע', audio_cleanup: 'ניקוי סאונד', zooms: 'זומים', caption_animation: 'הנפשת כתוביות', graphics: 'מואושן גרפיק' };
 const SOURCE_EXT       = new Set(['mp4', 'mov', 'm4v', 'webm', 'avi', 'mkv']);
 // Keys a project may override, with the range the worker accepts. Anything else is refused.
 const STYLE_OVERRIDABLE = {
   caption_size: { type: 'number', min: 40, max: 140 }, caption_y_px: { type: 'number', min: 200, max: 1700 },
   caption_max_lines: { type: 'number', oneOf: [1, 2] }, highlight_enabled: { type: 'boolean' }, backing: { type: 'boolean' },
   cover_size: { type: 'number', min: 40, max: 220 }, cover_y_px: { type: 'number', min: 100, max: 1800 },
+  caption_animation: { type: 'string', oneOf: ['none', 'fade', 'rise'] },
+  caption_ink: { type: 'string', pattern: /^#[0-9a-fA-F]{6}$/ }, caption_highlight: { type: 'string', pattern: /^#[0-9a-fA-F]{6}$/ },
 };
 const MAX_CAPTION_EDITS = 300, MAX_ZOOM_EDITS = 60, MAX_ACTIVE_RULES = 50;
 const ADAPTERS         = new Set(['heuristic', 'scripted', 'claude']);
@@ -150,6 +157,25 @@ function sanitizeZoomEdits(list) {
   });
 }
 
+/** Which kinds of adjustment the owner switched off (false) or back on (true) for a project. Unknown kinds are refused. */
+function sanitizeAdjustments(a) {
+  if (!a || typeof a !== 'object' || Array.isArray(a)) throw new StudioError(400, 'adjustments_invalid', 'adjustments must be an object');
+  const out = {};
+  for (const [k, v] of Object.entries(a)) {
+    if (!ADJUSTMENT_KINDS[k] || typeof v !== 'boolean') throw new StudioError(400, 'adjustments_invalid', `סוג תיקון לא מוכר: ${k}`);
+    out[k] = v;
+  }
+  return out;
+}
+/** A destination account must be one of the connected (verified) accounts, or empty. Nothing is typed in freely here. */
+function sanitizeAccount(a) {
+  const name = String(a ?? '').trim().replace(/^@/, '');
+  if (!name) return null;
+  const known = require('../utils/dana_brand').accounts().find(x => x.username === name);
+  if (!known) throw new StudioError(400, 'account_unknown', 'החשבון הזה אינו ברשימת החשבונות המחוברים');
+  return name;
+}
+
 function sanitizeOptions(o = {}) {
   const out = {};
   if (o.adapter !== undefined) {
@@ -164,6 +190,7 @@ function sanitizeOptions(o = {}) {
       if (typeof v !== rule.type || (rule.type === 'number' && !Number.isFinite(v))) throw new StudioError(400, 'style_override_invalid', `${k} must be ${rule.type}`);
       if (rule.oneOf && !rule.oneOf.includes(v)) throw new StudioError(400, 'style_override_invalid', `${k} must be one of ${rule.oneOf.join(' | ')}`);
       if (rule.min != null && (v < rule.min || v > rule.max)) throw new StudioError(400, 'style_override_invalid', `${k} must be between ${rule.min} and ${rule.max}`);
+      if (rule.pattern && !rule.pattern.test(v)) throw new StudioError(400, 'style_override_invalid', `${k} must be a colour like #FFFF00`);
       out.style_overrides[k] = v;
     }
   }
@@ -180,6 +207,12 @@ function sanitizeOptions(o = {}) {
     if (o.test_inject !== 'unverified_price_and_paraphrased_cover') throw new StudioError(400, 'test_inject_invalid', 'unknown test injection');
     out.test_inject = o.test_inject;
   }
+  if (o.adjustments !== undefined) out.adjustments = sanitizeAdjustments(o.adjustments);
+  if (o.kind !== undefined) {
+    if (!['edit', 'review_only'].includes(o.kind)) throw new StudioError(400, 'kind_invalid', 'kind must be edit | review_only');
+    out.kind = o.kind;
+  }
+  if (o.account !== undefined) out.account = sanitizeAccount(o.account);
   if (o.caption_edits !== undefined) out.caption_edits = sanitizeCaptionEdits(o.caption_edits);
   if (o.zoom_edits !== undefined) out.zoom_edits = sanitizeZoomEdits(o.zoom_edits);
   if (o.exclude_ranges !== undefined) {
@@ -214,6 +247,10 @@ async function registerUpload({ tmpPath, originalName, options, actor = 'owner' 
   const project = {
     id: newId('prj'), title: String(originalName).replace(/\.[^.]+$/, '').slice(0, 120), createdAt: now(),
     source, status: 'editing', adapter: opts.adapter ?? null, adapterExplicit: opts.adapter !== undefined,   // null → the worker's configuration decides
+    kind: opts.kind ?? 'edit',                                         // 'review_only': a finished video uploaded for Dana's review; nothing is edited
+    account: opts.account ?? null,                                     // destination account chosen for this project (null → the brand default)
+    adjustments: opts.adjustments ?? {},                               // kinds of adjustment switched off / on for this project
+    captionVerifications: [], polish: null,
     styleOverrides: opts.style_overrides ?? {}, excludeRanges: opts.exclude_ranges ?? [], captionEdits: [], zoomEdits: [],
     versions: [], currentVersion: 0,
     consent: { status: 'unknown', note: null, by: null, at: null },   // publication consent of the people in the footage
@@ -221,8 +258,8 @@ async function registerUpload({ tmpPath, originalName, options, actor = 'owner' 
     publication: null, history: [],
   };
   s.projects[project.id] = project;
-  hist(project, actor, 'uploaded', { sha256, bytes, originalName: source.originalName });
-  enqueueEdit(project, opts, actor);
+  hist(project, actor, 'uploaded', { sha256, bytes, originalName: source.originalName, kind: project.kind });
+  if (project.kind === 'review_only') enqueueReview(project, actor); else enqueueEdit(project, opts, actor);
   save();
   return { duplicate: false, project };
 }
@@ -234,6 +271,7 @@ function enqueueEdit(project, options, actor) {
   const n = (project.versions.at(-1)?.n ?? 0) + 1;
   const adapter = options.adapter ?? projectAdapter(project);
   const rules = activeRules(), profile = require('./dana_references').defaultProfile();
+  const adjustments = { ...(project.adjustments ?? {}), ...(options.adjustments ?? {}) };
   const job = {
     id: newId('job'), projectId: project.id, version: n, type: 'edit', status: 'queued',
     attempts: 0, maxAttempts: MAX_ATTEMPTS, lease: null, notBefore: null,
@@ -246,16 +284,33 @@ function enqueueEdit(project, options, actor) {
                // the owner's standing corrections travel with every later job of the project
                ...((project.captionEdits ?? []).length ? { caption_edits: project.captionEdits } : {}),
                ...((project.zoomEdits ?? []).length ? { zoom_edits: project.zoomEdits } : {}),
+               ...(Object.keys(adjustments).length ? { adjustments } : {}),
+               // an improved version of the owner's own finished edit: the content is kept, only technical improvements are applied
+               ...(project.polish ? { polish: project.polish } : {}), ...(options.apply_review ? { apply_review: true } : {}),
                ...(rules.length ? { rules } : {}), ...(profile ? { profile } : {}) },
-    createdAt: now(), updatedAt: now(),
+    stageLog: [], createdAt: now(), updatedAt: now(),
   };
   s.jobs[job.id] = job;
   project.versions.push({ n, jobId: job.id, createdAt: now(), status: 'editing', package: null, artifacts: {},
     caption: null, destination: null, scheduledAt: null, exceptions: [], approval: null, notifiedAt: null,
-    changeRequest: options.change_request ?? null });
+    changeRequest: options.change_request ?? null, kind: 'edit', appliedReview: !!options.apply_review || (!!project.polish && n > 1) });
   project.currentVersion = n;
   project.status = 'editing';
   hist(project, actor, 'edit_queued', { jobId: job.id, version: n, adapter: job.options.adapter ?? 'worker_default' });
+  return job;
+}
+
+/** Dana's review of a finished video the owner uploaded. The source is the video; no edit is made. */
+function enqueueReview(project, actor) {
+  const s = state();
+  const n = (project.versions.at(-1)?.n ?? 0) + 1;
+  const job = { id: newId('job'), projectId: project.id, version: n, type: 'review', status: 'queued', attempts: 0, maxAttempts: MAX_ATTEMPTS, lease: null,
+    notBefore: null, stage: 'queued', note: 'ממתין לעובד העריכה', error: null, uploaded: {}, options: {}, stageLog: [], createdAt: now(), updatedAt: now() };
+  s.jobs[job.id] = job;
+  project.versions.push({ n, jobId: job.id, createdAt: now(), status: 'editing', package: null, artifacts: {}, caption: null, destination: null,
+    scheduledAt: null, exceptions: [], approval: null, notifiedAt: null, changeRequest: null, kind: 'review_only' });
+  project.currentVersion = n; project.status = 'editing';
+  hist(project, actor, 'review_queued', { jobId: job.id, version: n });
   return job;
 }
 
@@ -323,12 +378,13 @@ function lease(info) {
   if (!j) { save(); return null; }
   const p = s.projects[j.projectId];
   j.status = 'leased'; j.attempts += 1; j.stage = 'starting'; j.note = 'העובד קיבל את המשימה'; j.updatedAt = now(); j.uploaded = {};
+  j.leasedAt = now(); j.stageLog = [{ stage: 'starting', at: j.leasedAt }];
   j.lease = { token: crypto.randomBytes(24).toString('hex'), workerId: s.worker.workerId, expiresAt: new Date(Date.now() + LEASE_MS).toISOString() };
   s.worker.state = 'busy';
   hist(p, 'worker', 'job_leased', { jobId: j.id, attempt: j.attempts });
   save();
   // The job is DECLARATIVE: what to edit and with which options. No commands.
-  return { leaseToken: j.lease.token, job: { id: j.id, projectId: j.projectId, version: j.version, attempt: j.attempts,
+  return { leaseToken: j.lease.token, job: { id: j.id, projectId: j.projectId, version: j.version, attempt: j.attempts, type: j.type ?? 'edit',
            source: { sha256: p.source.sha256, ext: p.source.ext, bytes: p.source.bytes }, options: { ...j.options, brand: brandFacts() } } };
 }
 
@@ -350,6 +406,8 @@ function leasedJob(jobId, token) {
 function progress(jobId, token, { stage, note }) {
   const j = leasedJob(jobId, token);
   j.stage = String(stage || '').slice(0, 40); j.note = String(note || '').slice(0, 200); j.updatedAt = now();
+  (j.stageLog = j.stageLog ?? []).push({ stage: j.stage, at: j.updatedAt });        // measured: when each stage really started
+  if (j.stageLog.length > 200) j.stageLog.splice(0, j.stageLog.length - 200);
   touchWorker({ workerId: j.lease.workerId, state: 'busy' });
   save();
 }
@@ -377,7 +435,8 @@ function complete(jobId, token, body) {
   const j = leasedJob(jobId, token);
   const p = getProject(j.projectId), v = p.versions.find(x => x.n === j.version);
   if (!['success', 'review_required'].includes(body.status)) throw new StudioError(400, 'status_invalid', 'status must be success | review_required');
-  for (const [name, spec] of Object.entries(ARTIFACTS)) if (spec.required && !j.uploaded[name]) throw new StudioError(409, 'artifact_missing', `artifact not uploaded: ${name}`);
+  const required = j.type === 'review' ? REVIEW_REQUIRED : Object.entries(ARTIFACTS).filter(([, spec]) => spec.required).map(([name]) => name);
+  for (const name of required) if (!j.uploaded[name]) throw new StudioError(409, 'artifact_missing', `artifact not uploaded: ${name}`);
   for (const a of body.artifacts ?? []) if (j.uploaded[a.name] && j.uploaded[a.name].sha256 !== a.sha256) throw new StudioError(409, 'artifact_mismatch', `artifact hash differs: ${a.name}`);
   let pkg;
   try { pkg = JSON.parse(fs.readFileSync(artifactPath(p.id, v.n, 'package.json'), 'utf8')); }
@@ -385,11 +444,30 @@ function complete(jobId, token, body) {
   if (pkg.source?.sha256 !== p.source.sha256) throw new StudioError(422, 'package_invalid', 'the package was built from a different source file');
   const brand = require('../utils/dana_brand').get();
   v.package = pkg; v.artifacts = { ...j.uploaded };
+  if (j.type === 'review') {                         // a review: nothing to approve or publish; the uploaded file is the video
+    v.status = 'reviewed'; v.videoIsSource = true;
+    p.polish = pkg.polish_options && typeof pkg.polish_options === 'object'
+      ? { burned_in_text: pkg.polish_options.burned_in_text !== false, add_captions: pkg.polish_options.add_captions === true } : { burned_in_text: true, add_captions: false };
+    j.status = 'succeeded'; j.lease = null; j.stage = 'done'; j.note = 'הביקורת מוכנה'; j.updatedAt = now(); j.totalSeconds = pkg.total_s ?? null;
+    if (p.currentVersion === v.n) p.status = 'reviewed';
+    if (state().worker) state().worker.state = 'idle';
+    hist(p, 'worker', 'review_ready', { version: v.n, totalSeconds: pkg.total_s });
+    save();
+    return view(p);
+  }
+  // Caption corrections Dana derived from the owner's free-text request are stored like the owner's own corrections
+  // (so later versions keep them), marked as corrected on request — not as verified by ear.
+  for (const e of pkg.request_interpretation?.caption_edits ?? []) {
+    if (!num(e.source_start_s) || !num(e.source_end_s) || !e.text) continue;
+    p.captionEdits = (p.captionEdits ?? []).filter(x => !(Math.abs(x.source_start_s - e.source_start_s) < 0.02 && Math.abs(x.source_end_s - e.source_end_s) < 0.02));
+    p.captionEdits.push({ id: `ce_${Math.round(e.source_start_s * 1000)}_${Math.round(e.source_end_s * 1000)}`, source_start_s: e.source_start_s, source_end_s: e.source_end_s,
+      original: String(e.original ?? '').slice(0, 200), text: String(e.text).slice(0, 80), by: 'דנה, לפי הבקשה שלך', at: v.createdAt, status: 'corrected', from: 'owner_request' });
+  }
   // An automatic transcript is not an exact quote: a caption draft may not call it one unless the owner verified the text.
   if (pkg.caption?.text && pkg.transcript?.status !== 'owner_corrected')
     pkg.caption.text = String(pkg.caption.text).replace(/ציטוט מדויק מהסרטון/g, 'תמלול אוטומטי מהסרטון — לא אומת');
   v.caption = { text: String(pkg.caption?.text ?? ''), cta: pkg.caption?.cta ?? brand.cta_default.value ?? null, isDraft: true };
-  v.destination = { platform: 'instagram', format: 'reel', account: brand.instagram_account.value ?? null };
+  v.destination = { platform: 'instagram', format: 'reel', account: p.account ?? brand.instagram_account.value ?? null };
   v.scheduledAt = require('./dana_publisher').proposeTime();
   v.scheduleProposed = true;                       // a neutral default, not a timing recommendation
   v.status = 'ready_for_review';
@@ -565,6 +643,10 @@ function previousOf(v) {
                                          source_start_s: c.source_start_s, source_end_s: c.source_end_s })),
     cover: pk.cover, caption: { text: v.caption?.text ?? pk.caption.text, cta: v.caption?.cta ?? null },
     plan: pk.plan ?? null, zooms: pk.zooms ?? null, judgement_mode: judgementMode(pk), style: pk.style ?? null,
+    graphics: pk.graphics ?? null,
+    // the previous review's category levels (same rubric → the next package can show before / after)
+    dana_review: pk.dana_review ? { rubric_version: pk.dana_review.rubric_version,
+      categories: (pk.dana_review.categories ?? []).map(c => ({ key: c.key, label: c.label, level: c.level, met: c.met, decided: c.decided })) } : null,
     // kept for workers that read the short form
     ...(pk.plan?.content_judgement === 'model' ? { story_plan: {
       message: pk.plan.message, hook: pk.plan.hook,
@@ -638,7 +720,11 @@ function revise(projectId, body = {}, actor = 'owner') {
   const note = String(body.note || '').trim().slice(0, 2000);
   if (note && !['project', 'permanent'].includes(body.note_scope))
     throw new StudioError(400, 'note_scope_required', 'יש לבחור: "תיקון לפרויקט הזה" או "כלל קבוע"');
-  if (!edits.length && !zooms.length && !style && !note) throw new StudioError(400, 'nothing_to_revise', 'לא סומן שום תיקון');
+  const adjustments = body.adjustments !== undefined ? sanitizeAdjustments(body.adjustments) : null;
+  const adjChanged = adjustments && Object.entries(adjustments).some(([k, val]) => (p.adjustments ?? {})[k] !== val && !(val === true && (p.adjustments ?? {})[k] === undefined));
+  const pending = pendingEdits(p, v).length;                           // corrections saved with "אמת ושמור תיקון" that are not in a rendered version yet
+  if (!edits.length && !zooms.length && !style && !note && !adjChanged && !pending) throw new StudioError(400, 'nothing_to_revise', 'לא סומן שום תיקון');
+  if (v.kind === 'review_only') throw new StudioError(409, 'review_only', 'זה סרטון שהועלה לביקורת בלבד — אפשר להפיק ממנו גרסה משופרת דרך "יישם שיפורים"');
   const open = Object.values(state().jobs).find(j => j.projectId === p.id && ['queued', 'leased'].includes(j.status));
   if (open) throw new StudioError(409, 'job_in_progress', 'כבר יש עריכה פעילה לפרויקט הזה');
 
@@ -655,6 +741,7 @@ function revise(projectId, body = {}, actor = 'owner') {
   }
   p.captionEdits.sort((a, b2) => a.source_start_s - b2.source_start_s);
   for (const z of zooms) { p.zoomEdits = p.zoomEdits.filter(x => x.id !== z.id); p.zoomEdits.push({ ...z, by, at }); }
+  if (adjustments) p.adjustments = { ...(p.adjustments ?? {}), ...adjustments };
 
   let rule = null;
   if (note && body.note_scope === 'permanent') rule = addRule({ text: note, by, projectId: p.id, projectTitle: fixName(p.title), versionN: v.n });
@@ -663,8 +750,179 @@ function revise(projectId, body = {}, actor = 'owner') {
   const opts = { ...(style ? { style_overrides: style } : {}), ...(note ? { change_request: note } : {}) };
   dropApproval(p, v, actor, 'revision_requested');
   hist(p, actor, 'revision_requested', { version: v.n, by, captionEdits: edits.length, zoomEdits: zooms.length, style: style ?? null,
-    note: note || null, noteScope: note ? body.note_scope : null, ruleId: rule?.id ?? null });
-  return queueChange(p, v, opts, note, actor, { hasEdits: edits.length > 0 || zooms.length > 0 || !!rule });
+    note: note || null, noteScope: note ? body.note_scope : null, ruleId: rule?.id ?? null, adjustments: adjustments ?? null, pendingCorrections: pending });
+  return queueChange(p, v, opts, note, actor, { hasEdits: edits.length > 0 || zooms.length > 0 || !!rule || adjChanged || pending > 0 });
+}
+
+// ── Transcript: correct, listen, verify ───────────────────────────────────────
+const sameSpan = (a, e) => Math.abs(a.source_start_s - e.source_start_s) < 0.02 && Math.abs(a.source_end_s - e.source_end_s) < 0.02;
+/** Corrections that were saved after the current version was produced: they are not in any rendered video yet. */
+function pendingEdits(p, v) {
+  if (!v) return [];
+  return (p.captionEdits ?? []).filter(e => e.at > v.createdAt);
+}
+/**
+ * "אמת ושמור תיקון": the owner listened to one caption and either corrected its text or confirmed it as written.
+ * The correction (with the transcript's original beside it) and the verification are stored on the PROJECT, so every
+ * later version carries them and an automatic re-transcription never overwrites them. Verifying text is not an
+ * approval to publish, and nothing is rendered here: the next version is produced when the owner asks for it.
+ */
+function verifyCaption(projectId, body = {}, actor = 'owner') {
+  const p = getProject(projectId), v = currentVersion(p);
+  if (!v?.package) throw new StudioError(409, 'not_reviewable', 'אין עדיין חבילה עם כתוביות');
+  const by = String(body.by || '').trim().slice(0, 80);
+  if (!by) throw new StudioError(400, 'by_required', 'נדרש שם מי שמאמת/ת');
+  if (body.listened !== true) throw new StudioError(400, 'listen_required', 'אימות מלל נעשה אחרי האזנה לקטע — יש לסמן שהאזנת');
+  const [e] = sanitizeCaptionEdits([{ source_start_s: body.source_start_s, source_end_s: body.source_end_s, original: body.original, text: body.text }]);
+  const at = now();
+  p.captionEdits = p.captionEdits ?? []; p.captionEditHistory = p.captionEditHistory ?? []; p.captionVerifications = p.captionVerifications ?? [];
+  const i = p.captionEdits.findIndex(x => sameSpan(x, e));
+  const original = i >= 0 ? p.captionEdits[i].original : e.original;           // always the transcript's own text
+  p.captionVerifications = p.captionVerifications.filter(x => !sameSpan(x, e));
+  let changed = false;
+  if (e.text !== original) {
+    if (i < 0 || p.captionEdits[i].text !== e.text) {
+      if (i >= 0) { p.captionEditHistory.push({ ...p.captionEdits[i], replacedAt: at }); p.captionEdits.splice(i, 1); }
+      if (p.captionEdits.length >= MAX_CAPTION_EDITS) throw new StudioError(400, 'caption_edits_invalid', 'יותר מדי תיקוני כתוביות בפרויקט');
+      p.captionEdits.push({ id: `ce_${Math.round(e.source_start_s * 1000)}_${Math.round(e.source_end_s * 1000)}`, ...e, original, by, at, status: 'verified', verifiedBy: by, verifiedAt: at });
+      changed = true;
+    } else Object.assign(p.captionEdits[i], { status: 'verified', verifiedBy: by, verifiedAt: at });
+    p.captionEdits.sort((a, b2) => a.source_start_s - b2.source_start_s);
+  } else {
+    if (i >= 0) { p.captionEditHistory.push({ ...p.captionEdits[i], replacedAt: at }); p.captionEdits.splice(i, 1); changed = true; }   // back to the transcript's text
+    p.captionVerifications.push({ source_start_s: e.source_start_s, source_end_s: e.source_end_s, text: e.text, by, at });
+  }
+  if (changed) dropApproval(p, v, actor, 'caption_corrected');          // the approved video no longer shows the verified text
+  hist(p, actor, 'caption_verified', { version: v.n, by, source_start_s: e.source_start_s, original, text: e.text, changed });
+  save();
+  return view(p);
+}
+/** Per-card state for the page: לא נבדק / תוקן / אומת על ידי הבעלים, the original text, and whether the video already shows it. */
+function cardStates(p, v) {
+  const pk = v?.package;
+  if (!pk?.cards) return [];
+  return pk.cards.map(c => {
+    const span = num(c.source_start_s) && num(c.source_end_s) ? c : null;
+    const e = span && (p.captionEdits ?? []).find(x => sameSpan(x, span));
+    const ver = span && (p.captionVerifications ?? []).find(x => sameSpan(x, span));
+    const status = e ? (e.status === 'verified' ? 'verified' : 'corrected') : ver ? 'verified' : 'unchecked';
+    return { i: c.i, status, original: e ? e.original : null, saved: e ? e.text : null, by: (e ?? ver)?.by ?? null, at: (e ?? ver)?.at ?? null,
+             inVideo: e ? e.text === c.text : true, from: e?.from ?? null };
+  });
+}
+
+// ── Project settings: destination account and which kinds of adjustment are on ──
+function setSettings(projectId, body = {}, actor = 'owner') {
+  const p = getProject(projectId), v = currentVersion(p);
+  if (body.account !== undefined) {
+    p.account = sanitizeAccount(body.account);
+    if (v?.destination && v.status !== 'editing') {
+      const before = fingerprint(v);
+      v.destination.account = p.account ?? require('../utils/dana_brand').get().instagram_account.value ?? null;
+      if (fingerprint(v) !== before) dropApproval(p, v, actor, 'account_changed');
+    }
+  }
+  if (body.adjustments !== undefined) p.adjustments = { ...(p.adjustments ?? {}), ...sanitizeAdjustments(body.adjustments) };   // applies from the next version
+  hist(p, actor, 'settings_changed', { account: p.account ?? null, adjustments: p.adjustments ?? {} });
+  save();
+  return view(p);
+}
+
+// ── "יישם שיפורים והפק גרסה חדשה" ─────────────────────────────────────────────
+/**
+ * Dana applies, by herself, the improvements of her review that are inside the approved rules, and produces a new version.
+ * For one of her own edits: the same plan, and the editor may act on the review's findings.
+ * For a finished video the owner uploaded: the content is kept exactly; only technical improvements are applied.
+ */
+function applyReview(projectId, body = {}, actor = 'owner') {
+  const p = getProject(projectId), v = currentVersion(p);
+  if (!v?.package || v.status === 'editing') throw new StudioError(409, 'not_reviewable', 'אין ביקורת מוכנה בגרסה הנוכחית');
+  const by = String(body.by || '').trim().slice(0, 80);
+  if (!by) throw new StudioError(400, 'by_required', 'נדרש שם מי שמבקש/ת');
+  const open = Object.values(state().jobs).find(j => j.projectId === p.id && ['queued', 'leased'].includes(j.status));
+  if (open) throw new StudioError(409, 'job_in_progress', 'כבר יש עריכה פעילה לפרויקט הזה');
+  const can = (v.package.dana_review?.improvements ?? []).filter(i => i.can_apply).length + (v.package.dana_can_apply ?? []).length;
+  if (!can) throw new StudioError(409, 'nothing_to_apply', 'בביקורת הזו אין שיפור שדנה יכולה ליישם בעצמה — הנושאים הפתוחים דורשים החלטה שלך');
+  dropApproval(p, v, actor, 'apply_review');
+  hist(p, actor, 'apply_review_requested', { version: v.n, by, improvements: can });
+  if (v.kind === 'review_only' || p.kind === 'review_only') {
+    if (!p.polish) p.polish = { burned_in_text: true, add_captions: false };
+    enqueueEdit(p, {}, actor);
+  } else enqueueEdit(p, { apply_review: true, previous: previousOf(v) }, actor);
+  save();
+  return view(p);
+}
+
+// ── Progress: measured stage times; the percentage is a labelled estimate ────
+const PHASES = [['transcribe', 'תמלול'], ['analyse', 'ניתוח'], ['plan', 'תכנון'], ['edit', 'עריכה'], ['review', 'ביקורת'], ['fixes', 'תיקונים'], ['ready', 'מוכן לצפייה']];
+const STAGE_PHASE = { starting: 'transcribe', download: 'transcribe', source: 'transcribe', transcribe_source: 'transcribe',
+  transcribe_check: 'analyse', interpret: 'analyse', measure: 'analyse',
+  plan: 'plan', assemble: 'plan', render_base: 'edit', measure_picture: 'edit', align: 'edit', render_cards: 'edit', graphics: 'edit',
+  composite: 'edit', verify: 'edit', checks: 'edit', cover: 'edit', compare: 'edit', review: 'review', revise: 'fixes', upload: 'ready', done: 'ready' };
+// used only when no earlier edit exists to learn from; marked as a rough estimate
+const DEFAULT_STAGE_S = { source: 2, transcribe_source: 40, transcribe_check: 40, interpret: 15, plan: 40, assemble: 16, render_base: 16, measure_picture: 8,
+  align: 7, render_cards: 30, graphics: 25, composite: 14, verify: 4, checks: 37, cover: 2, compare: 10, review: 12, upload: 10 };
+/** Typical seconds per stage, from the timings the worker measured in earlier finished edits (median). */
+function typicalStageSeconds() {
+  const all = {};
+  let n = 0;
+  for (const p of Object.values(state().projects)) for (const v of p.versions) {
+    const t = v.package?.timings_s;
+    if (!t || typeof t !== 'object') continue;
+    n++;
+    for (const [k, sec] of Object.entries(t)) if (num(sec)) (all[k] = all[k] ?? []).push(sec);
+  }
+  const med = {};
+  for (const [k, list] of Object.entries(all)) { list.sort((a, b) => a - b); med[k] = list[Math.floor(list.length / 2)]; }
+  return { typical: { ...DEFAULT_STAGE_S, ...med }, samples: n };
+}
+function progressOf(p, v, job) {
+  if (!job) return null;
+  const done = ['succeeded', 'review_required'].includes(job.status);
+  const log = job.stageLog ?? [], nowMs = Date.now();
+  const cur = job.stage, curBase = String(cur ?? '').replace(/_\d+$/, '');
+  const phase = done ? 'ready' : job.status === 'queued' ? null : (log.some(x => x.stage === 'revise') && STAGE_PHASE[curBase] === 'edit' ? 'fixes' : STAGE_PHASE[curBase] ?? 'edit');
+  const idx = PHASES.findIndex(([k]) => k === phase);
+  const out = {
+    phase, phases: PHASES.map(([key, label], i) => ({ key, label, state: done || (idx >= 0 && i < idx) ? 'done' : i === idx ? 'current' : 'todo' })),
+    stage: cur, note: job.note, status: job.status, attempts: job.attempts, maxAttempts: job.maxAttempts,
+    startedAt: job.leasedAt ?? null, lastUpdateAt: job.updatedAt, elapsedS: job.leasedAt && !done ? Math.round((nowMs - Date.parse(job.leasedAt)) / 1000) : job.totalSeconds ?? null,
+    sinceUpdateS: Math.round((nowMs - Date.parse(job.updatedAt)) / 1000),
+    percent: null, percentBasis: null, percentNote: null,
+  };
+  if (done) { out.percent = 100; out.percentBasis = 'measured'; out.percentNote = 'החבילה זמינה לצפייה'; return out; }
+  if (job.status !== 'leased' || !log.length) return out;
+  // A correction round repeats edit stages an unknown number of times: there is no honest percentage for it.
+  if (phase === 'fixes') { out.percentNote = 'סבב תיקונים: אין מדידה לאחוז בשלב הזה'; out.stageElapsedS = Math.round((nowMs - Date.parse(log[log.length - 1].at)) / 1000); return out; }
+  const { typical, samples } = typicalStageSeconds();
+  // what the worker has reported so far is measured; what is left is estimated from earlier edits
+  const expected = job.type === 'review' ? ['source', 'transcribe_source', 'measure_picture', 'review', 'upload']
+    : ['source', 'transcribe_source', 'transcribe_check', 'plan', 'render_base', 'measure_picture', 'align', 'render_cards', 'composite', 'verify', 'checks', 'cover', 'compare', 'review', 'upload'];
+  const total = expected.reduce((t, k) => t + (typical[k] ?? 10), 0);
+  const seen = new Set(log.map(x => x.stage.replace(/_\d+$/, '')));
+  const stageStart = Date.parse(log[log.length - 1].at);
+  const base = cur.replace(/_\d+$/, '');
+  let spent = 0;
+  for (const k of expected) if (seen.has(k) && k !== base) spent += typical[k] ?? 10;
+  spent += Math.min((nowMs - stageStart) / 1000, (typical[base] ?? 10) * 0.95);
+  out.percent = Math.max(1, Math.min(99, Math.round(100 * spent / total)));
+  out.percentBasis = 'estimated';
+  out.percentNote = samples ? `משוער: לפי משך כל שלב ב-${samples} עריכות קודמות שנמדדו. השלב והזמנים עצמם נמדדים.` : 'משוער גס: אין עדיין עריכות קודמות ללמוד מהן. השלב והזמנים עצמם נמדדים.';
+  out.stageElapsedS = Math.round((nowMs - stageStart) / 1000);
+  return out;
+}
+
+/** What the owner should do next, as one key the page turns into the main button. */
+function nextAction(p, v, job) {
+  if (!v) return { key: 'upload', label: 'להעלות חומר גלם' };
+  if (job && ['queued', 'leased'].includes(job.status)) return { key: 'wait', label: workerStatus().online ? 'דנה עובדת — אין מה לעשות כרגע' : 'עובד העריכה לא מחובר — העריכה ממתינה בתור' };
+  if (['failed', 'waiting'].includes(v.status)) return { key: 'retry', label: 'לנסות שוב (בלי עבודה כפולה: התמלול נשמר)' };
+  if (v.kind === 'review_only') return { key: 'apply_review', label: 'לקרוא את הביקורת של דנה, ואז "יישם שיפורים והפק גרסה חדשה"' };
+  if (pendingEdits(p, v).length) return { key: 'render_corrections', label: `להפיק גרסה עם ${pendingEdits(p, v).length} תיקוני המלל ששמרת` };
+  if (v.status === 'approved' && approvalValid(v)) return { key: 'approved', label: 'הגרסה מאושרת. פרסום הוא שלב נפרד וכבוי כרגע.' };
+  if (judgementMissing(v) && !judgementExcepted(v)) return { key: 'revise', label: 'עריכה טכנית בלבד — להפיק גרסה מתוקנת' };
+  if (unresolved(v).length) return { key: 'review_items', label: `לבדוק ${unresolved(v).length} פריטים פתוחים (צפייה והאזנה)` };
+  return { key: 'watch_approve', label: 'לצפות בסרטון ולאשר את הגרסה, או לבקש תיקון' };
 }
 
 // ── Standing rules: feedback the owner marked as "כלל קבוע" — global, with history ──
@@ -743,7 +1001,8 @@ function retry(projectId, actor = 'owner') {
   const p = getProject(projectId), v = currentVersion(p);
   if (!v || !['failed', 'waiting'].includes(v.status)) throw new StudioError(409, 'not_retryable', 'אין עריכה שנכשלה לנסות שוב');
   const prev = state().jobs[v.jobId];
-  enqueueEdit(p, { adapter: prev?.options.adapter ?? undefined, style_overrides: prev?.options.style_overrides, decisions: prev?.options.decisions,
+  if (prev?.type === 'review') { enqueueReview(p, actor); save(); return view(p); }
+  enqueueEdit(p, { apply_review: prev?.options.apply_review, adapter: prev?.options.adapter ?? undefined, style_overrides: prev?.options.style_overrides, decisions: prev?.options.decisions,
                    change_request: prev?.options.change_request, previous: prev?.options.previous }, actor);   // a retried revision keeps its basis
   save();
   return view(p);
@@ -756,6 +1015,9 @@ function view(p) {
   return {
     id: p.id, title: fixName(p.title), status: p.status, createdAt: p.createdAt, currentVersion: p.currentVersion,
     source: { sha256: p.source.sha256, bytes: p.source.bytes, originalName: fixName(p.source.originalName), ext: p.source.ext },
+    kind: p.kind ?? 'edit', account: p.account ?? null, adjustments: p.adjustments ?? {}, adjustmentKinds: ADJUSTMENT_KINDS,
+    progress: progressOf(p, v, job), nextAction: nextAction(p, v, job),
+    pendingCorrections: pendingEdits(p, v).length, cardStates: cardStates(p, v),
     consent: p.consent, rights: p.rights, pendingChange: p.pendingChange ?? null,
     adapter: projectAdapter(p),                                    // null = the worker's configuration decides
     captionEdits: p.captionEdits ?? [], zoomEdits: p.zoomEdits ?? [], styleOverrides: p.styleOverrides ?? {},
@@ -763,14 +1025,21 @@ function view(p) {
                  error: job.error ? { code: job.error.code, message: job.error.message, retryable: job.error.retryable } : null,
                  totalSeconds: job.totalSeconds ?? null } : null,
     version: v ? {
-      n: v.n, status: v.status, createdAt: v.createdAt, changeRequest: v.changeRequest ?? null,
+      n: v.n, status: v.status, createdAt: v.createdAt, changeRequest: v.changeRequest ?? null, kind: v.kind ?? 'edit',
+      hasCompare: !!v.artifacts['compare_frames.jpg'], hasCompareClip: !!v.artifacts['compare_clip.mp4'],
       fingerprint: fingerprint(v), approval: v.approval, approvalValid: approvalValid(v),
       caption: v.caption, destination: v.destination, scheduledAt: v.scheduledAt,
       scheduledLocal: require('./dana_publisher').toLocal(v.scheduledAt), scheduleProposed: !!v.scheduleProposed, timezone: 'Asia/Jerusalem',
       exceptions: v.exceptions, unresolved: unresolved(v),
       contentJudgement: v.package ? { mode: judgementMode(v.package), missing: judgementMissing(v), excepted: judgementExcepted(v), exceptionId: JUDGEMENT_EXCEPTION } : null,
-      package: v.package ? { duration: v.package.duration, segment: v.package.segment, adapter: v.package.adapter, spokenText: v.package.spoken_text,
-        cards: v.package.cards, cover: v.package.cover, checks: v.package.checks, issues: v.package.issues, style: v.package.style,
+      package: v.package ? { duration: v.package.duration, segment: v.package.segment ?? null, adapter: v.package.adapter, spokenText: v.package.spoken_text ?? v.package.transcript?.text ?? '',
+        cards: v.package.cards ?? [], cover: v.package.cover ?? null, checks: v.package.checks ?? [], issues: v.package.issues ?? [], style: v.package.style,
+        graphics: v.package.graphics ?? null, adjustments: v.package.adjustments ?? null, compare: v.package.compare ?? null,
+        danaReview: v.package.dana_review ?? null, reviewVsPrevious: v.package.review_vs_previous ?? null,
+        requestInterpretation: v.package.request_interpretation ?? null, derivedTextUpdates: v.package.derived_text_updates ?? [],
+        measured: v.package.measured ?? null, burnedInText: v.package.burned_in_text ?? v.package.plan?.burned_in_text ?? null,
+        danaCanApply: v.package.dana_can_apply ?? null, graphicsSeen: v.package.graphics_seen ?? null, note: v.package.note ?? null,
+        tools: v.package.tools ?? null,
         considered: v.package.considered ?? [], revisionNote: v.package.revision_note ?? '', spelling: v.package.spelling ?? [],
         usage: v.package.judgement_usage ?? null, bundle: v.package.instruction_bundle ?? null, editorial: v.package.editorial ?? null,
         timings: v.package.timings_s, totalSeconds: v.package.total_s, pipelineVersion: v.package.pipeline_version,
@@ -778,10 +1047,12 @@ function view(p) {
         plan: v.package.plan ?? null, judgementMode: judgementMode(v.package), zooms: v.package.zooms ?? null, transcript: v.package.transcript ?? null,
         rulesUsed: v.package.rules_used ?? null, captionStatus: v.package.caption?.status ?? null,
         quality: v.package.quality ?? null, revisionMode: v.package.revision_mode ?? null } : null,
-      hasVideo: !!v.artifacts['final.mp4'], hasCover: !!v.artifacts['cover.jpg'],
+      hasVideo: !!v.artifacts['final.mp4'] || !!v.videoIsSource, hasCover: !!v.artifacts['cover.jpg'],
     } : null,
     versions: p.versions.map(x => ({ n: x.n, status: x.status, createdAt: x.createdAt, approved: !!x.approval, changeRequest: x.changeRequest ?? null,
-      hasVideo: !!x.artifacts?.['final.mp4'], hasCover: !!x.artifacts?.['cover.jpg'], duration: x.package?.duration ?? null,
+      hasVideo: !!x.artifacts?.['final.mp4'] || !!x.videoIsSource, hasCover: !!x.artifacts?.['cover.jpg'], duration: x.package?.duration ?? null,
+      kind: x.kind ?? 'edit', appliedReview: !!x.appliedReview, hasCompare: !!x.artifacts?.['compare_frames.jpg'],
+      reviewLevels: (x.package?.dana_review?.categories ?? []).map(c => ({ key: c.key, label: c.label, level: c.level, met: c.met, decided: c.decided })),
       judgementMode: judgementMode(x.package), profile: x.package?.rules_used?.profile ?? null, revisionMode: x.package?.revision_mode ?? null })),
     publication: { ...publisher.gate(p), record: p.publication },
     history: p.history.slice(-60),
@@ -789,7 +1060,8 @@ function view(p) {
 }
 function list() {
   return Object.values(state().projects).sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-    .map(p => { const x = view(p); return { id: x.id, title: x.title, status: x.status, createdAt: x.createdAt, currentVersion: x.currentVersion,
+    .map(p => { const x = view(p); return { id: x.id, title: x.title, status: x.status, createdAt: x.createdAt, currentVersion: x.currentVersion, kind: x.kind,
+      progress: x.progress && { phase: x.progress.phase, percent: x.progress.percent, percentBasis: x.progress.percentBasis }, nextAction: x.nextAction,
       job: x.job && { status: x.job.status, stage: x.job.stage, note: x.job.note }, unresolved: x.version?.unresolved.length ?? 0, consent: x.consent.status }; });
 }
 
@@ -801,4 +1073,5 @@ module.exports = {
   progress, acceptArtifact, complete, fail, recover, reconcileOnStartup, fingerprint, unresolved, approvalValid, editPackage, recordException,
   approve, confirmReview, requestChanges, revise, reject, setConsent, retry, sourcePath, artifactPath, dir, save, state, hist, _resetForTests,
   listRules, activeRules, addRule, editRule, retireRule, previousOf, fixName, projectAdapter, judgementMode, judgementMissing, STYLE_OVERRIDABLE,
+  verifyCaption, setSettings, applyReview, progressOf, nextAction, cardStates, pendingEdits, ADJUSTMENT_KINDS, PHASES,
 };

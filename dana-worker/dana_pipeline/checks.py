@@ -275,7 +275,7 @@ def check_safe_zone(cfg, png_dir, cards):
 
 
 # ── What is actually on screen, measured from the rendered pixels ───────────
-def cards_in_motion(cfg, final, base, png_dir, cards, fps):
+def cards_in_motion(cfg, final, base, png_dir, cards, fps, anim_s=0.0):
     import numpy as np
     from PIL import Image
     boxes = [b for b in (_ink_box(Path(png_dir) / f"c{c['i']:03d}.png")[1] for c in cards) if b]
@@ -306,6 +306,15 @@ def cards_in_motion(cfg, final, base, png_dir, cards, fps):
         errs = {i: np.abs(a - (b * (1 - al) + gr * al)).mean() for i, (al, gr) in layers.items()}
         best = min(errs, key=errs.get)
         none_err = np.abs(a - b).mean()
+        if anim_s:                                # a card that is still fading in is not a pixel match for its finished image
+            t = f / fps
+            fading = next((i for i in when if when[i][0] - 1e-3 <= t < when[i][0] + anim_s + 1.0 / fps), None)
+            if fading is not None:
+                if none_err > 0.3:
+                    shown[fading].append(f)
+                else:
+                    blank += 1
+                continue
         if none_err <= errs[best]:
             blank += 1
             continue
