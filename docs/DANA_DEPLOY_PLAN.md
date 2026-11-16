@@ -159,3 +159,25 @@ the deploy still open with their versions.
 
 **Decisions the owner must make first.** Which server the permanent worker connects to; whether the editing
 computer may sleep when idle (a job that arrives while it sleeps waits until it wakes); approval of the deploy itself.
+
+### Addendum 2026-11-16 (after the owner's acceptance feedback) — still NOT executed
+
+The candidate is the head of `dana-phase-1a` on origin. Since the update above the same server files changed again
+(`public/dana-studio.js`, `routes/dana_studio_routes.js`, `services/dana_studio.js`, `services/dana_media.js`,
+`services/dana_skills.js`); no new server file, no Barak / Tomer file, no new environment variable.
+
+What changes for data that already exists in production after a deploy:
+- the music level of a project is read as "dB under the speech" (range -20…-6). A stored value below -20 is applied as -20
+  by the worker; nothing is rewritten on disk until the owner saves the mix again;
+- packages made before this version have no `top_improvements` / `plain`: the page falls back to the long list;
+- the review rubric is `dana-review-2026-11-16.2`: the first version produced after the deploy has no category comparison
+  with the version before it (different rubric), and says so.
+
+The worker and the server must be updated together: a new worker with the old server works; the old worker (1.0.0) with
+the new server ignores the direction, the music level meaning and the narration-caption corrections.
+
+Rollback is unchanged (`7166b2b` / deployment `7831b280`). Projects that were given a direction keep the field; the old
+code ignores it.
+
+Before the owner approves a deploy: watch the three previews, and decide the open items in
+`docs/DANA_ROUND_5_FEEDBACK_2026-11-16.md` ("מה לא נסגר").
