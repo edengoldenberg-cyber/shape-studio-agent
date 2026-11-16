@@ -181,3 +181,42 @@ code ignores it.
 
 Before the owner approves a deploy: watch the three previews, and decide the open items in
 `docs/DANA_ROUND_5_FEEDBACK_2026-11-16.md` ("מה לא נסגר").
+
+---
+
+## DEPLOYED 2026-11-16 23:08 (Israel) — approved by the owner for this deployment
+
+| | |
+|---|---|
+| Active deployment | `90ef135d-520e-46e0-9828-bfcc4ec17a7f` (SUCCESS), started 2026-11-16T21:09:27Z |
+| Commit | `76e58d3` on `dana-phase-1a` (on origin). Feature tag in `/api/version`: `dana_rating_v1` |
+| Previous | deployment `7831b280-fa37-4399-9fe2-361c5f828a4a`, commit `7166b2b` |
+| Worker | `windows-editor-1`, pipeline `1.5.0`, started after the server; config `C:/Users/owner/dana-work/worker.config.production.json`, log `C:/Users/owner/dana-work/worker.production.out.log` |
+| Unchanged | no Railway variable was changed. Publishing off, notifications mocked (`DANA_PUBLISHING_ENABLED`, `DANA_PUBLISHER_MODE`, `DANA_NOTIFY_REAL`, `DANA_NOTIFY_PHONE` not set) |
+
+**Checked before the deploy.** Full Jest 526/526; standalone Barak / Tomer harnesses 373/0; panel browser checks: Barak 33/0,
+Tomer 92/0, member care 60/0, Dana tab 33/0; worker unit tests 218/218; Dana page checks in a browser; one full track with the
+real worker (`scripts/dana_e2e_track.cjs`, 21/21). Server files that differ from `7166b2b` are Dana files only, plus one line in
+`server.js` (the feature tag). The production log showed no conversation in progress (scheduled jobs only).
+
+**Checked after the deploy.** `/health` 200 with `startupComplete` and `storeReady`; the Dana, Barak and Tomer APIs and the pages
+answer 401 without a session and the login page loads; the four main server files on the container have the same SHA-256 as the
+commit; `dana-worker/` is not on the server; the project that existed (`prj_mwhu0wmt8b8ce592`, one version, eight files) is intact;
+no send in the startup log; the server records the worker as `idle`, pipeline `1.5.0`, and the worker polls the three queues.
+
+**Not checked.** Nothing was done with a logged-in session: the dashboard password was not used. So the page was not opened in
+production, and no job has gone through the production queue with the new code yet. The owner's first action does that.
+
+**Rollback.**
+1. Stop the worker first: create an empty file `C:/Users/owner/dana-work/STOP` (it exits after the current job).
+2. Make sure no rating job is waiting (a job of type `rereview` is unknown to the old server code and must not be left queued).
+3. `git checkout 7166b2b && railway up --detach`, then `git checkout dana-phase-1a`. Verify `/api/version` shows the new
+   deployment id and no `dana_rating_v1` tag. Data under `/data/dana/` stays in place; review history and ratings written by the
+   new code are ignored by the old code.
+4. Kill switch without a deploy: deleting `DANA_WORKER_TOKEN` closes the worker API.
+
+**The worker is a plain process, not an auto-start.** It was started hidden from this session and keeps running after the
+session ends, but not after a restart of the computer, and it cannot take a job while the computer sleeps (idle sleep is 15
+minutes; the worker asks Windows to stay awake only while a job runs). The computer had six unclean shutdowns in 14 days; the cause
+is unknown. To start it again: delete `STOP` if present and run
+`python -X utf8 dana-worker\worker.py --config C:\Users\owner\dana-work\worker.config.production.json`.
