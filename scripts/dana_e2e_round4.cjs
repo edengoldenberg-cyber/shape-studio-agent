@@ -231,7 +231,7 @@ async function main() {
         resent += topics[n].filter(t => failed.includes(t)).length; }
       check(`R.${tag}.4`, `${tag}: a finding the editor did not fix is not sent to the editor again; the reason is recorded for the owner`, resent === 0,
         { rounds: cyc.length, revisions: ed.revisions, stop: ed.stop_reason, sent_per_round: topics.map(t => t.length), not_sent_again: cyc.flatMap(c => c.not_sent_again ?? []).map(x => x.problem.slice(0, 50)), stopped_because: cyc.map(c => c.stopped_because).filter(Boolean) });
-      const proh = (P.skill_report?.rules ?? []).filter(r => r.prohibition && ['music', 'sound_effects', 'b_roll', 'transitions'].includes(r.domain));
+      const proh = (P.skill_report?.rules ?? []).filter(r => r.prohibition && ['music', 'sound_effects', 'broll', 'transitions'].includes(r.domain));
       check(`R.${tag}.5`, `${tag}: "בלי מוזיקת רקע" is checked as a prohibition that was kept (measured), not listed as unsupported`,
         proh.length >= 1 && proh.every(r => r.status === 'applied' && r.decided_by === 'measured') && !(P.skill_report?.rules ?? []).some(r => r.status === 'unsupported' && /^(בלי|ללא)/.test(r.text)),
         proh.map(r => `${r.text} → ${r.status} (${r.note})`));

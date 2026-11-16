@@ -397,11 +397,40 @@ def produce(j, video, smap, sp, sha_before, tg, tspec, zone_used):
                 records.append(motion.check(cfg, j.work / "titled.mp4", picture, graphics, zone_used, {g["id"]: faces}, st["width"]))
                 picture = j.work / "titled.mp4"
 
+    # ── captions of the NARRATION: the words of the uploaded narration, timed by transcribing it; marked as narration, unverified ──
+    cards, nar_words = [], []
+    if nar and st.get("captions_enabled", True):
+        with j.stage("render_cards"):
+            try:
+                wav = j.work / "narration_16k.wav"
+                run([tool(cfg, "ffmpeg"), "-y", "-v", "error", "-i", nar["path"], "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav], "narration_unreadable", timeout=300)
+                off = float(nar.get("start_s", 0))
+                nar_words = [dict(w, start=round(w["start"] + off, 3), end=round(w["end"] + off, 3)) for w in checks.transcribe(cfg, wav)["words"] if w["start"] + off < dur - 0.2]
+                if nar_words:
+                    line_px = captions.max_line_px(zone_used, st["width"])
+                    fits = lambda t: len(t) <= cfg["cards"]["merge_max_chars"] and captions.text_px(cfg, st, t) <= line_px
+                    one = [{"text": judgement.BIDI.sub("", w["word"]).strip(), "highlight": []} for w in nar_words]
+                    grouped, _ = captions.regroup(one, [[w] for w in nar_words], fits, cfg["cards"]["min_on_screen_s"], cfg["cards"]["max_chars_per_s"], 3, cfg["cards"]["hold_after_s"])
+                    spans, k = [], 0
+                    for c in grouped:
+                        n_w = len(c["text"].split())
+                        spans.append(nar_words[k:k + n_w])
+                        k += n_w
+                    cards = captions.time_cards(grouped, spans, st["fps"], cfg["cards"]["hold_after_s"], dur)
+                    png_dir = captions.render_png(cfg, st, [{"name": f"c{c['i']:03d}", "text": c["plain"], "highlight": []} for c in cards], j.work / "caps")
+                    records += [checks.check_width(png_dir, cards, st["width"]), checks.check_safe_zone(cfg, png_dir, cards)]
+                    captions.composite(cfg, picture, picture, cards, png_dir, j.work / "captioned.mp4", dur, animation=None, graphics=None, fps=st["fps"])
+                    picture = j.work / "captioned.mp4"
+                    issues.append(judgement.issue("narration_captions_unverified", "warn", f"הכתוביות ({len(cards)}) נוצרו מתמלול אוטומטי של הקריינות ולא אומתו. הן מציגות קריינות, לא ציטוט של המצולמים — לקרוא ולבדוק לפני אישור"))
+            except PipelineError as e:
+                cards = []
+                issues.append(judgement.issue("narration_captions_failed", "warn", f"לא נוצרו כתוביות לקריינות ({e.code}); הקריינות עצמה נכנסה למיקס"))
+
     # ── the mix: original sound (kept or muted, per part), narration, music ──
     final = j.out / "final.mp4"
     mute = [(s["tl_in_s"], s["tl_out_s"]) for s in segs if s["n"] in ((audio.get("original") or {}).get("mute_segments") or [])]
-    speech = []
-    if nar:
+    speech = [(w["start"], w["end"]) for w in nar_words]
+    if nar and not speech:
         nd = mixer_probe(cfg, nar["path"])
         speech.append((float(nar.get("start_s", 0)), min(dur, float(nar.get("start_s", 0)) + nd)))
     with j.stage("mix"):
@@ -493,7 +522,10 @@ def produce(j, video, smap, sp, sha_before, tg, tspec, zone_used):
              from_rec("A1", "sound", "עוצמת הקול הכוללת ביעד", "loudness"), from_rec("A2", "sound", "אין עיוות מקטימה במיקס", "mix_clipping"),
              from_rec("A4", "sound", "בזמן דיבור המוזיקה נמוכה ממנו ב-10 dB לפחות", "mix_speech_over_music"),
              _row("A3", "sound", "המיקס נשמע טוב ומתאים לתוכן", "not_checked", "human", "דורש האזנה שלך"),
-             _row("K1", "captions", "כתוביות", "na", "measured", "בלקט אין כתוביות בגרסה הזו" + (" (כתוביות לקריינות עדיין לא נתמכות)" if nar else ""))]
+             (_row("K1", "captions", "כתוביות הקריינות בתוך הפריים ובאזור הבטוח", "met" if all((rec_by.get(i) or {}).get("status") in ("pass", "warn") for i in ("caption_width", "safe_zone")) else "not_met",
+                   "measured", f"{len(cards)} כתוביות מתמלול אוטומטי של הקריינות") if cards else _row("K1", "captions", "כתוביות", "na", "measured", "אין קריינות, ולכן אין כתוביות בגרסה הזו")),
+             (_row("K2", "captions", "הכתוביות תואמות את מה שנאמר בקריינות", "not_checked", "human", "נוצרו מתמלול אוטומטי ולא אומתו; דורש קריאה והאזנה שלך") if cards
+              else _row("K2", "captions", "הכתוביות תואמות את הקריינות", "na", "measured", "אין כתוביות"))]
     dana_review = {"rubric_version": RUBRIC, "kind": "montage", "categories": _categories(rows), "improvements": [],
                    "legend": {"basis": review.BASIS_HE, "levels": [n for _, n in review.LEVELS] + ["לא נבדק"]},
                    "note": "הדירוג סופר כמה מהקריטריונים שנבדקו מתקיימים. קריטריון שלא נבדק מסומן כך ואינו נספר. הדירוג אינו אישור לפרסום.",
@@ -529,11 +561,11 @@ def produce(j, video, smap, sp, sha_before, tg, tspec, zone_used):
                           for s in segs],
                 "events": [{"t0": g["tl_start_s"], "t1": g["tl_end_s"], "kind": g["kind"], "label": f"{g['label']}: {g['text']}", "layer": "over_picture", "skill": "דנה", "why": g["reason"]} for g in graphics]}
     outputs = [{"name": "final.mp4", "what": "הלקט", "seconds": dur}]
-    for name, payload in (("captions.json", []), ("transcript_source.json", {"words": [], "note": "לקט: לא בוצע תמלול"}), ("transcript_final.json", {"words": [], "note": "לקט: לא בוצע תמלול"})):
+    for name, payload in (("captions.json", [{k: c[k] for k in ("i", "start", "dur", "plain")} for c in cards]), ("transcript_source.json", {"words": [], "note": "לקט: לא בוצע תמלול"}), ("transcript_final.json", {"words": [], "note": "לקט: לא בוצע תמלול"})):
         write_json(j.out / name, payload)
     write_json(j.out / "checks.json", {"pipeline_version": PIPELINE_VERSION, "records": records})
     ed = {"status": "ready_for_owner_review" if not failed else "stopped_with_issues", "stop_reason": "montage_single_pass", "revisions": 0, "cycles": [], "delivered_cycle": 0,
-          "criteria": [], "rules_in_force": ["בלקט אין כתוביות בגרסה הזו", "המעברים הם חיתוכים ישרים בלבד"],
+          "criteria": [], "rules_in_force": ["כתוביות נוצרות רק לקריינות שהועלתה (מתמלול אוטומטי, לא מאומת)", "המעברים הם חיתוכים ישרים בלבד"],
           "budget": {"cost_usd_reported": round(sum(float(u.get("cost_usd") or 0) for u in usages), 4), "seconds": round(time.time() - j.t0, 1), "max_cycles": 0},
           "note": "לקט מופק במעבר אחד: תכנון לפי פריימים, רינדור, מיקס, בדיקות וביקורת על הקובץ הסופי. אין סבבי תיקון אוטומטיים."}
     write_json(j.out / "editorial.json", ed)
@@ -549,14 +581,16 @@ def produce(j, video, smap, sp, sha_before, tg, tspec, zone_used):
                  "brief": [], "model_error": model_error, "candidates_considered": len(cands),
                  "basis": "מדידת תנועה, חדות ובהירות בכל המקורות, ופריים אחד לכל רגע מועמד. המודל לא צפה בתנועה ולא שמע את האודיו; הוא אינו מזהה תרגילים ואינו שופט איכות ביצוע."},
         "montage": {"candidates": [{k: c[k] for k in ("n", "name", "in_s", "out_s", "movement", "sharpness", "must")} for c in cands], "limits_s": [lo, hi], "notes": notes, "unused_sources": unused, "doubts": plan_meta["doubts"]},
-        "zooms": [], "graphics": [{k: v for k, v in g.items() if k != "frames"} for g in graphics], "graphics_dropped": graphics_dropped, "cards": [], "spoken_text": "",
+        "zooms": [], "graphics": [{k: v for k, v in g.items() if k != "frames"} for g in graphics], "graphics_dropped": graphics_dropped, "spoken_text": " ".join(w["word"] for w in nar_words),
+        "cards": [{"i": c["i"], "text": c["plain"], "lines": [c["plain"]], "highlight": [], "start": c["start"], "dur": c["dur"], "source_start_s": c["start"], "source_end_s": round(c["start"] + c["dur"], 3),
+                   "of": "narration"} for c in cards],
         "adjustments": {"color": {"enabled": False, "applied": False, "note": "תיקון צבע לא מופעל בלקט בגרסה הזו"}, "audio_cleanup": {"enabled": False, "applied": False},
                         "zooms": {"enabled": False, "count": 0}, "caption_animation": {"enabled": False, "applied": "none"},
                         "graphics": {"enabled": True, "applied": bool(graphics), "count": len(graphics), "engine": "HyperFrames"}, "animation": {"enabled": False, "allowed": False, "applied": False, "count": 0}},
         "mix": mix_rec, "dana_review": dana_review, "final_review": final_review, "review_provenance": provenance, "review_compact": review.compact(dana_review), "timeline": timeline,
         "target": {"key": tg, "label": tspec["label"], "max_parts": tspec.get("max_parts"), "part_max_s": tspec.get("part_max_s"), "cover_text": False, "post_caption": False, "publish": tspec["publish"],
                    "safe_zone": {k: v for k, v in zone_used.items() if not k.startswith("_")}}, "outputs": outputs,
-        "style": {k: st.get(k) for k in ("caption_size", "caption_y_px", "caption_max_lines", "font_family")} | {"captions_enabled": False}, "captions_added": False,
+        "style": {k: st.get(k) for k in ("caption_size", "caption_y_px", "caption_max_lines", "font_family")} | {"captions_enabled": bool(cards)}, "captions_added": bool(cards), "captions_of": "narration" if cards else None,
         "cover": {"text": "", "frame_s": round(min(0.6, dur / 2), 2), "source": "first_part"}, "caption": {"text": "", "cta": None, "is_draft": True, "note": "ללקט לא נכתבת טיוטת קפשן אוטומטית"},
         "checks": records, "failed_checks": failed, "issues": issues, "review_items": review_items, "editorial": ed,
         "rules_used": {"skill": {"name": "dana-montage", "version": RUBRIC}, "profile": None, "references": []},

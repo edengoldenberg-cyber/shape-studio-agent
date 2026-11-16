@@ -249,7 +249,7 @@ def review_block(skill):
 
 
 # what the pipeline can MEASURE about a rule, by area: (fact, Hebrew name)
-ADDED_FACT = {"music": ("music_added", "מוזיקה"), "sound_effects": ("sound_effects_added", "אפקטים קוליים"), "b_roll": ("b_roll_added", "צילומי השלמה"),
+ADDED_FACT = {"music": ("music_added", "מוזיקה"), "sound_effects": ("sound_effects_added", "אפקטים קוליים"), "broll": ("b_roll_added", "צילומי השלמה"),
               "transitions": ("transition_effects_added", "אפקט מעבר")}
 COUNT_FACT = {"animation": ("scenes", "קטע אנימציה"), "motion_graphics": ("overlays", "גרפיקה מעל הצילום")}
 

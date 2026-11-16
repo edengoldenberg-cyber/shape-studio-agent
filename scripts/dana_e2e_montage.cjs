@@ -118,6 +118,9 @@ async function main() {
     check('3.3', 'the new music settings and the narration are in the mix; the music is measured against the speech', m2.params?.music?.start_s === 30 && m2.params?.music?.volume_db === -20 && !!m2.params?.narration
       && typeof m2.measured?.speech_over_music_db === 'number' && !!c2('mix_speech_over_music'), { measured: m2.measured, check: c2('mix_speech_over_music')?.summary });
     check('3.4', 'the narration is recorded as a script written for the video, not as a quotation', m2.narration_script?.is_script === true, m2.narration_script);
+    check('3.6', 'the narration gets captions: timed from a transcription of the narration, inside the safe zone, marked as narration and as NOT verified', (P2.cards ?? []).length >= 3 && P2.cards.every(c => c.of === 'narration')
+      && c2('safe_zone')?.status === 'pass' && (P2.issues ?? []).some(i => i.code === 'narration_captions_unverified') && (P2.final_review?.not_checked ?? []).some(x => /תואמות/.test(x.criterion)),
+      { cards: (P2.cards ?? []).length, first: (P2.cards ?? []).slice(0, 4).map(c => c.text), width: c2('caption_width')?.status, zone: c2('safe_zone')?.summary });
     check('3.5', 'version 1 is kept on disk, nothing is approved, and version 2 has its own final review', fs.existsSync(path.join(vdir(id, 1), 'final.mp4')) && r2.p.status !== 'approved' && P2.final_review?.file_sha256 !== f1.file_sha256);
 
     // ── 4: replace ONE part ──
