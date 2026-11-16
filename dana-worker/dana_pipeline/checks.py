@@ -574,18 +574,19 @@ def review_items(records, issues, cards, sync, adjudications, dur):
         locked = next(r for r in sync["cards"] if r["i"] == i)
         orig = a["original"] if a else f"tail {locked['tail_ms']}ms"
         items.append({"id": f"timing:{i}", "kind": "timing", "card": i, **excerpt(i),
+                      "check": "sync_not_found" if locked["status"] == "not_found" else "sync_tail" if i in sync["tail_fail"] and i not in sync["lead_fail"] else "sync_lead",
                       "original": f"בדיקת הסנכרון הנעולה: {orig}",
                       "verdict": a["verdict"] if a else "confirmed", "explanation": a["reason"] if a else "הכרטיס נעלם לפני סוף המילה",
                       "ask": "האם הכתובית מופיעה יחד עם המילה?"})
     text = status.get("caption_text")
     for t in (text["data"]["items"] if text and text["status"] == "review" else []):
         if t["kind"] == "homophone":
-            items.append({"id": f"text:{t['card']}:{t['shown']}", "kind": "text", "card": t["card"], **excerpt(t["card"]),
+            items.append({"id": f"text:{t['card']}:{t['shown']}", "kind": "text", "card": t["card"], "check": "caption_text", **excerpt(t["card"]),
                           "original": f"מוצג '{t['shown']}', התמלול כתב '{t['heard']}' (נשמעות זהה)",
                           "verdict": "needs_reading", "explanation": "בחירת איות לפי ההקשר — לא עניין של תזמון או של איכות אודיו",
                           "ask": f"האם '{t['shown']}' היא המילה הנכונה במשפט?"})
         else:
-            items.append({"id": f"text:{t['card']}:{t['kind']}", "kind": "text", "card": t["card"], **excerpt(t["card"]),
+            items.append({"id": f"text:{t['card']}:{t['kind']}", "kind": "text", "card": t["card"], "check": "caption_text", **excerpt(t["card"]),
                           "original": f"בכתובית '{t['shown'] or '—'}', תמלול חוזר של הקובץ הסופי כתב '{t['heard'] or '—'}'",
                           "verdict": "needs_listening",
                           "explanation": "הכתובית זהה לתמלול המקור. תמלול שני של אותו אודיו כתב אחרת — צריך לשמוע מה נאמר בפועל."
@@ -595,14 +596,14 @@ def review_items(records, issues, cards, sync, adjudications, dur):
     for w in sync["suspicious_words"]:
         if (w["card"], strip(w["word"])) in text_words:
             continue                                   # low confidence caused by the homophone itself; listed once, as text
-        items.append({"id": f"acoustic:{w['card']}:{strip(w['word'])}", "kind": "acoustic", "card": w["card"], **excerpt(w["card"]),
+        items.append({"id": f"acoustic:{w['card']}:{strip(w['word'])}", "kind": "acoustic", "card": w["card"], "check": "energy_gate", **excerpt(w["card"]),
                       "original": f"ודאות אקוסטית נמוכה למילה '{w['word']}' ({'; '.join(w['reasons'])})",
                       "verdict": "needs_listening", "explanation": "התמלול לא בטוח שהמילה נאמרה — זו בדיקת שמיעה, לא בדיקת איות",
                       "ask": f"האם שומעים את המילה '{w['word']}'?"})
     covered = {"sync_lead", "sync_not_found", "sync_tail", "energy_gate", "caption_text"}
     for r in records:
         if r["status"] == "fail" and r["id"] not in covered:
-            items.append({"id": f"check:{r['id']}", "kind": "technical", "card": None, "t0": None, "t1": None, "text": None,
+            items.append({"id": f"check:{r['id']}", "kind": "technical", "check": r["id"], "card": None, "t0": None, "t1": None, "text": None,
                           "original": r["summary"], "verdict": "confirmed", "explanation": "בדיקה טכנית שנכשלה", "ask": "לתקן בעריכה חוזרת"})
     for i in issues:
         if i["severity"] == "blocker":

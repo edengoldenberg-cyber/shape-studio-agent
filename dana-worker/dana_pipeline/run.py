@@ -1167,6 +1167,7 @@ def pipeline(j):
             outputs.append({"name": name, "what": f"כרטיס סטורי {sg['n']}", "seconds": round(b - a, 2), "tl_in_s": round(a, 3), "tl_out_s": round(b, 3)})
     prev_review = options.get("previous_review") if isinstance(options.get("previous_review"), dict) else prev.get("dana_review")
     final_review = review_rubric.final(dana_review, skill_report, provenance, review_items, records, prev_review, tg, skill_info, owner_resolved=owner_resolved, issues=issues)
+    final_review["references"] = [profile["source_reference"]] if profile.get("source_reference") else []
     timeline = review_rubric.timeline(pl["segments"], res["dur"], res.get("shift", 0.0), cards, res.get("zooms") or [], res.get("graphics") or [], skill, res["audio_clean"], tg) if pl else None
     adjustments = {
         "color": res["color"], "audio_cleanup": res["audio_clean"],

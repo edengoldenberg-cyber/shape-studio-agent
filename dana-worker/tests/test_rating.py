@@ -141,6 +141,31 @@ class ProvenUncertainOrNotRelevant(unittest.TestCase):
         self.assertEqual({x["id"] for x in fin["next_steps"]["owner"]}, {"c:Y1", "c:K7", "c:K8"})
         self.assertEqual(fin["source"]["kind"], "fresh_review")
 
+    def test_every_recommendation_has_a_fixed_id_bound_to_the_file_and_a_time_or_says_it_is_about_the_whole_video(self):
+        timing = dict(TIMING, t0=8.9, check="sync_lead")
+        heard = dict(HEARD, t0=3.1, check="energy_gate")
+        other = {"id": "timing:20", "kind": "timing", "card": 20, "t0": 15.0, "original": "drift", "verdict": "suspected_false_positive", "check": "sync_tail"}
+        f = facts(spoken_text=SPOKEN, review_items=[timing, heard, other], longest_pause={"s": 2.0, "at_s": 19.0})
+        f["records"].update(sync_lead=REC("sync_lead", "fail"), energy_gate=REC("energy_gate", "fail"))
+        f["criteria"]["A15"] = {"id": "A15", "met": False, "note": "שני מסרים", "decided_by": "reviewer"}
+        fin = review.final(review.build(f), None, PROV, [timing, heard, other], [f["records"]["sync_lead"], f["records"]["energy_gate"]], None, "reel", None, issues=[])
+        by = {x["id"]: x for x in fin["all_improvements"]}
+        self.assertEqual({k: (by[k]["time_s"], by[k]["where"]) for k in ("c:Y1", "c:K7", "c:P2", "c:M1")},
+                         {"c:Y1": (8.9, "time"), "c:K7": (3.1, "time"), "c:P2": (19.0, "time"), "c:M1": (None, "whole_video")})        # the item of the OTHER check (15.0) is not used
+        self.assertTrue(all(x["finding"] == f"{x['id']}@{SHA[:12]}" for x in fin["all_improvements"]))
+        self.assertTrue(all(x.get("why") is not None and x.get("action") for x in fin["top_improvements"]))
+
+    def test_technical_checks_and_the_editorial_assessment_are_counted_apart(self):
+        f = facts(spoken_text=SPOKEN, review_items=[HEARD])
+        f["records"]["energy_gate"] = REC("energy_gate", "fail")
+        f["criteria"]["A16"] = {"id": "A16", "met": False, "note": "פתיחה חלשה", "decided_by": "reviewer"}
+        k = review.score(review.build(f))["kinds"]
+        self.assertEqual((k["editorial"]["met"], k["editorial"]["decided"]), (13, 14))
+        self.assertEqual({t["key"]: (t["met"], t["decided"]) for t in k["editorial"]["topics"]}["opening"], (1, 2))
+        self.assertEqual(k["technical"]["uncertain"], 1)
+        self.assertEqual((k["owner"]["listening"], k["owner"]["watching"]), (1, 4))
+        self.assertIn("לא האזנה", k["editorial"]["what"])
+
     def test_a_confirmed_failure_and_a_word_not_found_in_the_audio_are_proven(self):
         confirmed = dict(TIMING, verdict="confirmed")
         nf = {"id": "timing:37", "kind": "timing", "card": 37, "original": "NOT_FOUND", "verdict": "suspected_false_positive", "hearing_key": "timing|80.0|timing"}
@@ -269,3 +294,17 @@ class RatingOfAnExistingFile(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WhatThePipelineCouldNotSolveIsNotOfferedAgain(unittest.TestCase):
+    def test_captions_that_no_division_of_the_words_fixes_are_a_choice_for_the_owner(self):
+        f = facts(spoken_text=SPOKEN)
+        f["criteria"]["A13"] = {"id": "A13", "met": False, "note": "7 כרטיסים חולפים מהר מדי", "decided_by": "check"}
+        conflict = [{"code": "caption_rule_conflict", "severity": "warn", "message": "7 כרטיסים חולפים מהר מדי ואין חלוקה אחרת"}]
+        free = review.final(review.build(f), None, PROV, [], [], None, "reel", None, issues=[])
+        self.assertEqual(([x["id"] for x in free["next_steps"]["dana"]], free["verdict"]), (["c:K4"], "needs_fix"))
+        stuck = review.final(review.build(f), None, PROV, [], [], None, "reel", None, issues=conflict)
+        self.assertEqual(stuck["next_steps"]["dana"], [])
+        self.assertIn("c:K4", [x["id"] for x in stuck["next_steps"]["owner"]])
+        self.assertEqual(stuck["verdict"], "ready_for_viewing")                     # nothing proven, nothing automatic left: it is the owner's choice
+        self.assertEqual([x["kind"] for x in stuck["next_steps"]["blockers"]], ["יכולת"])

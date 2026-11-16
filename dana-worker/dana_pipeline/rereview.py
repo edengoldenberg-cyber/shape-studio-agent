@@ -136,6 +136,7 @@ def rate(pkg, checks, file_sha, version, now=None, hearing=()):
         broken = old_final.get("mandatory_violations") or []
         extra = review.material_blocks(issues)
         top, every = review.top_improvements(dana_review, records, broken, settled, extra)
+        review.stamp(every, items, file_sha)
         final = dict(old_final)
         if not final.get("top_improvements"):
             final["top_improvements"], final["improvements_total"] = top, len(every)
@@ -158,6 +159,7 @@ def rate(pkg, checks, file_sha, version, now=None, hearing=()):
               "note": "הדירוג חושב מהמדידות ומהערכת המודל שנעשו על הקובץ הזה בזמן הפקתו. לא נעשתה מדידה חדשה, המודל לא הופעל שוב, "
                       "ולא נוצר סרטון או גרסה חדשה."}
     final["rating"] = rating
+    final.setdefault("references", ((pkg.get("rules_used") or {}).get("references")) or [])
     final["source"] = {"kind": "stored_results", "label": "חישוב מתוצאות שמורות: לא נמדד שוב והמודל לא הופעל"}
     final["rubric_version"] = dana_review["rubric_version"]
     final["file_sha256"] = file_sha

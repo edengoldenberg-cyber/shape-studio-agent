@@ -90,7 +90,9 @@ REC_KIND = {"sync_lead": "timing", "sync_not_found": "timing", "sync_tail": "tim
 def _mine(rid, items):
     kind = REC_KIND.get(rid)
     out = [i for i in items or [] if i.get("kind") == kind]
-    if kind == "timing":
+    if any(i.get("check") for i in out):          # packages made since 2026-11-16 name the check on every item
+        return [i for i in out if i.get("check") == rid]
+    if kind == "timing":                          # older packages: the check is read from the item's wording
         want = {"sync_lead": "lead", "sync_not_found": "not_found", "sync_tail": "tail"}[rid]
         tag = lambda i: "not_found" if "NOT_FOUND" in str(i.get("original")) else "tail" if "tail" in str(i.get("original")) else "lead"
         out = [i for i in out if tag(i) == want]
@@ -465,7 +467,14 @@ def final(dana_review, skill_report, provenance, review_items, records, previous
     failed = [r for r in bad if state[r["id"]] == "proven"]
     review_items = [i for i in every_item if not i.get("owner_decision")]
     imps = dana_review.get("improvements") or []
-    fixable = [i for i in imps if i.get("can_apply") and (i.get("importance") == 1 or i.get("criterion_id") in REPLAN)]
+    # What the pipeline already tried and found no solution for is not offered as something Dana can fix by herself:
+    # it is a choice for the owner (the same finding would come back from every automatic round).
+    for code, cid in (("caption_rule_conflict", "K4"),):
+        if any(i.get("code") == code for i in issues or []):
+            for i in imps:
+                if i.get("criterion_id") == cid and i.get("can_apply"):
+                    i.update(can_apply=False, how=ISSUE_STEP[code][1], correction=ISSUE_STEP[code][1])
+    fixable =[i for i in imps if i.get("can_apply") and (i.get("importance") == 1 or i.get("criterion_id") in REPLAN)]
     sk = (skill_report or {}).get("summary")
     broken = (skill_report or {}).get("mandatory_violations") or []          # measured, not assessed
     if failed or fixable or broken:
@@ -491,6 +500,7 @@ def final(dana_review, skill_report, provenance, review_items, records, previous
     unchecked = [{"criterion": r["criterion"], "why": "דורש צפייה או האזנה שלך" if r["basis"] == "human" else r["note"]} for r in rows if r["status"] == "not_checked"]
     unchecked += [{"criterion": x["text"], "why": x["note"], "skill": x.get("skill")} for x in (skill_report or {}).get("rules") or [] if x["status"] == "not_checked"]
     top, every = top_improvements(dana_review, records, broken, [r["id"] for r in settled], extra_improvements or ())
+    stamp(every, every_item, (provenance or {}).get("final_sha256"))
     if extra_improvements and verdict != "needs_fix" and any(x.get("blocks") for x in extra_improvements):
         verdict, vtext = "needs_fix", "נדרש תיקון נוסף לפני צפייה"
         reasons = [x["title"] for x in extra_improvements if x.get("blocks")] + reasons
@@ -554,6 +564,40 @@ def _tally(rows):
             "human_only": sum(r["status"] == "not_checked" and r["basis"] == "human" for r in rows)}
 
 
+def stamp(every, items, file_sha):
+    """Every recommendation gets (a) an id that stays the same from version to version - the criterion or the check it comes
+    from - bound to the file it was found on, and (b) a time in the video when one is known. A recommendation that is about
+    the video as a whole says so; no time is made up."""
+    rec_of = {cid: src[1] for cid, _, _, src in CRITERIA if src[0] == "record"}
+    for x in every:
+        xid = str(x.get("id") or "")
+        x["finding"] = f"{xid}@{str(file_sha or '')[:12]}"
+        if x.get("time_s") is None:
+            rid = rec_of.get(xid[2:]) if xid.startswith("c:") else xid[2:] if xid.startswith("r:") else None
+            mine = _mine(rid, items) if rid in REC_KIND else []
+            x["time_s"] = next((i["t0"] for i in mine if isinstance(i.get("t0"), (int, float)) and not i.get("owner_decision")), None)
+        x["where"] = "time" if x.get("time_s") is not None else "whole_video"
+    return every
+
+
+EDITORIAL_TOPICS = [("opening", "פתיחה", ("opening",)), ("message", "מסר", ("message",)), ("pace", "קצב ומבנה", ("pace", "structure")),
+                    ("captions", "כתוביות", ("captions",)), ("design", "עיצוב", ("framing", "zooms", "graphics", "color", "cover"))]
+
+
+def kinds_of(rows):
+    """Technical checks (measured by code on the file) and the editorial assessment (a model on the transcript and stills),
+    side by side and never added together silently. What only the owner can decide is counted on its own."""
+    cnt = lambda rs: {"met": sum(r["status"] == "met" for r in rs), "decided": sum(r["status"] in ("met", "not_met") for r in rs)}
+    tech = [r for r in rows if r["basis"] in ("measured", "frames")]
+    model = [r for r in rows if r["basis"] == "model"]
+    return {"technical": dict(cnt(tech), label="בדיקות טכניות", what="נמדדו בקוד על הקובץ הסופי",
+                              uncertain=sum(r["status"] == "uncertain" for r in tech)),
+            "editorial": dict(cnt(model), label="הערכה עריכתית", what="הערכת מודל על התמלול ועל פריימים בודדים; לא האזנה ולא צפייה בתנועה",
+                              topics=[dict(cnt([r for r in model if r["category"] in cats]), key=k, label=lb) for k, lb, cats in EDITORIAL_TOPICS]),
+            "owner": {"label": "מחכה לך", "watching": sum(r["status"] == "not_checked" and r["basis"] == "human" for r in rows),
+                      "listening": sum(r["status"] == "uncertain" for r in rows), "settled": sum(r["status"] == "met" and r["basis"] == "human" for r in rows)}}
+
+
 def blocking_of(failed_records, broken_rules, extra):
     """The mandatory failures of a review, in the owner's words. The mark never cancels them."""
     blocks = [x["title"][:160] for x in extra or [] if x.get("blocks")]
@@ -606,6 +650,7 @@ def score(dana_review, blocking=(), uncertain=()):
         ev = {"state": "sufficient", "label": "ציון מבוסס", "text": "כל בדיקות החובה שרלוונטיות לסרטון הוכרעו."}
     return {"version": SCORE_VERSION, "rubric_version": dana_review.get("rubric_version"), "out_of": 100,
             "overall": _half_up(sum(marked) / len(marked)) if marked and enough else None, "groups": groups, "coverage": cov, "evidence": ev,
+            "kinds": kinds_of(every),
             # while doubts are open the total is a range: from "every doubt is a real failure" to "every doubt is fine"
             "range": ({"low": _half_up(sum(g["low"] for g in groups if g["low"] is not None) / sum(1 for g in groups if g["low"] is not None)),
                        "high": _half_up(sum(marked) / len(marked)),
