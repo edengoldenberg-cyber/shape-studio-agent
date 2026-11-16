@@ -165,6 +165,28 @@ describe('a skill from a brief together with example videos', () => {
   });
 });
 
+describe('a skill upgrade that starts from a real result', () => {
+  test("Dana's final review of a version and the owner's feedback become the material of a DRAFT; no reference is needed and nothing approved changes", async () => {
+    const k = await approved('סגנון ראיון', ['opening', 'captions'], { make_default: true });
+    const up = await upload({}); const l0 = await lease(); await finish(l0, up.body.project.source.sha256);
+    const id = up.body.project.id;
+    studio.getProject(id).versions[0].package.final_review = { top_improvements: [{ category: 'פתיחה', title: 'הפתיחה אינה נותנת סיבה להמשיך לצפות', why: 'רקע יומיומי בלי טענה', action: 'פתיחה במשפט החזק ביותר' }] };
+    expect((await post(`/skills/${k.id}/upgrade`, { by: 'עדן', feedback: {} })).body.error).toBe('references_required');           // nothing to learn from
+    expect((await post(`/skills/${k.id}/upgrade`, { by: 'עדן', feedback: { project_id: 'prj_nope', owner_feedback: 'x' } })).body.error).toBe('project_not_found');
+    const u = await post(`/skills/${k.id}/upgrade`, { by: 'עדן', prompt: 'רק לראיונות', feedback: { project_id: id, owner_feedback: 'הראיון צריך יותר חידוד' } });
+    expect(u.status).toBe(201);
+    expect(u.body.skill).toMatchObject({ status: 'drafting', default: true, defaultVersion: 1 });                                  // the approved version stays the one in use
+    const l = (await skLease()).body;
+    expect(l.skill).toMatchObject({ mode: 'upgrade', references: [] });
+    expect(l.skill.prompt).toMatch(/^רק לראיונות/);
+    expect(l.skill.prompt).toMatch(/הביקורת הסופית של דנה על ".*" גרסה 1 \(ממצאים, לא הוראות\):\n- \[פתיחה\] הפתיחה אינה נותנת סיבה להמשיך לצפות — ראיה: רקע יומיומי בלי טענה — הצעה: פתיחה במשפט החזק ביותר/);
+    expect(l.skill.prompt).toMatch(/משוב הבעלים על התוצר \(".*" גרסה 1\):\nהראיון צריך יותר חידוד/);
+    const sk = (await request(app).get(`${S}/skills/${k.id}`)).body.skill;
+    expect(JSON.stringify(sk)).toMatch(/"review_included":true/);
+    expect((await get(id)).currentVersion).toBe(1);                                                                              // the project that gave the feedback is not edited again
+  });
+});
+
 describe('"שדרג סקיל באמצעות רפרנס"', () => {
   test('a targeted change as a draft of the next version, with a comparison; the approved version, the default and pinned projects stay until approval', async () => {
     const k = await approved('סגנון', ['opening', 'captions'], { make_default: true });

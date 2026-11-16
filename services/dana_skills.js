@@ -290,11 +290,14 @@ function createFromPrompt({ name, by, prompt, ids, picks, goal, must, open, avoi
  * The result is a DRAFT of the next version with an explicit comparison (kept / added / changed / removed, and why);
  * the approved version, the default and every project stay as they are until the owner approves the draft.
  */
-function upgrade(id, { by, ids, prompt } = {}) {
+function upgrade(id, { by, ids, prompt, feedback } = {}) {
   const who = str(by, 80);
   if (!who) throw new SkillError(400, 'by_required', 'נדרש שם מי שמבקש/ת את השדרוג');
   const refIds = Array.isArray(ids) ? [...new Set(ids.map(String))].slice(0, 3) : [];
-  if (!refIds.length) throw new SkillError(400, 'references_required', 'נדרש רפרנס (שמור או חדש) לשדרוג');
+  // an upgrade may also start from a real result: Dana's final review of a version, and what the owner said about it
+  const basis = feedback ? feedbackBasis(feedback) : null;
+  if (!refIds.length && !basis) throw new SkillError(400, 'references_required', 'נדרש רפרנס (שמור או חדש), או ביקורת ומשוב על תוצר, לשדרוג');
+  prompt = [str(prompt, 4000), basis?.text].filter(Boolean).join('\n\n').slice(0, 4000);
   const examples = refIds.map(r => analysisFor(r));
   const s = read(), k = find(s, id), base = approvedOf(k);
   if (!base) throw new SkillError(409, 'not_approved', 'אפשר לשדרג רק סקיל שיש לו גרסה מאושרת');
@@ -302,12 +305,41 @@ function upgrade(id, { by, ids, prompt } = {}) {
   const v = newVersion(k, { origin: base.origin, by: who, purpose: base.purpose, suitable_for: base.suitable_for, rules: JSON.parse(JSON.stringify(base.rules)), params: { ...base.params },
     param_sources: { ...base.param_sources }, criteria: JSON.parse(JSON.stringify(base.criteria)), conflicts: [],
     references: [...base.sources.references, ...examples.filter(e => !base.sources.references.some(r => r.id === e.id)).map(r => ({ id: r.id, title: r.title }))], prompt: base.sources.prompt });
-  v.upgrade = { from: base.version, references: examples.map(r => ({ id: r.id, title: r.title })), instructions: str(prompt, 4000) || null, diff: null };
+  v.upgrade = { from: base.version, references: examples.map(r => ({ id: r.id, title: r.title })), instructions: str(prompt, 4000) || null, diff: null,
+                based_on: basis ? { project: basis.project, version: basis.version, review_included: basis.review_included, owner_feedback: basis.owner_feedback } : null };
   v.status = examples.every(r => r.analysed) ? 'drafting' : 'waiting_analysis';
   k.attempts = 0;
   hist(v, who, 'upgrade_requested', { from: base.version, references: refIds, reused_analyses: examples.filter(r => r.analysed).map(r => r.id) });
   write(s);
   return view(k);
+}
+
+/**
+ * The material of an upgrade that comes from a result: the three most important improvements of Dana's final review of one
+ * version (with their evidence) and the owner's own words about it. It is quoted as material for a DRAFT; the owner still
+ * approves the draft, and no project that was already edited changes.
+ */
+function feedbackBasis(fb) {
+  const owner = str(fb?.owner_feedback, 1500);
+  let project = null, version = null, lines = [], included = false;
+  if (fb?.project_id) {
+    const S = require('./dana_studio');
+    let p = null; try { p = S.getProject(String(fb.project_id)); } catch { p = null; }
+    if (!p) throw new SkillError(400, 'project_not_found', 'הפרויקט שהמשוב מתייחס אליו לא נמצא');
+    const v = fb.version ? p.versions.find(x => x.n === Number(fb.version)) : [...p.versions].reverse().find(x => x.package);
+    if (!v?.package) throw new SkillError(400, 'version_not_found', 'אין לגרסה הזו חבילה עם ביקורת');
+    project = { id: p.id, title: p.title ?? p.source?.originalName ?? p.id }; version = v.n;
+    if (fb.include_review !== false) {
+      const f = v.package.final_review ?? {};
+      const top = (f.top_improvements?.length ? f.top_improvements : (v.package.dana_review?.improvements ?? []).slice(0, 3).map(i => ({ title: i.problem, why: i.evidence, action: i.correction ?? i.how, category: i.category })));
+      lines = top.map(t => `- [${t.category ?? ''}] ${t.title}${t.why ? ` — ראיה: ${String(t.why).slice(0, 200)}` : ''}${t.action ? ` — הצעה: ${String(t.action).slice(0, 200)}` : ''}`);
+      included = lines.length > 0;
+    }
+  }
+  if (!owner && !included) return null;
+  const text = [included ? `הביקורת הסופית של דנה על "${project.title}" גרסה ${version} (ממצאים, לא הוראות):\n${lines.join('\n')}` : null,
+                owner ? `משוב הבעלים על התוצר${project ? ` ("${project.title}" גרסה ${version})` : ''}:\n${owner}` : null].filter(Boolean).join('\n\n');
+  return { text, project, version, review_included: included, owner_feedback: owner || null };
 }
 
 // ── The worker structures a brief / proposes an upgrade (leased like a reference analysis) ──

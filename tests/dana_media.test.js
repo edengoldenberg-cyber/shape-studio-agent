@@ -112,7 +112,8 @@ describe('uploaded music and narration, and the mix', () => {
     expect((await patch(`/projects/${id}/audio`, { by: 'עדן', music: { asset: 'mus_nope' } })).body.error).toBe('asset_not_found');
     const a = (await patch(`/projects/${id}/audio`, { by: 'עדן', music: { asset: m.asset.id, start_s: 12.5, volume_db: -60, fade_in_s: 1, fade_out_s: 99 },
       narration: { asset: n.asset.id }, original: { mode: 'mute' }, cut_on_beat: true })).body.project.media.audio;
-    expect(a.music).toEqual({ asset: m.asset.id, start_s: 12.5, volume_db: -40, fade_in_s: 1, fade_out_s: 10, duck: true, duck_db: 10 });      // clamped to the limits
+    // volume_db is how far UNDER THE SPEECH the music sits. -60 was asked: the limit is -20 - below that the music is not heard (owner, 2026-11-16)
+    expect(a.music).toEqual({ asset: m.asset.id, start_s: 12.5, volume_db: -20, fade_in_s: 1, fade_out_s: 10, duck: true, duck_db: 10 });
     expect(a).toMatchObject({ narration: { asset: n.asset.id, volume_db: 0 }, original: { mode: 'mute' }, cut_on_beat: true });
     expect((await get(id)).currentVersion).toBe(1);                    // settings alone render nothing
     await post(`/projects/${id}/assets/${n.asset.id}/narration-info`, { by: 'עדן', is_script: true, text: 'טקסט שנכתב לסרטון' });
@@ -129,11 +130,11 @@ describe('uploaded music and narration, and the mix', () => {
     const m1 = (await addAsset(id, 'music')).body.asset, m2 = (await addAsset(id, 'music', crypto.randomBytes(3100), 'other.mp3')).body.asset;
     await patch(`/projects/${id}/audio`, { by: 'עדן', music: { asset: m1.id } });
     expect((await post(`/projects/${id}/revise`, { by: 'עדן', audio: { music: { asset: m1.id } } })).body.error).toBe('nothing_to_revise');     // the same mix is not a change
-    const r = await post(`/projects/${id}/revise`, { by: 'עדן', audio: { music: { asset: m2.id, volume_db: -22 } } });
+    const r = await post(`/projects/${id}/revise`, { by: 'עדן', audio: { music: { asset: m2.id, volume_db: -12 } } });
     expect(r.body.ok).toBe(true);
     const j = (await lease()).body.job;
     expect(j.options.previous).toBeDefined();                          // locked to the previous plan: nothing is planned again
-    expect(j.options.audio.music).toMatchObject({ volume_db: -22, file: { sha256: m2.sha256 } });
+    expect(j.options.audio.music).toMatchObject({ volume_db: -12, file: { sha256: m2.sha256 } });
     expect((await get(id)).versions.map(v => v.n)).toEqual(expect.arrayContaining([1, 2]));
   });
 
@@ -166,5 +167,28 @@ describe('external connections are shown as they are', () => {
     await W(request(app).post('/api/dana/worker/lease')).send({ workerId: 'w1', pipelineVersion: '1.4.0', capabilities: { narration_tts: { active: true, key_present: true, enabled: true } } });
     expect((await request(app).get(`${S}/status`)).body.connectors.narration_tts).toMatchObject({ state: 'active', needs: [] });
     expect(JSON.stringify((await request(app).get(`${S}/status`)).body)).not.toMatch(/xi-api-key|ELEVENLABS_API_KEY=/);
+  });
+});
+
+describe('the owner\'s direction for a project (feedback of 2026-11-16)', () => {
+  test('a goal, what to take and what not to, and a required number of sources travel with the job; one source is not a requirement', async () => {
+    const up = await upload({ project_type: 'montage', more_files: true }); const id = up.body.project.id;
+    await addSource(id); await addSource(id, vid(), 'c.mp4');
+    expect((await patch(`/projects/${id}/brief`, { goal: 'x' })).body.error).toBe('by_required');
+    expect((await patch(`/projects/${id}/brief`, { by: 'עדן', min_sources: 7 })).body.error).toBe('min_sources_too_high');     // more than were uploaded: said, not ignored
+    expect((await patch(`/projects/${id}/brief`, { by: 'עדן', reference_id: 'ref_nope' })).body.error).toBe('reference_not_found');
+    const b = (await patch(`/projects/${id}/brief`, { by: 'עדן', goal: 'להראות אווירה של אימון קבוצתי', take: 'קצב חיתוך מהיר', avoid: 'בלי ראיונות', min_sources: 3 })).body.project.media.brief;
+    expect(b).toMatchObject({ goal: 'להראות אווירה של אימון קבוצתי', take: 'קצב חיתוך מהיר', avoid: 'בלי ראיונות', min_sources: 3, demo: false, reference: null, by: 'עדן' });
+    await post(`/projects/${id}/start`, { by: 'עדן' });
+    const j = (await lease()).body.job;
+    expect(j.options.brief).toEqual({ goal: 'להראות אווירה של אימון קבוצתי', take: 'קצב חיתוך מהיר', avoid: 'בלי ראיונות', min_sources: 3, demo: false, reference: null });
+  });
+
+  test('no brief: the job carries none, and a single required source is stored as "no requirement"', async () => {
+    const up = await upload({ project_type: 'montage' }); const id = up.body.project.id;
+    expect((await lease()).body.job.options.brief).toBeUndefined();
+    await finish({ job: { id: Object.keys(studio.state().jobs)[0] }, leaseToken: Object.values(studio.state().jobs)[0].lease.token }, up.body.project.source.sha256);
+    expect((await patch(`/projects/${id}/brief`, { by: 'עדן', min_sources: 1, demo: true })).body.project.media.brief).toMatchObject({ min_sources: 0, demo: true });
+    expect((await get(id)).media.musicLevel).toEqual({ default: -14, loudest: -6, quietest: -20 });
   });
 });

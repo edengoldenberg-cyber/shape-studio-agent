@@ -25,6 +25,10 @@ const AUDIO_EXT = new Set(['mp3', 'wav', 'm4a', 'aac', 'ogg', 'flac']);
 const AUDIO_MIME = { mp3: 'audio/mpeg', wav: 'audio/wav', m4a: 'audio/mp4', aac: 'audio/aac', ogg: 'audio/ogg', flac: 'audio/flac' };
 const PROJECT_TYPES = { interview: 'ראיון / עדות', montage: 'לקט אימונים', narrated: 'סרטון עם קריינות', mixed: 'שילוב' };
 const MAX_SOURCES = 12;
+// "volume_db" of the music = how many dB UNDER THE SPEECH it sits while somebody speaks (the worker measures the speech and
+// sets the gain). Before 2026-11-16 it was a gain on the file, and music ended 23-30 dB under the speech: not heard.
+const MUSIC_LEVEL = { default: -14, loudest: -6, quietest: -20 };
+const BRIEF_DEFAULT = { goal: '', take: '', avoid: '', reference_id: null, min_sources: 0, demo: false };
 const AUDIO_DEFAULT = { music: null, narration: null, original: { mode: 'keep', level_db: 0, mute_segments: [] }, cut_on_beat: false };
 
 function hashFile(p) {
@@ -148,7 +152,7 @@ function cleanAudio(p, body) {
     if (body.music === null) out.music = null;
     else { const a = assets.find(x => x.id === body.music?.asset && x.kind === 'music');
       if (!a) throw Err(400, 'asset_not_found', 'קובץ המוזיקה שנבחר לא נמצא בפרויקט');
-      out.music = { asset: a.id, start_s: num(body.music.start_s, 0, 3600, 0), volume_db: num(body.music.volume_db, -40, 0, -18), fade_in_s: num(body.music.fade_in_s, 0, 10, 0.5),
+      out.music = { asset: a.id, start_s: num(body.music.start_s, 0, 3600, 0), volume_db: num(body.music.volume_db, MUSIC_LEVEL.quietest, MUSIC_LEVEL.loudest, MUSIC_LEVEL.default), fade_in_s: num(body.music.fade_in_s, 0, 10, 0.5),
         fade_out_s: num(body.music.fade_out_s, 0, 10, 1.5), duck: body.music.duck !== false, duck_db: num(body.music.duck_db, 3, 24, 10) }; }
   }
   if (body.narration !== undefined) {
@@ -176,6 +180,50 @@ function setAudio(projectId, body = {}) {
   return S.view(p);
 }
 
+/**
+ * The owner's direction for the edit: what the video is for, a reference with what to take from it and what not to, and -
+ * for a compilation - how many different source files must appear. Nothing here is a style the owner approved for other
+ * projects; it belongs to this project and travels with its next jobs.
+ */
+function setBrief(projectId, body = {}) {
+  const S = studio(), p = S.getProject(projectId);
+  const who = str(body.by, 80); if (!who) throw Err(400, 'by_required', 'נדרש שם');
+  if (busy(p)) throw Err(409, 'job_in_progress', 'העריכה רצה כרגע — השינוי יישמר כשתסתיים');
+  const cur = { ...BRIEF_DEFAULT, ...(p.brief ?? {}) }, active = sourcesOf(p).filter(s => !s.removedAt).length;
+  const out = { ...cur };
+  for (const k of ['goal', 'take', 'avoid']) if (body[k] !== undefined) out[k] = str(body[k], 600);
+  if (body.reference_id !== undefined) {
+    if (body.reference_id === null || body.reference_id === '') out.reference_id = null;
+    else { let r = null; try { r = require('./dana_references').get(String(body.reference_id)); } catch { r = null; }
+      if (!r) throw Err(400, 'reference_not_found', 'הרפרנס שנבחר לא נמצא');
+      out.reference_id = r.id; }
+  }
+  if (body.min_sources !== undefined) {
+    const n = Math.round(num(body.min_sources, 0, MAX_SOURCES, 0));
+    if (n > active) throw Err(400, 'min_sources_too_high', `ביקשת לפחות ${n} מקורות, ובפרויקט יש ${active}. מוסיפים קבצים או מקטינים את הדרישה`);
+    out.min_sources = n >= 2 ? n : 0;
+  }
+  if (body.demo !== undefined) out.demo = body.demo === true;
+  p.brief = { ...out, by: who, at: new Date().toISOString() };
+  S.hist(p, 'owner', 'brief_set', { by: who, goal: !!out.goal, reference: out.reference_id, min_sources: out.min_sources, demo: out.demo });
+  refreshQueued(p); S.save();
+  return S.view(p);
+}
+function briefForJob(p) {
+  const b = { ...BRIEF_DEFAULT, ...(p.brief ?? {}) };
+  if (!b.goal && !b.take && !b.avoid && !b.reference_id && !b.min_sources && !b.demo) return null;
+  let reference = null;
+  if (b.reference_id) { try { const r = require('./dana_references').get(b.reference_id);
+    reference = { id: r.id, title: r.title, owner_note: r.owner_note ?? '', summary: r.analysis?.summary ?? '', analysed: !!r.analysis }; } catch { reference = null; } }
+  return { goal: b.goal, take: b.take, avoid: b.avoid, min_sources: b.min_sources, demo: b.demo, reference };
+}
+function briefView(p) {
+  const b = { ...BRIEF_DEFAULT, ...(p.brief ?? {}) };
+  let reference = null;
+  if (b.reference_id) { try { const r = require('./dana_references').get(b.reference_id); reference = { id: r.id, title: r.title, analysed: !!r.analysis }; } catch { reference = { id: b.reference_id, title: null, missing: true }; } }
+  return { ...b, reference };
+}
+
 function setType(p, type) {
   if (type === undefined) return;
   if (!PROJECT_TYPES[type]) throw Err(400, 'project_type_invalid', 'סוג הפרויקט אינו מוכר');
@@ -189,6 +237,7 @@ function forJob(p) {
   const music = au.music && file(au.music.asset) ? { ...au.music, file: file(au.music.asset), license: assets.find(x => x.id === au.music.asset).license } : null;
   const nar = au.narration && file(au.narration.asset) ? { ...au.narration, file: file(au.narration.asset), script: assets.find(x => x.id === au.narration.asset).script } : null;
   const out = { project_type: p.projectType ?? 'interview' };
+  const brief = briefForJob(p); if (brief) out.brief = brief;
   if (active.length > 1 || active.some(s => s.marks?.length)) out.sources = active.map(s => ({ id: s.id, sha256: s.sha256, ext: s.ext, name: s.originalName, marks: s.marks ?? [] }));
   if (music || nar || au.original.mode !== 'keep' || au.original.mute_segments.length || au.cut_on_beat) out.audio = { music, narration: nar, original: au.original, cut_on_beat: au.cut_on_beat };
   return out;
@@ -203,8 +252,8 @@ function view(p) {
   return { projectType: p.projectType ?? 'interview', projectTypes: PROJECT_TYPES,
     sources: sourcesOf(p).map(s => ({ id: s.id, name: s.originalName, bytes: s.bytes, ext: s.ext, addedAt: s.uploadedAt, marks: s.marks ?? [], removed: !!s.removedAt, primary: s.id === 'src1' })),
     assets: (p.assets ?? []).map(a => ({ id: a.id, kind: a.kind, name: a.originalName, bytes: a.bytes, ext: a.ext, uploadedAt: a.uploadedAt, by: a.by, license: a.license ?? null, script: a.script ?? null })),
-    audio: au };
+    audio: au, brief: briefView(p), musicLevel: MUSIC_LEVEL };
 }
 
-module.exports = { VIDEO_EXT, AUDIO_EXT, AUDIO_MIME, PROJECT_TYPES, MAX_SOURCES, sourcesOf, addSource, setMarks, removeSource, addAsset, setLicense, setNarrationInfo, setAudio, cleanAudio, setType,
+module.exports = { VIDEO_EXT, AUDIO_EXT, AUDIO_MIME, PROJECT_TYPES, MAX_SOURCES, sourcesOf, addSource, setMarks, removeSource, addAsset, setLicense, setNarrationInfo, setAudio, cleanAudio, setType, setBrief, MUSIC_LEVEL,
                    forJob, fileFor, filePath, view };

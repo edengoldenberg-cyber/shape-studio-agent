@@ -260,6 +260,30 @@ describe('an edited video submitted for Dana\'s review, and "apply improvements"
     const clean = await ready({ dana_review: { ...REVIEW, improvements: [{ id: 'x', can_apply: false }] } });
     expect((await post(`/projects/${clean.id}/apply-review`, { by: 'עדן' })).body.error).toBe('nothing_to_apply');
   });
+
+  // owner, 2026-11-16: "the interview needs sharpening" - the review already said the opening was weak, and nothing acted on it
+  test('an improvement of the CONTENT is applied by planning the cut again: Dana\'s finding and its evidence go to the worker as the request', async () => {
+    const { id } = await ready({ dana_review: { ...REVIEW, improvements: [
+      { id: 'c:O2', criterion_id: 'O2', category: 'opening', can_apply: true, problem: 'המילים בשלוש השניות הראשונות נותנות סיבה להמשיך לצפות — לא מתקיים', correction: 'פתיחה במשפט החזק ביותר שיש בחומר', evidence: 'רקע יומיומי בלי טענה' },
+      { id: 'c:Y1', criterion_id: 'Y1', category: 'sync', can_apply: true, problem: 'סנכרון', correction: 'יישור' },
+      { id: 'c:K6', criterion_id: 'K6', category: 'captions', can_apply: false, problem: 'קריאות', correction: 'דורש החלטה שלך' }] } });
+    await post(`/projects/${id}/apply-review`, { by: 'עדן', note: 'הראיון צריך יותר חידוד' });
+    const l = await lease();
+    expect(l.job.options).toMatchObject({ apply_review: true });
+    const req = l.job.options.change_request;
+    expect(req).toMatch(/יישום שיפורי הביקורת הסופית של דנה על גרסה 1/);
+    expect(req).toMatch(/המילים בשלוש השניות הראשונות נותנות סיבה להמשיך לצפות\. מה לעשות: פתיחה במשפט החזק ביותר שיש בחומר\. ראיה: רקע יומיומי בלי טענה/);
+    expect(req).toMatch(/משוב הבעלים על גרסה 1: הראיון צריך יותר חידוד/);
+    expect(req).not.toMatch(/סנכרון|קריאות/);                                  // a technical fix needs no request; what Dana cannot apply is not sent as if she could
+    expect((await get(id)).versions.at(-1).changeRequest).toBe(req);
+  });
+
+  test('the owner\'s own feedback is enough to ask for a new version, even when the review found nothing Dana can apply', async () => {
+    const { id } = await ready({ dana_review: { ...REVIEW, improvements: [{ id: 'x', can_apply: false }] } });
+    expect((await post(`/projects/${id}/apply-review`, { by: 'עדן' })).body.error).toBe('nothing_to_apply');
+    expect((await post(`/projects/${id}/apply-review`, { by: 'עדן', note: 'לפתוח במשפט על הקהילה' })).body.project.currentVersion).toBe(2);
+    expect((await lease()).job.options.change_request).toBe('משוב הבעלים על גרסה 1: לפתוח במשפט על הקהילה');
+  });
 });
 
 describe('comparing references and a combined profile', () => {

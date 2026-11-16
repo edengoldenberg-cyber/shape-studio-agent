@@ -209,6 +209,7 @@ panelRouter.get('/projects/:id/assets/:aid/audio', wrap((req, res) => {
 }));
 panelRouter.post('/projects/:id/assets/:aid/license', json, wrap((req, res) => res.json({ ok: true, project: media_.setLicense(req.params.id, req.params.aid, req.body ?? {}) })));
 panelRouter.post('/projects/:id/assets/:aid/narration-info', json, wrap((req, res) => res.json({ ok: true, project: media_.setNarrationInfo(req.params.id, req.params.aid, req.body ?? {}) })));
+panelRouter.patch('/projects/:id/brief', json, wrap((req, res) => res.json({ ok: true, project: media_.setBrief(req.params.id, req.body ?? {}) })));
 panelRouter.patch('/projects/:id/audio', json, wrap((req, res) => res.json({ ok: true, project: media_.setAudio(req.params.id, req.body ?? {}) })));
 
 const media = (name) => wrap((req, res) => {

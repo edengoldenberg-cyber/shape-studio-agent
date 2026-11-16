@@ -927,16 +927,36 @@ function applyReview(projectId, body = {}, actor = 'owner') {
   if (!by) throw new StudioError(400, 'by_required', 'נדרש שם מי שמבקש/ת');
   const open = Object.values(state().jobs).find(j => j.projectId === p.id && ['queued', 'leased'].includes(j.status));
   if (open) throw new StudioError(409, 'job_in_progress', 'כבר יש עריכה פעילה לפרויקט הזה');
+  const note = String(body.note ?? '').trim().slice(0, 1500);
   const can = (v.package.dana_review?.improvements ?? []).filter(i => i.can_apply).length + (v.package.dana_can_apply ?? []).length;
-  if (!can) throw new StudioError(409, 'nothing_to_apply', 'בביקורת הזו אין שיפור שדנה יכולה ליישם בעצמה — הנושאים הפתוחים דורשים החלטה שלך');
+  if (!can && !note) throw new StudioError(409, 'nothing_to_apply', 'בביקורת הזו אין שיפור שדנה יכולה ליישם בעצמה — הנושאים הפתוחים דורשים החלטה שלך');
   dropApproval(p, v, actor, 'apply_review');
-  hist(p, actor, 'apply_review_requested', { version: v.n, by, improvements: can });
+  const request = improvementsRequest(v, note);
+  hist(p, actor, 'apply_review_requested', { version: v.n, by, improvements: can, replan: request.replan.length, owner_note: !!note });
   if (v.kind === 'review_only' || p.kind === 'review_only') {
     if (!p.polish) p.polish = { burned_in_text: true, add_captions: false };
     enqueueEdit(p, {}, actor);
-  } else enqueueEdit(p, { apply_review: true, previous: previousOf(v) }, actor);
+  } else enqueueEdit(p, { apply_review: true, previous: previousOf(v), ...(request.text ? { change_request: request.text } : {}) }, actor);
   save();
   return view(p);
+}
+
+/**
+ * What "apply Dana's improvements" asks the worker for. Technical improvements need no text: the same plan is produced again
+ * and the pipeline fixes what it measures. An improvement of the CONTENT (message, opening, structure, pace) is applied by
+ * planning the cut again, so it is written as a request - Dana's own findings with their evidence, and the owner's note when
+ * there is one. The owner's standing rules and the transcript stay in force; nothing here approves a style.
+ */
+const CONTENT_CATEGORIES = new Set(['message', 'opening', 'structure', 'pace']);
+function improvementsRequest(v, note = '') {
+  const replan = (v.package?.dana_review?.improvements ?? []).filter(i => i.can_apply && CONTENT_CATEGORIES.has(i.category));
+  const lines = [];
+  if (replan.length) {
+    lines.push(`יישום שיפורי הביקורת הסופית של דנה על גרסה ${v.n} — לתכנן את החיתוך מחדש כך שהבעיות האלה ייפתרו, ולשמור על כל מה שלא נוגע להן:`);
+    for (const i of replan.slice(0, 8)) lines.push(`- ${String(i.problem ?? '').replace(' — לא מתקיים', '')}. מה לעשות: ${i.correction ?? i.how ?? ''}.${i.evidence ? ` ראיה: ${String(i.evidence).slice(0, 240)}` : ''}`);
+  }
+  if (note) lines.push(`משוב הבעלים על גרסה ${v.n}: ${note}`);
+  return { replan, text: lines.join('\n').slice(0, 3800) };
 }
 
 // ── Library skills on a project ────────────────────────────────────────────────
