@@ -156,7 +156,7 @@ def _fact(name, f):
         return ("met" if ok else "not_met", "measured", f"יחס דיבור/רעש {m['snr_db']:.0f}dB ברווחים שבין המילים, רעש רקע {m['room_tone_db']}dB" + (" אחרי ניקוי" if a.get("applied") else ""), None)
     if name == "cover_quote":
         if not f.get("cover_text"):
-            return "na", "measured", "לקאבר אין שכבת טקסט", None
+            return "na", "measured", ((f["criteria"].get("A3") or {}).get("note") if (f["criteria"].get("A3") or {}).get("decided_by") == "not_applicable" else None) or "לקאבר אין שכבת טקסט", None
         c = f["criteria"].get("A3")
         return ("not_checked", "measured", "לא נבדק", None) if not c or c.get("met") is None else \
             ("met" if c["met"] else "not_met", "measured", c.get("note") or "", None)
@@ -181,7 +181,9 @@ def build(f):
             rows.append(_row(cid, cat, text, st, basis, note))
         elif src[0] == "criterion":
             c = f["criteria"].get(src[1])
-            if c is None or c.get("met") is None:
+            if c is not None and c.get("decided_by") == "not_applicable":
+                rows.append(_row(cid, cat, text, "na", "measured", c.get("note")))
+            elif c is None or c.get("met") is None:
                 rows.append(_row(cid, cat, text, "not_checked", "none", (c or {}).get("note") or "לא נבדק בגרסה הזו"))
             else:
                 basis = {"check": "measured", "skill": "measured", "reviewer": "model"}.get(c.get("decided_by"), "model")
@@ -284,13 +286,15 @@ def final(dana_review, skill_report, provenance, review_items, records, previous
     imps = dana_review.get("improvements") or []
     fixable = [i for i in imps if i.get("can_apply") and i.get("importance") == 1]
     sk = (skill_report or {}).get("summary")
-    if failed or fixable:
+    broken = (skill_report or {}).get("mandatory_violations") or []          # measured, not assessed
+    if failed or fixable or broken:
         verdict, vtext = "needs_fix", "נדרש תיקון נוסף לפני צפייה"
     elif review_items:
         verdict, vtext = "needs_owner", "מוכן לצפייה שלך — עם פריטים שרק את/ה יכול/ה להכריע"
     else:
         verdict, vtext = "ready_for_viewing", "מוכן לצפייה שלך"
-    reasons = ([f"בדיקה אוטומטית נכשלה: {r['id']} — {r['summary']}"[:260] for r in failed[:6]]
+    reasons = ([f"כלל מחייב של הסקיל הופר (נמדד): {b['text']} — {b['evidence']}"[:260] for b in broken[:4]]
+               + [f"בדיקה אוטומטית נכשלה: {r['id']} — {r['summary']}"[:260] for r in failed[:6]]
                + [f"שיפור טכני שדנה עוד יכולה ליישם: {i['problem']}"[:260] for i in fixable[:4]]
                + ([f"{len(review_items)} פריטים פתוחים שדורשים צפייה או האזנה שלך"] if review_items else []))
     if sk and not sk["fully_applied"]:
@@ -298,7 +302,8 @@ def final(dana_review, skill_report, provenance, review_items, records, previous
     worked = [{"category": c["label"], "what": f"{c['met']} מתוך {c['decided']} קריטריונים שנבדקו מתקיימים"} for c in dana_review["categories"] if c["decided"] and c["met"] == c["decided"]]
     needs = [{"category": next(c["label"] for c in dana_review["categories"] if c["key"] == r["category"]), "criterion": r["criterion"], "evidence": r["note"],
               "time_s": r.get("time_s"), "basis": r["basis"]} for r in rows if r["status"] == "not_met"]
-    needs += [{"category": "כללי הסקיל", "criterion": x["text"], "evidence": x["note"], "time_s": None, "basis": "model", "skill": x.get("skill")}
+    needs += [{"category": "כללי הסקיל", "criterion": x["text"], "evidence": x.get("verified_by") or x["note"], "time_s": None,
+               "basis": "measured" if x.get("verified") else "model", "skill": x.get("skill"), "mandatory": bool(x.get("mandatory"))}
               for x in (skill_report or {}).get("rules") or [] if x["status"] == "not_followed"]
     unchecked = [{"criterion": r["criterion"], "why": "דורש צפייה או האזנה שלך" if r["basis"] == "human" else r["note"]} for r in rows if r["status"] == "not_checked"]
     unchecked += [{"criterion": x["text"], "why": x["note"], "skill": x.get("skill")} for x in (skill_report or {}).get("rules") or [] if x["status"] == "not_checked"]
@@ -317,6 +322,7 @@ def final(dana_review, skill_report, provenance, review_items, records, previous
                                               + (f"; מכללי הסקילים יושמו {sk['applied']} מתוך {sk['applied'] + sk['not_followed'] + sk['not_applicable'] + sk['not_checked']} שנתמכים" if sk else ""),
             "worked": worked, "needs_improvement": needs, "not_checked": unchecked, "verdict": verdict, "verdict_text": vtext, "verdict_reasons": reasons,
             "verdict_basis": "נקבע לפי בדיקות אוטומטיות שנכשלו ופריטים פתוחים — לא לפי הדירוג לבדו.",
+            "mandatory_violations": broken,
             "changes": changes(previous, dana_review),
             "limits": ["הערכת מודל נעשתה על תמלול ופריימים בודדים ויכולה להשתנות בין הרצות", "איש לא האזין לאודיו ולא צפה בתנועה",
                        "הדירוג אינו אישור פרסום ואינו מבטיח ביצועים באינסטגרם", "כל שינוי בסרטון הופך את הביקורת הזו ללא עדכנית"]}

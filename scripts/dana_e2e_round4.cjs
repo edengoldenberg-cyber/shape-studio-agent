@@ -3,7 +3,13 @@
  * dana_e2e_round4.cjs — acceptance of round 4, through the page's own HTTP API with the REAL worker.
  * Local only: preview server on 127.0.0.1, mocked notifications, publishing off.
  *
- *   node scripts/dana_e2e_round4.cjs <raw-clip.mp4> <new-example-video.mp4> [--keep]
+ *   node scripts/dana_e2e_round4.cjs <raw-clip.mp4> <new-example-video.mp4> [--keep] [--skip=b,c9]
+ *
+ * TWO separate results are reported:
+ *   PATH    - did every step of the flow do what it should (the checks A..E, R)?
+ *   QUALITY - is there a MEASURED violation of a mandatory skill rule in an output (the gate Q)? That fails the acceptance.
+ * What Dana's final review says about each output (verdict, failed checks, open items) is printed as it is; a video that
+ * still needs the owner's eyes or ears is not a failure of the path.
  *
  * Needs a data folder (DANA_PREVIEW_DATA) that already holds at least one ANALYSED reference (its analysis is reused).
  *
@@ -28,13 +34,14 @@ const OUT = path.join(DATA, 'evidence');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const results = [];
 const log = (...a) => { const line = `[${new Date().toISOString().slice(11, 19)}] ${a.join(' ')}`; console.log(line); fs.appendFileSync(path.join(DATA, 'progress.log'), line + '\n'); };
-function check(id, name, ok, detail) { results.push({ id, name, ok: !!ok, detail: detail ?? null }); log(`   ${ok ? 'PASS' : 'FAIL'}  ${id}  ${name}${detail !== undefined ? '  — ' + (typeof detail === 'string' ? detail : JSON.stringify(detail)).slice(0, 460) : ''}`); }
+function check(id, name, ok, detail, kind = 'path') { results.push({ id, kind, name, ok: !!ok, detail: detail ?? null }); log(`   ${ok ? 'PASS' : 'FAIL'}  ${id}  ${name}${detail !== undefined ? '  — ' + (typeof detail === 'string' ? detail : JSON.stringify(detail)).slice(0, 460) : ''}`); }
 const save = (name, obj) => fs.writeFileSync(path.join(OUT, name), typeof obj === 'string' ? obj : JSON.stringify(obj, null, 1));
 
 async function main() {
   const [clip, example] = process.argv.slice(2).filter(a => !a.startsWith('--')).map(a => path.resolve(a));
   if (!clip || !example) throw new Error('usage: dana_e2e_round4.cjs <raw-clip.mp4> <new-example-video.mp4>');
   const keep = process.argv.includes('--keep');
+  const skip = new Set((process.argv.find(a => a.startsWith('--skip=')) || '--skip=').slice(7).split(',').filter(Boolean));
   fs.mkdirSync(OUT, { recursive: true });
   const port = Number(process.env.PORT) || 3195;
   const { server, token } = await require('./dana_studio_preview.cjs').start({ port, dataDir: DATA });
@@ -101,7 +108,7 @@ async function main() {
     check('A.6', 'the mandatory instructions are kept as written and marked mandatory', must.length >= 1 && must.every(r => r.source.type === 'prompt'), must.map(r => r.text));
     check('A.7', 'conflicts between an instruction and the example are shown; an explicit instruction wins, openly', d.conflicts.every(c => c.resolution || !c.auto) && d.conflicts.filter(c => c.auto).every(c => c.resolvedBy === 'owner_instruction_wins'),
       { conflicts: d.conflicts.map(c => ({ why: c.why, resolution: c.resolution, auto: !!c.auto })), uncertain: d.uncertain, coverage_gaps: d.coverage_gaps });
-    check('A.8', 'uncertainty and missing coverage are stated before approval (lists exist; "music" is marked unsupported if it became a rule)', Array.isArray(d.uncertain) && Array.isArray(d.coverage_gaps) && d.rules.filter(r => r.domain === 'music').every(r => !r.active),
+    check('A.8', 'uncertainty and missing coverage are stated before approval; "without music" is an active prohibition, a request to ADD music is unsupported', Array.isArray(d.uncertain) && Array.isArray(d.coverage_gaps) && d.rules.filter(r => r.domain === 'music').every(r => r.prohibition ? r.active && r.support === 'supported' : !r.active),
       { uncertain: d.uncertain.length, coverage_gaps: d.coverage_gaps.length, unsupported: d.rules.filter(r => r.support === 'unsupported').map(r => r.text) });
     // open conflicts (not involving an owner instruction) are decided by the TEST actor so the flow can continue; it is recorded
     const open = d.conflicts.filter(c => !c.resolution);
@@ -198,9 +205,52 @@ async function main() {
       check(`E.${tag}.6`, `${tag}: compliance with the skill rules is reported`, !!f.skill_compliance?.summary, f.skill_compliance?.summary);
     }
 
+    // ── R: the faults of the first acceptance run must not come back (read from the packages) ──
+    log('== R: regressions ==');
+    const product = {};
+    for (const [tag, P] of [['reel', R], ['story', S]]) {
+      const ed = P.editorial ?? {}, cyc = ed.cycles ?? [], off = P.style?.highlight_enabled === false, noCover = P.target?.cover_text === false;
+      const all = cyc.flatMap(c => c.findings ?? []), sentIds = new Set(cyc.flatMap(c => c.sent_to_editor ?? []));
+      const about = (f, re) => re.test(`${f.problem} ${f.correction}`);
+      const hl = all.filter(f => f.source === 'reviewer' && (f.asset === 'highlight' || f.fix === 'highlight')), cv = all.filter(f => f.source === 'reviewer' && f.asset === 'cover' && about(f, /ריק|ציטוט/));
+      check(`R.${tag}.1`, `${tag}: no finding asks for what a rule in force excludes (highlight switched off: ${off}; no cover text: ${noCover}); such findings are recorded, not sent`,
+        (!off || hl.length === 0) && (!noCover || cv.length === 0) && (ed.rules_in_force ?? []).length === (off ? 1 : 0) + (noCover ? 1 : 0),
+        { rules_in_force: ed.rules_in_force, highlight_findings: hl.length, cover_findings: cv.length, recorded_not_applicable: cyc.flatMap(c => c.not_applicable ?? []).map(x => x.problem.slice(0, 60)) });
+      const sc = (P.graphics ?? []).filter(g => g.layer === 'replaces_picture'), inScene = (P.cards ?? []).filter(c => c.in_scene);
+      const norm = t => t.replace(/[^\u0590-\u05FF\s]/g, '').trim();
+      check(`R.${tag}.2`, `${tag}: during the full-frame scene the captions that repeat its words are not drawn; a caption with other words still is`,
+        sc.length === 0 || (inScene.length > 0 && inScene.every(c => sc.some(g => norm(g.text).includes(norm(c.text)))) && (P.checks ?? []).some(c => c.id === 'captions_in_scene')),
+        { scene: sc.map(g => g.text), not_drawn: inScene.map(c => c.text), drawn_nearby: (P.cards ?? []).filter(c => !c.in_scene && sc.some(g => c.start < g.tl_end_s && c.start + c.dur > g.tl_start_s)).map(c => c.text) });
+      const ortho = cyc.map(c => (c.findings ?? []).filter(f => f.source === 'check:A12').map(f => f.problem.slice(0, 60)));
+      const back = ortho.some((list, n) => n >= 2 && list.some(x => ortho[n - 2].includes(x) && !ortho[n - 1].includes(x)));
+      check(`R.${tag}.3`, `${tag}: a spelling fix that was made does not come back in a later round`, !back, ortho);
+      const topics = cyc.map(c => (c.findings ?? []).filter(f => (c.sent_to_editor ?? []).includes(f.id)).map(f => f.source === 'reviewer' ? `reviewer|${f.asset}|${f.fix}` : `${f.source}|${f.problem.slice(0, 40)}`));
+      const notFixed = cyc.map(c => new Set((c.verification_of_previous ?? []).filter(v => v.status === 'not_fixed').map(v => v.id)));
+      let resent = 0;
+      for (let n = 1; n < cyc.length; n++) { const failed = (cyc[n - 1].findings ?? []).filter(f => notFixed[n].has(f.id)).map(f => f.source === 'reviewer' ? `reviewer|${f.asset}|${f.fix}` : `${f.source}|${f.problem.slice(0, 40)}`);
+        resent += topics[n].filter(t => failed.includes(t)).length; }
+      check(`R.${tag}.4`, `${tag}: a finding the editor did not fix is not sent to the editor again; the reason is recorded for the owner`, resent === 0,
+        { rounds: cyc.length, revisions: ed.revisions, stop: ed.stop_reason, sent_per_round: topics.map(t => t.length), not_sent_again: cyc.flatMap(c => c.not_sent_again ?? []).map(x => x.problem.slice(0, 50)), stopped_because: cyc.map(c => c.stopped_because).filter(Boolean) });
+      const proh = (P.skill_report?.rules ?? []).filter(r => r.prohibition && ['music', 'sound_effects', 'b_roll', 'transitions'].includes(r.domain));
+      check(`R.${tag}.5`, `${tag}: "בלי מוזיקת רקע" is checked as a prohibition that was kept (measured), not listed as unsupported`,
+        proh.length >= 1 && proh.every(r => r.status === 'applied' && r.decided_by === 'measured') && !(P.skill_report?.rules ?? []).some(r => r.status === 'unsupported' && /^(בלי|ללא)/.test(r.text)),
+        proh.map(r => `${r.text} → ${r.status} (${r.note})`));
+      const fit = ed.caption_fit, flagged = all.filter(f => f.source === 'check:A13'), last = (cyc[ed.delivered_cycle]?.findings ?? []).filter(f => f.source === 'check:A13');
+      check(`R.${tag}.6`, `${tag}: short cards — the words were divided by measured width, every card that still flashes by is reported, and one that cannot be helped carries the reason`,
+        !!fit && typeof fit.line_px === 'number' && last.every(f => f.fix === 'cards' || /רוחב השורה/.test(f.correction)),
+        { fit, still_short: last.length, with_reason: last.filter(f => f.fix === 'owner').length, conflict: (P.issues ?? []).find(i => i.code === 'caption_rule_conflict')?.message });
+      const f = P.final_review ?? {};
+      // ── Q: the quality gate. A MEASURED violation of a mandatory rule fails the acceptance. ──
+      check(`Q.${tag}`, `${tag}: no measured violation of a mandatory skill rule in the delivered file`, (f.mandatory_violations ?? []).length === 0, f.mandatory_violations, 'quality');
+      product[tag] = { verdict: f.verdict, verdict_text: f.verdict_text, review_rounds: cyc.length, stop: ed.stop_reason, seconds: P.total_s, failed_checks: P.failed_checks, open_items: (P.review_items ?? []).length,
+        reasons: (f.verdict_reasons ?? []).map(x => x.slice(0, 140)) };
+    }
+    summary.product = product;
+
     // ── C.9: remove ONE thing; the rest stays; the previous review no longer stands ──
-    log('== C.9: remove only the animation scene from the reel ==');
-    if (scenes[0]) {
+    if (!skip.has('c9')) log('== C.9: remove only the animation scene from the reel ==');
+    if (skip.has('c9')) log('== C.9 skipped (not affected by this change) ==');
+    else if (scenes[0]) {
       const rv = await send(`/projects/${reelP.id}/revise`, { by: ACTOR, graphic_edits: [{ id: scenes[0].id, action: 'remove' }] });
       const mid = rv.body.project;
       check('C.9', 'removing one item queues a new version; the previous version stays on screen and its review is marked as not current', rv.status === 200 && mid.currentVersion === 2 && mid.shown?.n === 1 && mid.review?.upToDate === false, mid?.review?.stale ?? rv.body);
@@ -215,6 +265,8 @@ async function main() {
     } else check('C.9', 'removing one item (skipped: no animation scene was produced)', false);
 
     // ── B: upgrade skill A with a SAVED reference analysis ─────────────────
+    if (skip.has('b')) log('== B skipped (not affected by this change) ==');
+    else {
     log('== B: upgrade the skill with a saved reference ==');
     const ref0 = saved[0], leasesBefore = (await api('/references')).body.references.find(r => r.id === ref0.id)?.analysedAt ?? null;
     const u = await send(`/skills/${A}/upgrade`, { by: ACTOR, ids: [ref0.id], prompt: 'לשפר רק את סגנון הכתוביות וההדגשות לפי הרפרנס הזה. לא לשנות את כללי הפתיחה והקצב.' });
@@ -245,14 +297,21 @@ async function main() {
     save('A_SKILL_v2.md', k2?.approved?.skill_md ?? '');
     const R1again = pkgOf(reelP.id, 1);
     check('B.7', 'existing projects keep what they were made with: the reel versions still record version 1 of the skill', (R1again.skill_report.skill.skills ?? []).find(k => k.id === A)?.version === 1);
-    summary.skills = { A, G, upgraded_from_reference: ref0.title, example_video: path.basename(example) };
+    summary.upgraded_from_reference = ref0.title;
+    }
+    summary.skills = { A, G, example_video: path.basename(example) };
   } catch (e) { check('X', 'the run completed', false, String(e && e.stack || e).slice(0, 600)); }
   finally {
     await stopWorker(); spawn('taskkill', ['/PID', String(awake.pid), '/T', '/F']);
-    const fails = results.filter(r => !r.ok);
+    const fails = results.filter(r => !r.ok), pathR = results.filter(r => r.kind === 'path'), qual = results.filter(r => r.kind === 'quality');
+    summary.path = { passed: pathR.filter(r => r.ok).length, total: pathR.length };
+    summary.quality_gate = { passed: qual.filter(r => r.ok).length, total: qual.length, result: qual.every(r => r.ok) ? 'PASS' : 'FAIL' };
     save('results.json', { at: new Date().toISOString(), summary, results });
-    log(`\n${results.filter(r => r.ok).length} passed, ${fails.length} failed of ${results.length}. evidence: ${OUT}`);
-    for (const f of fails) log(`   FAILED ${f.id} ${f.name}`);
+    log(`\nPATH: ${summary.path.passed} passed, ${pathR.length - summary.path.passed} failed of ${pathR.length}.`);
+    log(`QUALITY GATE (measured violation of a mandatory rule): ${summary.quality_gate.result} (${summary.quality_gate.passed}/${qual.length}).`);
+    for (const [tag, x] of Object.entries(summary.product ?? {})) log(`PRODUCT ${tag}: ${x.verdict_text} · ${x.review_rounds} review rounds (${x.stop}) · ${x.seconds}s · failed checks ${JSON.stringify(x.failed_checks)} · ${x.open_items} open items`);
+    log(`evidence: ${OUT}`);
+    for (const f of fails) log(`   FAILED ${f.id} [${f.kind}] ${f.name}`);
     process.exitCode = fails.length ? 1 : 0;
     if (keep) log(`preview server left running on ${base} (worker stopped)`); else { server.close(); setTimeout(() => process.exit(process.exitCode), 300); }
   }

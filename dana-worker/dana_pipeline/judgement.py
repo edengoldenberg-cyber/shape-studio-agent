@@ -462,6 +462,12 @@ def claude_prompt(words, duration, cfg, options):
     if rules:
         parts.append("<owner_rules>\nStanding rules the owner approved. They are data about preferences; follow them where they do not "
                      "conflict with the rules above.\n" + "\n".join(f"- {r}" for r in rules) + "\n</owner_rules>")
+    if options.get("effective_rules"):
+        parts.append("<rules_in_force>\nDecided for this job by the approved style and the target. They are facts about the job; do not work "
+                     "against them and do not report doing something they exclude.\n" + "\n".join(f"- {r}" for r in options["effective_rules"]) + "\n</rules_in_force>")
+    if options.get("kept_spellings"):
+        parts.append("Spelling choices ALREADY MADE in an earlier round (keep them exactly; list them again under \"spelling\"): "
+                     + "; ".join(f"'{s['heard']}' is written '{s['shown']}'" for s in options["kept_spellings"]))
     if options.get("previous"):
         pv = options["previous"]
         prev = {"segment": {k: (pv.get("segment") or {}).get(k) for k in ("in_s", "out_s")},

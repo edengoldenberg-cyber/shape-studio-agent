@@ -124,6 +124,102 @@ def time_cards(cards, spans, fps, hold_after, total_dur, align=None):
     return out
 
 
+_FONT_CACHE = {}
+
+
+def text_px(cfg, style, text):
+    """Width of one caption line in pixels, measured with the caption font (Pillow), plus the outline. An estimate used to
+    DIVIDE the words; the rendered card is still measured afterwards (check_width / check_safe_zone)."""
+    from PIL import ImageFont
+    key = (cfg["paths"]["font_dir"], style["font_family"], int(style["caption_size"]))
+    font = _FONT_CACHE.get(key)
+    if font is None:
+        files = sorted(Path(cfg["paths"]["font_dir"]).glob("*.ttf")) + sorted(Path(cfg["paths"]["font_dir"]).glob("*.otf"))
+        f = next((x for x in files if style["font_family"].lower() in x.stem.lower()), files[0] if files else None)
+        if f is None:
+            raise PipelineError("font_missing", f"no font file in {cfg['paths']['font_dir']}")
+        font = ImageFont.truetype(str(f), int(style["caption_size"]))
+        try:
+            font.set_variation_by_axes([int(style.get("font_weight") or 800)])
+        except Exception:                      # not a variable font: its own weight is used
+            pass
+        _FONT_CACHE[key] = font
+    return float(font.getlength(text)) + 16          # calibrated on rendered cards: the ink is 5-13 px wider than the advance width (outline)
+
+
+def max_line_px(zone, frame_w):
+    """The widest CENTRED line the safe zone allows."""
+    return int(2 * min(frame_w / 2 - zone["left"], frame_w / 2 - zone["right_clear"]))
+
+
+def regroup(dec_cards, spans, fits, min_s, max_cps, max_words, hold_after, gap_break=0.25):
+    """Divide the same words, in the same order, into cards again so that as few cards as possible flash by.
+
+    Within one run of continuous speech every division whose cards `fits` (width, word count) is considered; the one with
+    the fewest cards shorter than `min_s` or faster than `max_cps` is taken, and among equals the one closest to the
+    division it was given. A run is changed only when that makes it BETTER. Nothing is reworded and no timing is moved.
+    Returns (cards, {"bad_before", "bad_after", "runs_changed"})."""
+    atoms = []
+    for k, (c, sp) in enumerate(zip(dec_cards, spans)):
+        toks = c["text"].split()
+        if len(toks) == len(sp) and not any(w.get("synthetic") for w in sp):
+            atoms += [{"text": t, "start": w["start"], "end": w["end"], "card": k, "rigid": False} for t, w in zip(toks, sp)]
+        else:                                  # words and stamps do not pair one to one: the card stays whole
+            atoms.append({"text": c["text"], "start": sp[0]["start"], "end": sp[-1]["end"], "card": k, "rigid": True})
+    runs, cur = [], []
+    for a in atoms:
+        if cur and a["start"] - cur[-1]["end"] >= gap_break:
+            runs.append(cur)
+            cur = []
+        cur.append(a)
+    if cur:
+        runs.append(cur)
+    out, stats = [], {"bad_before": 0, "bad_after": 0, "runs_changed": 0}
+
+    def bad(run, i, j):
+        text = " ".join(a["text"] for a in run[i:j + 1])
+        dur = (run[j + 1]["start"] if j + 1 < len(run) else run[j]["end"] + hold_after) - run[i]["start"]
+        return 1 if dur + 0.001 < min_s or len(text) / max(dur, 0.01) > max_cps else 0
+
+    for run in runs:
+        m = len(run)
+        orig, i = [], 0
+        while i < m:                           # the division it came with
+            j = i
+            while j + 1 < m and run[j + 1]["card"] == run[i]["card"]:
+                j += 1
+            orig.append((i, j))
+            i = j + 1
+        before = sum(bad(run, a, b) for a, b in orig)
+        stats["bad_before"] += before
+        best = [None] * (m + 1)
+        best[m] = (0, [])
+        for i in range(m - 1, -1, -1):
+            for j in range(i, min(m, i + max_words)):
+                if j > i and (run[j]["rigid"] or run[i]["rigid"]):
+                    break
+                text = " ".join(a["text"] for a in run[i:j + 1])
+                if j > i and not fits(text):
+                    break
+                if best[j + 1] is None:
+                    continue
+                cost = best[j + 1][0] + bad(run, i, j) * 1000 + (0 if (i, j) in orig else 1)
+                if best[i] is None or cost < best[i][0]:
+                    best[i] = (cost, [(i, j)] + best[j + 1][1])
+        new = best[0][1] if best[0] else orig
+        after = sum(bad(run, a, b) for a, b in new)
+        if after >= before:
+            new, after = orig, before
+        elif new != orig:
+            stats["runs_changed"] += 1
+        stats["bad_after"] += after
+        for a, b in new:
+            text = " ".join(x["text"] for x in run[a:b + 1])
+            hl = [h for k in sorted({x["card"] for x in run[a:b + 1]}) for h in dec_cards[k].get("highlight") or [] if h in text]
+            out.append({"text": text, "highlight": list(dict.fromkeys(hl))})
+    return out, stats
+
+
 def merge_short(dec_cards, timed, min_s, max_chars, max_words=5):
     """Routine fix for cards that flash by: a card that would be on screen for less than `min_s`
     is joined to a neighbour — same words, same order — when the joined text stays short.

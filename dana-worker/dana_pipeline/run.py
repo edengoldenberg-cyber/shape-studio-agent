@@ -26,7 +26,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import PIPELINE_VERSION, adjust, captions, checks, editorial, interpret, judgement, motion, review
+from . import PIPELINE_VERSION, adjust, captions, checks, editorial, effective, interpret, judgement, motion, review
 from . import review as review_rubric
 from . import skillgen
 from . import target as target_mod
@@ -305,11 +305,30 @@ def edit(j, dec, words, sp, sha_before, check, cache):
                 tspans, timing_source = check(dec)[0], "source_transcript"   # same words, stamps from the source transcript
             cards = captions.time_cards(dec["cards"], tspans, st["fps"], cfg["cards"]["hold_after_s"], dur, align)
             if split_round == 0:
-                # Routine fix: cards that would flash by are joined to a neighbour (same words, same order).
-                new, joined = captions.merge_short(dec["cards"], cards, cfg["cards"]["min_on_screen_s"], cfg["cards"]["merge_max_chars"])
-                if joined:
-                    issues.append(judgement.issue("short_cards_joined", "info",
-                                                  f"{len(joined)} כרטיסים קצרים מדי אוחדו עם שכן (אותן מילים, אותו סדר): " + " | ".join(joined)))
+                # Routine fix: the same words, in the same order, are divided into cards again so that as few as possible flash by.
+                # Only divisions that fit the safe width on the allowed number of lines are considered (measured, not guessed), so a
+                # join is never made and then undone.
+                fit_zone = read_json(cfg["paths"]["safe_zone"])
+                line_px = captions.max_line_px(fit_zone, st["width"])
+                one_line = st["caption_max_lines"] < 2
+                fits = lambda t: len(t) <= cfg["cards"]["merge_max_chars"] and (not one_line or captions.text_px(cfg, st, t) <= line_px)
+                j.caption_fit = {"line_px": line_px, "caption_size": st["caption_size"], "max_lines": st["caption_max_lines"], "fits": fits}
+                max_words = int(((getattr(j, "profile", None) or {}).get("params") or {}).get("max_words_per_line", 3)) * int(st["caption_max_lines"])
+                new, fit_stats = captions.regroup(dec["cards"], tspans, fits, cfg["cards"]["min_on_screen_s"], cfg["cards"]["max_chars_per_s"],
+                                                  max(max_words, 2), cfg["cards"]["hold_after_s"])
+                j.caption_fit["stats"] = fit_stats
+                if fit_stats["runs_changed"]:
+                    issues.append(judgement.issue("cards_regrouped", "info",
+                                                  f"המילים חולקו מחדש לכרטיסים (אותן מילים, אותו סדר) כדי שפחות כרטיסים יחלפו מהר מדי: "
+                                                  f"{fit_stats['bad_before']} קצרים לפני, {fit_stats['bad_after']} אחרי (הערכה לפי זמני המילים)"))
+                    dec["cards"] = new
+                    continue
+            if split_round <= 1 and planned_scenes and not getattr(j, "_scene_cut_done", None) == id(dec):
+                # the words a full-frame scene shows get cards of their own (not drawn over it); the words around them keep theirs
+                j._scene_cut_done = id(dec)
+                new, made = motion.isolate_scene_words(dec["cards"], tspans, planned_scenes)
+                if made:
+                    issues.append(judgement.issue("cards_cut_at_scene", "info", f"{made} כרטיסים נחתכו בגבול קטע האנימציה (אותן מילים, אותו סדר), כדי שהמילים שבסצנה לא יוצגו פעמיים"))
                     dec["cards"] = new
                     continue
             png_dir = captions.render_png(cfg, st, [{"name": f"c{c['i']:03d}", "text": layouts.get(c["plain"], c["plain"]), "highlight": c["highlight"]}
@@ -380,8 +399,10 @@ def edit(j, dec, words, sp, sha_before, check, cache):
     final = j.out / "final.mp4"
     attempts = []
     for attempt in range(cfg["sync"]["max_fix_attempts"] + 1):
+        in_scene = motion.cards_in_scenes(cards, scenes)        # their words are on screen in the scene itself
+        drawn = [c for c in cards if c["i"] not in in_scene]
         with j.stage("composite"):
-            captions.composite(cfg, base, voice, cards, png_dir, final, dur, animation=animation if cards else None, graphics=graphics, fps=st["fps"])
+            captions.composite(cfg, base, voice, drawn, png_dir, final, dur, animation=animation if drawn else None, graphics=graphics, fps=st["fps"])
         with j.stage("verify"):
             wav = to16k(cfg, final, j.work / "final_audio_16k.wav")            # the audio of the OUTPUT file
             heard, kept_notes = story.keep_owner_corrections(checks.transcribe(cfg, wav)["words"], own)
@@ -415,8 +436,13 @@ def edit(j, dec, words, sp, sha_before, check, cache):
 
     with j.stage("checks"):
         if cards:
-            motion_rec, comfort = checks.cards_in_motion(cfg, final, base, png_dir, cards, st["fps"], anim_s=animation["in_s"] if animation else 0.0)
+            motion_rec, comfort = checks.cards_in_motion(cfg, final, base, png_dir, drawn, st["fps"], anim_s=animation["in_s"] if animation else 0.0)
             records += [motion_rec, comfort]
+            if in_scene:
+                records.append(checks.rec("captions_in_scene", "info",
+                                          f"{len(in_scene)} כתוביות לא צוירו בזמן קטע האנימציה, כי המילים שלהן מוצגות בו: "
+                                          + " | ".join(c["plain"] for c in cards if c["i"] in in_scene)
+                                          + ". כתובית שיש בה מילה שאינה בסצנה נשארת מצוירת.", cards=sorted(in_scene)))
         else:
             motion_rec = {"data": {}}
         if graphics:
@@ -453,10 +479,30 @@ def edit(j, dec, words, sp, sha_before, check, cache):
             why.append(f"נקרא ב-{r['chars_per_s']:.0f} תווים/ש")
         if why:
             comfort_rows.append({"i": r["i"], "text": by_i[r["i"]]["plain"], "why": ", ".join(why), "t0": r["t0"]})
+    # WHY a card that still flashes by could not be helped: measured against the width one line allows
+    fit = getattr(j, "caption_fit", None)
+    if fit and comfort_rows and st["captions_enabled"]:
+        order = [c["i"] for c in cards]
+        for row in comfort_rows:
+            k = order.index(row["i"])
+            near = [cards[k - 1]["plain"] + " " + row["text"]] if k > 0 and cards[k]["start"] - (cards[k - 1]["start"] + cards[k - 1]["dur"]) < 0.25 else []
+            near += [row["text"] + " " + cards[k + 1]["plain"]] if k + 1 < len(cards) and cards[k + 1]["start"] - (cards[k]["start"] + cards[k]["dur"]) < 0.25 else []
+            if not any(fit["fits"](t) for t in near):
+                row["cannot"] = (f"איחוד עם כרטיס שכן חורג מרוחב השורה ({fit['line_px']}px באזור הבטוח, גודל {fit['caption_size']}, "
+                                 f"{'שורה אחת' if fit['max_lines'] < 2 else str(fit['max_lines']) + ' שורות'}), והדיבור רציף — אין לאן להזיז את התזמון")
+        blocked = [r for r in comfort_rows if r.get("cannot")]
+        if blocked:
+            issues.append(judgement.issue(
+                "caption_rule_conflict", "warn",
+                f"{len(blocked)} כרטיסים חולפים מהר מדי ואין חלוקה אחרת של המילים שפותרת זאת: בגודל {fit['caption_size']} וב"
+                f"{'שורה אחת' if fit['max_lines'] < 2 else str(fit['max_lines']) + ' שורות'} נכנסים עד {fit['line_px']}px באזור הבטוח של היעד, "
+                "והדיבור רציף. להכרעתך: גודל כתובית קטן יותר, שתי שורות, או לקבל את הכרטיסים כפי שהם.", cards=[r["i"] for r in blocked]))
     seg_words = [w for w in words if w["end"] > in_s + 0.05 and w["start"] < out_s - 0.05]
     cards = burned_cards if not st["captions_enabled"] else cards
     for c in cards:
         c["lines"] = layouts.get(c["plain"], c["plain"]).split("\n")
+        if st["captions_enabled"] and c["i"] in in_scene:
+            c["in_scene"] = in_scene[c["i"]]
     if two_lined and st["captions_enabled"]:
         issues.append(judgement.issue("cards_two_lines", "info", f"{len(two_lined)} כרטיסים הוצגו בשתי שורות כדי להיכנס לאזור הבטוח (אותן מילים, אותו סדר)"))
     for n in kept_notes:
@@ -468,7 +514,7 @@ def edit(j, dec, words, sp, sha_before, check, cache):
            "captions_added": bool(st["captions_enabled"]), "zooms": zooms, "caption_position": cap_pos, "shift": shift, "key": key, "cards": cards, "records": records, "sync": sync, "adjudications": adjudications, "odiffs": odiffs,
            "heard": heard, "dur": dur, "final": final, "base": base, "cover": cover, "png_dir": png_dir, "attempts": attempts,
            "timing_source": timing_source, "audio_src": audio_src, "motion_rows": motion_rec["data"].get("rows") or [],
-           "comfort_rows": comfort_rows, "source_text": " ".join(w["word"] for w in seg_words), "issues": issues,
+           "comfort_rows": comfort_rows, "caption_fit": {k: v for k, v in (fit or {}).items() if k != "fits"} or None, "source_text": " ".join(w["word"] for w in seg_words), "issues": issues,
            "reused_render": False}
     cache.update(key=key, res=res)
     return res
@@ -604,6 +650,8 @@ def pipeline(j):
                                                        "caption_animation", "caption_ink", "caption_highlight") if k in pp},
                     **j.style_overrides}
     cfg["cards"].update(min_on_screen_s=pp["min_on_screen_s"], max_chars_per_s=pp["max_chars_per_s"])
+    eff = j.effective = effective.build(st, tspec, tg, skill)
+    options["effective_rules"] = eff["lines"]
     standing_rules = [r for r in options.get("rules") or [] if isinstance(r, dict)]
     # the planner and the editor get the owner's standing rules and the approved profile's style rules together
     options["rules"] = standing_rules + [{"id": f"profile:{profile['id']}", "text": r} for r in profile.get("rules") or []]
@@ -743,13 +791,15 @@ def pipeline(j):
                 "exact_spoken_text": " ".join(w["word"] for w in seg_words(dec)),
                 "edit_brief": dec["plan"]["brief"],
                 "caption_requirements": ["רק מה שנאמר בסרטון ועובדות מאומתות", "בלי מחיר, הצעה או הבטחה", "CTA רק אם הוגדר"],
-                "cover_requirements": ["ציטוט מדויק של 2–5 מילים מהקטע"],
+                "cover_requirements": ["ציטוט מדויק של 2–5 מילים מהקטע"] if eff["cover_text"] else ["אין קאבר עם טקסט בגרסה הזו"],
+                "rules_in_force": eff["notes"],
                 "verified_facts": dec["plan"]["facts_used"], "missing_information": dec["plan"]["missing_info"],
                 "adapter": dec["adapter"], "test_injection": injection}
         write_json(j.ed / "plan.json", plan)
 
     use_model = dec["adapter"] == "claude" and cfg["judgement"]["claude"].get("enabled")
     sent_prev, res, tools, det, review, prev_signature, kept, final_cycle = [], None, None, [], None, set(), None, 0
+    exhausted, kept_spellings, allowed_all, escalations = {}, [], set(), []
     for n in range(ecfg["max_cycles"] + 1):
         # ── EDIT ────────────────────────────────────────────────────────────
         t_edit = time.time()
@@ -760,7 +810,7 @@ def pipeline(j):
         with j.stage("review"):
             tools = editorial.caption_tools(cfg, dec["caption"]["text"])
             res["style_rules"] = [str(r.get("text"))[:300] for r in options.get("rules") or [] if r.get("text")]
-            res["skill"] = skill
+            res["skill"], res["effective"] = skill, eff
             det = editorial.deterministic_findings(cfg, dec, res, tools)
             review, review_error = None, None
             if use_model:
@@ -773,9 +823,15 @@ def pipeline(j):
                         usages.append(e.usage)
             findings = det + (review["findings"] if review else [])
             verification = editorial.verify(sent_prev, det, review, dec.get("addressed")) if sent_prev else []
-            # advisory findings are offered to the editor once; blocking ones every cycle
-            actionable = [f for f in findings if f["fix"] in editorial.EDITOR_FIXES and not f["key"].startswith("comfort:")
-                          and (f["severity"] == "blocking" or n == 0)]
+            # A finding the editor was already asked about and did not fix is NOT sent again: another round would spend time and
+            # change nothing. It goes to the owner with what the editor said and what the check found.
+            exhausted.update(effective.exhausted_after(sent_prev, verification))
+            # advisory findings are offered to the editor once; blocking ones until they are fixed or exhausted
+            wanted = [f for f in findings if f["fix"] in editorial.EDITOR_FIXES and not f["key"].startswith("comfort:")
+                      and (f["severity"] == "blocking" or n == 0)]
+            actionable = [f for f in wanted if effective.topic(f) not in exhausted]
+            escalated = [{"id": f["id"], "problem": f["problem"], "why_not_sent_again": exhausted[effective.topic(f)]} for f in wanted if effective.topic(f) in exhausted]
+            escalations[:] = escalated
             signature = {(f["asset"], f.get("card"), f["fix"]) for f in actionable if f["severity"] == "blocking"}
             repeated = bool(n) and bool(signature) and signature <= prev_signature
             cost, secs = spent()
@@ -786,6 +842,9 @@ def pipeline(j):
                      "reviewer_frames_s": (review or {}).get("frames_s"), "review_error": review_error,
                      # restated automatic checks are not sent to the editor; they stay in the owner's review list
                      "reviewer_findings_not_forwarded": (review or {}).get("dropped_as_already_measured") or [],
+                     # asked for something a rule in force excludes (a highlight the skill switched off, a cover text on a story)
+                     "reviewer_findings_not_applicable": (review or {}).get("dropped_not_applicable") or [],
+                     "not_sent_again": escalated, "rules_in_force": eff["notes"],
                      "verification_of_previous": verification, "editor_addressed": dec.get("addressed") or [],
                      "sent_to_editor": [f["id"] for f in actionable] if use_model else [],
                      "cost_usd_reported_so_far": cost, "seconds_so_far": secs}
@@ -819,6 +878,9 @@ def pipeline(j):
             break
         if not actionable:
             stop = "accepted" if not blocking_left else "needs_owner"
+            if escalated:
+                cycles[-1]["stopped_because"] = (f"{len(escalated)} הערות נשלחו לעורך פעם אחת ולא נפתרו; סבב נוסף לא היה משנה דבר — הועברו להכרעתך עם הראיות")
+                write_json(j.ed / f"cycle_{n}.json", cycles[-1])
             break
         if repeated:                                # the same blocking request again: another cycle would change nothing
             stop = "no_progress"
@@ -838,7 +900,12 @@ def pipeline(j):
         shutil.copyfile(j.out / "cover.jpg", j.work / "kept_cover.jpg")
         kept = {"dec": dec, "res": res, "issues": j_issues, "cycle": n}
         with j.stage("revise"):
-            opts = dict(options, previous=as_raw(dec), _tag=f"edit{n + 1}", allowed_spellings=editorial.allowed_spellings(res),
+            # spelling choices already made stay made: they remain allowed, the editor is told, and the code puts them back if needed
+            allowed_all.update(editorial.allowed_spellings(res))
+            for s_ in dec.get("spelling") or []:
+                if judgement.skeleton(s_["heard"]) == judgement.skeleton(s_["shown"]) and not any(x["heard"] == s_["heard"] for x in kept_spellings):
+                    kept_spellings.append(dict(s_))
+            opts = dict(options, previous=as_raw(dec), _tag=f"edit{n + 1}", allowed_spellings=sorted(allowed_all), kept_spellings=kept_spellings,
                         review_findings=[{k: f[k] for k in ("id", "asset", "card", "time_s", "problem", "correction", "evidence", "severity")}
                                          for f in actionable])
             opts.pop("change_request", None)
@@ -854,6 +921,15 @@ def pipeline(j):
                 break
             if not st["captions_enabled"] or not tspec["cover_text"]:
                 new_dec["cover"]["text"] = ""
+            restored = effective.keep_spellings(new_dec, kept_spellings)
+            if restored:
+                new_issues.append(judgement.issue("spelling_kept", "info", "תיקון כתיב מסבב קודם נשמר (העורך חזר לכתיב הקודם והוא הוחזר): " + ", ".join(restored)))
+            if effective.same_edit(dec, new_dec):       # the editor changed nothing that is seen: rendering it again would only spend time
+                stop = "editor_made_no_change"
+                cycles[-1]["stopped_because"] = "העורך החזיר את אותה עריכה בדיוק; ההערות שנשלחו אליו הועברו להכרעתך"
+                escalations[:] = [{"id": f["id"], "problem": f["problem"], "why_not_sent_again": "העורך לא שינה דבר בתגובה להערה"} for f in actionable]
+                write_json(j.ed / f"cycle_{n}.json", cycles[-1])
+                break
             dec, j_issues, sent_prev = new_dec, new_issues, actionable
 
     # ── PACKAGE ─────────────────────────────────────────────────────────────
@@ -874,7 +950,8 @@ def pipeline(j):
             review_items.append({"id": f"editorial:{f['id']}", "kind": "editorial", "card": f.get("card"), "t0": None, "t1": None, "text": None,
                                  "original": f["problem"], "verdict": "needs_decision",
                                  "explanation": f"תיקון מבוקש: {f['correction']}. ראיה: {f['evidence']}",
-                                 "ask": "נדרשת החלטה שלך" if f["fix"] == "owner" else "לא תוקן אוטומטית בתוך מגבלת הסבבים"})
+                                 "ask": "נדרשת החלטה שלך" if f["fix"] == "owner" else
+                                 next((e["why_not_sent_again"] for e in escalations if e["id"] == f["id"]), "לא תוקן אוטומטית")})
     checks.assert_nothing_hidden(records, res["sync"], issues, review_items)
     cost, secs = spent()
     accepted = stop in ("accepted", "locked_revision")
@@ -952,7 +1029,11 @@ def pipeline(j):
                   "on_delivered_file": fc.get("final_sha256") == final_sha, "review_rounds": len(cycles), "delivered_round": final_cycle,
                   "model_review_ran": bool(reviews.get(final_cycle)),
                   "basis": "הבדיקות האוטומטיות נמדדו על הקובץ הסופי. הערכת המודל נעשתה על תמלול האודיו של אותו קובץ ועל פריימים בודדים ממנו — לא האזנה ולא צפייה בתנועה."}
-    skill_report = skillgen.report(skill, st, reviews.get(final_cycle), (options.get("profile") or {}).get("params")) if skill else None
+    measured = {"overlays": sum(1 for g in res.get("graphics") or [] if g.get("layer") != "replaces_picture"),
+                "scenes": sum(1 for g in res.get("graphics") or [] if g.get("layer") == "replaces_picture"),
+                "music_added": False, "sound_effects_added": False, "b_roll_added": False, "transition_effects_added": False,       # the worker has no stage that adds them
+                "max_caption_lines": max((len(c.get("lines") or [1]) for c in cards), default=0), "style_overrides": sorted(j.style_overrides)}
+    skill_report = skillgen.report(skill, st, reviews.get(final_cycle), (options.get("profile") or {}).get("params"), measured) if skill else None
     # ── a story is delivered as its cards too: one file per part, cut from the reviewed file ──
     outputs = [{"name": "final.mp4", "what": "כל הכרטיסים ברצף, לצפייה ולביקורת" if tg == "story" else "הריל", "seconds": res["dur"]}]
     if tg == "story" and pl:
@@ -1024,7 +1105,8 @@ def pipeline(j):
         "style_overrides": j.style_overrides,
         "spoken_text": " ".join(c["plain"] for c in cards),
         "cards": [{"i": c["i"], "text": c["plain"], "lines": c.get("lines"), "highlight": c["highlight"], "start": c["start"], "dur": c["dur"],
-                   "source_start_s": src_time(c["start"] + 0.02), "source_end_s": src_time(max(c["start"] + 0.02, c["last_word_end_audio_s"]))} for c in cards],
+                   "source_start_s": src_time(c["start"] + 0.02), "source_end_s": src_time(max(c["start"] + 0.02, c["last_word_end_audio_s"])),
+                   **({"in_scene": c["in_scene"]} if c.get("in_scene") else {})} for c in cards],
         "cover": dict(dec["cover"], source="plan" if pl else "fallback"),
         "caption": dict(dec["caption"], status="draft_no_voice" if tspec["post_caption"] else "not_applicable_story"),
         "checks": [{k: r[k] for k in ("id", "status", "summary")} for r in records],
@@ -1032,9 +1114,11 @@ def pipeline(j):
         "editorial": {"status": ed["status"], "stop_reason": stop, "revisions": ed["revisions"], "test_injection": injection,
                       "objective": plan["objective"], "brief": plan["edit_brief"], "missing_information": plan["missing_information"],
                       "verified_facts": plan["verified_facts"], "perception": editorial.PERCEPTION,
-                      "criteria": cycles[final_cycle]["criteria"], "delivered_cycle": final_cycle,
+                      "criteria": cycles[final_cycle]["criteria"], "delivered_cycle": final_cycle, "rules_in_force": eff["notes"],
+                      "caption_fit": res.get("caption_fit"),
                       "cycles": [{"cycle": c["cycle"], "rejected": c.get("rejected"), "stopped_because": c.get("stopped_because"), "findings": [{k: f[k] for k in ("id", "source", "asset", "card", "problem", "correction", "severity", "fix")} for f in c["findings"]],
                                   "sent_to_editor": c["sent_to_editor"], "verification_of_previous": c["verification_of_previous"],
+                                  "not_sent_again": c.get("not_sent_again") or [], "not_applicable": c.get("reviewer_findings_not_applicable") or [],
                                   "caption": c["caption"], "cover_text": c["cover_text"], "reused_render": c["reused_render"]} for c in cycles],
                       "budget": ed["budget"]},
         "tools": {"caption_renderer_sha256": cfg.get("caption_renderer_sha256"), "asr_model": cfg["asr"]["model"],

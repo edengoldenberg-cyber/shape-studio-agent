@@ -286,3 +286,24 @@ describe('what a package shows, and fixing one thing', () => {
     expect((await request(app).get(`${S}/status`)).body.adjustmentKinds.animation).toMatch(/מחליפים את הצילום/);
   });
 });
+
+describe('a prohibition is a rule that is kept, not an unsupported capability', () => {
+  test('"בלי מוזיקת רקע" stays active, is marked as a prohibition and travels to the worker with the mandatory flag; "להוסיף מוזיקה" is still unsupported', async () => {
+    await post('/skills/from-prompt', { by: 'עדן', name: 'איסורים', prompt: 'כתוביות גדולות במרכז המסך', must: ['בלי מוזיקת רקע'] });
+    const l = (await skLease()).body;
+    await skDraft(l.skill.id, l, { purpose: 'p', suitable_for: [], params: {}, conflicts: [], criteria: [], rules: [
+      { text: 'בלי מוזיקת רקע', domain: 'music', source: 'owner', mandatory: true, executable: false, note: 'העובד לא מוסיף מוזיקה' },
+      { text: 'מוזיקה קצבית לאורך כל הסרטון', domain: 'music', source: 'owner', executable: false },
+      { text: 'אווירה נקייה', domain: 'sound_effects', source: 'owner', prohibition: true, executable: true },
+      { text: 'כתוביות גדולות', domain: 'captions', source: 'owner', executable: true }] });
+    const d = (await skill(l.skill.id)).draft;
+    expect(d.rules.map(r => [r.domain, r.support, r.active, !!r.prohibition])).toEqual([['music', 'supported', true, true], ['music', 'unsupported', false, false],
+      ['sound_effects', 'supported', true, true], ['captions', 'supported', true, false]]);
+    expect(d.rules[0].support_note).toMatch(/איסור: נבדק בכל גרסה שלא נוספה מוזיקה/);
+    await post(`/skills/${l.skill.id}/approve`, { by: 'עדן', make_default: true });
+    await upload({});
+    const sk = (await lease()).job.options.skill_set[0].skill;
+    expect(sk.rules.find(r => r.domain === 'music')).toMatchObject({ text: 'בלי מוזיקת רקע', mandatory: true, prohibition: true, support: 'supported' });
+    expect(sk.unsupported.map(r => r.text)).toEqual(['מוזיקה קצבית לאורך כל הסרטון']);
+  });
+});

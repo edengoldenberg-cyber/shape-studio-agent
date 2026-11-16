@@ -24,7 +24,7 @@ class Report(unittest.TestCase):
         r = skillgen.report(SKILL, {"caption_size": 84, "caption_max_lines": 1}, REVIEW, {"caption_size": 84, "caption_max_lines": 2})
         self.assertEqual([(x["id"], x["status"]) for x in r["rules"]],
                          [("r1", "applied"), ("r2", "not_followed"), ("r3", "not_checked"), ("r4", "unsupported")])
-        self.assertEqual(r["summary"], {"applied": 1, "not_followed": 1, "not_applicable": 0, "unsupported": 1, "not_checked": 1, "fully_applied": False})
+        self.assertEqual(r["summary"], {"applied": 1, "not_followed": 1, "not_applicable": 0, "unsupported": 1, "not_checked": 1, "fully_applied": False, "mandatory_violations_verified": 0})
         self.assertEqual(r["rules"][3]["decided_by"], "worker_capabilities")          # never judged "applied" by a model
 
     def test_parameters_are_compared_by_code_and_a_project_override_is_shown(self):

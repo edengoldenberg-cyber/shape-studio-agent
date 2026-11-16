@@ -137,6 +137,57 @@ def box_height(text, scale=1.0):
     return int(len(lines_of(text)) * int(SIZE * scale) * LINE_H + 2 * PAD_Y + 22)
 
 
+def isolate_scene_words(dec_cards, spans, scenes, slack_s=1.0):
+    """Cut the caption cards at the edges of the words a full-frame scene shows, so that those words sit in cards of their
+    own (which are then not drawn over the scene) and the words around them stay in cards that ARE drawn. Same words, same
+    order; a card is only ever split, never reworded. Returns (cards, number of cuts made)."""
+    toks = []                                   # (card index, token, start time or None)
+    for k, (c, sp) in enumerate(zip(dec_cards, spans)):
+        ws = c["text"].split()
+        paired = len(ws) == len(sp) and not any(w.get("synthetic") for w in sp)
+        toks += [(k, w, sp[n]["start"] if paired else None) for n, w in enumerate(ws)]
+    cuts = set()
+    for s in scenes or []:
+        sw = [judgement.strip(w) for w in s["text"].split() if judgement.strip(w)]
+        for a in range(len(toks) - len(sw) + 1):
+            run = toks[a:a + len(sw)]
+            if [judgement.strip(t[1]) for t in run] != sw or any(t[2] is None for t in run):
+                continue
+            if s["tl_start_s"] - slack_s <= run[0][2] <= s["tl_end_s"] + slack_s:
+                cuts.update((a, a + len(sw)))
+                break
+    out, made, n = [], 0, 0
+    for k, c in enumerate(dec_cards):
+        ws = c["text"].split()
+        inner = sorted(x - n for x in cuts if n < x < n + len(ws))
+        n += len(ws)
+        if not inner:
+            out.append(c)
+            continue
+        made += len(inner)
+        for a, b in zip([0] + inner, inner + [len(ws)]):
+            text = " ".join(ws[a:b])
+            out.append({"text": text, "highlight": [h for h in c.get("highlight") or [] if h in text]})
+    return out, made
+
+
+def cards_in_scenes(cards, scenes):
+    """{card i: scene id} for the caption cards that are NOT drawn while a full-frame scene is on screen, because the scene
+    itself shows their words. A card with a word the scene does not show is not in the result: it stays drawn, so nothing
+    that is said goes missing from the picture."""
+    out = {}
+    for s in scenes or []:
+        sw = [judgement.strip(w) for w in s["text"].split() if judgement.strip(w)]
+        for c in cards:
+            mid = c["start"] + c["dur"] / 2
+            cw = [judgement.strip(w) for w in c["plain"].split() if judgement.strip(w)]
+            if not cw or not (s["tl_start_s"] <= mid <= s["tl_end_s"]):
+                continue
+            if any(sw[k:k + len(cw)] == cw for k in range(len(sw) - len(cw) + 1)):
+                out[c["i"]] = s["id"]
+    return out
+
+
 def place(items, zone, face_boxes_by_item, caption_band, H=1920):
     """Vertical position for every graphic: the upper part of the safe zone, clear of the measured face and of the
     caption band. A graphic with no free place is dropped (recorded), never drawn over a face."""

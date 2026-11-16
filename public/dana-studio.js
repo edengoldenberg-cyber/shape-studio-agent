@@ -551,7 +551,7 @@
     if (v.status === 'draft_failed') return setHtml(el, `<h2>${esc(k.name)}</h2><span class="pill bad">הניסוח נכשל</span><div class="bad">${esc((v.error || {}).message || '')}</div><button class="sm danger" data-sk="retire" style="margin-top:8px">הסרה</button>`);
     const rule = r => { const b = BASIS2[r.basis] || [r.basis, 'mute'], s = SUP[r.support], src = r.source || {};
       return `<li data-rule="${esc(r.id)}"><div class="row"><span class="pill mute">${esc(domLabel(r.domain))}</span><span class="pill ${b[1]}">${esc(b[0])}</span><span class="pill ${s[1]}">${s[0]}</span>
-          ${r.support === 'unsupported' ? '<span class="pill bad">לא יופעל</span>' : r.overruled ? '<span class="pill mute">נדחה מפני הוראה שלך</span>' : r.basis === 'hypothesis' ? '<span class="pill warn">השערה — לא כלל</span>' : r.basis === 'dana_suggestion' ? '<span class="pill warn">הצעה — לא כלל</span>' : r.active ? '<span class="pill ok">פעיל</span>' : '<span class="pill mute">כבוי</span>'}</div>
+          ${r.prohibition && r.support !== 'unsupported' ? '<span class="pill ok">איסור — נבדק בכל גרסה</span>' : ''}${r.support === 'unsupported' ? '<span class="pill bad">לא יופעל</span>' : r.overruled ? '<span class="pill mute">נדחה מפני הוראה שלך</span>' : r.basis === 'hypothesis' ? '<span class="pill warn">השערה — לא כלל</span>' : r.basis === 'dana_suggestion' ? '<span class="pill warn">הצעה — לא כלל</span>' : r.active ? '<span class="pill ok">פעיל</span>' : '<span class="pill mute">כבוי</span>'}</div>
         <textarea data-rule="${esc(r.id)}" style="min-height:44px;margin-top:4px" ${ro}>${esc(r.text)}</textarea>
         <div class="small mute">${src.type === 'reference' ? `מקור: הרפרנס "${esc(src.title)}" · ${esc(ASPECT[src.aspect] || src.aspect)} · ${esc(src.observation || '')} ${(src.times_s || []).map(t => `<button class="sm" data-refplay="${esc(src.ref)}" data-t="${t}">▶ ${tfmt(t)}</button>`).join(' ')}`
           : src.type === 'dana' ? 'מקור: הצעה של דנה — לא כלל עד שתאמצ/י אותה' : src.type === 'prompt' ? `מקור: הוראה שלך${r.mandatory ? ' (חובה)' : ''}` : src.type === 'conflict_resolution' ? 'מקור: פתרון סתירה שבחרת' : src.type === 'profile' ? 'מקור: פרופיל קודם' : 'מקור: עריכה שלך'}${r.adopted ? ` · אומץ מהשערה על ידי ${esc(r.adopted.by)}` : ''}</div>
@@ -933,6 +933,18 @@
         <div class="small mute">אודיו: ${esc(x.audio)} · נכסים: ${esc(x.assets)}</div></li>`).join('')}</ul>
       ${tl.events.length ? `<h3>מה מונח על הציר</h3><ul class="plain small">${tl.events.map(e => `<li><button class="sm" data-play="${Math.max(0, e.t0 - 0.5).toFixed(2)},${(e.t1 + 0.3).toFixed(2)}">▶ ${tfmt(e.t0)}</button> ${esc(e.label)} <span class="pill mute">${esc(LAYER[e.layer] || e.layer)}</span> · סקיל אחראי: ${esc(e.skill)}${e.why ? `<div class="mute">${esc(e.why)}</div>` : ''}</li>`).join('')}</ul>` : ''}</div>`;
   }
+  /** Why the correction rounds stopped, what was not sent to the editor again and what a rule in force made irrelevant. */
+  function loopNotes(pkg) {
+    const e = pkg.editorial; if (!e || !Array.isArray(e.cycles)) return '';
+    const last = e.cycles[e.delivered_cycle] || e.cycles[e.cycles.length - 1] || {}, ns = last.not_sent_again || [], na = e.cycles.flatMap(c => c.not_applicable || []);
+    const stop = e.cycles.map(c => c.stopped_because).filter(Boolean).pop();
+    if (!ns.length && !na.length && !stop && !(e.rules_in_force || []).length) return '';
+    return `<details class="small" ${ns.length ? 'open' : ''}><summary><b>סבבי התיקון: ${e.cycles.length} סבבי ביקורת, ${e.revisions} תיקונים</b></summary>
+      ${stop ? `<div>למה נעצר: ${esc(stop)}</div>` : ''}
+      ${(e.rules_in_force || []).length ? `<div>כללים בתוקף בגרסה הזו:</div><ul class="plain">${e.rules_in_force.map(x => `<li>${esc(x)}</li>`).join('')}</ul>` : ''}
+      ${ns.length ? `<div>הערות שלא נשלחו שוב לעורך (להכרעתך):</div><ul class="plain">${ns.map(x => `<li>${esc(x.problem)}<div class="mute">${esc(x.why_not_sent_again)}</div></li>`).join('')}</ul>` : ''}
+      ${na.length ? `<div>הערות של הביקורת שלא רלוונטיות לכללים בתוקף (לא נשלחו לעורך):</div><ul class="plain">${na.map(x => `<li>${esc(x.problem)}<div class="mute">${esc(x.why)}</div></li>`).join('')}</ul>` : ''}</details>`;
+  }
   /** "הביקורת הסופית של דנה": about ONE file and ONE version, after all the corrections. */
   function finalReviewCard(p, v, pkg) {
     const f = pkg.finalReview, r = p.review; if (!f) return '';
@@ -955,6 +967,8 @@
       <details><summary><b>מה לא נבדק (${f.not_checked.length})</b></summary><ul class="plain small">${f.not_checked.map(x => `<li>${esc(x.criterion)} <span class="mute">— ${esc(x.why)}</span></li>`).join('')}</ul></details>
       ${f.changes ? `<details ${f.changes.criteria.length ? 'open' : ''}><summary><b>מה השתנה בדירוג מול הגרסה הקודמת (${f.changes.criteria.length})</b></summary><ul class="plain small">${f.changes.criteria.map(x => `<li><span class="pill mute">${esc(x.category)}</span> ${esc(x.criterion)}: ${esc(x.before)} → <b>${esc(x.after)}</b> <span class="pill mute">${esc(B[x.basis] || x.basis)}</span><div class="mute">${esc(x.why)}</div></li>`).join('')}
         ${f.changes.categories.map(x => `<li>${esc(x.label)}: ${esc(x.before)} → <b>${esc(x.after)}</b></li>`).join('')}</ul><div class="small mute">${esc(f.changes.note)}</div></details>` : '<div class="small mute">אין גרסה קודמת עם אותם קריטריונים להשוואה.</div>'}
+      ${(f.mandatory_violations || []).length ? `<div class="bad"><b>כלל מחייב הופר (נמדד):</b><ul class="plain small">${f.mandatory_violations.map(x => `<li>${esc(x.text)} — ${esc(x.evidence)}</li>`).join('')}</ul></div>` : ''}
+      ${loopNotes(pkg)}
       <details class="small"><summary>מגבלות הביקורת</summary><ul class="plain">${f.limits.map(x => `<li>${esc(x)}</li>`).join('')}</ul></details></div>`;
   }
   function panelEdit() {

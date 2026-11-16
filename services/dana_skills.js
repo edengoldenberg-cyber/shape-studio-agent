@@ -94,12 +94,20 @@ function cleanParams(p) {
   return out;
 }
 /** A rule as stored. Support comes from its AREA (what the worker can do), never from the skill's name or the text's confidence. */
-function makeRule(n, { text, domain, basis, source, executable, executable_note }) {
+// "בלי מוזיקה", "ללא אפקטים": a PROHIBITION. In an area the worker never adds anything to, it is not an unsupported
+// capability - it is a rule that is kept, and it is checked in every version against what was actually put into the file.
+const PROHIBITION = /^\s*(בלי|ללא|בלא|אין להוסיף|לא להוסיף|לא לשים|לא להשתמש|לא לשלב|אסור)(\s|$)/;
+const NEVER_ADDED = { music: 'מוזיקה', sound_effects: 'אפקטים קוליים', b_roll: 'צילומי השלמה', transitions: 'אפקט מעבר' };
+function makeRule(n, { text, domain, basis, source, executable, executable_note, prohibition }) {
   const d = DOMAINS[domain] ? domain : 'other';
-  const unsupported = DOMAINS[d].support === 'unsupported' || executable === false;
+  const neg = prohibition === true || PROHIBITION.test(String(text ?? ''));
+  const keptByCheck = neg && !!NEVER_ADDED[d];
+  const unsupported = !keptByCheck && (DOMAINS[d].support === 'unsupported' || executable === false);
   const b = BASES.includes(basis) ? basis : 'hypothesis';
-  return { id: `r${n}`, text: str(text, 400), domain: d, basis: b, source: source ?? { type: 'prompt' },
-    support: unsupported ? 'unsupported' : DOMAINS[d].support, support_note: executable === false && executable_note ? str(executable_note, 300) : DOMAINS[d].note,
+  return { id: `r${n}`, text: str(text, 400), domain: d, basis: b, source: source ?? { type: 'prompt' }, ...(neg ? { prohibition: true } : {}),
+    support: unsupported ? 'unsupported' : keptByCheck ? 'supported' : DOMAINS[d].support,
+    support_note: keptByCheck ? `איסור: נבדק בכל גרסה שלא נוספה ${NEVER_ADDED[d]} לקובץ הסופי`
+      : executable === false && executable_note ? str(executable_note, 300) : DOMAINS[d].note,
     // a hypothesis is not a rule until the owner adopts it; an unsupported rule is kept for the record and never applied
     active: !unsupported && !UNADOPTED.includes(b) };
 }
@@ -323,12 +331,12 @@ function ruleFromWorker(v, examples, r) {
   const n = v.rules.reduce((m, x) => Math.max(m, Number(x.id.slice(1)) || 0), 0) + 1;
   if (r.source === 'reference') {
     const ex = examples[(Number(r.reference) || 0) - 1], asp = ex?.aspects.find(a => a.aspect === r.aspect);
-    if (ex && asp) return makeRule(n, { text: r.text, domain: r.domain, basis: asp.basis, executable: r.executable, executable_note: r.note,
+    if (ex && asp) return makeRule(n, { text: r.text, domain: r.domain, basis: asp.basis, executable: r.executable, executable_note: r.note, prohibition: r.prohibition,
       source: { type: 'reference', ref: ex.id, title: ex.title, aspect: asp.aspect, observation: str(asp.observation, 500), times_s: (asp.example_times_s ?? []).slice(0, 6) } });
     return makeRule(n, { text: r.text, domain: r.domain, basis: 'dana_suggestion', executable: r.executable, executable_note: r.note, source: { type: 'dana', note: 'יוחס לרפרנס, אך לא נמצא ממצא תואם בניתוח השמור' } });
   }
   if (r.source === 'dana') return makeRule(n, { text: r.text, domain: r.domain, basis: 'dana_suggestion', executable: r.executable, executable_note: r.note, source: { type: 'dana' } });
-  const rule = makeRule(n, { text: r.text, domain: r.domain, basis: 'owner_instruction', executable: r.executable, executable_note: r.note, source: { type: 'prompt' } });
+  const rule = makeRule(n, { text: r.text, domain: r.domain, basis: 'owner_instruction', executable: r.executable, executable_note: r.note, prohibition: r.prohibition, source: { type: 'prompt' } });
   if (r.mandatory === true) rule.mandatory = true;
   return rule;
 }
@@ -547,7 +555,7 @@ function payload(k, v, { test = false, chosen_by = 'owner', why = null } = {}) {
                status: test ? 'draft_test' : 'owner_approved' },
     skill: { id: k.id, name: k.name, version: v.version, sha256: v.sha256, origin: v.origin, status: test ? 'draft_test' : v.status, chosen_by, why,
       purpose: v.purpose, suitable_for: v.suitable_for,
-      rules: act.map(r => ({ id: r.id, text: r.text, domain: r.domain, support: r.support, basis: r.basis })),
+      rules: act.map(r => ({ id: r.id, text: r.text, domain: r.domain, support: r.support, basis: r.basis, ...(r.mandatory ? { mandatory: true } : {}), ...(r.prohibition ? { prohibition: true } : {}) })),
       unsupported: v.rules.filter(r => r.support === 'unsupported').map(r => ({ id: r.id, text: r.text, domain: r.domain, why: r.support_note })),
       not_adopted: v.rules.filter(r => !r.active && r.support !== 'unsupported').map(r => ({ id: r.id, text: r.text, domain: r.domain })),
       criteria: v.criteria.map(c => ({ id: c.id, text: c.text, domain: c.domain })), references: v.sources.references.map(r => r.id) },

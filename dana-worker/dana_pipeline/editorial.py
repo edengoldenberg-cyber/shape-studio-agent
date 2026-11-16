@@ -25,6 +25,7 @@ import sys
 from pathlib import Path
 
 from . import judgement
+from . import effective
 from .core import PipelineError, run, tool, sha256_file
 from .judgement import skeleton, strip
 
@@ -204,6 +205,11 @@ def deterministic_findings(cfg, dec, res, tools):
                          f"לבחור לפי ההקשר את הכתיב הנכון; מותר לכתוב '{d['heard']}' במקום '{d['shown']}'",
                          f"מקור: '{d['shown']}', תמלול חוזר: '{d['heard']}'", "blocking", "spelling", card=d["card"], time_s=d.get("t0")))
     for row in res["comfort_rows"]:
+        if row.get("cannot"):                 # measured: no other division of these words helps - a decision, not an edit
+            out.append(F(f"comfort:{row['text']}", "check:A13", "card", f"הכרטיס '{row['text']}' {row['why']}",
+                         "להכרעתך: גודל כתובית קטן יותר, שתי שורות, או לקבל את הכרטיס כפי שהוא. " + row["cannot"],
+                         f"{row['why']}; {row['cannot']}", "advisory", "owner", card=row["i"], time_s=row["t0"]))
+            continue
         out.append(F(f"comfort:{row['text']}", "check:A13", "card", f"הכרטיס '{row['text']}' {row['why']}",
                      "לאחד עם כרטיס שכן או לחלק אחרת את המילים, בלי לשנות מילים, כך שיישאר על המסך לפחות 0.5 שניות",
                      row["why"], "advisory", "cards", card=row["i"], time_s=row["t0"]))
@@ -234,9 +240,11 @@ def model_review(cfg, job_dir, dec, res, previous, tag, work):
     """The tool-free model reviewer. Returns (review, usage)."""
     shots, cover_small = frames(cfg, res["final"], res["cover"], res["dur"], Path(work) / f"frames_{tag}")
     by_i = {r["i"]: r for r in res["motion_rows"]}
-    cards = [{"n": c["i"], "text": c["plain"], "highlight": c["highlight"],
-              "on_screen_s": [by_i[c["i"]]["t0"], by_i[c["i"]]["t1"]] if c["i"] in by_i else None} for c in res["cards"]]
-    asked = [{"id": i, "criterion": t} for i, t, who in ACCEPTANCE if who == "reviewer"]
+    eff = res.get("effective") or {}
+    cards = [dict({"n": c["i"], "text": c["plain"], "highlight": c["highlight"],
+                   "on_screen_s": [by_i[c["i"]]["t0"], by_i[c["i"]]["t1"]] if c["i"] in by_i else None},
+                  **({"not_drawn": "its words are shown by the full-frame animation scene at that moment"} if c.get("in_scene") else {})) for c in res["cards"]]
+    asked = [{"id": i, "criterion": t} for i, t, who in ACCEPTANCE if who == "reviewer" and i not in (eff.get("na") or {})]
     text = "\n\n".join([
         "<criteria>\n" + json.dumps(asked, ensure_ascii=False, indent=1) + "\n</criteria>",
         "<plan>\n" + json.dumps({"objective": dec["plan"]["objective"], "message": dec["segment"]["complete_thought"],
@@ -262,6 +270,12 @@ def model_review(cfg, job_dir, dec, res, previous, tag, work):
                                    ensure_ascii=False) + "\nEach zoom eases in at tl_t_s and holds until hold_until_s, then cuts back to the wide "
          "frame. You see stills only; judge framing in the stills, not the feel of the motion.\n</zooms>") if res.get("zooms") else "",
         skill_block(res.get("skill")),
+        ("<rules_in_force>\n" + "\n".join(f"- {x}" for x in eff["lines"]) + "\nThese are decisions already made for this job by the approved "
+         "style and the target. They are facts about the job, not preferences: a finding that asks for the opposite is wrong.\n</rules_in_force>") if eff.get("lines") else "",
+        ("<animation_scene>\nA card marked \"not_drawn\" is deliberately not drawn: for those seconds the picture is a full-frame animation of the "
+         "same words, and drawing the card as well would show them twice. The words are on screen in the scene. A still taken during a scene "
+         "shows one moment of an animation that builds the sentence up; do not report words that have not appeared YET as missing.\n</animation_scene>")
+        if any(c.get("in_scene") for c in res["cards"]) else "",
         f"Still frames follow, in order, taken at {', '.join(str(s['t']) + ' s' for s in shots)}; the last image is the cover.",
     ])
     content = [{"type": "text", "text": text}] + [{"type": "image", "path": s["path"]} for s in shots] + [{"type": "image", "path": cover_small}]
@@ -274,10 +288,14 @@ def model_review(cfg, job_dir, dec, res, previous, tag, work):
         schema["required"] += ["skill_rules", "skill_criteria"]
     data, usage = judgement.claude_json(cfg, job_dir, REVIEW_SYSTEM, content, schema, tag)
     usage["role"] = "reviewer"
-    findings, dropped = [], []
+    findings, dropped, not_applicable = [], [], []
     for n, f in enumerate(data.get("findings") or []):
         if not all(isinstance(f.get(k), str) and f.get(k).strip() for k in ("problem", "correction", "evidence")):
             continue                                   # a finding without evidence is dropped
+        why = effective.not_applicable(f, eff)
+        if why:                                        # asks for something a rule in force excludes: recorded, never sent to the editor
+            not_applicable.append({"problem": f["problem"][:200], "why": why})
+            continue
         if MEASURED.search(f["problem"] + " " + f["evidence"]):
             dropped.append(f["problem"][:200])         # already measured by a mandatory check; not the reviewer's to restate
             continue
@@ -291,7 +309,7 @@ def model_review(cfg, job_dir, dec, res, previous, tag, work):
             "skill_rules": [x for x in data.get("skill_rules") or [] if isinstance(x, dict)],
             "skill_criteria": [x for x in data.get("skill_criteria") or [] if isinstance(x, dict)],
             "reviewed_sha256": sha256_file(res["final"]),          # the exact file the reviewer's stills were taken from
-            "dropped_as_already_measured": dropped}, usage
+            "dropped_as_already_measured": dropped, "dropped_not_applicable": not_applicable}, usage
 
 
 def skill_block(skill):
@@ -317,8 +335,11 @@ def criteria_table(dec, res, det, tools, review):
     }
     rows = []
     rv = {c["id"]: c for c in (review or {}).get("criteria") or []}
+    na = (res.get("effective") or {}).get("na") or {}
     for cid, text, who in ACCEPTANCE:
-        if cid in table:
+        if cid in na:                              # a rule in force makes the criterion meaningless for this job: neither met nor failed
+            rows.append({"id": cid, "criterion": text, "decided_by": "not_applicable", "met": None, "note": na[cid]})
+        elif cid in table:
             w, met, note = table[cid]
             rows.append({"id": cid, "criterion": text, "decided_by": w, "met": met, "note": note})
         else:

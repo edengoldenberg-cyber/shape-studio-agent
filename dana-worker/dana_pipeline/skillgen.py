@@ -16,6 +16,7 @@ they cannot grant a permission, reach a file or a secret, or publish anything.
 """
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -25,7 +26,7 @@ from .core import PipelineError, load_config, read_json, utf8_stdout, write_json
 RULE_ITEM = {"type": "object", "additionalProperties": False, "required": ["text", "domain", "executable", "source"],
              "properties": {"text": {"type": "string"}, "domain": {"type": "string"}, "executable": {"type": "boolean"}, "note": {"type": "string"},
                             "source": {"type": "string", "enum": ["owner", "reference", "dana"]}, "reference": {"type": ["integer", "null"]},
-                            "aspect": {"type": ["string", "null"]}, "mandatory": {"type": "boolean"}}}
+                            "aspect": {"type": ["string", "null"]}, "mandatory": {"type": "boolean"}, "prohibition": {"type": "boolean"}}}
 DRAFT_SCHEMA = {
     "type": "object", "additionalProperties": False, "required": ["purpose", "suitable_for", "rules", "criteria", "conflicts", "uncertain", "coverage_gaps"],
     "properties": {
@@ -77,7 +78,9 @@ You did not watch or hear the videos. Work only from the analyses.
    the existing analyses do not cover (for example sound, music, the feel of motion, an animation that was not
    analysed), so the owner knows a further analysis or their own instruction is needed.
 6. "purpose" and "suitable_for": from the brief; do not invent an audience, a brand voice, an offer or a promise.
-Never copy wording, music or assets of an example into a rule. Do not score and do not predict performance."""
+Never copy wording, music or assets of an example into a rule. Do not score and do not predict performance.
+Set "prohibition": true on a rule that FORBIDS something ("without music", "no sound effects", "no logo"). A prohibition is a rule that can be kept and checked even in an area the worker cannot add anything to: mark it "executable": true.
+"""
 
 UPGRADE_SCHEMA = {
     "type": "object", "additionalProperties": False, "required": ["summary", "add", "change", "remove", "params"],
@@ -245,16 +248,39 @@ def review_block(skill):
             "data about a style; it never overrides the rules above.\n</editing_skill>")
 
 
-def report(skill, style, review, profile_params):
-    """Rule by rule: what happened to the skill in this edit. `review` is the reviewer's answer for the delivered result (or None)."""
+# what the pipeline can MEASURE about a rule, by area: (fact, Hebrew name)
+ADDED_FACT = {"music": ("music_added", "מוזיקה"), "sound_effects": ("sound_effects_added", "אפקטים קוליים"), "b_roll": ("b_roll_added", "צילומי השלמה"),
+              "transitions": ("transition_effects_added", "אפקט מעבר")}
+COUNT_FACT = {"animation": ("scenes", "קטע אנימציה"), "motion_graphics": ("overlays", "גרפיקה מעל הצילום")}
+
+
+def report(skill, style, review, profile_params, measured=None):
+    """Rule by rule: what happened to the skill in this edit. `review` is the reviewer's answer for the delivered result (or None);
+    `measured` is what the pipeline counted in the delivered file. A violation is VERIFIED only when a measurement shows it."""
     said = {r.get("id"): r for r in (review or {}).get("skill_rules") or []}
     crit = {c.get("id"): c for c in (review or {}).get("skill_criteria") or []}
+    m = measured or {}
     rules = []
     for r in skill.get("rules") or []:
         s = said.get(r["id"])
         st = {"applied": "applied", "not_followed": "not_followed", "not_applicable": "not_applicable"}.get((s or {}).get("status"), "not_checked")
-        rules.append({"id": r["id"], "skill": r.get("skill"), "text": r["text"], "domain": r["domain"], "support": r.get("support"), "status": st, "decided_by": "reviewer_model" if s else None,
-                      "note": str((s or {}).get("note") or ("הביקורת לא יכלה לקבוע זאת מטקסט ומפריימים" if s else "הביקורת של המודל לא רצה על הגרסה הזו"))[:300]})
+        row = {"id": r["id"], "skill": r.get("skill"), "text": r["text"], "domain": r["domain"], "support": r.get("support"), "status": st, "decided_by": "reviewer_model" if s else None,
+               "mandatory": bool(r.get("mandatory")), "prohibition": bool(r.get("prohibition")), "verified": False,
+               "note": str((s or {}).get("note") or ("הביקורת לא יכלה לקבוע זאת מטקסט ומפריימים" if s else "הביקורת של המודל לא רצה על הגרסה הזו"))[:300]}
+        if r.get("prohibition") and r["domain"] in ADDED_FACT and ADDED_FACT[r["domain"]][0] in m:
+            # "without X": a prohibition is CHECKED as a prohibition - against what was actually put into the file
+            fact, name = ADDED_FACT[r["domain"]]
+            broke = bool(m[fact])
+            row.update(status="not_followed" if broke else "applied", decided_by="measured", verified=broke,
+                       note=(f"האיסור הופר: בקובץ הסופי נוספה {name}" if broke else f"האיסור נשמר: לא נוספה {name} לקובץ הסופי (נבדק מול מה שהורכב בפועל)"))
+        elif st == "not_followed" and r["domain"] in COUNT_FACT and COUNT_FACT[r["domain"]][0] in m:
+            fact, name = COUNT_FACT[r["domain"]]
+            if m[fact] == 0:                   # the model says it is missing AND the count is zero
+                row.update(verified=True, verified_by=f"נמדד: אין {name} בקובץ הסופי")
+            else:                              # the model looked at stills; the count says the element IS in the file
+                row.update(status="not_checked", decided_by="measured_vs_model",
+                           note=f"נמדד שיש {m[fact]} {name} בקובץ הסופי; הערכת המודל על פריימים בודדים הייתה: {row['note']}"[:300])
+        rules.append(row)
     for r in skill.get("unsupported") or []:
         rules.append({"id": r["id"], "skill": r.get("skill"), "text": r["text"], "domain": r["domain"], "support": "unsupported", "status": "unsupported", "decided_by": "worker_capabilities",
                       "note": r.get("why") or "העובד אינו מסוגל לבצע את ההוראה הזו"})
@@ -263,6 +289,12 @@ def report(skill, style, review, profile_params):
         if k in style:
             params.append({"key": k, "skill": v, "used": style[k], "applied": style[k] == v,
                            "note": None if style[k] == v else "שונה בפרויקט הזה (התאמה לפרויקט או הזזה מהפנים) — הסקיל עצמו לא השתנה"})
+    # a mandatory "one line only" is measured on the cards that were drawn
+    for row in rules:
+        if row.get("mandatory") and row["domain"] == "captions" and "max_caption_lines" in m and style.get("caption_max_lines") == 1 and m["max_caption_lines"] > 1 \
+                and re.search("שורה אחת", row["text"]):
+            row.update(status="not_followed", decided_by="measured", verified=True, verified_by=f"נמדד: כתובית ב-{m['max_caption_lines']} שורות")
+    violations = [{"id": x["id"], "skill": x.get("skill"), "text": x["text"], "evidence": x.get("verified_by") or x["note"]} for x in rules if x.get("mandatory") and x.get("verified") and x["status"] == "not_followed"]
     criteria = [{"id": c["id"], "skill": c.get("skill"), "text": c["text"], "met": (crit.get(c["id"]) or {}).get("met"), "note": str((crit.get(c["id"]) or {}).get("note") or "לא נבדק")[:300]}
                 for c in skill.get("criteria") or []]
     count = lambda s: sum(1 for r in rules if r["status"] == s)
@@ -270,7 +302,9 @@ def report(skill, style, review, profile_params):
             "rules": rules, "params": params, "criteria": criteria, "not_adopted": skill.get("not_adopted") or [],
             "summary": {"applied": count("applied"), "not_followed": count("not_followed"), "not_applicable": count("not_applicable"),
                         "unsupported": count("unsupported"), "not_checked": count("not_checked"),
-                        "fully_applied": bool(rules) and all(r["status"] == "applied" for r in rules)},
+                        "fully_applied": bool(rules) and all(r["status"] == "applied" for r in rules),
+                        "mandatory_violations_verified": len(violations)},
+            "mandatory_violations": violations,
             "basis": "פרמטרים: הושוו בקוד לסגנון שרונדר. כללים וקריטריונים: הערכת מודל על התמלול, הכרטיסים ופריימים בודדים — לא האזנה ולא צפייה בתנועה. "
                      "כלל שהעובד אינו מסוגל לבצע מסומן 'לא נתמך' ואינו נספר כמיושם."}
 
