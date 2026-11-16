@@ -116,3 +116,46 @@ at the approved time.
 
 **H. Verify and measure** — the page shows media id and permalink; open the permalink; the caption
 matches; after 48 hours and 7 days the metrics appear with source `instagram`.
+
+---
+
+## Update 2026-11-16 — plan for the next deployment (prepared for review, NOT executed)
+
+**State today.** Production runs deployment `7831b280-fa37-4399-9fe2-361c5f828a4a` (2026-11-15 20:25), commit `7166b2b`
+per the checkpoint (the CLI does not show the commit). `DANA_PUBLISHING_ENABLED`, `DANA_PUBLISHER_MODE`,
+`DANA_NOTIFY_REAL` and `DANA_NOTIFY_PHONE` are not set: publishing off, notifications mocked. No worker is running
+against production.
+
+**What would be deployed.** The head of `dana-phase-1a` on origin at the time of approval. Server files that differ
+from `7166b2b`: `public/dana-studio.html`, `public/dana-studio.js`, `routes/dana_studio_routes.js`,
+`services/dana_studio.js`, `services/dana_skills.js` (new), `services/dana_media.js` (new),
+`services/dana_references.js`, `services/dana_notify.js`, `utils/dana_brand.js`. No Barak / Tomer source file.
+`dana-worker/`, `data/`, `.env` and `.claude/` are not uploaded (`.railwayignore`). A `git push` does not deploy:
+the pushes of 2026-11-16 created no deployment.
+
+**Before deploying.**
+1. Evidence on the commit: full Jest, the standalone harnesses and the four panel browser checks (results of
+   2026-11-16 are in `docs/DANA_ACCEPTANCE_LIST.md`, section ט).
+2. Free space on the volume (1.3 GB of 4.9 GB used on 2026-11-16): compilations store several source files per project.
+3. A time with no conversation in progress: the deployment restarts the shared Barak / Tomer service once.
+4. The production worker must be stopped before the deploy and started after it with the NEW pipeline (1.4.0); the
+   last production worker ran 1.0.0. A job queued in production in between waits; it is not lost.
+
+**Deploy.** `railway status` (confirm project and service) → `railway up --detach` from the repository root → no
+variable is changed.
+
+**Verify.** `/health` 200; the new deployment id in `railway status`; the Dana, Barak and Tomer APIs answer 401
+without a session; with a session `GET /api/dana/studio/status` shows `publishingEnabled: false` and
+`notifications: "mock"`; the Barak and Tomer panels load; no send in the startup log; projects that existed before
+the deploy still open with their versions.
+
+**Rollback.**
+1. Without a deploy: stop the worker (`STOP` file in `C:/Users/owner/dana-work`); deleting `DANA_WORKER_TOKEN` closes
+   the worker API.
+2. Code: `git checkout 7166b2b && railway up --detach`, then return to the branch. Or redeploy `7831b280` from the
+   Railway dashboard. Data under `/data/dana/` stays in place.
+3. Data written by the new code (skills, compilation projects, extra source files) is not read by the old code and is
+   not deleted by a rollback. Not tested: opening, with the old code, a project that the new code changed.
+
+**Decisions the owner must make first.** Which server the permanent worker connects to; whether the editing
+computer may sleep when idle (a job that arrives while it sleeps waits until it wakes); approval of the deploy itself.
