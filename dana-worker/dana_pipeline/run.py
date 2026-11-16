@@ -301,7 +301,7 @@ def edit(j, dec, words, sp, sha_before, check, cache):
 
     with j.stage("render_cards"):
         joined, layouts, two_lined = {}, {}, set()
-        for split_round in range(4):
+        for split_round in range(8):
             try:
                 tspans, _ = captions.align_cards(dec["cards"], voice_words, groups)
             except PipelineError:
@@ -314,7 +314,13 @@ def edit(j, dec, words, sp, sha_before, check, cache):
                 fit_zone = read_json(cfg["paths"]["safe_zone"])
                 line_px = captions.max_line_px(fit_zone, st["width"])
                 one_line = st["caption_max_lines"] < 2
-                fits = lambda t: len(t) <= cfg["cards"]["merge_max_chars"] and (not one_line or captions.text_px(cfg, st, t) <= line_px)
+                def fits(t):                    # one line: the line fits; two lines: each of the two balanced lines fits
+                    if len(t) > cfg["cards"]["merge_max_chars"]:
+                        return False
+                    if captions.text_px(cfg, st, t) <= line_px:
+                        return True
+                    tl = None if one_line else captions.two_lines(t)
+                    return bool(tl) and all(captions.text_px(cfg, st, ln) <= line_px for ln in tl.split("\n"))
                 j.caption_fit = {"line_px": line_px, "caption_size": st["caption_size"], "max_lines": st["caption_max_lines"], "fits": fits}
                 max_words = int(((getattr(j, "profile", None) or {}).get("params") or {}).get("max_words_per_line", 3)) * int(st["caption_max_lines"])
                 new, fit_stats = captions.regroup(dec["cards"], tspans, fits, cfg["cards"]["min_on_screen_s"], cfg["cards"]["max_chars_per_s"],
@@ -341,13 +347,13 @@ def edit(j, dec, words, sp, sha_before, check, cache):
             # Routine fix 1: a card that is too wide on one line is laid out on two (same words, same order).
             relaid = [i for i in too_wide if st["caption_max_lines"] >= 2 and dec["cards"][i - 1]["text"] not in layouts
                       and captions.two_lines(dec["cards"][i - 1]["text"])]
-            if relaid and split_round < 3:
+            if relaid and split_round < 7:
                 for i in relaid:
                     layouts[dec["cards"][i - 1]["text"]] = captions.two_lines(dec["cards"][i - 1]["text"])
                 two_lined.update(relaid)
                 continue
             splittable = [i for i in too_wide if len(dec["cards"][i - 1]["text"].split()) > 1]
-            if not splittable or split_round == 3:
+            if not splittable or split_round == 7:
                 break
             # Routine fix: a card that does not fit is split in two. Same words, same order.
             new = []
@@ -1131,7 +1137,7 @@ def pipeline(j):
                   "basis": "הבדיקות האוטומטיות נמדדו על הקובץ הסופי. הערכת המודל נעשתה על תמלול האודיו של אותו קובץ ועל פריימים בודדים ממנו — לא האזנה ולא צפייה בתנועה."}
     measured = {"overlays": sum(1 for g in res.get("graphics") or [] if g.get("layer") != "replaces_picture"),
                 "scenes": sum(1 for g in res.get("graphics") or [] if g.get("layer") == "replaces_picture"),
-                "music_added": False, "sound_effects_added": False, "b_roll_added": False, "transition_effects_added": False,       # the worker has no stage that adds them
+                "music_added": bool(((res.get("mix") or {}).get("params") or {}).get("music")), "sound_effects_added": False, "b_roll_added": False, "transition_effects_added": False,       # the worker has no stage that adds them
                 "max_caption_lines": max((len(c.get("lines") or [1]) for c in cards), default=0), "style_overrides": sorted(j.style_overrides)}
     skill_report = skillgen.report(skill, st, reviews.get(final_cycle), (options.get("profile") or {}).get("params"), measured) if skill else None
     # ── a story is delivered as its cards too: one file per part, cut from the reviewed file ──

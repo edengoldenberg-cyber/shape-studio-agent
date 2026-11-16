@@ -175,6 +175,44 @@ describe('worker offline, recovery and restart', () => {
     expect((await lease()).body.job.attempt).toBe(2);
   });
 
+  // What happened on 2026-11-16: the machine slept in the middle of a job, the lease expired, the attempt went on and finished.
+  test('an attempt that lost its lease cannot write over the attempt that replaced it', async () => {
+    const up = await upload(); const id = up.body.project.id, src = up.body.project.source.sha256;
+    const a1 = (await lease()).body;
+    studio.state().jobs[a1.job.id].lease.expiresAt = new Date(Date.now() - 1000).toISOString();     // the machine slept: no heartbeat
+    const a2 = (await lease()).body;                                                              // the queue recovered by itself
+    expect(a2.job).toMatchObject({ id: a1.job.id, attempt: 2, version: a1.job.version }); expect(a2.leaseToken).not.toBe(a1.leaseToken);
+    expect(Object.values(studio.state().jobs).filter(j => j.projectId === id)).toHaveLength(1);    // the same job, not a second one
+    // attempt 1 wakes up and delivers: every write is refused and nothing of it is stored
+    const stale = crypto.randomBytes(3000);
+    const put = (l, name, buf) => W(request(app).put(`/api/dana/worker/jobs/${l.job.id}/artifacts/${name}`)).set('X-Lease-Token', l.leaseToken)
+      .set('X-Content-SHA256', sha(buf)).set('Content-Type', 'application/octet-stream').send(buf);
+    expect((await put(a1, 'final.mp4', stale)).status).toBe(409);
+    expect((await W(request(app).post(`/api/dana/worker/jobs/${a1.job.id}/progress`)).set('X-Lease-Token', a1.leaseToken).send({ stage: 'upload' })).status).toBe(409);
+    expect((await W(request(app).post(`/api/dana/worker/jobs/${a1.job.id}/complete`)).set('X-Lease-Token', a1.leaseToken).send({ status: 'success' })).status).toBe(409);
+    expect(studio.state().jobs[a1.job.id]).toMatchObject({ status: 'leased', attempts: 2, uploaded: {} });
+    // attempt 2 delivers; a late write of attempt 1 afterwards changes nothing
+    expect((await finish(a2, src)).status).toBe(200);
+    const video = () => request(app).get(`/api/dana/studio/projects/${id}/versions/1/video`).buffer(true).parse((res, cb) => { const c = []; res.on('data', d => c.push(d)); res.on('end', () => cb(null, Buffer.concat(c))); });
+    const delivered = sha((await video()).body);
+    expect((await put(a1, 'final.mp4', stale)).status).toBe(409);
+    expect(sha((await video()).body)).toBe(delivered); expect(delivered).not.toBe(sha(stale));
+    const p = await get(id);
+    expect(p.status).toBe('ready_for_review'); expect(p.versions.map(v => v.n)).toEqual([1]);
+  });
+
+  test('power loss: the server comes back with a lease nobody holds → the job returns to the queue once, with its attempt counted', async () => {
+    const up = await upload(); const l = (await lease()).body;
+    studio.state().jobs[l.job.id].lease.expiresAt = new Date(Date.now() - 1000).toISOString(); studio.save?.();
+    fs.writeFileSync(path.join(studio.dir(), 'studio.json'), JSON.stringify(studio.state()));       // what was on disk when the power went
+    boot({ keepData: true });
+    expect(studio.state().jobs[l.job.id]).toMatchObject({ status: 'queued', attempts: 1, lease: null });
+    expect((await request(app).get('/api/dana/studio/projects')).body.worker).toMatchObject({ queued: 1, running: 0 });   // nothing is shown as running without a worker
+    expect((await get(up.body.project.id)).job.note).toMatch(/נקטעה/);
+    const again = (await lease()).body;
+    expect(again.job).toMatchObject({ id: l.job.id, attempt: 2 }); expect((await lease()).status).toBe(204);   // one job, taken once
+  });
+
   test('server restart during a job: state survives, the same worker finishes, nothing is duplicated', async () => {
     const up = await upload(); const l = (await lease()).body;
     boot({ keepData: true });                                              // process restart, same disk

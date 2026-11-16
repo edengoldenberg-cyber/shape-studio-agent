@@ -151,6 +151,21 @@ STAGE_HE = {"join": "מאחד את קובצי המקור לקובץ עבודה �
             "composite": "מרכיב כתוביות", "verify": "בודק סנכרון מול האודיו הסופי", "checks": "מריץ בדיקות", "cover": "מכין קאבר"}
 
 
+def keep_awake(on):
+    """While a job is being edited, ask Windows not to put the machine to sleep for being idle (a render looks idle to it:
+    no keyboard, no mouse). Nothing in the power settings is changed; the request ends with the job, and the screen may
+    still turn off. Returns True when the request was accepted. On 2026-11-16 an idle sleep of 851 s in the middle of a
+    job made the server release its lease, and the finished result of that attempt was refused."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+        return bool(ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if on else 0)))
+    except Exception:                   # never a reason to fail a job
+        return False
+
+
 def handle(api, cfg, cfg_path, leased):
     job, lease = leased["job"], leased["leaseToken"]
     jid = job["id"]
@@ -176,9 +191,16 @@ def handle(api, cfg, cfg_path, leased):
     stop = threading.Event()
 
     def beat():
+        last = time.time()
         while not stop.wait(20):
-            api.call("POST", "/api/dana/worker/heartbeat", {"workerId": api.worker_id, "state": "busy", "jobId": jid,
-                                                            "leaseToken": lease, "pipelineVersion": PIPELINE_VERSION})
+            gap, last = time.time() - last, time.time()
+            if gap > 90:                # the heartbeat itself stopped: the machine slept (or was frozen) in the middle of the job
+                log(f"job {jid}: no heartbeat for {gap:.0f}s — the machine slept or froze; the server may have released the lease")
+            try:
+                api.call("POST", "/api/dana/worker/heartbeat", {"workerId": api.worker_id, "state": "busy", "jobId": jid,
+                                                                "leaseToken": lease, "pipelineVersion": PIPELINE_VERSION})
+            except (urllib.error.URLError, OSError) as e:      # one missed beat must not end the heartbeat for the rest of the job
+                log(f"job {jid}: heartbeat not delivered ({e}); trying again in 20s")
     threading.Thread(target=beat, daemon=True).start()
 
     def stage(name):
@@ -351,6 +373,26 @@ def handle_reference(api, cfg, cfg_path, leased):
         src.unlink(missing_ok=True)                 # the reference file itself is not kept on the editing machine
 
 
+def hello(api, cfg, once=False, wait_s=30, sleep=time.sleep):
+    """Announce the worker. After a power loss the machine can be up before the network or the server is: an unreachable
+    server is waited for (the STOP file still ends the wait), it does not end the worker. A server that ANSWERS and refuses
+    (wrong token, wrong version) is returned as is and does end it. Returns (code, body), or (None, "stopped" | "unreachable")."""
+    stop_file, tries = Path(cfg["paths"]["work_root"]) / "STOP", 0
+    while True:
+        try:
+            return api.call("POST", "/api/dana/worker/hello", {"workerId": api.worker_id, "pipelineVersion": PIPELINE_VERSION, "capabilities": capabilities(cfg)})
+        except (urllib.error.URLError, OSError) as e:
+            tries += 1
+            if tries == 1 or tries % 10 == 0:
+                log(f"server unreachable at start ({e}); trying again every {wait_s}s")
+            if once:
+                return None, "unreachable"
+            if stop_file.exists():
+                log(f"STOP file present ({stop_file}) — worker exits")
+                return None, "stopped"
+            sleep(wait_s)
+
+
 def main():
     utf8_stdout()
     ap = argparse.ArgumentParser()
@@ -370,7 +412,9 @@ def main():
         log("STOP file present — worker does not start (delete the file to allow it)")
         return 0
     api = Api(cfg["server_url"], token, cfg.get("worker_id") or "worker")
-    code, body = api.call("POST", "/api/dana/worker/hello", {"workerId": api.worker_id, "pipelineVersion": PIPELINE_VERSION, "capabilities": capabilities(cfg)})
+    code, body = hello(api, cfg, a.once)
+    if code is None:
+        return 0 if body == "stopped" else 1
     if code != 200:
         log(f"server refused the worker: HTTP {code} {body}")
         return 1
@@ -401,7 +445,11 @@ def main():
             code, body = api.call("POST", "/api/dana/worker/lease", {"workerId": api.worker_id, "pipelineVersion": PIPELINE_VERSION})
             if code == 200 and body and body.get("job"):
                 log(f"job {body['job']['id']} leased (attempt {body['job'].get('attempt')})")
-                handle(api, cfg, a.config, body)
+                keep_awake(True)
+                try:
+                    handle(api, cfg, a.config, body)
+                finally:
+                    keep_awake(False)
                 continue
             if code not in (200, 204):
                 log(f"lease: HTTP {code} {body}")

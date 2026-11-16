@@ -58,7 +58,10 @@ const DOMAINS = {
   color:           { label: 'צבע',                 support: 'partial',     note: 'תיקון עדין לפי מדידה (חשיפה, קונטרסט, איזון לבן, רוויה); אין מראה / גרייד' },
   sound:           { label: 'סאונד',               support: 'partial',     note: 'ניקוי רעש עדין ונרמול עוצמה בלבד' },
   cover:           { label: 'קאבר',                support: 'partial',     note: 'ציטוט מדויק על פריים מהסרטון' },
-  music:           { label: 'מוזיקה',              support: 'unsupported', note: 'העובד לא מוסיף מוזיקה' },
+  // since compilations and the mix: music is what the OWNER uploaded; Dana mixes it, she does not choose or add a track herself
+  music:           { label: 'מוזיקה',              support: 'partial',     note: 'רק מוזיקה שהעלית: נקודת התחלה, עוצמה, כניסה ויציאה והנמכה מתחת לדיבור. דנה לא בוחרת ולא מוסיפה רצועה מעצמה' },
+  montage:         { label: 'לקט',                 support: 'partial',     note: 'לקט מכמה קבצים: אורך קטעים, סדר, גיוון וחיתוך לפי פעימות. הבחירה לפי מדידת התמונה ופריים אחד לכל רגע — בלי זיהוי תרגילים' },
+  narration:       { label: 'קריינות',             support: 'partial',     note: 'קריינות שהעלית נכנסת למיקס. אין כתוביות לקריינות, ויצירת קריינות מטקסט אינה פעילה' },
   sound_effects:   { label: 'אפקטים קוליים',       support: 'unsupported', note: 'העובד לא מוסיף אפקטים קוליים' },
   broll:           { label: 'צילומי השלמה',        support: 'unsupported', note: 'אין שילוב צילומי השלמה' },
   other:           { label: 'אחר',                 support: 'partial',     note: 'הוראה כללית: נמסרת לדנה כהנחיה, בלי בדיקה ייעודית' },
@@ -97,7 +100,7 @@ function cleanParams(p) {
 // "בלי מוזיקה", "ללא אפקטים": a PROHIBITION. In an area the worker never adds anything to, it is not an unsupported
 // capability - it is a rule that is kept, and it is checked in every version against what was actually put into the file.
 const PROHIBITION = /^\s*(בלי|ללא|בלא|אין להוסיף|לא להוסיף|לא לשים|לא להשתמש|לא לשלב|אסור)(\s|$)/;
-const NEVER_ADDED = { music: 'מוזיקה', sound_effects: 'אפקטים קוליים', b_roll: 'צילומי השלמה', transitions: 'אפקט מעבר' };
+const NEVER_ADDED = { music: 'מוזיקה', sound_effects: 'אפקטים קוליים', broll: 'צילומי השלמה', transitions: 'אפקט מעבר' };
 function makeRule(n, { text, domain, basis, source, executable, executable_note, prohibition }) {
   const d = DOMAINS[domain] ? domain : 'other';
   const neg = prohibition === true || PROHIBITION.test(String(text ?? ''));
@@ -167,7 +170,7 @@ function view(k) {
 const list = () => settle(read()).skills.map(view);
 const get = id => view(find(settle(read()), id));
 // what a skill is ABOUT, from the areas of its active rules (shown to the owner when combining skills)
-const KIND_OF = { structure: 'תוכן ומבנה', opening: 'תוכן ומבנה', pace: 'תוכן ומבנה', pauses: 'תוכן ומבנה', cuts: 'תוכן ומבנה', captions: 'סגנון וכתוביות', emphasis: 'סגנון וכתוביות',
+const KIND_OF = { montage: 'לקט, מוזיקה וקריינות', music: 'לקט, מוזיקה וקריינות', narration: 'לקט, מוזיקה וקריינות', structure: 'תוכן ומבנה', opening: 'תוכן ומבנה', pace: 'תוכן ומבנה', pauses: 'תוכן ומבנה', cuts: 'תוכן ומבנה', captions: 'סגנון וכתוביות', emphasis: 'סגנון וכתוביות',
   zooms: 'זומים', motion_graphics: 'מואושן גרפיק', animation: 'קטעי אנימציה', color: 'צבע וסאונד', sound: 'צבע וסאונד', cover: 'קאבר' };
 function settle(s) {
   let changed = false;

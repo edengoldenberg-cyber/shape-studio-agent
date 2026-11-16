@@ -125,7 +125,8 @@ describe('"צור סקיל מהוראות"', () => {
     expect(l.skill).toMatchObject({ id, name: 'שלי', mode: 'draft', reference_rules: [{ id: 'r1', domain: 'captions' }] });
     expect(l.skill.references[0]).toMatchObject({ title: 'רפרנס א', aspects: expect.any(Array) });      // the SAVED analysis is reused; nothing is analysed again
     expect(l.skill.prompt).toMatch(/מוזיקה קצבית/);
-    expect(l.skill.domains.music.support).toBe('unsupported');
+    expect(l.skill.domains.sound_effects.support).toBe('unsupported');     // music became 'partial' when uploaded music and the mix were added
+    expect(l.skill.domains.music.support).toBe('partial');
     expect((await W(request(app).post(`/api/dana/worker/skills/${id}/draft`)).set('X-Lease-Token', 'wrong').send({ status: 'drafted', draft: DRAFT })).status).toBe(409);
     expect((await W(request(app).post(`/api/dana/worker/skills/${id}/draft`)).set('X-Lease-Token', l.leaseToken).send({ status: 'drafted', draft: DRAFT })).body.status).toBe('draft');
     const d = (await request(app).get(`${S}/skills/${id}`)).body.skill.draft;

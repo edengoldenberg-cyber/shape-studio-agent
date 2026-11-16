@@ -118,18 +118,24 @@ async function main() {
     check('3.3', 'the new music settings and the narration are in the mix; the music is measured against the speech', m2.params?.music?.start_s === 30 && m2.params?.music?.volume_db === -20 && !!m2.params?.narration
       && typeof m2.measured?.speech_over_music_db === 'number' && !!c2('mix_speech_over_music'), { measured: m2.measured, check: c2('mix_speech_over_music')?.summary });
     check('3.4', 'the narration is recorded as a script written for the video, not as a quotation', m2.narration_script?.is_script === true, m2.narration_script);
+    check('3.6', 'the narration gets captions: timed from a transcription of the narration, inside the safe zone, marked as narration and as NOT verified', (P2.cards ?? []).length >= 3 && P2.cards.every(c => c.of === 'narration')
+      && c2('safe_zone')?.status === 'pass' && (P2.issues ?? []).some(i => i.code === 'narration_captions_unverified') && (P2.final_review?.not_checked ?? []).some(x => /תואמות/.test(x.criterion)),
+      { cards: (P2.cards ?? []).length, first: (P2.cards ?? []).slice(0, 4).map(c => c.text), width: c2('caption_width')?.status, zone: c2('safe_zone')?.summary });
     check('3.5', 'version 1 is kept on disk, nothing is approved, and version 2 has its own final review', fs.existsSync(path.join(vdir(id, 1), 'final.mp4')) && r2.p.status !== 'approved' && P2.final_review?.file_sha256 !== f1.file_sha256);
 
     // ── 4: replace ONE part ──
     log('== 4: replace one part ==');
-    const target = P2.plan.segments[1], other = target.source_id === 'src2' ? 'src1' : 'src2';
+    // the part that is replaced must not be the one carrying the "must be included" mark (src3 5-8 s): replacing THAT one is a
+    // different case, and the pipeline rightly reports it as a failed mark (seen in the run of 2026-11-16)
+    const holdsMust = s => s.source_id === 'src3' && s.file_in_s < 8 && s.file_out_s > 5;
+    const target = P2.plan.segments.find((s, i) => i > 0 && !holdsMust(s)) ?? P2.plan.segments[1], other = target.source_id === 'src2' ? 'src1' : 'src2';
     const rs = await send(`/projects/${id}/revise`, { by: ACTOR, segment_edits: [{ n: target.n, action: 'replace', source_id: other, from_s: 10, to_s: 13 }] });
     check('4.1', 'replacing one part queues a new version', rs.status === 200 && rs.body.project.currentVersion === 3, rs.body.error);
     const r3 = await wait(id, 1200, 'compilation v3 (one part replaced)');
     const P3 = pkgOf(id, 3); save('v3_package.json', P3); keepCopy(id, 3, 'compilation_v3_one_part_replaced.mp4');
-    const a2 = parts(P2), a3 = parts(P3);
-    check('4.2', 'only that part changed: it now comes from the file and time that were asked for; every other part is identical', a3.length === a2.length && a3.every((x, i) => i === 1 ? x.startsWith(`${other}:10`) : x === a2[i])
-      && P3.plan.segments[1].replaced_by_owner === true, { before: a2, after: a3, seconds: r3.seconds });
+    const a2 = parts(P2), a3 = parts(P3), ti = P2.plan.segments.indexOf(target);      // the position of the part that was replaced
+    check('4.2', 'only that part changed: it now comes from the file and time that were asked for; every other part is identical', a3.length === a2.length && a3.every((x, i) => i === ti ? x.startsWith(`${other}:10`) : x === a2[i])
+      && P3.plan.segments[ti].replaced_by_owner === true, { before: a2, after: a3, seconds: r3.seconds });
     check('4.3', 'the mix of version 2 is carried over unchanged', JSON.stringify(P3.mix?.params) === JSON.stringify(P2.mix?.params));
     check('5.2', 'every version has its own final review of its own file', new Set([P1, P2, P3].map(p => p.final_review?.file_sha256)).size === 3 && (await project(id)).status !== 'approved');
     summary.project = id; summary.versions = [P1, P2, P3].map((p, i) => ({ n: i + 1, seconds: p.total_s, duration: p.duration, verdict: p.final_review?.verdict_text, failed_checks: p.failed_checks, open_items: (p.review_items ?? []).length }));
