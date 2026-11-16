@@ -68,11 +68,15 @@ try {
         pb && sb && sb.y > pb.y && (mobile ? sb.y - (pb.y + pb.h) < 260 : Math.abs(sb.x - pb.x) < 12 && sb.y - (pb.y + pb.h) < 260), JSON.stringify({ pb, sb }));
       const drawn = await ev(`(() => { const q = document.querySelector('#sidereview .score b'); return { overall: q && q.innerText.trim(), groups: [...document.querySelectorAll('#sidereview .sg')].map(g => [g.querySelector('.grow').innerText.trim(), g.querySelector('b').innerText.trim()]),
         imps: [...document.querySelectorAll('#sidereview li.imp')].map(li => li.innerText), bars: [...document.querySelectorAll('#sidereview .sg .bar i')].map(i => i.getBoundingClientRect().width) }; })()`);
-      check(`${tag}: the mark on screen is the server's (${s.overall} of 100)`, drawn.overall === String(s.overall) && /מתוך 100/.test(side), drawn.overall);
+      const want = s.overall === null ? s.evidence.label : s.range && s.range.low !== s.range.high ? `${s.range.low}–${s.range.high}` : String(s.overall);
+      check(`${tag}: "ציון דנה" on screen is the server's (${want}), with how well it is founded (${s.evidence.label})`, drawn.overall === want && /ציון דנה/.test(side) && (s.overall === null || /מתוך 100/.test(side)) && (await text('#sidereview #evidence')).includes(s.evidence.label), drawn.overall);
+      check(`${tag}: the readiness state is said in words`, /מצב מוכנות/.test(await text('#sidereview #readiness')) && /לא מוכן|מוכן לצפייה/.test(await text('#sidereview #readiness')), await text('#sidereview #readiness'));
+      check(`${tag}: it says whether this is a fresh review or a computation from stored results`, (await text('#sidereview #reviewsource')).includes(f.source.label), await text('#sidereview #reviewsource'));
+      check(`${tag}: a doubt that needs listening is shown apart from a proven failure`, s.uncertain.count ? (await text('#sidereview #uncertain')).includes(s.uncertain.text) : !(await has('#sidereview #uncertain')));
       check(`${tag}: the five areas on screen are the server's, each with its mark or "לא נבדק"`,
         JSON.stringify(drawn.groups) === JSON.stringify(s.groups.map(g => [g.label, g.score === null ? 'לא נבדק' : String(g.score)])) && drawn.groups.length === 5, JSON.stringify(drawn.groups));
-      check(`${tag}: the coverage is said next to the mark`, new RegExp(`מבוסס על ${s.coverage.decided} מתוך ${s.coverage.applicable} קריטריונים`).test(side) && /לא נבדקו ואינם בציון/.test(side));
-      check(`${tag}: mandatory failures are said beside the mark, never hidden by it`, s.blocking.count ? side.includes(s.blocking.text) : !/כשלים מחייבים/.test(side), s.blocking.text);
+      check(`${tag}: the coverage of the checks is said next to the mark`, new RegExp(`כיסוי הבדיקות: ${s.coverage.decided} מתוך ${s.coverage.applicable} קריטריונים רלוונטיים הוכרעו`).test(side) && /אינם בציון/.test(side));
+      check(`${tag}: mandatory failures are said beside the mark, never hidden by it`, s.blocking.count ? side.includes(s.blocking.text) : !/כשלים מוכחים/.test(side), s.blocking.text);
       check(`${tag}: what works and what is still weak`, /מה עובד/.test(side) && /מה עדיין חלש|לא נמצא דבר חלש/.test(side));
       const top = f.top_improvements || [];
       check(`${tag}: up to three improvements in order, each with what to do${top.some(x => x.why) ? ' and why' : ''}`,
@@ -92,6 +96,8 @@ try {
       check(`${tag}: next steps in three separate lists`, JSON.stringify(ns) === JSON.stringify([f.next_steps.dana.length, f.next_steps.owner.length, f.next_steps.blockers.length]), JSON.stringify(ns));
       check(`${tag}: "apply the improvements" lists exactly what Dana can do and renders nothing by itself`,
         (await ev(`document.querySelectorAll('#applylist li').length`)) === f.next_steps.dana.length && (await text('#applybox')).includes('שום דבר לא מופק עד שלוחצים'));
+      check(`${tag}: it says what will NOT be done automatically and that the owner's earlier corrections are kept`,
+        new RegExp(`לא יבוצע אוטומטית: ${f.next_steps.owner.length} פריטים`).test(await text('#applyleft')) && /התיקונים הקודמים שלך נשמרים/.test(await text('#applykept')));
       check(`${tag}: the history of this version's reviews, with the file and the criteria version of each`,
         (await ev(`document.querySelectorAll('#reviewlist > li').length`)) === p.reviews.length && (await ev(`document.querySelector('#reviewhistory').textContent`)).includes(f.rubric_version));
       check(`${tag}: review step — nothing runs off the screen`, (await overflow()).length === 0, JSON.stringify(await overflow()));

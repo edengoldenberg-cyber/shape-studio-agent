@@ -601,7 +601,8 @@ async function requestRating(projectId, body = {}, actor = 'owner') {
   if (!f.sha256 || sha !== f.sha256) throw new StudioError(409, 'file_changed', 'קובץ הווידאו השמור שונה מהקובץ שנרשם לגרסה הזו — אי אפשר לדרג אותו מהמדידות השמורות');
   const job = { id: newId('job'), projectId: p.id, version: v.n, type: 'rereview', status: 'queued', attempts: 0, maxAttempts: MAX_ATTEMPTS, lease: null, notBefore: null,
     stage: 'queued', note: 'ממתין לעובד: דירוג הקובץ הקיים, בלי רינדור', error: null, uploaded: {}, requestedBy: by,
-    options: { review_of: { version: v.n, file_sha256: sha } }, stageLog: [], createdAt: now(), updatedAt: now() };
+    options: { review_of: { version: v.n, file_sha256: sha },
+               hearing_decisions: Object.entries(p.hearing ?? {}).map(([key, d]) => ({ key, decision: d.decision })) }, stageLog: [], createdAt: now(), updatedAt: now() };
   state().jobs[job.id] = job;
   hist(p, actor, 'rating_requested', { jobId: job.id, version: v.n, by, file: sha.slice(0, 12) });
   save();
@@ -628,7 +629,9 @@ function submitRating(jobId, token, body = {}) {
   // no number where nothing was decided, and none without it being computable from the criteria that were sent
   for (const g of sc.groups) if ((g.score === null) !== (g.decided === 0) || (g.decided && g.score !== Math.round(100 * g.met / g.decided))) throw bad('a mark does not follow from its criteria');
   const marked = sc.groups.filter(g => g.score !== null).map(g => g.score);
-  if ((sc.overall === null) !== (marked.length === 0) || (marked.length && sc.overall !== Math.round(marked.reduce((a, b) => a + b, 0) / marked.length))) throw bad('the total does not follow from its areas');
+  const thin = sc.evidence?.state === 'insufficient';
+  if (sc.overall === null ? !(thin || marked.length === 0) : (thin || !marked.length || sc.overall !== Math.round(marked.reduce((a, b) => a + b, 0) / marked.length))) throw bad('the total does not follow from its areas');
+  if (sc.range && !(markOk(sc.range.low) && sc.range.high === sc.overall && sc.range.low <= sc.range.high)) throw bad('the range is malformed');
   if (r.rendered !== false) throw bad('a rating job must not render');
   if (JSON.stringify(r).length > 1500000) throw bad('too large');
   if (!v.reviews) v.reviews = [firstReview(v)];
@@ -1014,17 +1017,30 @@ function applyReview(projectId, body = {}, actor = 'owner') {
   const open = Object.values(state().jobs).find(j => j.projectId === p.id && ['queued', 'leased'].includes(j.status));
   if (open) throw new StudioError(409, 'job_in_progress', 'כבר יש עריכה פעילה לפרויקט הזה');
   const note = String(body.note ?? '').trim().slice(0, 1500);
-  const can = (v.package.dana_review?.improvements ?? []).filter(i => i.can_apply).length + (v.package.dana_can_apply ?? []).length;
+  // The review's own list of what Dana can do by herself is what "apply" applies - nothing else. A doubt that needs the
+  // owner's ears, a decision and a blocker stay with the owner. Reviews made before the list existed fall back to the count.
+  const ns = v.package.final_review?.next_steps ?? null;
+  const can = ns ? ns.dana.length + (v.package.dana_can_apply ?? []).length
+    : (v.package.dana_review?.improvements ?? []).filter(i => i.can_apply).length + (v.package.dana_can_apply ?? []).length;
   if (!can && !note) throw new StudioError(409, 'nothing_to_apply', 'בביקורת הזו אין שיפור שדנה יכולה ליישם בעצמה — הנושאים הפתוחים דורשים החלטה שלך');
   dropApproval(p, v, actor, 'apply_review');
   const request = improvementsRequest(v, note);
-  hist(p, actor, 'apply_review_requested', { version: v.n, by, improvements: can, replan: request.replan.length, owner_note: !!note });
+  hist(p, actor, 'apply_review_requested', { version: v.n, by, improvements: can, replan: request.replan.length, owner_note: !!note,
+    ...(ns ? { applied: ns.dana.map(x => x.id), left_for_owner: ns.owner.length, blocked: ns.blockers.length } : {}) });
+  const applied = { fromVersion: v.n, by, at: now(), ownerNote: !!note, items: (ns?.dana ?? []).map(x => ({ id: x.id, title: x.title, replan: !!x.replan })),
+    leftForOwner: (ns?.owner ?? []).map(x => ({ id: x.id, title: x.title })), blockers: (ns?.blockers ?? []).map(x => ({ id: x.id, kind: x.kind, title: x.title })), kept: keptOf(p) };
   if (v.kind === 'review_only' || p.kind === 'review_only') {
     if (!p.polish) p.polish = { burned_in_text: true, add_captions: false };
     enqueueEdit(p, {}, actor);
   } else enqueueEdit(p, { apply_review: true, previous: previousOf(v), ...(request.text ? { change_request: request.text } : {}) }, actor);
+  p.versions.at(-1).appliedImprovements = applied;          // what this new version was asked to fix, and what was left to the owner
   save();
   return view(p);
+}
+/** The owner's standing corrections of a project. Every later job carries them (enqueueEdit), so applying improvements keeps them. */
+function keptOf(p) {
+  return { captionEdits: (p.captionEdits ?? []).length, zoomEdits: (p.zoomEdits ?? []).length, segmentEdits: (p.segmentEdits ?? []).length,
+    graphicEdits: (p.graphicEdits ?? []).length, hearing: Object.values(p.hearing ?? {}).filter(d => d.decision === 'ok').length, rules: activeRules().length };
 }
 
 /**
@@ -1035,7 +1051,9 @@ function applyReview(projectId, body = {}, actor = 'owner') {
  */
 const CONTENT_CATEGORIES = new Set(['message', 'opening', 'structure', 'pace']);
 function improvementsRequest(v, note = '') {
-  const replan = (v.package?.dana_review?.improvements ?? []).filter(i => i.can_apply && CONTENT_CATEGORIES.has(i.category));
+  const ns = v.package?.final_review?.next_steps ?? null;
+  const replan = ns ? ns.dana.filter(x => x.replan).map(x => ({ problem: x.title, correction: x.action, evidence: x.why }))
+    : (v.package?.dana_review?.improvements ?? []).filter(i => i.can_apply && CONTENT_CATEGORIES.has(i.category));
   const lines = [];
   if (replan.length) {
     lines.push(`יישום שיפורי הביקורת הסופית של דנה על גרסה ${v.n} — לתכנן את החיתוך מחדש כך שהבעיות האלה ייפתרו, ולשמור על כל מה שלא נוגע להן:`);
@@ -1368,7 +1386,7 @@ function view(p, viewN) {
     pendingCorrections: pendingEdits(p, cur).length, cardStates: cardStates(p, v),
     shown: v ? { n: v.n, isCurrent: v.n === p.currentVersion, currentN: p.currentVersion, currentStatus: cur?.status ?? null, currentHasPackage: !!cur?.package } : null,
     review: reviewInfo(p, v, cur), skill: p.skill ?? { mode: 'default' },
-    reviews: reviewHistory(p, v), rating: ratingJob(p, v),          // every review of the version on screen; the state of a rating in progress
+    reviews: reviewHistory(p, v), rating: ratingJob(p, v), kept: keptOf(p),          // every review of the version on screen; the state of a rating in progress
     consent: p.consent, rights: p.rights, pendingChange: p.pendingChange ?? null,
     adapter: projectAdapter(p),                                    // null = the worker's configuration decides
     captionEdits: p.captionEdits ?? [], zoomEdits: p.zoomEdits ?? [], styleOverrides: p.styleOverrides ?? {},
@@ -1376,7 +1394,7 @@ function view(p, viewN) {
                  error: job.error ? { code: job.error.code, message: job.error.message, retryable: job.error.retryable } : null,
                  totalSeconds: job.totalSeconds ?? null } : null,
     version: v ? {
-      n: v.n, status: v.status, createdAt: v.createdAt, changeRequest: v.changeRequest ?? null, kind: v.kind ?? 'edit',
+      n: v.n, status: v.status, createdAt: v.createdAt, changeRequest: v.changeRequest ?? null, kind: v.kind ?? 'edit', appliedImprovements: v.appliedImprovements ?? null,
       hasCompare: !!v.artifacts['compare_frames.jpg'], hasCompareClip: !!v.artifacts['compare_clip.mp4'],
       storyParts: Object.keys(v.artifacts ?? {}).filter(n => /^story_part_\d\.mp4$/.test(n)).sort(),
       fingerprint: fingerprint(v), approval: v.approval, approvalValid: approvalValid(v),

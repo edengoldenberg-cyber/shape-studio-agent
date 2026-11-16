@@ -61,10 +61,44 @@ function rating(file, version, over = {}) {
   return { schema: 1, mode: 'rubric_upgrade', version, file_sha256: file, rated_at: '2026-11-16T22:00:00+0200', measured_at: '2026-11-16T16:12:37+0200', rubric_version: 'r2', score_version: 's1',
     skills: [{ name: 'dana-review', version: 'r2', role: 'סקיל הביקורת' }], model_called: false, rendered: false, dana_review,
     final_review: { ...FINAL, rubric_version: 'r2', file_sha256: file, score: { version: 's1', overall: 84, out_of: 100, groups, coverage: { decided: 4, applicable: 4 } },
-      next_steps: { dana: [], owner: [], blockers: [], open_items: 0, apply: { count: 0, replan: 0, text: '' } }, same_file: { text: 'הקריטריונים עודכנו', criteria: [] } },
+      next_steps: { dana: [{ id: 'c:Y3', title: 'כתובית נעלמת לפני סוף המילה', action: 'הארכת הכתובית', why: 'tail -80ms', replan: false }, { id: 'c:O2', title: 'פתיחה חלשה', action: 'לפתוח במשפט החזק', why: 'שלוש שניות של רקע', replan: true }],
+        owner: [{ id: 'c:K7', title: 'מילה שספק אם נאמרה — דורש האזנה שלך' }], blockers: [{ id: 'i:cta_missing', kind: 'מידע עסקי', title: 'אין CTA' }], open_items: 1, apply: { count: 2, replan: 1, text: '' } },
+      same_file: { text: 'הקריטריונים עודכנו', criteria: [] } },
     review_compact: { rubric_version: 'r2' }, review_provenance: { reviewed_at: '2026-11-16T16:12:37+0200', final_sha256: file, on_delivered_file: true, rated_at: '2026-11-16T22:00:00+0200' }, ...over };
 }
 const submit = (l, review) => W(request(app).post(`/api/dana/worker/jobs/${l.job.id}/review-result`)).set('X-Lease-Token', l.leaseToken).send({ status: 'success', review });
+
+describe('"apply the improvements" does what the rating says Dana can do, and nothing else', () => {
+  test('only the supported fixes are sent; a doubt, a decision and a blocker stay with the owner; earlier corrections travel with the job', async () => {
+    const id = await deliver(), file = sha(VIDEO);
+    // the owner corrected a caption before: a standing correction of the project
+    expect((await post(`/projects/${id}/captions/verify`, { by: 'עדן', listened: true, source_start_s: 3, source_end_s: 4.2, original: 'שלום לכולם', text: 'שלום לכולן' })).status).toBe(200);
+    await post(`/projects/${id}/rating`, { by: 'עדן' });
+    const l = await lease();
+    expect(l.job.options.hearing_decisions).toEqual([]);
+    // a rating that leaves nothing Dana can do: applying is refused instead of rendering the same thing again
+    const none = rating(file, 1); none.final_review.next_steps.dana = [];
+    await submit(l, none);
+    expect((await get(id)).kept).toMatchObject({ captionEdits: 1 });
+    const refused = await post(`/projects/${id}/apply-review`, { by: 'עדן' });
+    expect([refused.status, refused.body.error]).toEqual([409, 'nothing_to_apply']);
+    expect((await get(id)).versions).toHaveLength(1);
+    // a rating with two supported improvements, one of them a change of the cut
+    await post(`/projects/${id}/rating`, { by: 'עדן' });
+    await submit(await lease(), rating(file, 1));
+    const r = await post(`/projects/${id}/apply-review`, { by: 'עדן' });
+    expect(r.status).toBe(200);
+    const job = (await lease()).job;
+    expect(job).toMatchObject({ type: 'edit', version: 2, options: { apply_review: true, caption_edits: [{ text: 'שלום לכולן' }] } });       // the earlier correction is kept
+    expect(job.options.change_request).toMatch(/פתיחה חלשה\. מה לעשות: לפתוח במשפט החזק/);       // the content improvement, as a request to plan the cut again
+    expect(job.options.change_request).not.toMatch(/ספק אם נאמרה|CTA|כתובית נעלמת/);                // not the doubt, not the blocker; the technical fix needs no text
+    const v2 = (await get(id)).version;
+    expect((await get(id)).currentVersion).toBe(2);
+    const applied = (await get(id, 2)).version.appliedImprovements ?? v2.appliedImprovements;
+    expect(applied).toMatchObject({ fromVersion: 1, by: 'עדן', items: [{ id: 'c:Y3', replan: false }, { id: 'c:O2', replan: true }], leftForOwner: [{ id: 'c:K7' }],
+      blockers: [{ id: 'i:cta_missing', kind: 'מידע עסקי' }], kept: { captionEdits: 1 } });
+  });
+});
 
 describe('rating the existing final file of a version', () => {
   test('a rating job is about the stored file: no version, no video, no change of status; the review is replaced and the history keeps both', async () => {
@@ -120,6 +154,9 @@ describe('rating the existing final file of a version', () => {
     expect(await bad({}, r => { r.final_review.score.groups[1].score = 95; })).toMatch(/does not follow/);       // 2 of 3 is 67, not 95
     expect(await bad({}, r => { r.final_review.score.groups[2].score = 50; })).toMatch(/does not follow/);       // nothing decided: no number
     expect(await bad({}, r => { r.final_review.score.overall = 90; })).toMatch(/total does not follow/);          // the average of 100 and 67 is 84
+    expect(await bad({}, r => { r.final_review.score.overall = null; })).toMatch(/total does not follow/);        // "no total" needs the evidence to be too thin
+    expect(await bad({}, r => { r.final_review.score.evidence = { state: 'insufficient' }; })).toMatch(/total does not follow/);   // and then there is no number
+    expect(await bad({}, r => { r.final_review.score.range = { low: 90, high: 84 }; })).toMatch(/range is malformed/);
     expect(await bad({}, r => { delete r.final_review.score; })).toMatch(/malformed/);
     const p = await get(id);
     expect(p.reviews).toHaveLength(1);
