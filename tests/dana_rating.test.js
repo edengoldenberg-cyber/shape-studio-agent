@@ -100,6 +100,37 @@ describe('"apply the improvements" does what the rating says Dana can do, and no
   });
 });
 
+describe('no repeated round without progress', () => {
+  test('an improvement the current version was already produced to fix, and that is still listed, is not sent again', async () => {
+    const id = await deliver(), file = sha(VIDEO);
+    await post(`/projects/${id}/rating`, { by: 'עדן' });
+    await submit(await lease(), rating(file, 1));
+    const v = studio.state().projects[id].versions[0];
+    // this version came out of an "apply" round that asked for the two improvements the rating still lists
+    v.appliedImprovements = { fromVersion: 0, items: [{ id: 'c:Y3' }, { id: 'c:O2' }] };
+    const again = await post(`/projects/${id}/apply-review`, { by: 'עדן' });
+    expect([again.status, again.body.error]).toEqual([409, 'no_progress']);
+    expect(again.body.message).toMatch(/כבר נוסו/);
+    expect((await get(id)).versions).toHaveLength(1);                         // nothing was queued
+    // one of the two was tried: only the other is sent, and the tried one is recorded as not sent again
+    v.appliedImprovements = { fromVersion: 0, items: [{ id: 'c:O2' }] };
+    expect((await post(`/projects/${id}/apply-review`, { by: 'עדן' })).status).toBe(200);
+    const job = (await lease()).job;
+    expect(job.options.change_request ?? '').not.toMatch(/פתיחה חלשה/);        // the tried content improvement is not asked for again
+    const applied = (await get(id, 2)).version.appliedImprovements;
+    expect(applied.items.map(x => [x.id, x.finding])).toEqual([['c:Y3', `c:Y3@${file.slice(0, 12)}`]]);       // a fixed id, bound to the file it was found on
+    expect(applied).toMatchObject({ fromVersion: 1, fromFile: file, notSentAgain: [{ id: 'c:O2' }] });
+  });
+  test('the owner can still send a new round with written feedback when everything left was tried', async () => {
+    const id = await deliver(), file = sha(VIDEO);
+    await post(`/projects/${id}/rating`, { by: 'עדן' });
+    await submit(await lease(), rating(file, 1));
+    studio.state().projects[id].versions[0].appliedImprovements = { fromVersion: 0, items: [{ id: 'c:Y3' }, { id: 'c:O2' }] };
+    expect((await post(`/projects/${id}/apply-review`, { by: 'עדן', note: 'לפתוח במשפט על הקהילה' })).status).toBe(200);
+    expect((await lease()).job.options.change_request).toMatch(/משוב הבעלים על גרסה 1: לפתוח במשפט על הקהילה/);
+  });
+});
+
 describe('rating the existing final file of a version', () => {
   test('a rating job is about the stored file: no version, no video, no change of status; the review is replaced and the history keeps both', async () => {
     const id = await deliver(), before = await get(id), file = sha(VIDEO);

@@ -81,6 +81,14 @@ try {
       const top = f.top_improvements || [];
       check(`${tag}: up to three improvements in order, each with what to do${top.some(x => x.why) ? ' and why' : ''}`,
         drawn.imps.length === Math.min(3, top.length) && drawn.imps.every((t, i) => t.startsWith(`${i + 1}. `) && /מה לעשות:/.test(t) && (!top[i].why || /למה:/.test(t))), drawn.imps.join(' | ').slice(0, 300));
+      if (s.kinds) {
+        const kt = await text('#sidereview #kinds');
+        check(`${tag}: technical checks, the editorial assessment and what waits for the owner are shown apart`,
+          kt.includes(`${s.kinds.technical.label}: ${s.kinds.technical.met} מתוך ${s.kinds.technical.decided}`) && kt.includes(`${s.kinds.editorial.label}: ${s.kinds.editorial.met} מתוך ${s.kinds.editorial.decided}`) && /פתיחה/.test(kt) && /מחכה לך/.test(kt), kt.slice(0, 200));
+        check(`${tag}: every recommendation on screen has a time in the video or says it is about the whole video, and carries its fixed id`,
+          await ev(`[...document.querySelectorAll('#sidereview li.imp')].every(li => (li.querySelector('[data-play]') || /כל הסרטון/.test(li.innerText)) && li.dataset.finding.length > 3)`));
+        check(`${tag}: the references the review rests on are named, or it says none was chosen`, /רפרנסים: /.test(side));
+      }
       check(`${tag}: the version of the video and the skills the rating rests on`, new RegExp(`גרסה ${p.version.n} של הסרטון`).test(side) && f.skills.every(k => side.includes(k.name)) && side.includes(f.file_sha256.slice(0, 12)));
       check(`${tag}: dana can / needs you / blocked — the three counts`, new RegExp(`דנה יכולה לבצע ${f.next_steps.dana.length}`).test(side) && new RegExp(`דורש אותך ${f.next_steps.owner.length}`).test(side) && new RegExp(`חסום ${f.next_steps.blockers.length}`).test(side));
       check(`${tag}: nothing runs off the screen`, (await overflow()).length === 0, JSON.stringify(await overflow()));

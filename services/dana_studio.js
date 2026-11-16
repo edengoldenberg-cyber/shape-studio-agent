@@ -1020,14 +1020,24 @@ function applyReview(projectId, body = {}, actor = 'owner') {
   // The review's own list of what Dana can do by herself is what "apply" applies - nothing else. A doubt that needs the
   // owner's ears, a decision and a blocker stay with the owner. Reviews made before the list existed fall back to the count.
   const ns = v.package.final_review?.next_steps ?? null;
-  const can = ns ? ns.dana.length + (v.package.dana_can_apply ?? []).length
+  // One attempt per finding: an improvement this very version was produced to fix, and that the new review still lists,
+  // was tried and did not help. It is not sent again - another identical round would render the same thing. It stays with
+  // the owner, who can write what to do differently.
+  const triedIds = new Set((v.appliedImprovements?.items ?? []).map(x => x.id));
+  const todo = ns ? ns.dana.filter(x => !triedIds.has(x.id)) : null, repeated = ns ? ns.dana.filter(x => triedIds.has(x.id)) : [];
+  const can = ns ? todo.length + (v.package.dana_can_apply ?? []).length
     : (v.package.dana_review?.improvements ?? []).filter(i => i.can_apply).length + (v.package.dana_can_apply ?? []).length;
-  if (!can && !note) throw new StudioError(409, 'nothing_to_apply', 'בביקורת הזו אין שיפור שדנה יכולה ליישם בעצמה — הנושאים הפתוחים דורשים החלטה שלך');
+  if (!can && !note) throw repeated.length
+    ? new StudioError(409, 'no_progress', `${repeated.length} השיפורים שנותרו כבר נוסו בהפקת הגרסה הזו ולא נפתרו. סבב זהה נוסף לא ישנה דבר — כתוב/כתבי משוב על מה לעשות אחרת, או החליטו לקבל אותם.`)
+    : new StudioError(409, 'nothing_to_apply', 'בביקורת הזו אין שיפור שדנה יכולה ליישם בעצמה — הנושאים הפתוחים דורשים החלטה שלך');
   dropApproval(p, v, actor, 'apply_review');
-  const request = improvementsRequest(v, note);
+  const request = improvementsRequest(v, note, todo);
   hist(p, actor, 'apply_review_requested', { version: v.n, by, improvements: can, replan: request.replan.length, owner_note: !!note,
-    ...(ns ? { applied: ns.dana.map(x => x.id), left_for_owner: ns.owner.length, blocked: ns.blockers.length } : {}) });
-  const applied = { fromVersion: v.n, by, at: now(), ownerNote: !!note, items: (ns?.dana ?? []).map(x => ({ id: x.id, title: x.title, replan: !!x.replan })),
+    ...(ns ? { applied: todo.map(x => x.id), not_sent_again: repeated.map(x => x.id), left_for_owner: ns.owner.length, blocked: ns.blockers.length } : {}) });
+  const fileSha = storedFile(p, v).sha256;
+  const applied = { fromVersion: v.n, fromFile: fileSha, by, at: now(), ownerNote: !!note,
+    items: (todo ?? []).map(x => ({ id: x.id, finding: x.finding ?? `${x.id}@${String(fileSha ?? '').slice(0, 12)}`, title: x.title, replan: !!x.replan })),
+    notSentAgain: repeated.map(x => ({ id: x.id, title: x.title })),
     leftForOwner: (ns?.owner ?? []).map(x => ({ id: x.id, title: x.title })), blockers: (ns?.blockers ?? []).map(x => ({ id: x.id, kind: x.kind, title: x.title })), kept: keptOf(p) };
   if (v.kind === 'review_only' || p.kind === 'review_only') {
     if (!p.polish) p.polish = { burned_in_text: true, add_captions: false };
@@ -1050,9 +1060,9 @@ function keptOf(p) {
  * there is one. The owner's standing rules and the transcript stay in force; nothing here approves a style.
  */
 const CONTENT_CATEGORIES = new Set(['message', 'opening', 'structure', 'pace']);
-function improvementsRequest(v, note = '') {
+function improvementsRequest(v, note = '', todo = null) {
   const ns = v.package?.final_review?.next_steps ?? null;
-  const replan = ns ? ns.dana.filter(x => x.replan).map(x => ({ problem: x.title, correction: x.action, evidence: x.why }))
+  const replan = ns ? (todo ?? ns.dana).filter(x => x.replan).map(x => ({ problem: x.title, correction: x.action, evidence: x.why }))
     : (v.package?.dana_review?.improvements ?? []).filter(i => i.can_apply && CONTENT_CATEGORIES.has(i.category));
   const lines = [];
   if (replan.length) {

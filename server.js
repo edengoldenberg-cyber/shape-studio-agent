@@ -664,6 +664,7 @@ const CODE_FEATURES = [
   'staff_confirm_lifecycle', // confirm / outcome endpoints enforce transitions
   'current_callback_latest', // a lead's current callback = its most recent request only
   'quiet_hours_restored',    // utils/time.isQuietHours active again (22:00–08:00 Israel)
+  'dana_rating_v1',          // Dana studio: rating of a stored file, review history, score with evidence, apply-improvements guard
 ];
 app.get('/api/version', (_req, res) => {
   res.json({
