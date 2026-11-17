@@ -21,9 +21,17 @@
  * WRITES: routes exist (POST /v3/users/memberships/hold | cancel) but their request
  * contract is UNVERIFIED — it can only be learned by sending a POST. They are therefore
  * disabled in code (`WRITE_CONTRACTS[op].verified === false`) AND by configuration
- * (`ARBOX_WRITES_ENABLED` must be 'true'). There is NO route to book or cancel a
- * member's class, or to join a waitlist; `POST /v3/schedule/cancel` is suspected to
- * cancel the whole class for everyone and is never called.
+ * (`ARBOX_WRITES_ENABLED` must be 'true').
+ *
+ * CLASS BOOKINGS (corrected 2026-11-17 from the official OpenAPI document,
+ * https://arboxserver.arboxapp.com/docs/api.json, and an OPTIONS-only probe with the studio's key):
+ *   POST /v3/schedule/bookSession        { user_id, schedule_id, membership_user_id?, book_without_membership? }
+ *   POST /v3/schedule/cancelUserBooking  { schedule_id, user_id, late_cancellation?, without_late_cancellation? }
+ * Both routes answer OPTIONS 200 "allow: POST" for this key. Whether the key is PERMITTED to use them, and what
+ * they do to a member's sessions, is not documented and can only be learned by one approved request against a test
+ * member. They are therefore unverified and off, like the membership writes, and need an explicit per-operation
+ * allow-list on top of the switch (ARBOX_WRITE_OPS). There is no documented route to join or leave a waiting list.
+ * `POST /v3/schedule/cancel` cancels the WHOLE class for everyone and is never called.
  */
 
 const axios  = require('axios');
@@ -255,6 +263,9 @@ async function getClasses({ from, to, fresh = false } = {}) {
         scheduleId: c.schedule_id, date: c.date, start: c.start_time, end: c.end_time,
         name: c.session_name ?? 'שיעור', instructor: c.staff_member?.name ?? null,
         capacity, registrationLink: c.registration_link || null,
+        // the class's own rule in Arbox: cancelling closes this many hours before the start; 0 = no limit recorded
+        cancelLockHours: Number.isFinite(c.disable_cancellation_time) ? c.disable_cancellation_time : null,
+        lateCancellationAllowed: c.enable_late_cancellation === 1 ? true : c.enable_late_cancellation === 0 ? false : null,
         status: o?.status ?? null,                                  // 'active' | 'cancelled' | null (unknown)
         occupancy: o && capacity !== null ? {
           registered: o.registration_count, capacity, standby: o.standby_members ?? 0,
@@ -316,6 +327,19 @@ const WRITE_CONTRACTS = {
     verified: false, method: 'POST', path: '/v3/users/memberships/cancel',
     body: a => ({ location_id: Number(LOC()), membership_user_id: a.membershipUserId, user_id: a.userId, end_date: a.endDate ?? null }),
   },
+  // A member's booking of ONE class session. Field names are the documented BookSessionRequest / CancelUserBookingRequest.
+  // `book_without_membership`, `late_cancellation` and `without_late_cancellation` are never sent: their effect is not
+  // documented, and a booking must be charged to the member's own membership exactly as the app would.
+  class_book: {
+    verified: false, explicit: true, method: 'POST', path: '/v3/schedule/bookSession', required: ['userId', 'scheduleId'],
+    body: a => ({ user_id: Number(a.userId), schedule_id: Number(a.scheduleId), ...(a.membershipUserId ? { membership_user_id: Number(a.membershipUserId) } : {}) }),
+    clears: a => [`bookings:${a.userId}`, 'classes:'],
+  },
+  class_cancel: {
+    verified: false, explicit: true, method: 'POST', path: '/v3/schedule/cancelUserBooking', required: ['userId', 'scheduleId'],
+    body: a => ({ schedule_id: Number(a.scheduleId), user_id: Number(a.userId) }),
+    clears: a => [`bookings:${a.userId}`, 'classes:'],
+  },
 };
 
 // Tests may exercise the executor against a LOCAL mock with the assumed contract. This
@@ -324,13 +348,19 @@ function _testContractOverride() {
   return process.env.NODE_ENV === 'test' && process.env.ARBOX_TEST_ASSUME_CONTRACT === 'true'
     && /^https?:\/\/(localhost|127\.0\.0\.1)[:/]/.test(process.env.ARBOX_BASE_URL ?? '');
 }
+/** Operations named in ARBOX_WRITE_OPS (comma separated). An `explicit` operation runs only when it is named there. */
+function _allowedOps() { return new Set(String(process.env.ARBOX_WRITE_OPS ?? '').split(',').map(s => s.trim()).filter(Boolean)); }
 function writesEnabled(op) {
-  return process.env.ARBOX_WRITES_ENABLED === 'true' && !!WRITE_CONTRACTS[op]
-    && (WRITE_CONTRACTS[op].verified === true || _testContractOverride());
+  const c = WRITE_CONTRACTS[op];
+  if (process.env.ARBOX_WRITES_ENABLED !== 'true' || !c) return false;
+  const named = _allowedOps();
+  if (c.explicit ? !named.has(op) : (named.size > 0 && !named.has(op))) return false;
+  return c.verified === true || _testContractOverride();
 }
 function writeStatus() {
   return Object.fromEntries(Object.entries(WRITE_CONTRACTS).map(([op, c]) => [op, {
-    route: `${c.method} ${c.path}`, contractVerified: c.verified, switchOn: process.env.ARBOX_WRITES_ENABLED === 'true', executable: writesEnabled(op),
+    route: `${c.method} ${c.path}`, contractVerified: c.verified, switchOn: process.env.ARBOX_WRITES_ENABLED === 'true',
+    namedInAllowList: _allowedOps().has(op), needsAllowList: !!c.explicit, executable: writesEnabled(op),
   }]));
 }
 
@@ -346,7 +376,8 @@ async function executeWrite(op, args) {
   const c = WRITE_CONTRACTS[op];
   if (!c) throw new ArboxError('bad_args', `unknown write operation: ${op}`);
   if (!writesEnabled(op)) throw new ArboxError('write_disabled', `Arbox write "${op}" is disabled (switch=${process.env.ARBOX_WRITES_ENABLED === 'true'}, contractVerified=${c.verified})`);
-  if (!args?.userId || !args?.membershipUserId) throw new ArboxError('bad_args', 'userId and membershipUserId are required');
+  const need = c.required ?? ['userId', 'membershipUserId'];
+  if (need.some(k => args?.[k] === undefined || args?.[k] === null || args?.[k] === '')) throw new ArboxError('bad_args', `${need.join(' and ')} are required`);
   let res;
   await _slot();
   try {
@@ -354,10 +385,10 @@ async function executeWrite(op, args) {
   } catch (err) {
     throw new ArboxError('unavailable', `Arbox ${op} request did not complete: ${err.code ?? err.message}`, { submitted: true, uncertain: true });
   } finally { _release(); }
-  clearCache(`memberships:${args.userId}`);
+  for (const k of (c.clears ? c.clears(args) : [`memberships:${args.userId}`])) clearCache(k);
   if (res.status >= 500 || res.status === 429) throw new ArboxError('unavailable', `Arbox ${op} → ${res.status}`, { submitted: true, uncertain: true, status: res.status });
   if (res.status >= 400) throw new ArboxError('rejected', `Arbox ${op} → ${res.status}`, { submitted: true, status: res.status, detail: JSON.stringify(res.data?.error?.message ?? res.data ?? '').slice(0, 300) });
-  return { accepted: true, status: res.status };   // accepted ≠ completed: the caller verifies by reading back
+  return { accepted: true, status: res.status, data: res.data?.data ?? null };   // accepted ≠ completed: the caller verifies by reading back
 }
 
 // ── Studio-wide reads for member care (all read-only, all paged) ──────────────

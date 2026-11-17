@@ -69,7 +69,7 @@ function matchHour(hr, starts) {
 }
 
 function createMemberHandoff(deps) {
-  const { gateway, tomerStore, alertOwner, sendText, logger, now = () => new Date() } = deps;
+  const { gateway, tomerStore, alertOwner, sendText, logger, now = () => new Date(), classActions = null } = deps;
   const tail = p => String(p).slice(-4);
   const local = p => String(p).startsWith('972') ? '0' + String(p).slice(3) : String(p);
   const openTask = (phone, type) => tomerStore.getTasks({ phone, type }).find(t => !['resolved', 'closed', 'done'].includes(t.status)) ?? null;
@@ -205,9 +205,38 @@ function createMemberHandoff(deps) {
     const want = kind === 'move' ? `מעבר ${cur ? `מ-${hhmm(cur.h, cur.min)} ` : ''}${tgt ? `ל-${hhmm(tgt.h, tgt.min)} ` : ''}${dTxt}` : kind === 'book' ? `רישום ${tgt ? `ל-${hhmm(tgt.h, tgt.min)} ` : ''}${dTxt}`
       : kind === 'cancel' ? `ביטול הרישום ${cur ? `של ${hhmm(cur.h, cur.min)} ` : ''}${dTxt}` : 'שינוי בשיבוץ הקבוע';
 
+    // ── do it in Arbox, when this system is permitted to (services/class_actions.js; off unless explicitly enabled) ──
+    // The staff task below is the fallback: it is opened whenever the change was not made AND verified.
+    let action = null;
+    if (classActions && !rq.missing && kind !== 'regular') {
+      try {
+        const pl = await classActions.plan({ kind, member: f.member, date: f.date, bookings: f.bookings, classes: f.classes, current: cur, target: tgt });
+        action = { plan: pl, result: pl.ok ? await classActions.execute(pl) : null };
+      } catch (err) {
+        logger.error('[member-handoff] class action failed before any request — handing over to the staff', { tail: tail(phone), error: err.message });
+        action = { plan: { ok: false, reason: 'error', text: `תקלה פנימית לפני שליחת בקשה ל-Arbox (${err.message})` }, result: null };
+      }
+    }
+    const res = action?.result ?? null;
+    const actionLines = res ? res.log.map(l => `Arbox ${l.op}: ${l.accepted ? 'התקבל' : `לא התקבל (${l.error?.message ?? ''})`}${l.verify ? ` · אימות בקריאה: ${l.verify.verified ? 'אושר' : 'לא אושר'}` : ''}`) : [];
+    if (res?.ok) {
+      // done and seen in Arbox: recorded as a closed task (no alert - nothing is waiting for the staff)
+      const did = kind === 'move' ? `עברת מ-${hhmm(cur.h, cur.min)} ל-${hhmm(tgt.h, tgt.min)} ${dTxt}` : kind === 'book' ? `נרשמת ל${tgt.cls.name} ב-${hhmm(tgt.h, tgt.min)} ${dTxt}` : `הרישום שלך ל-${hhmm(cur.h, cur.min)} ${dTxt} בוטל`;
+      let task = tomerStore.createTask({ type: 'class_change', phone, memberName: who, arboxId: f.member?.userId ?? null, summary: `${KIND_HE[kind]} — ${want} (בוצע אוטומטית)`,
+        detail: [`בקשה: ${want}`, ...facts, ...actionLines, `קריאות Arbox: ${f.calls.join(' · ')}`].join('\n'), memberMessage: fullText, priority: 'normal' });
+      task = tomerStore.updateTask(task.id, { kind, missing: null, arboxCalls: f.calls, action: { state: 'done', done: res.done, log: res.log } });
+      tomerStore.resolveTask(task.id, { resolutionNote: 'בוצע ואומת ב-Arbox על ידי תומר', resolvedBy: 'tomer' });
+      const doneText = [`בוצע ✅ ${did}.`, `אימתתי את זה עכשיו מול Arbox.`].join('\n');
+      const sendStateDone = await reply(phone, doneText, task, pending);
+      logger.info('[member-handoff] class change done and verified in Arbox', { tail: tail(phone), kind, taskId: task.id, done: res.done, sendState: sendStateDone });
+      return { handled: true, kind, taskId: task.id, isNew: true, missing: null, alert: null, replyText: doneText, sendState: sendStateDone, facts: f, request: rq, action: { state: 'done', done: res.done } };
+    }
+    const whyStaff = res ? `הפעולה האוטומטית לא הושלמה (${res.failed.op}: ${res.failed.reason}). מצב: ${res.state === 'holds_both' ? 'רשומה לשני השיעורים' : res.state === 'unknown' ? 'לא ידוע — נדרש אימות ב-Arbox' : 'לא השתנה דבר'}`
+      : action?.plan && !action.plan.ok && action.plan.reason !== 'writes_disabled' ? `לא בוצע אוטומטית: ${action.plan.text}` : BLOCK_REASON;
+
     // ── ONE durable task ────────────────────────────────────────────────────
-    const detail = [`בקשה: ${want}`, ...facts, rq.missing ? `חסר: ${rq.missing === 'target_time' ? 'שעת היעד — המתאמנ/ת נשאל/ה' : 'איזה שיעור — המתאמנ/ת נשאל/ה'}` : null,
-      `למה זה אצל הצוות: ${BLOCK_REASON}`, `קריאות Arbox (קריאה בלבד): ${f.calls.join(' · ')}`].filter(Boolean).join('\n');
+    const detail = [`בקשה: ${want}`, ...facts, ...actionLines, rq.missing ? `חסר: ${rq.missing === 'target_time' ? 'שעת היעד — המתאמנ/ת נשאל/ה' : 'איזה שיעור — המתאמנ/ת נשאל/ה'}` : null,
+      `למה זה אצל הצוות: ${whyStaff}`, `קריאות Arbox (קריאה בלבד): ${f.calls.join(' · ')}`].filter(Boolean).join('\n');
     let task, isNew = false;
     const wasMissing = existing?.missing ?? null;            // read before the task object is updated in place
     if (existing) task = tomerStore.updateTask(existing.id, { summary: `${KIND_HE[kind]} — ${want}`, detail, memberMessage: fullText, missing: rq.missing, kind, arboxCalls: f.calls });
@@ -221,15 +250,24 @@ function createMemberHandoff(deps) {
     let alert = task.alert ?? null;
     if (isNew || (wasMissing && !rq.missing)) {
       alert = await sendAlert(task, `${isNew ? '📌 תומר' : '🔁 תומר — עדכון'}: ${KIND_HE[kind]} — ${who}`,
-        [`👤 ${who}`, `📱 ${local(phone)}`, `💬 "${String(fullText).slice(0, 200)}"`, ...detail.split('\n').slice(0, -1), `לא בוצע שום שינוי ב-Arbox.`, `מזהה פנייה: ${task.id}`, `💬 https://wa.me/${phone}`].join('\n'));
+        [`👤 ${who}`, `📱 ${local(phone)}`, `💬 "${String(fullText).slice(0, 200)}"`, ...detail.split('\n').slice(0, -1),
+         res?.state === 'holds_both' ? `⚠️ הרישום החדש בוצע ב-Arbox; הרישום הקודם לא בוטל — נדרש ביטול ידני.` : res?.state === 'unknown' ? `⚠️ נשלחה בקשה ל-Arbox ותוצאתה לא אומתה — נא לבדוק ב-Arbox.` : `לא בוצע שום שינוי ב-Arbox.`,
+         `מזהה פנייה: ${task.id}`, `💬 https://wa.me/${phone}`].join('\n'));
+      if (res) tomerStore.updateTask(task.id, { priority: 'high', action: { state: res.state, done: res.done, failed: res.failed, log: res.log } });
     }
 
     // ── the member: only what is true ───────────────────────────────────────
     let replyText;
     if (rq.missing === 'target_time') replyText = `קיבלתי 🙏 ${lines.join(' ')} לאיזו שעה ${kind === 'move' ? 'לעבור' : 'לרשום אותך'}?`.replace(/\s+/g, ' ');
     else if (rq.missing === 'which_class') replyText = `קיבלתי 🙏 ${lines.join(' ')} איזה שיעור לבטל? (יום ושעה)`.replace(/\s+/g, ' ');
+    else if (res?.state === 'holds_both') replyText = [`רשמתי אותך ל${tgt.cls.name} ב-${hhmm(tgt.h, tgt.min)} ${dTxt}, ואימתתי את זה מול Arbox ✅`,
+      `את הרישום ל-${hhmm(cur.h, cur.min)} לא הצלחתי לבטל, אז כרגע יש לך רישום לשני השיעורים.`, alert?.state === 'sent' ? `העברתי לצוות כדי שיבטלו את ${hhmm(cur.h, cur.min)}.` : `רשמתי לצוות לבטל את ${hhmm(cur.h, cur.min)}.`].join('\n');
+    else if (res?.state === 'unknown') replyText = [`קיבלתי את הבקשה: ${want}.`, `שלחתי אותה ל-Arbox, אבל לא הצלחתי לאמת שהיא בוצעה, ולכן אני לא אומר לך שזה נעשה.`,
+      alert?.state === 'sent' ? `העברתי לצוות לבדיקה, ויעדכנו אותך כאן.` : `רשמתי לצוות לבדוק, ויעדכנו אותך כאן.`].join('\n');
     else replyText = [`קיבלתי את הבקשה: ${want}.`, ...lines,
-      alert?.state === 'sent' ? `אין לי הרשאה לשנות רישום בעצמי, אז העברתי את הבקשה לצוות.` : `אין לי הרשאה לשנות רישום בעצמי, אז רשמתי את הבקשה לטיפול הצוות.`,
+      (res || (action?.plan && !action.plan.ok && action.plan.reason !== 'writes_disabled'))
+        ? `${res ? 'ניסיתי לבצע את זה ב-Arbox ולא הצלחתי' : `לא ביצעתי את זה בעצמי: ${action.plan.text}`} ${alert?.state === 'sent' ? 'העברתי את הבקשה לצוות.' : 'רשמתי את הבקשה לטיפול הצוות.'}`
+        : alert?.state === 'sent' ? `אין לי הרשאה לשנות רישום בעצמי, אז העברתי את הבקשה לצוות.` : `אין לי הרשאה לשנות רישום בעצמי, אז רשמתי את הבקשה לטיפול הצוות.`,
       kind === 'move' ? `הרישום הקיים שלך לא השתנה: הוא נשאר במקומו עד שהצוות יאשר לך כאן את המעבר.` : kind === 'cancel' ? `הרישום שלך לא בוטל עד שהצוות יאשר לך כאן.` : `עדיין לא נרשמת: הצוות יאשר לך כאן.`].join('\n');
     const sendState = await reply(phone, replyText, task, pending);
     logger.info('[member-handoff] class request recorded for the staff', { tail: tail(phone), kind, taskId: task.id, isNew, missing: rq.missing, alert: alert?.state ?? null, sendState, arbox: f.calls });
