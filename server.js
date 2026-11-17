@@ -57,6 +57,7 @@ const tomerStore                       = require('./utils/tomer_store');
 const arboxGateway                     = require('./services/arbox_gateway');
 const serviceCases                     = require('./utils/service_case_store');
 const tomerTest                        = require('./services/tomer_test_mode');
+const { createMemberHandoff }          = require('./services/member_handoff');
 const careStore                        = require('./utils/member_care_store');
 const contactPolicy                    = require('./services/contact_policy');
 const { createMemberCare }             = require('./services/member_care');
@@ -1523,6 +1524,8 @@ cron.schedule('*/15 * * * *', async () => {
     // After seeding the legacy cache, purge any leads the registry now confirms
     // as members. The registry's own 60s interval may have refreshed it since the
     // last pass, so this catches conversions that happened within the last hour.
+    await _retryFailedCallbackSummaries().catch(err => logger.warn('Cron: callback summary retry failed', { error: err.message }));
+    await memberHandoff.retryFailedAlerts().catch(err => logger.warn('Cron: member hand-off alert retry failed', { error: err.message }));
     const purged = _purgeKnownMembersFromLeadStore('cron_15min');
     if (purged > 0) {
       persist.saveLeads(store);
@@ -3053,6 +3056,18 @@ const tomerLeadStore = {
   logEvent:   (type, phone, data) => (tomerTest.routeOverride(phone) ? undefined : store.logEvent(type, phone, data)),
 };
 let _tomerOpenAI = null;
+// Members on the legacy route (everyone while the new Tomer flow is test-only): a class change or a voice
+// message becomes a durable staff task with a manager alert and an honest reply. Read-only towards Arbox.
+const memberHandoff = app.locals.memberHandoff = createMemberHandoff({
+  gateway: arboxGateway, tomerStore, logger, alertOwner,
+  sendText: async (to, text) => {
+    if (process.env.WHATSAPP_AUTO_REPLY !== 'true') return { blocked: true };
+    _markBotSent(to);
+    const r = await sendText(to, text);
+    if (r?.idMessage) _recordBotSend(r.idMessage, to);
+    return r;
+  },
+});
 let memberCare = null;                                   // created right after the service (it sends through it)
 const tomerGateway = tomerTest.wrapGateway(arboxGateway);
 const tomerService = app.locals.tomerService = createTomerService({
@@ -3279,6 +3294,19 @@ function _saneDate(ts) {
  *   phase 'new'    — the lead is asking for a callback, answering a callback
  *                    invitation with a time, or supplying a time we asked for.
  */
+// A staff member is talking to the lead by hand. Their own message offered a call or asked when to call
+// (within the last 30 minutes), and the lead now answers with a time: that answer is a callback request.
+const _STAFF_CALLBACK_CTX_RE = /שיחה|נציג|ניצור\s*(?:איתך\s*)?קשר|נחזור\s+אלי|נתקשר|אתקשר|להתקשר|מתי\s+(?:יהיה\s+)?(?:לך\s+)?נוח|טלפונ/;
+function _isManualCallbackAnswer(phone, msg) {
+  const text = (msg.text ?? '').trim();
+  if (msg.type !== 'text' || !text || !callbackTime.hasTimeSignal(text) || leadAgent.TIME_REJECTION_RE.test(text)) return false;
+  const at = _saneDate(msg.timestamp).getTime();
+  const msgs = (inbox.getThread ? inbox.getThread(phone) : null)?.messages ?? [];
+  return msgs.some(m => m.direction === 'out' && m.agentId === 'staff' && _STAFF_CALLBACK_CTX_RE.test(m.text ?? '')
+    && at - new Date(m.timestamp).getTime() >= 0 && at - new Date(m.timestamp).getTime() <= 30 * 60 * 1000);
+}
+
+const _INVITE_ACCEPT_RE = /^(?:כן|בטח|ברור|אשמח|בשמחה|יאללה|סבבה|מעולה|אוקיי?|אוקי|בסדר|נשמע טוב|מתאים|yes|ok|sure)(?:[\s,.!]|$)/i;
 async function handleLeadCallbackFlow({ msg, fromNorm, fromIsraeli, clientMatch, intent, phase }) {
   const lead   = store.getLead(fromNorm);
   const status = lead?.status ?? null;
@@ -3371,7 +3399,7 @@ async function handleLeadCallbackFlow({ msg, fromNorm, fromIsraeli, clientMatch,
 
     const route = r.isReschedule ? 'appointment_rescheduled' : 'appointment_created';
     const routeIntent = r.isReschedule ? 'reschedule_time' : 'callback_time';
-    const fmt = callbackTime.formatCallbackTime(r.apt.scheduledAt);
+    const fmt = callbackTime.formatCallbackTime(r.apt.scheduledAt, r.apt.windowEndAt ?? null);
     const name = store.getLead(fromNorm)?.meta?.qualData?.confirmedName ?? null;
 
     if (name) {
@@ -3474,7 +3502,7 @@ async function handleLeadCallbackFlow({ msg, fromNorm, fromIsraeli, clientMatch,
     // 6. Asking for a call again.
     if (isRequest) {
       if (future) {
-        const fmt = callbackTime.formatCallbackTime(apt.scheduledAt);
+        const fmt = callbackTime.formatCallbackTime(apt.scheduledAt, apt.windowEndAt ?? null);
         store.logEvent('post_call_representative_acknowledged', fromNorm, { existingAptId: apt.id });
         return finish('post_call_rep_acknowledged',
           `רשומה אצלנו בקשת שיחה: ${fmt} 😊\nאם המועד לא נוח — כתבו לי יום ושעה אחרים ואעדכן.`);
@@ -3517,6 +3545,12 @@ async function handleLeadCallbackFlow({ msg, fromNorm, fromIsraeli, clientMatch,
   const awaiting  = meta.awaitingCallbackTime === true;
   const inviteCtx = !CALL_DECLINED_RE.test(text) && leadAgent.isCallbackInviteContext(fromNorm);
 
+  // "כן בבקשה" right after Barak offered a representative's call IS the request. Without this the short answer was
+  // treated as a brief acknowledgement and nobody answered the lead who had just agreed.
+  if (!isRequest && !awaiting && inviteCtx && !hasTime && text.length <= 30 && _INVITE_ACCEPT_RE.test(text)) {
+    store.logEvent('callback_invite_accepted', fromNorm, { preview: text.slice(0, 40) });
+    return askForTime(`מעולה 😊 מתי נוח לך שנחזור אליך? (יום ושעה)`);
+  }
   if (!isRequest && !awaiting && !(inviteCtx && hasTime)) return null;
 
   if (!isRequest && !awaiting) {
@@ -4035,15 +4069,28 @@ async function processInboundWAMessage(msg) {
         const _hc = tomerService.recordWhileHumanOwned({ phone: fromNorm, text: msg.text ?? '', type: msg.type, messageId: msg.messageId ?? null });
         if (_hc) broadcastSse('tomer_case', { id: _hc.id });
       } catch (err) { logger.warn('[tomer] could not add a held message to the case', { from: fromNorm, error: err.message }); }
+      let _holdRoute = 'human_owns_hold';
+      try {
+        if (!isExistingClient && _isManualCallbackAnswer(fromNorm, msg)) {
+          const cap = await callbackSvc.captureWhileHumanOwned({ phone: fromNorm, text: msg.text ?? '', sentAt: _saneDate(msg.timestamp), displayName: msg.name ?? null });
+          if (cap?.captured && !cap.unchanged) {
+            _holdRoute = cap.isReschedule ? 'human_owns_callback_rescheduled' : 'human_owns_callback_captured';
+            broadcastSse('appointment_updated', { phone: fromNorm, aptId: cap.apt?.id ?? null });
+            logger.info('[pipeline] callback arranged by hand was recorded — nothing sent to the lead', { from: fromNorm, aptId: cap.apt?.id ?? null, managerAccepted: cap.manager?.accepted ?? null });
+          } else if (cap && !cap.captured) {
+            _holdRoute = 'human_owns_callback_unresolved';
+          }
+        }
+      } catch (err) { logger.error('[pipeline] manual callback capture failed', { from: fromNorm, error: err.message }); }
       const hoEntry = inbox.push({
         from: fromNorm, fromIsraeli, name: msg.name ?? clientMatch.arboxName ?? null,
         text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
         receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null,
-        clientMatch, intent, route: 'human_owns_hold', barakReply: null,
+        clientMatch, intent, route: _holdRoute, barakReply: null,
       });
       broadcastSse('message', { phone: hoEntry.from, name: hoEntry.name ?? null, route: 'human_owns' });
       persist.saveInbox(inbox);
-      return { inboxEntry: hoEntry, clientMatch, intent, route: 'human_owns_hold', barakReply: null };
+      return { inboxEntry: hoEntry, clientMatch, intent, route: _holdRoute, barakReply: null };
     }
 
     if (_stopStatus === 'opted_out') {
@@ -4318,7 +4365,23 @@ async function processInboundWAMessage(msg) {
     // ════════════════════════════════════════════════════════════════════════
     route = 'tomer';
 
-    if (isSchedulingMsg) {
+    // A request to move / book / cancel a class is an ACTION this system may not perform in Arbox. It is never
+    // answered by a free-text model: the facts are read from Arbox, a staff task is opened, the manager is alerted.
+    let _handoff = null;
+    if (msg.type === 'text' && msg.text?.trim() && !(intent === 'schedule_query' && isWeeklyTimetableQuery(msg.text))) {
+      try {
+        _handoff = await memberHandoff.handleClassRequest({ phone: fromNorm, text: msg.text, name: clientMatch.arboxName ?? msg.name ?? null,
+          sentAt: _saneDate(msg.timestamp), pending: _pendingMessages });
+      } catch (err) {
+        logger.error('[member-handoff] class request handling failed — falling back to the previous flow', { from: fromNorm, error: err.message });
+      }
+    }
+    if (_handoff) {
+      route = 'tomer_handoff';
+      barakReply = _handoff.replyText;
+      _replyAlreadySent = true;
+      store.logEvent('member_handoff_task', fromNorm, { taskId: _handoff.taskId, kind: _handoff.kind, isNew: _handoff.isNew, alert: _handoff.alert?.state ?? null, sendState: _handoff.sendState });
+    } else if (isSchedulingMsg) {
       // Scheduling query from an existing member: Tomer uses Arbox live data
       const timetableUrlTomer = getActiveTimetableUrl();
       if (intent === 'schedule_query'
@@ -4366,9 +4429,24 @@ async function processInboundWAMessage(msg) {
     } else if (msg.type !== 'text' && msg.type !== 'reaction') {
       // Non-text, non-payment media from an existing client (image, audio, document, etc.)
       // — a warm holding reply so the person knows we received it.
-      barakReply = `תודה! קיבלנו את ההודעה 😊 הצוות שלנו יחזור אליך בהקדם.`;
-      // Logged to inbox only — no alertOwner (staff sees it in the dashboard)
+      // No promise without a task: a documented staff task is opened and the manager is alerted BEFORE the member is
+      // told anything. Audio is not transcribed by this system, so the member is told so and invited to write.
       store.logEvent('client_media_in', fromNorm, { type: msg.type, name: msg.name ?? clientMatch.arboxName });
+      try {
+        const _mh = await memberHandoff.handleMedia({ phone: fromNorm, type: msg.type, name: clientMatch.arboxName ?? msg.name ?? null,
+          caption: msg.mediaCaption ?? null, pending: _pendingMessages });
+        route = 'tomer_handoff';
+        barakReply = _mh.replyText;
+        _replyAlreadySent = true;
+        store.logEvent('member_handoff_task', fromNorm, { taskId: _mh.taskId, kind: msg.type, isNew: _mh.isNew, alert: _mh.alert?.state ?? null, sendState: _mh.sendState });
+      } catch (err) {
+        // Nothing is promised to the member; the manager is told directly so the message is not lost.
+        logger.error('[member-handoff] media handling failed', { from: fromNorm, error: err.message });
+        alertOwner('⚠️ תומר — הודעת מדיה ממתאמנ/ת לא טופלה', `📱 ${fromIsraeli ?? fromNorm}
+סוג: ${msg.type}
+לא נשלחה תשובה אוטומטית ולא נפתחה פנייה (${err.message}).
+💬 https://wa.me/${fromNorm}`, { linkPreview: false }).catch(() => {});
+      }
     }
 
   } else {
@@ -6427,7 +6505,9 @@ async function _retryClosingSummary(phone, { force = false } = {}) {
   const meta     = lead.meta ?? {};
   const qd       = meta.qualData ?? {};
   const callTime = qd.callTimeGiven ?? meta.callbackTime ?? null;
-  if (!qd.confirmedName) return { ok: false, error: 'no_name' };
+  const _heldApt = callbackSvc.openCallback(phone);
+  const provisionalName = !qd.confirmedName && _heldApt?.capturedDuring === 'human_hold' ? (_heldApt.leadName ?? lead.name ?? phone) : null;
+  if (!qd.confirmedName && !provisionalName) return { ok: false, error: 'no_name' };
   if (!callTime)         return { ok: false, error: 'no_call_time' };
   if (qd.closingSummarySent && !force) {
     return { ok: false, error: 'already_sent',
@@ -6435,7 +6515,7 @@ async function _retryClosingSummary(phone, { force = false } = {}) {
   }
 
   const skippedBefore = [...(meta.closingSummaryManagerSentTo ?? [])];
-  const fin = await callbackSvc.finalize({ phone, trigger: force ? 'admin_retry_force' : 'retry' });
+  const fin = await callbackSvc.finalize({ phone, trigger: force ? 'admin_retry_force' : 'retry', provisionalName });
   if (!fin.apt) return { ok: false, error: fin.error };
 
   return {
@@ -7059,6 +7139,29 @@ app.post('/api/demo/flags', express.json(), (req, res) => {
   res.json({ ok: true, qualData: { ...current, ...flags } });
 });
 
+// ── Controlled retry of a summary the provider never accepted ─────────────────
+// A manager / prospect summary that definitively FAILED stays visible as failed in the panel and is retried here
+// every 15 minutes, at most three times, through callbackSvc.finalize (persisted appointment, durable dedup per
+// recipient). 'uncertain' sends are never retried automatically. Nothing is sent for an expired or closed callback.
+const MAX_SUMMARY_RETRIES = 3;
+async function _retryFailedCallbackSummaries() {
+  if (process.env.WHATSAPP_AUTO_REPLY !== 'true') return { retried: 0 };
+  let retried = 0;
+  for (const l of store.getAllLeads()) {
+    const m = l.meta ?? {};
+    const failed  = m.closingSummaryProspectState === 'failed'    || m.closingSummaryManagerState === 'failed';
+    const unknown = m.closingSummaryProspectState === 'uncertain' || m.closingSummaryManagerState === 'uncertain';
+    if (!failed || unknown || (m.closingSummaryRetries ?? 0) >= MAX_SUMMARY_RETRIES) continue;
+    if (!callbackSvc.isFuture(callbackSvc.openCallback(l.phone))) continue;
+    store.upsertLead(l.phone, { meta: { ...m, closingSummaryRetries: (m.closingSummaryRetries ?? 0) + 1, closingSummaryRetryAt: new Date().toISOString() } });
+    persist.saveLeads(store);
+    const r = await _retryClosingSummary(l.phone).catch(err => ({ ok: false, error: err.message }));
+    store.logEvent('closing_summary_retry', l.phone, { attempt: (m.closingSummaryRetries ?? 0) + 1, ok: !!r.ok, error: r.error ?? null });
+    retried++;
+  }
+  return { retried };
+}
+
 // ── Startup closing-summary recovery ──────────────────────────────────────────
 // in_flight after a crash = UNKNOWN outcome: the provider may have accepted the send
 // before the process died. It becomes 'uncertain' and is surfaced for review in the
@@ -7299,6 +7402,7 @@ app.listen(PORT, async () => {
 
 } // end else (TEST_NO_BIND !== 'true')
 
+app.locals.retryFailedCallbackSummaries = _retryFailedCallbackSummaries;   // also run by the 15-minute job; exposed for tests
 module.exports = app;
 // Exposed for tests only: the real startup-recovery routine (production runs it from
 // the listen callback).

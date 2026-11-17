@@ -209,7 +209,7 @@ async function notifyStaffCallbackConfirmed(apt, assignedStaff, icsDownloadUrl, 
 async function sendStaffReminder(apt, assignedStaff, { skipPhones = new Set() } = {}) {
   // Displayed time comes from the persisted scheduledAt, in Asia/Jerusalem.
   const hasTime   = apt.scheduledAt instanceof Date && !isNaN(apt.scheduledAt.getTime());
-  const timeLabel = hasTime ? formatCallbackTime(apt.scheduledAt) : formatTime(apt.scheduledAt, apt.rawTime);
+  const timeLabel = hasTime ? formatCallbackTime(apt.scheduledAt, apt.windowEndAt ?? null) : formatTime(apt.scheduledAt, apt.rawTime);
   const lead      = apt.leadName || (String(apt.leadPhone).startsWith('972') ? '0' + String(apt.leadPhone).slice(3) : apt.leadPhone);
 
   // Actual minutes remaining so the text matches the real timing.

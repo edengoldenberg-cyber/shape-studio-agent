@@ -35,6 +35,8 @@ const AVAIL_RESCHEDULE_RE = /לא\s*(?:נוח|מתאים|יכול|יכולה|א�
 const AVAIL_CANCEL_RE     = /לבטל|אבטל|מבטל|תבטלו|לא\s*רוצ[הי]|לא\s*מעוניי?נ|לא\s+רלוונטי|לא\s+צריך|not interested|cancel/i;
 
 function validDate(d) { return d instanceof Date && !isNaN(d.getTime()); }
+/** The time of an appointment as it is shown to anyone: an hour, or the RANGE the prospect gave (never an appointed hour). */
+function fmtApt(apt) { return formatCallbackTime(apt.scheduledAt, apt.windowEndAt ?? null); }
 function firstName(n) { return String(n ?? '').trim().split(/\s+/)[0] || null; }
 function localPhone(p) { return String(p).startsWith('972') ? '0' + String(p).slice(3) : String(p); }
 
@@ -146,11 +148,14 @@ function createCallbackService(deps) {
 
     let apt, isReschedule = false;
     try {
+      const windowEndAt = validDate(res.windowEndAt) ? res.windowEndAt.toISOString() : null;
       if (isFuture(open)) {
-        if (open.scheduledAt.getTime() === res.scheduledAt.getTime()) {
+        if (open.scheduledAt.getTime() === res.scheduledAt.getTime() && (open.windowEndAt ?? null) === windowEndAt) {
           return { ok: true, apt: open, isReschedule: false, unchanged: true };
         }
+        // the SAME request is moved: the store clears the reminder flags of the old time, so no old reminder can fire
         apt = aptStore.reschedule(open.id, { rawTime, scheduledAt: res.scheduledAt });
+        apt = aptStore.update(apt.id, { windowEndAt });
         isReschedule = true;
       } else {
         // No open callback, or the open one already expired without an outcome: the
@@ -165,6 +170,7 @@ function createCallbackService(deps) {
           durationMin:     getDurationMin(),
           assignedStaffId: getStaffId(),
         });
+        if (windowEndAt) apt = aptStore.update(apt.id, { windowEndAt });
       }
     } catch (err) {
       logger.error('[callback] appointment NOT persisted — no confirmation will be sent', { phone, source, error: err.message });
@@ -197,6 +203,7 @@ function createCallbackService(deps) {
     const metaPatch = {
       awaitingCallbackTime:  false,
       callbackTimeAttempts:  0,
+      closingSummaryRetries: 0,
       callbackTime:          rawTime,
       callbackRequestedAt:   sentIso,
       callTimeGivenAt:       sentIso,
@@ -238,24 +245,29 @@ function createCallbackService(deps) {
   // ── 2. Summaries ────────────────────────────────────────────────────────────
 
   function buildProspectSummary(name, apt, isReschedule) {
-    const fmt = formatCallbackTime(apt.scheduledAt);
+    const fmt = fmtApt(apt);
     return [
       isReschedule ? `${name}, עדכנו את בקשת השיחה שלך ✅` : `${name}, קיבלנו את בקשת השיחה שלך ✅`,
       `📞 ${fmt}`,
-      `נציג מהצוות של Shape Studio יצור איתך קשר.`,
+      // a range of hours is the prospect's availability: it is confirmed as a range, never as an appointed hour
+      apt.windowEndAt ? `נציג מהצוות של Shape Studio יצור איתך קשר בטווח השעות הזה.` : `נציג מהצוות של Shape Studio יצור איתך קשר.`,
     ].join('\n');
   }
 
   function buildManagerSummary(phone, name, apt, isReschedule) {
     const qd  = getLead(phone)?.meta?.qualData ?? {};
-    const fmt = formatCallbackTime(apt.scheduledAt);
+    const fmt = fmtApt(apt);
     const base = getBackendBase();
     const prev = isReschedule && apt.previousScheduledAt ? formatCallbackTime(new Date(apt.previousScheduledAt)) : null;
     const body = [
       isReschedule ? `🔄 שינוי מועד שיחה — ${name}` : `📞 בקשת שיחה חדשה — ${name}`,
       `📅 ${fmt}`,
       prev ? `↩️ מועד קודם: ${prev}` : null,
+      apt.windowEndAt ? `🕑 הליד מסר/ה טווח שעות, לא שעה מדויקת` : null,
       `📱 ${localPhone(phone)}`,
+      qd.lastTopic ? `💬 נושא הפנייה: ${qd.lastTopic}` : null,
+      apt.capturedDuring === 'human_hold' ? `✋ השיחה בטיפול ידני: לא נשלח אישור אוטומטי לליד` : null,
+      apt.nameProvisional ? `👤 השם מפרופיל הוואטסאפ, לא אומת` : null,
       qd.fitnessInterest ? `💪 עניין: ${qd.fitnessInterest}` : null,
       qd.location        ? `📍 מיקום: ${qd.location}` : null,
       qd.goal            ? `🎯 מטרה: ${qd.goal}` : null,
@@ -275,10 +287,13 @@ function createCallbackService(deps) {
    *
    * opts.notifyManager=false — staff changed the time themselves in the panel.
    */
-  async function finalize({ phone, trigger = 'unknown', notifyManager = true } = {}) {
+  async function finalize({ phone, trigger = 'unknown', notifyManager = true, provisionalName = null } = {}) {
     const lead = getLead(phone);
     if (!lead) return { ok: false, error: 'lead_not_found' };
-    const name = firstName(lead.meta?.qualData?.confirmedName);
+    // `provisionalName` (the WhatsApp profile name) is accepted only where the prospect cannot be asked for a name:
+    // a conversation a human owns. It is labelled as unverified to the manager and is never sent to the prospect.
+    const confirmed = firstName(lead.meta?.qualData?.confirmedName);
+    const name = confirmed ?? (provisionalName ? firstName(provisionalName) ?? localPhone(phone) : null);
     if (!name) return { ok: false, error: 'no_name' };
     const apt0 = openCallback(phone);
     if (!apt0 || !validDate(apt0.scheduledAt)) return { ok: false, error: 'no_persisted_callback' };
@@ -290,8 +305,11 @@ function createCallbackService(deps) {
       // Keep the appointment's name in sync BEFORE any send; if that cannot be
       // persisted nothing is sent.
       let apt = apt0;
-      if (apt.leadName !== lead.meta.qualData.confirmedName) {
-        try { apt = aptStore.update(apt.id, { leadName: lead.meta.qualData.confirmedName }); }
+      if (!confirmed) {
+        try { apt = aptStore.update(apt.id, { leadName: apt.leadName ?? name, nameProvisional: true }); }
+        catch (err) { logger.error('[callback] provisional name not persisted — summaries withheld', { phone, error: err.message }); return { ok: false, error: 'persist_failed' }; }
+      } else if (apt.leadName !== lead.meta.qualData.confirmedName) {
+        try { apt = aptStore.update(apt.id, { leadName: lead.meta.qualData.confirmedName, nameProvisional: false }); }
         catch (err) {
           logger.error('[callback] name not persisted — summaries withheld', { phone, error: err.message });
           return { ok: false, error: 'persist_failed' };
@@ -309,7 +327,7 @@ function createCallbackService(deps) {
       // Durable in-flight marker: if the process dies between a send and its record, the
       // next startup turns this into 'uncertain' (review needed) — never an automatic resend.
       const prospectPending = !alreadyNotified(apt, 'prospect_summary').has(phone);
-      patchLead(phone, { name: lead.meta.qualData.confirmedName }, {
+      patchLead(phone, confirmed ? { name: lead.meta.qualData.confirmedName } : {}, {
         closingSummaryProspectReply: prospectMsg,
         callbackAptId: apt.id,
         closingSummaryProspectState: prospectPending ? 'in_flight' : 'accepted',
@@ -398,6 +416,44 @@ function createCallbackService(deps) {
     }
   }
 
+  // ── 2b. A callback arranged BY HAND, while a human owns the conversation ─────
+  /**
+   * A staff member took the conversation over and arranged a call in their own words ("מתי נוח שניצור קשר?").
+   * The prospect's answer is the callback request: without this it existed only in the chat, and nobody was
+   * reminded. The request is persisted and the manager is told ONCE. Nothing is sent to the prospect - the
+   * human owns the conversation and answers there (rule 5); no name is asked for, the profile name is used
+   * and labelled as unverified.
+   * Returns null when this is not a human-owned lead, otherwise
+   *   { captured:true, apt, isReschedule, unchanged, manager }   the request is on disk
+   *   { captured:false, reason, managerAlerted }                 a time was mentioned but could not be resolved:
+   *                                                              the manager is told to arrange it by hand
+   */
+  async function captureWhileHumanOwned({ phone, text, sentAt, displayName = null }) {
+    const lead = getLead(phone);
+    if (!lead || lead.status !== 'human_owns') return null;
+    const who = firstName(lead.meta?.qualData?.confirmedName) ?? firstName(displayName) ?? firstName(lead.name) ?? localPhone(phone);
+    const r = acceptTime({ phone, text, sentAt, source: 'human_hold' });
+    if (!r.ok) {
+      store.logEvent('callback_hold_time_unresolved', phone, { reason: r.reason, preview: String(text).slice(0, 80) });
+      let managerAlerted = false;
+      try {
+        const ar = await alertOwner(`📞 ליד מסר/ה מועד לשיחה שלא נרשם — ${who}`,
+          [`👤 ${who}`, `📱 ${localPhone(phone)}`, `💬 "${String(text).slice(0, 200)}"`,
+           r.reason === 'persist_failed' ? `המועד לא נשמר במערכת (תקלה באחסון).` : `לא הצלחתי לקבוע מההודעה יום ושעה מפורשים, ולכן לא נרשמה בקשת שיחה ולא תישלח תזכורת.`,
+           `השיחה בטיפול ידני — נא לתאם ישירות.`, `💬 https://wa.me/${phone}`].join('\n'), { linkPreview: false });
+        managerAlerted = (ar?.results ?? []).some(x => x.idMessage);
+      } catch (err) { logger.warn('[callback] hold alert failed', { phone, error: err.message }); }
+      if (!managerAlerted) store.logEvent('callback_hold_alert_failed', phone, { reason: r.reason });
+      return { captured: false, reason: r.reason, managerAlerted };
+    }
+    if (r.unchanged) return { captured: true, unchanged: true, isReschedule: false, apt: r.apt, manager: null };
+    try { aptStore.update(r.apt.id, { capturedDuring: 'human_hold' }); }
+    catch (err) { logger.error('[callback] hold marker not persisted', { phone, error: err.message }); }
+    const fin = await finalize({ phone, trigger: 'human_hold', provisionalName: displayName ?? lead.name ?? localPhone(phone) });
+    store.logEvent('callback_captured_human_hold', phone, { aptId: r.apt.id, isReschedule: r.isReschedule, manager: fin.manager?.accepted ? 'accepted' : 'failed', prospect: fin.prospect?.state ?? null });
+    return { captured: true, unchanged: false, isReschedule: r.isReschedule, apt: openCallback(phone), manager: fin.manager ?? null, prospect: fin.prospect ?? null, error: fin.error ?? null };
+  }
+
   // ── 3. Prospect replies about an open callback ──────────────────────────────
 
   /**
@@ -412,7 +468,7 @@ function createCallbackService(deps) {
     if (!msg) return null;
     const name  = firstName(getLead(phone)?.meta?.qualData?.confirmedName) ?? firstName(apt.leadName) ?? firstName(displayName);
     const who   = name ?? localPhone(phone);
-    const fmt   = formatCallbackTime(apt.scheduledAt);
+    const fmt   = fmtApt(apt);
     const now   = Date.now();
     const future = apt.scheduledAt.getTime() > now;
 
@@ -573,7 +629,7 @@ function createCallbackService(deps) {
     if (!aptStore.ACTIVE_STATUSES.has(apt.status)) return { ok: false, error: 'not_open', apt };
     const res = resolveCallbackTime(rawTime, new Date());
     if (!res.ok) return { ok: false, error: 'invalid_time', reason: res.reason, clarification: res.clarification, apt };
-    const oldTime = validDate(apt.scheduledAt) ? formatCallbackTime(apt.scheduledAt) : (apt.rawTime ?? null);
+    const oldTime = validDate(apt.scheduledAt) ? fmtApt(apt) : (apt.rawTime ?? null);
     const updated = aptStore.reschedule(id, { rawTime: String(rawTime).trim(), scheduledAt: res.scheduledAt }); // throws on failure
     cancelCalendarEvent(apt).catch(() => {});
     if (getLead(apt.leadPhone)) {
@@ -647,7 +703,9 @@ function createCallbackService(deps) {
           status:                open.status,
           rawTime:               open.rawTime,
           scheduledAt:           open.scheduledAt,
-          scheduledLabel:        validDate(open.scheduledAt) ? formatCallbackTime(open.scheduledAt) : null,
+          scheduledLabel:        validDate(open.scheduledAt) ? fmtApt(open) : null,
+          isWindow:              !!open.windowEndAt,                  // the prospect gave a range of hours, not an appointed hour
+          capturedDuring:        open.capturedDuring ?? null,          // 'human_hold' = arranged by hand in the chat
           expired:               validDate(open.scheduledAt) ? open.scheduledAt.getTime() <= now : false,
           assignedStaffId:       open.assignedStaffId,
           staffConfirmedAt:      open.staffConfirmedAt ?? null,
@@ -672,7 +730,7 @@ function createCallbackService(deps) {
   }
 
   return {
-    acceptTime, finalize, handleAvailabilityReply, cancelForOptOut,
+    acceptTime, finalize, captureWhileHumanOwned, handleAvailabilityReply, cancelForOptOut,
     staffConfirm, staffOutcome, staffReschedule, panelRows,
     openCallback, isFuture, setLeadStatus,
     STOP_STATUSES, CALLBACK_STATUSES,

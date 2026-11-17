@@ -91,13 +91,23 @@ function isValidYmd(year, month0, day) {
   return d.getUTCFullYear() === year && d.getUTCMonth() === month0 && d.getUTCDate() === day;
 }
 
-/** "יום ראשון, 15.11.2026 בשעה 11:00" — always from a concrete instant, in Israel time. */
-function formatCallbackTime(date) {
+/**
+ * "יום ראשון, 15.11.2026 בשעה 11:00" — always from a concrete instant, in Israel time.
+ * With `windowEnd` (the prospect gave a RANGE of hours): "יום ראשון, 15.11.2026 בין 14:00 ל-16:00".
+ * A range is the prospect's availability, never an appointed hour, and is always written as a range.
+ */
+function formatCallbackTime(date, windowEnd = null) {
   const d = date instanceof Date ? date : new Date(date);
   if (isNaN(d.getTime())) return '';
   const p  = ilParts(d);
   const dd = String(p.day).padStart(2, '0'), mm = String(p.month + 1).padStart(2, '0');
   const hh = String(p.hour).padStart(2, '0'), mi = String(p.minute).padStart(2, '0');
+  const e  = windowEnd ? (windowEnd instanceof Date ? windowEnd : new Date(windowEnd)) : null;
+  if (e && !isNaN(e.getTime()) && e.getTime() > d.getTime()) {
+    const q = ilParts(e);
+    if (q.year === p.year && q.month === p.month && q.day === p.day)
+      return `יום ${HE_WEEKDAY_NAMES[p.weekday]}, ${dd}.${mm}.${p.year} בין ${hh}:${mi} ל-${String(q.hour).padStart(2, '0')}:${String(q.minute).padStart(2, '0')}`;
+  }
   return `יום ${HE_WEEKDAY_NAMES[p.weekday]}, ${dd}.${mm}.${p.year} בשעה ${hh}:${mi}`;
 }
 
@@ -301,7 +311,43 @@ function resolveMeridiem(hour, hours) {
 
 // ── Main resolver ─────────────────────────────────────────────────────────────
 
+// A RANGE of hours ("בין 14:00-16:00", "בין 2 ל-4", "מ-10 עד 12", "14:00–16:00"). The range is the prospect's
+// availability: its start becomes scheduledAt (reminders are timed from it) and its end is kept as windowEndAt.
+const WINDOW_RES = [
+  /בין\s*(?:השעות\s*|השעה\s*)?(\d{1,2})(?::(\d{2}))?\s*(?:-|–|—|עד|ו-?\s*|ל-?\s*)\s*(\d{1,2})(?::(\d{2}))?/,
+  /(\d{1,2}):(\d{2})\s*(?:-|–|—|עד)\s*(\d{1,2}):(\d{2})/,
+  /מ-?\s*(\d{1,2})(?::(\d{2}))?\s*עד\s*(\d{1,2})(?::(\d{2}))?/,
+];
+function extractWindow(text) {
+  for (const re of WINDOW_RES) {
+    const m = re.exec(text);
+    if (!m) continue;
+    const a = Number(m[1]), b = Number(m[3]), am = Number(m[2] ?? 0), bm = Number(m[4] ?? 0);
+    if (a > 23 || b > 23 || am > 59 || bm > 59) continue;
+    return { match: m[0], startH: a, startM: am, startExplicit: m[2] !== undefined || a >= 13, endH: b, endM: bm };
+  }
+  return null;
+}
+
 function resolveCallbackTime(rawText, ref = new Date(), opts = {}) {
+  const hours = opts.hours ?? callingHours();
+  const w = extractWindow(String(rawText ?? ''));
+  if (!w) return resolveSingleTime(rawText, ref, opts);
+  const pad = n => String(n).padStart(2, '0');
+  // The range is replaced by its START hour and resolved by the ordinary strict rules (so "בין 2 ל-4" becomes the
+  // afternoon exactly as "ב-2" would). The end is then placed after the resolved start, on the same day.
+  const start = w.startExplicit ? `${pad(w.startH)}:${pad(w.startM)}` : String(w.startH);
+  const res = resolveSingleTime(String(rawText).replace(w.match, ` ב-${start} `), ref, opts);
+  if (!res.ok) return res;
+  const p = ilParts(res.scheduledAt);
+  let endH = w.endH;
+  while (endH * 60 + w.endM <= p.hour * 60 + p.minute && endH + 12 <= 23) endH += 12;
+  if (endH * 60 + w.endM <= p.hour * 60 + p.minute) return res;                     // no sensible end: only the start is kept
+  if (endH > hours.end || (endH === hours.end && w.endM > 0)) return res;           // the range leaves the calling hours: not claimed
+  return { ...res, windowEndAt: ilDate(p.year, p.month, p.day, endH, w.endM) };
+}
+
+function resolveSingleTime(rawText, ref = new Date(), opts = {}) {
   const hours = opts.hours ?? callingHours();
   const refDate = ref instanceof Date ? ref : new Date(ref);
   if (isNaN(refDate.getTime())) throw new Error('resolveCallbackTime: invalid reference timestamp');

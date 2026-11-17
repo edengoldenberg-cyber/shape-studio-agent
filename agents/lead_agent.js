@@ -195,6 +195,12 @@ const COMMITMENT_RE = /(?:י?יצור|יצרו|ניצור|אצור)\s+(?:אית�
 // The sentence OFFERS a call (invitation marker before the verb) rather than announcing one.
 const OFFER_RE = /(?:רוצה|רוצים|תרצה|תרצי|תרצו|מעוניינ|בא לך|אפשר ש|אשמח ש|נשמח ש|האם|מתאים לך ש|נוח לך ש|כדאי ש)[^.!?\n]*(?:יצור|ייצור|יצרו|ניצור|יתקשר|נתקשר|יחזור|יחזרו|נחזור|אחזור|ידבר|נדבר)/;
 
+// A sentence that only says "I am here if you have more questions" - it answers nothing and proposes nothing.
+const GENERIC_CLOSER_RE = /אם\s+יש\s+(?:לך\s+)?(?:עוד\s+)?שאלות|שאלות\s+נוספות|אני\s+כאן\s+(?:לעזור|בשבילך|לכל)|כאן\s+לעזור|אשמח\s+לעזור\s+(?:בכל|עם\s+כל)|אל\s+תהסס|מוזמנ(?:ת|ים)?\s+(?:לשאול|לפנות)|לכל\s+שאלה|תרגיש[יו]?\s+חופשי|אני\s+לרשותך/u;
+// What the lead asked when a call with a representative is the natural next step.
+const SALES_QUESTION_RE = /כמה\s+(?:זה\s+)?עולה|מחיר|עלות|עולה\s+שיעור|ניסיון|היכרות|מנוי|חבילה|כרטיסי/u;
+const CALLBACK_NEXT_STEP = 'רוצה שנציג יחזור אליך ויעזור לבחור את האימון המתאים?';
+
 function postProcessReply(reply, qualData, assets, ctx = {}) {
   if (!reply) return reply;
   let out = reply;
@@ -274,6 +280,26 @@ function postProcessReply(reply, qualData, assets, ctx = {}) {
         ? stripped
         : (qualData.callTimeGiven && !qualData.confirmedName ? `מצוין! 😊 ואיך קוראים לך?` : `מתי יהיה לך נוח שנחזור אליך? (יום ושעה)`);
       ppChanges.push('gate3b_premature_booking_stripped');
+    }
+  }
+
+  // 2.9 Robotic closers and the missing next step.
+  //     "אם יש לך שאלות נוספות … אני כאן לעזור" ends a sales conversation instead of moving it on (production,
+  //     2026-11-16: a lead asked what a trial costs, got the price and that sentence, and a human had to step in to
+  //     offer the call). Such a sentence is removed. When the lead asked about price / trial / membership and the
+  //     reply then carries no question and no offer, ONE concrete next step is added: a representative's call.
+  //     Never after a call was already proposed, agreed, declined or recorded - no repeated offer.
+  {
+    const sentences = out.split(/(?<=[.!?\n])/u);
+    const kept = sentences.filter(sn => !(GENERIC_CLOSER_RE.test(sn) && !OFFER_RE.test(sn)));
+    if (kept.length !== sentences.length && kept.join('').trim().length >= 10) {
+      out = kept.join('').trim();
+      ppChanges.push('generic_closer_stripped');
+    }
+    const settled = ctx?.hasPersistedCallback || qualData.callTimeGiven || qualData.callProposed || qualData.callbackDeclined || qualData.locationViable === false;
+    if (!settled && ctx?.userText && SALES_QUESTION_RE.test(ctx.userText) && !/\?/.test(out) && !INVITE_CONTEXT_RE.test(out)) {
+      out = `${out.trimEnd()}\n${CALLBACK_NEXT_STEP}`;
+      ppChanges.push('next_step_offered');
     }
   }
 
@@ -1406,7 +1432,7 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
     const _openCb = aptStore.getActiveCallback(from);
     const hasPersistedCallback = !!_openCb && _openCb.scheduledAt instanceof Date
       && !isNaN(_openCb.scheduledAt.getTime()) && _openCb.scheduledAt.getTime() > Date.now();
-    reply = postProcessReply(reply, freshQualData, assets, { hasPersistedCallback });
+    reply = postProcessReply(reply, freshQualData, assets, { hasPersistedCallback, userText: text });
 
     // ── State flags: set ONLY when AI reply confirms the action happened ──────
     //
@@ -1697,5 +1723,5 @@ function isCallbackInviteContext(phone) {
   return !!lastAssistant && INVITE_CONTEXT_RE.test(String(lastAssistant.content ?? ''));
 }
 
-module.exports = { isCallbackInviteContext, handleInbound, clearSession, generateLeadBrief, sendIntroOffer, getLastDebugContext, recordSchedulingExchange, computeLeadProfile, TIME_PATTERN, TIME_REJECTION_RE, extractNameFromMessage, postProcessReply };
+module.exports = { isCallbackInviteContext, handleInbound, clearSession, generateLeadBrief, sendIntroOffer, getLastDebugContext, recordSchedulingExchange, computeLeadProfile, TIME_PATTERN, TIME_REJECTION_RE, extractNameFromMessage, postProcessReply, CALLBACK_NEXT_STEP };
 
