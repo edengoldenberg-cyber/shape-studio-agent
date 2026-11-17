@@ -30,7 +30,8 @@ function fakeArbox(over = {}) {
   const gw = {
     writesEnabled: op => s.enabled.has(op),
     resolveMember: async () => ({ status: 'found', member: { userId: 500, name: 'מתאמנת בדיקה', active: true, role: 'client' } }),
-    getBookings: async () => { s.reads++; if (s.fail.read) throw new Error('arbox down'); return { bookings: s.lag.hide ? s.bookings.filter(b => b.time !== s.lag.hide) : s.bookings.slice(), source: 'fake' }; },
+    getBookings: async () => { s.reads++; if (s.fail.read) throw new Error('arbox down');
+      return { bookings: (s.lag.hide ? s.bookings.filter(b => b.time !== s.lag.hide) : s.bookings.slice()).map(b => ({ ...b, sessionsLeft: s.sessions ?? null })), source: 'fake' }; },
     getClasses: async () => ({ classes: s.classes, occupancyAvailable: true, source: 'fake' }),
     getMemberships: async () => { if (s.fail.memberships) throw new Error('arbox down'); return { memberships: s.memberships }; },
     executeWrite: async (op, args) => {
@@ -38,7 +39,9 @@ function fakeArbox(over = {}) {
       const f = s.fail[op];
       if (f === 'rejected') { const e = new Error('Arbox class_x → 422'); e.kind = 'rejected'; e.submitted = true; e.detail = 'The selected schedule id is invalid.'; throw e; }
       const c = s.classes.find(x => x.scheduleId === args.scheduleId);
-      const apply = () => { if (op === 'class_book') s.bookings.push(booking(c.start)); else s.bookings = s.bookings.filter(b => b.time !== c.start); };
+      // a punch card (s.sessions) is charged on booking and refunded on cancelling, unless Arbox keeps the charge (s.noRefund)
+      const apply = () => { if (op === 'class_book') { s.bookings.push(booking(c.start)); if (s.sessions != null) s.sessions -= 1; if (s.doubleBook) s.bookings.push(booking(c.start)); }
+        else { s.bookings = s.bookings.filter(b => b.time !== c.start); if (s.sessions != null && !s.noRefund) s.sessions += 1; } };
       if (f === 'timeout_applied') { apply(); const e = new Error('timeout'); e.kind = 'unavailable'; e.uncertain = true; e.submitted = true; throw e; }
       if (f === 'timeout_lost') { const e = new Error('timeout'); e.kind = 'unavailable'; e.uncertain = true; e.submitted = true; throw e; }
       if (f !== 'accepted_not_applied') apply();
@@ -47,7 +50,7 @@ function fakeArbox(over = {}) {
   };
   return { s, gw };
 }
-const actionsOn = gw => createClassActions({ gateway: gw, logger: require('../utils/logger'), now: () => NOW, sleep: async () => {}, verifyWaitMs: 0 });
+const actionsOn = (gw, extra = {}) => createClassActions({ gateway: gw, logger: require('../utils/logger'), now: () => NOW, sleep: async () => {}, verifyWaitMs: 0, audience: () => true, ...extra });
 const facts = (s, { cur = '18:00', tgt = '17:00' } = {}) => ({ member: { userId: 500 }, date: DAY, bookings: s.bookings.slice(), classes: s.classes,
   current: cur ? { booking: s.bookings.find(b => b.time === cur) ?? null } : null, target: tgt ? { cls: s.classes.find(c => c.start === tgt) ?? null } : null });
 
@@ -80,7 +83,7 @@ describe('B. the plan: what may be done automatically', () => {
     ['no active membership covers the day', s => { s.memberships[0].endDate = '2026-11-01'; }, 'no_active_membership'],
     ['two active memberships: it is not clear which to charge', s => { s.memberships.push({ membershipUserId: 78, active: true, cancelled: false, startDate: '2026-01-01', endDate: null }); }, 'membership_ambiguous'],
     ['the membership cannot be read', s => { s.fail.memberships = true; }, 'membership_unreadable'],
-    ['the original class is inside its cancellation window in Arbox', s => { s.classes[1].cancelLockHours = 48; }, 'inside_cancellation_window'],
+    ['the original class is inside its cancellation window and a late move was not verified against Arbox', s => { s.classes[1].cancelLockHours = 48; }, 'late_move_unverified'],
     ['the cancellation rule of the original class is unknown', s => { s.classes[1].cancelLockHours = null; }, 'cancel_rule_unknown'],
     ['the original booking is not in Arbox', s => { s.bookings.length = 0; }, 'current_not_found'],
     ['two classes start at the hour of the original booking', s => { s.classes.push(cls(103, '18:00')); }, 'current_class_unclear'],
@@ -93,13 +96,82 @@ describe('B. the plan: what may be done automatically', () => {
     expect(s.writes).toHaveLength(0);
   });
 
-  test('a class that already started is not booked, and a late cancellation is never automatic', async () => {
+  test('inside the cancellation window: a cancellation alone is never automatic; a MOVE is, once the late-move capability is on', async () => {
     const { s, gw } = fakeArbox();
-    const late = createClassActions({ gateway: gw, logger: require('../utils/logger'), now: () => ilDate(2026, 10, 18, 15, 43), sleep: async () => {} });   // the day itself, 15:43
-    expect((await late.plan({ kind: 'cancel', ...facts(s, { tgt: null }) })).reason).toBe('inside_cancellation_window');     // 18:00 is 2h17m away, the rule is 8h
-    expect((await late.plan({ kind: 'move', ...facts(s) })).reason).toBe('inside_cancellation_window');                       // …so the move is not started at all
-    const after = createClassActions({ gateway: gw, logger: require('../utils/logger'), now: () => ilDate(2026, 10, 18, 17, 5), sleep: async () => {} });
-    expect((await after.plan({ kind: 'book', ...facts(s, { cur: null }) })).reason).toBe('target_started');
+    const at1543 = { now: () => ilDate(2026, 10, 18, 15, 43) };                        // the day itself, 15:43: 18:00 is 2h17m away, the rule is 8h
+    const late = actionsOn(gw, at1543);
+    expect((await late.plan({ kind: 'cancel', ...facts(s, { tgt: null }) })).reason).toBe('inside_cancellation_window');
+    expect((await late.plan({ kind: 'move', ...facts(s) })).reason).toBe('late_move_unverified');   // approved by the owner, not yet verified against Arbox
+    expect(s.writes).toHaveLength(0);
+    s.enabled.add('class_move_late');                                                  // after the controlled verification
+    const pl = await late.plan({ kind: 'move', ...facts(s) });
+    expect(pl).toMatchObject({ ok: true, late: true });
+    expect(pl.steps.map(x => x.op)).toEqual(['class_book', 'class_cancel']);           // still: the new class first
+    expect((await late.plan({ kind: 'cancel', ...facts(s, { tgt: null }) })).reason).toBe('inside_cancellation_window');   // the exception is for a move only
+    expect((await actionsOn(gw).plan({ kind: 'move', ...facts(s) })).late).toBe(false);                                   // outside the window nothing is "late"
+  });
+
+  test('both classes must not have started', async () => {
+    const { s, gw } = fakeArbox(); s.enabled.add('class_move_late');
+    const after17 = actionsOn(gw, { now: () => ilDate(2026, 10, 18, 17, 5) });
+    expect((await after17.plan({ kind: 'book', ...facts(s, { cur: null }) })).reason).toBe('target_started');
+    expect((await after17.plan({ kind: 'move', ...facts(s) })).reason).toBe('target_started');
+    s.classes.push(cls(103, '19:00'));
+    const after18 = actionsOn(gw, { now: () => ilDate(2026, 10, 18, 18, 5) });
+    expect((await after18.plan({ kind: 'move', ...facts(s, { tgt: '19:00' }) })).reason).toBe('current_started');
+    expect((await actionsOn(gw).plan({ kind: 'move', ...facts(s, { tgt: '18:00' }) })).reason).toBe('same_class');     // "move me" to the class she is in
+    expect(s.writes).toHaveLength(0);
+  });
+
+  test('who: only a phone on the test list, until the audience is opened to everyone', async () => {
+    const { s, gw } = fakeArbox();
+    const saved = { a: process.env.ARBOX_WRITE_AUDIENCE, p: process.env.ARBOX_WRITE_TEST_PHONES };
+    try {
+      delete process.env.ARBOX_WRITE_AUDIENCE; delete process.env.ARBOX_WRITE_TEST_PHONES;
+      const real = createClassActions({ gateway: gw, logger: require('../utils/logger'), now: () => NOW, sleep: async () => {} });   // the shipped audience rule
+      expect((await real.plan({ kind: 'move', phone: '972500000001', ...facts(s) })).reason).toBe('not_in_test_audience');           // nothing configured = nobody
+      process.env.ARBOX_WRITE_TEST_PHONES = '972500000009, 0500000001';
+      expect((await real.plan({ kind: 'move', phone: '972500000001', ...facts(s) })).reason).toBe('not_in_test_audience');           // an Israeli-format number is not a match by accident
+      process.env.ARBOX_WRITE_TEST_PHONES = '972500000009,972500000001';
+      expect((await real.plan({ kind: 'move', phone: '972500000001', ...facts(s) })).ok).toBe(true);
+      expect((await real.plan({ kind: 'move', phone: '972500000002', ...facts(s) })).reason).toBe('not_in_test_audience');
+      process.env.ARBOX_WRITE_AUDIENCE = 'all';
+      expect((await real.plan({ kind: 'move', phone: '972500000002', ...facts(s) })).ok).toBe(true);
+      expect(s.writes).toHaveLength(0);
+    } finally {
+      for (const [k, v] of [['ARBOX_WRITE_AUDIENCE', saved.a], ['ARBOX_WRITE_TEST_PHONES', saved.p]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    }
+  });
+});
+
+describe('B. bookings and sessions are read before and after: no double charge passes as a success', () => {
+  const run = async (over, kind = 'move') => { const { s, gw } = fakeArbox(over); const a = actionsOn(gw); const pl = await a.plan({ kind, ...facts(s, kind === 'book' ? { cur: null } : kind === 'cancel' ? { tgt: null } : {}) }); return { s, res: await a.execute(pl) }; };
+
+  test('a move on a punch card: one session before, one session after', async () => {
+    const { res } = await run({ sessions: 5 });
+    expect(res.ok).toBe(true);
+    expect(res.balance).toMatchObject({ check: 'ok', before: { count: 1, sessionsLeft: 5 }, after: { count: 1, sessionsLeft: 5 } });
+  });
+  test('Arbox kept the charge of the cancelled class: the move is verified, the balance is NOT, and that is reported', async () => {
+    const { res } = await run({ sessions: 5, noRefund: true });
+    expect(res.ok).toBe(true);
+    expect(res.balance).toMatchObject({ check: 'mismatch', before: { sessionsLeft: 5 }, after: { sessionsLeft: 4 } });
+    expect(res.balance.note).toMatch(/ירדה מ-5 ל-4/);
+  });
+  test('a booking may cost exactly one session; a cancellation none', async () => {
+    const b = await run({ sessions: 5, bookings: [] }, 'book');
+    expect(b.res.balance).toMatchObject({ check: 'ok', before: { count: 0, sessionsLeft: null }, after: { count: 1, sessionsLeft: 4 } });   // a first booking: nothing to compare with, the count is verified
+    const c = await run({ sessions: 5 }, 'cancel');
+    expect(c.res.balance).toMatchObject({ check: 'ok', after: { count: 0 } });
+  });
+  test('the same class booked twice is seen', async () => {
+    const { res } = await run({ doubleBook: true, bookings: [] }, 'book');
+    expect(res.balance.check).toBe('mismatch');
+    expect(res.balance.note).toMatch(/רישום כפול/);
+  });
+  test('a period membership (Arbox reports no count): the number of bookings is what is checked', async () => {
+    const { res } = await run();
+    expect(res.balance).toMatchObject({ check: 'ok', before: { sessionsLeft: null }, after: { sessionsLeft: null, count: 1 } });
   });
 });
 
@@ -156,40 +228,162 @@ describe('B. carrying a move out: success is what Arbox shows afterwards', () =>
 });
 
 describe('B. through the member hand-off: what the member and the staff are told', () => {
-  function world(over) {
+  function world(over, opts = {}) {
     const { s, gw } = fakeArbox(over);
     const tasks = [], sent = [], alerts = [];
+    const clock = { t: NOW };
     let seq = 0;
     const tomerStore = {
       getTasks: ({ phone, type } = {}) => tasks.filter(t => (!phone || t.phone === phone) && (!type || t.type === type)),
       getOpenTasks: () => tasks.filter(t => t.status === 'open'),
-      createTask: t => { const x = { id: `t${++seq}`, status: 'open', createdAt: NOW.toISOString(), updatedAt: NOW.toISOString(), ...t }; tasks.push(x); return x; },
-      updateTask: (id, u) => Object.assign(tasks.find(t => t.id === id), u, { updatedAt: NOW.toISOString() }),
+      createTask: t => { const x = { id: `t${++seq}`, status: 'open', createdAt: clock.t.toISOString(), updatedAt: clock.t.toISOString(), ...t }; tasks.push(x); return x; },
+      updateTask: (id, u) => Object.assign(tasks.find(t => t.id === id), u, { updatedAt: clock.t.toISOString() }),
       resolveTask: (id, r) => Object.assign(tasks.find(t => t.id === id), { status: 'resolved', ...r }),
       appendAudit: () => {},
     };
-    const h = createMemberHandoff({ gateway: gw, tomerStore, logger: require('../utils/logger'), now: () => NOW, classActions: actionsOn(gw),
+    const h = createMemberHandoff({ gateway: gw, tomerStore, logger: require('../utils/logger'), now: () => clock.t, classActions: actionsOn(gw, { now: () => clock.t, ...(opts.actions ?? {}) }),
       alertOwner: async (subject, body) => { alerts.push({ subject, body }); return { results: [{ phone: 'mgr', idMessage: `A${alerts.length}` }] }; },
       sendText: async (to, text) => { sent.push({ to, text }); return { idMessage: `M${sent.length}` }; } });
-    return { s, h, tasks, sent, alerts };
+    const say = (text, extra = {}) => h.handleClassRequest({ phone: P, text, sentAt: clock.t, ...extra });
+    return { s, h, tasks, sent, alerts, clock, say, last: () => sent[sent.length - 1]?.text ?? null };
   }
+  const P = '972500000001';
   const ASK = 'אני רשומה מחר לפילאטיס ב-18:00 ורוצה לעבור ל-17:00';
+  const minutes = (w, n) => { w.clock.t = new Date(w.clock.t.getTime() + n * 60000); };
+
+  test('NOTHING is written on the request alone: the exact action is shown and a written "כן" is awaited', async () => {
+    const w = world();
+    const r = await w.say(ASK);
+    expect(r.action).toMatchObject({ state: 'awaiting_member_confirmation' });
+    expect(w.s.writes).toHaveLength(0);
+    expect(w.sent[0].text).toBe('רק לוודא לפני שאני משנה ב-Arbox:\nמעבר מפילאטיס מכשירים ב-18:00 לפילאטיס מכשירים ב-17:00, ביום רביעי 18.11.\nלאשר? אפשר לענות "כן" ואבצע, או "לא" ולא אשנה דבר.');
+    expect(w.tasks[0]).toMatchObject({ status: 'open', action: { state: 'awaiting_member_confirmation' }, pendingConfirm: { date: DAY, kind: 'move', current: { time: '18:00' }, target: { time: '17:00', scheduleId: 101 } } });
+    expect(w.alerts).toHaveLength(0);                                       // nothing is waiting for the staff yet
+  });
+
+  test('"לא": nothing is sent to Arbox, the task is closed, and she is told her registration is as it was', async () => {
+    const w = world();
+    await w.say(ASK); await w.say('לא תודה');
+    expect(w.s.writes).toHaveLength(0);
+    expect(w.tasks[0]).toMatchObject({ status: 'resolved', pendingConfirm: null, action: { state: 'declined_by_member' } });
+    expect(w.last()).toMatch(/לא שיניתי דבר/);
+    expect(await w.say('כן')).toBeNull();                                   // a later "כן" confirms nothing
+    expect(w.s.writes).toHaveLength(0);
+  });
+
+  test('a "כן" after 30 minutes does not act on old facts: Arbox is read again and the question is asked again', async () => {
+    const w = world();
+    await w.say(ASK); minutes(w, 45);
+    const r = await w.say('כן');
+    expect(r.action.state).toBe('awaiting_member_confirmation');
+    expect(w.s.writes).toHaveLength(0);
+    expect(w.last()).toMatch(/^עבר זמן מאז ששאלתי, אז בדקתי שוב ב-Arbox/);
+    expect(w.tasks).toHaveLength(1);
+    minutes(w, 1);
+    expect((await w.say('כן')).action.state).toBe('done');                  // the fresh question, answered in time
+    expect(w.s.bookings.map(b => b.time)).toEqual(['17:00']);
+  });
+
+  test('no answer: after 30 minutes the request goes to the staff once, with what was asked; the member is not messaged', async () => {
+    const w = world();
+    await w.say(ASK); minutes(w, 31);
+    expect(await w.h.sweepConfirmations()).toBe(1);
+    expect(await w.h.sweepConfirmations()).toBe(0);
+    expect(w.alerts).toHaveLength(1);
+    expect(w.alerts[0].subject).toMatch(/לא אישר\/ה בכתב/);
+    expect(w.alerts[0].body).toMatch(/לא בוצע שום שינוי ב-Arbox/);
+    expect(w.sent).toHaveLength(1);
+    expect(w.tasks[0]).toMatchObject({ status: 'open', action: { state: 'not_confirmed_by_member' }, alert: { state: 'sent' } });
+    minutes(w, 6 * 60);
+    await w.h.sweepConfirmations();
+    expect(w.tasks[0].pendingConfirm).toBeNull();
+    expect(await w.say('כן')).toBeNull();
+    expect(w.s.writes).toHaveLength(0);
+  });
+
+  test('a new request before the answer replaces the old question; the old one can no longer be confirmed', async () => {
+    const w = world();
+    w.s.classes.push(cls(103, '19:00'));
+    await w.say(ASK);
+    await w.say('אני רשומה מחר לפילאטיס ב-18:00 ורוצה לעבור ל-19:00');
+    expect(w.tasks.map(t => t.status)).toEqual(['resolved', 'open']);
+    expect(w.tasks[0].action.state).toBe('replaced_by_new_request');
+    await w.say('כן');
+    expect(w.s.writes.map(x => x.args.scheduleId)).toEqual([103, 102]);     // 19:00 was booked, 18:00 released; 17:00 never touched
+  });
+
+  test('the class filled up between the question and the "כן": nothing is sent, the staff get the reason', async () => {
+    const w = world();
+    await w.say(ASK);
+    w.s.classes[0].occupancy = { registered: 8, capacity: 8, standby: 0, spotsLeft: 0 };
+    await w.say('כן');
+    expect(w.s.writes).toHaveLength(0);
+    expect(w.tasks).toHaveLength(1);
+    expect(w.tasks[0]).toMatchObject({ status: 'open', pendingConfirm: null, action: { state: 'not_done_after_confirmation' }, alert: { state: 'sent' } });
+    expect(w.last()).toMatch(/לא ביצעתי את זה בעצמי: השיעור המבוקש מלא/);
+  });
+
+  test('a phone outside the test audience: no question, no write - the staff task, as before', async () => {
+    const w = world(undefined, { actions: { audience: () => false } });
+    const r = await w.say(ASK);
+    expect(r.action).toBeUndefined();
+    expect(w.s.writes).toHaveLength(0);
+    expect(w.alerts).toHaveLength(1);
+    expect(w.last()).toMatch(/אין לי הרשאה לשנות רישום בעצמי, אז העברתי את הבקשה לצוות/);
+    expect(w.tasks[0].detail).toMatch(/אין לתומר הרשאה לשנות רישום/);
+  });
+
+  test('a request that came from a voice transcript is asked about in writing, and a spoken "כן" confirms nothing', async () => {
+    const w = world();
+    const r = await w.say(ASK, { fromVoice: true });
+    expect(r.action.state).toBe('awaiting_member_confirmation');
+    expect(w.sent[0].text).toMatch(/^מהתמלול של ההודעה הקולית הבנתי את הבקשה כך:/);
+    expect(w.tasks[0].pendingConfirm.fromVoice).toBe(true);
+    expect(await w.say('כן', { fromVoice: true })).toBeNull();              // a transcript saying "כן"
+    expect(w.s.writes).toHaveLength(0);
+    expect((await w.say('כן')).action.state).toBe('done');                  // the written one
+  });
+
+  test('a late move, once the capability is on: asked, confirmed, booked first, verified', async () => {
+    const w = world(); w.s.enabled.add('class_move_late');
+    w.clock.t = ilDate(2026, 10, 18, 15, 43);                              // inside the 8-hour window of the 18:00 class
+    const r = await w.say('אני רשומה היום לפילאטיס ב-18:00 ורוצה לעבור ל-17:00');
+    expect(r.action.state).toBe('awaiting_member_confirmation');
+    expect(w.sent[0].text).toMatch(/מעבר מפילאטיס מכשירים ב-18:00 לפילאטיס מכשירים ב-17:00, היום, יום רביעי 18\.11\./);
+    expect(w.tasks[0].pendingConfirm.late).toBe(true);
+    await w.say('מאשרת');
+    expect(w.s.writes.map(x => x.op)).toEqual(['class_book', 'class_cancel']);
+    expect(w.tasks[0]).toMatchObject({ status: 'resolved', action: { state: 'done', late: true } });
+  });
+
+  test('done, but the sessions dropped: she is told the move was made, the staff are asked to check the balance, the task stays open', async () => {
+    const w = world({ sessions: 5, noRefund: true });
+    await w.say(ASK); await w.say('כן');
+    expect(w.last()).toMatch(/^בוצע ✅ עברת מ-18:00 ל-17:00/);
+    expect(w.last()).toMatch(/ביקשתי מהצוות לוודא את יתרת הכניסות/);
+    expect(w.alerts).toHaveLength(1);
+    expect(w.alerts[0].body).toMatch(/ירדה מ-5 ל-4/);
+    expect(w.tasks[0]).toMatchObject({ status: 'open', priority: 'high', action: { state: 'done', balance: { check: 'mismatch' } } });
+    expect(w.s.writes).toHaveLength(2);                                     // nothing further was sent
+  });
 
   test('done and verified: the member is told it was done; the task is recorded as closed and nobody is alerted', async () => {
     const w = world();
-    const r = await w.h.handleClassRequest({ phone: '972500000001', text: ASK, sentAt: NOW });
+    await w.say(ASK);
+    const r = await w.say('כן');
     expect(r.action).toMatchObject({ state: 'done' });
     expect(w.s.bookings.map(b => b.time)).toEqual(['17:00']);
-    expect(w.sent[0].text).toMatch(/^בוצע ✅ עברת מ-18:00 ל-17:00/);
-    expect(w.sent[0].text).toMatch(/אימתתי את זה עכשיו מול Arbox/);
-    expect(w.tasks[0]).toMatchObject({ status: 'resolved', resolvedBy: 'tomer', action: { state: 'done' } });
+    expect(w.sent[1].text).toMatch(/^בוצע ✅ עברת מ-18:00 ל-17:00/);
+    expect(w.sent[1].text).toMatch(/אימתתי את זה עכשיו מול Arbox/);
+    expect(w.tasks).toHaveLength(1);
+    expect(w.tasks[0]).toMatchObject({ status: 'resolved', resolvedBy: 'tomer', pendingConfirm: null, action: { state: 'done', balance: { check: 'ok' }, confirmedText: 'כן' } });
     expect(w.alerts).toHaveLength(0);
   });
 
   test('refused by a rule: nothing is sent to Arbox, the staff get the exact reason, the member keeps her place and is told so', async () => {
     const w = world();
     w.s.classes[0].occupancy = { registered: 8, capacity: 8, standby: 1, spotsLeft: 0 };
-    await w.h.handleClassRequest({ phone: '972500000001', text: ASK, sentAt: NOW });
+    await w.say(ASK);
     expect(w.s.writes).toHaveLength(0);
     expect(w.tasks[0]).toMatchObject({ status: 'open' });
     expect(w.tasks[0].detail).toMatch(/לא בוצע אוטומטית: השיעור המבוקש מלא/);
@@ -200,27 +394,30 @@ describe('B. through the member hand-off: what the member and the staff are told
 
   test('the booking fails: she is told it was NOT done and that her registration is unchanged; the staff are alerted', async () => {
     const w = world({ fail: { class_book: 'rejected' } });
-    await w.h.handleClassRequest({ phone: '972500000001', text: ASK, sentAt: NOW });
+    await w.say(ASK); await w.say('כן');
     expect(w.s.bookings.map(b => b.time)).toEqual(['18:00']);
-    expect(w.sent[0].text).toMatch(/ניסיתי לבצע את זה ב-Arbox ולא הצלחתי/);
-    expect(w.sent[0].text).toMatch(/הרישום הקיים שלך לא השתנה/);
-    expect(w.sent[0].text).not.toMatch(/בוצע ✅/);
+    expect(w.sent[1].text).toMatch(/ניסיתי לבצע את זה ב-Arbox ולא הצלחתי/);
+    expect(w.sent[1].text).toMatch(/הרישום הקיים שלך לא השתנה/);
+    expect(w.sent[1].text).not.toMatch(/בוצע ✅/);
+    expect(w.s.writes).toHaveLength(1);                                     // the refused request was not repeated
     expect(w.alerts[0].body).toMatch(/לא בוצע שום שינוי ב-Arbox/);
     expect(w.tasks[0]).toMatchObject({ status: 'open', priority: 'high', action: { state: 'nothing_changed' } });
   });
 
   test('booked but the old class could not be cancelled: she is told she holds both, and the staff are asked to cancel one', async () => {
     const w = world({ fail: { class_cancel: 'rejected' } });
-    await w.h.handleClassRequest({ phone: '972500000001', text: ASK, sentAt: NOW });
-    expect(w.sent[0].text).toMatch(/רשמתי אותך לפילאטיס מכשירים ב-17:00/);
-    expect(w.sent[0].text).toMatch(/כרגע יש לך רישום לשני השיעורים/);
+    await w.say(ASK); await w.say('כן');
+    expect(w.sent[1].text).toMatch(/רשמתי אותך לפילאטיס מכשירים ב-17:00/);
+    expect(w.sent[1].text).toMatch(/כרגע יש לך רישום לשני השיעורים/);
+    expect(w.s.writes.map(x => x.op)).toEqual(['class_book', 'class_cancel']);   // stopped: no second cancel, no undo of the booking
     expect(w.alerts[0].body).toMatch(/הרישום החדש בוצע ב-Arbox; הרישום הקודם לא בוטל — נדרש ביטול ידני/);
   });
 
   test('an unknown outcome is never reported as done', async () => {
     const w = world({ fail: { class_book: 'accepted_not_applied' } });
-    await w.h.handleClassRequest({ phone: '972500000001', text: ASK, sentAt: NOW });
-    expect(w.sent[0].text).toMatch(/לא הצלחתי לאמת שהיא בוצעה, ולכן אני לא אומר לך שזה נעשה/);
+    await w.say(ASK); await w.say('כן');
+    expect(w.sent[1].text).toMatch(/לא הצלחתי לאמת שהיא בוצעה, ולכן אני לא אומר לך שזה נעשה/);
+    expect(w.s.writes).toHaveLength(1);
     expect(w.alerts[0].body).toMatch(/תוצאתה לא אומתה — נא לבדוק ב-Arbox/);
   });
 });

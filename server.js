@@ -59,6 +59,7 @@ const serviceCases                     = require('./utils/service_case_store');
 const tomerTest                        = require('./services/tomer_test_mode');
 const { createMemberHandoff }          = require('./services/member_handoff');
 const { createClassActions }           = require('./services/class_actions');
+const { createVoiceIntake }            = require('./services/voice_intake');
 const careStore                        = require('./utils/member_care_store');
 const contactPolicy                    = require('./services/contact_policy');
 const { createMemberCare }             = require('./services/member_care');
@@ -295,6 +296,9 @@ app.use((req, _res, next) => {
 // Mounted BEFORE the dashboard auth on purpose: it has its own scoped credential
 // (DANA_WORKER_TOKEN, fails closed when unset) and accepts nothing else.
 app.use('/api/dana/worker', require('./routes/dana_studio_routes').workerRouter);
+// Voice messages: the same editing worker fetches a recording, transcribes it locally and returns the text. Same scoped
+// token, three routes (services/voice_intake.js). The router is attached further down, once the service exists.
+app.use('/api/voice/worker', (req, res, next) => (app.locals.voiceWorkerRouter ? app.locals.voiceWorkerRouter(req, res, next) : res.status(503).json({ ok: false, error: 'starting' })));
 
 // ── Authentication ────────────────────────────────────────────────────────────
 // Mounted BEFORE the static dashboard and every API route. Public exceptions (provider
@@ -661,6 +665,9 @@ const CODE_FEATURES = [
   'member_care_v1',       // services/member_care.js — proactive programs (all off by default) + shared contact policy
   'identity_resolver_v1', // services/identity_resolver.js — one resolver for registry, cache and live lookup; active flag ≠ membership
   'member_care_gates_v2', // owner approval of the contact policy gates activation; unknown freeze status blocks absence outreach; late replies → context or one clarification
+  'class_move_confirm_v1', // services/class_actions.js + member_handoff.js — a class move/booking is written to Arbox only after the member's written confirmation; late move = separate capability; test-phone audience
+  'voice_local_transcription_v1', // services/voice_intake.js — voice messages transcribed by the local editing worker; audio deleted after the transcript and within 24 h
+  'mobile_panels_v1',     // Barak + Tomer panels usable on a phone (360–430 px)
   'strict_callback_time', // utils/callback_time.js — no default hour, no AI date guessing
   'apt_persist_strict',   // appointment_store update/updateBatch throw + roll back on failed write
   'staff_confirm_lifecycle', // confirm / outcome endpoints enforce transitions
@@ -2457,20 +2464,21 @@ async function buildSchedulingReply(intent, msg, clientMatch, { noMatchPassthrou
     );
   }
 
-  if (intent === 'cancellation') {
-    return (
-      `בקשת הביטול התקבלה ✅\n` +
-      `אנחנו מעדכנים את הלוח ונחזור אליך עם אישור. ` +
-      `אם תרצה/י לתאם מועד חלופי — רק תגיד/י 🗓️`
-    );
-  }
-
-  if (intent === 'fixed_booking') {
-    return (
-      `נשמח לשבץ אותך קבוע! 🎯\n` +
-      `אחד מהצוות ייצור איתך קשר תוך שעה לתיאום. ` +
-      `איזה שיעור מעניין אותך?`
-    );
+  // A cancellation or a fixed weekly slot is done by the staff. Nothing is confirmed and no deadline is promised:
+  // a task is opened and the manager is alerted FIRST, and the reply says only what happened (before 2026-11-17 these
+  // two answered "בקשת הביטול התקבלה ✅ … נחזור אליך עם אישור" / "ייצור איתך קשר תוך שעה" with nothing behind them).
+  if (intent === 'cancellation' || intent === 'fixed_booking') {
+    const phone = normalizeToE164(msg.from);
+    const cancel = intent === 'cancellation';
+    let fu = null;
+    try { fu = await memberHandoff.recordFollowup({ phone, name: clientMatch?.arboxName ?? msg.name ?? null, type: cancel ? 'cancel_request' : 'fixed_booking_request',
+      title: cancel ? 'בקשת ביטול' : 'בקשה לשיבוץ קבוע', memberMessage: msgText }); broadcastSse('tomer_task', { id: fu.task.id }); }
+    catch (err) { logger.error('[pipeline] follow-up task could not be recorded', { intent, error: err.message }); }
+    const passed = fu?.sent ? 'העברתי אותה לצוות' : fu ? 'רשמתי אותה לטיפול הצוות' : null;
+    if (!passed) return cancel ? `קיבלתי את בקשת הביטול 🙏 לא הצלחתי לרשום אותה כרגע, אז כדאי לכתוב לנו שוב או להתקשר לסטודיו. שום דבר לא בוטל.`
+      : `קיבלתי 🙏 לא הצלחתי לרשום את הבקשה כרגע, אז כדאי לכתוב לנו שוב או להתקשר לסטודיו.`;
+    return cancel ? `קיבלתי את בקשת הביטול 🙏 ${passed}.\nעדיין לא בוטל דבר: הביטול ייכנס לתוקף רק אחרי שהצוות יאשר לך כאן.`
+      : `קיבלתי את הבקשה לשיבוץ קבוע 🙏 ${passed}, ויענו לך כאן.\nאיזה שיעור ובאיזה יום מעניין אותך?`;
   }
 
   // For booking / schedule_query — pull live Arbox schedule for the right day.
@@ -3059,8 +3067,23 @@ const tomerLeadStore = {
 let _tomerOpenAI = null;
 // Members on the legacy route (everyone while the new Tomer flow is test-only): a class change or a voice
 // message becomes a durable staff task with a manager alert and an honest reply. Read-only towards Arbox.
+// Voice messages → local transcription on the editing PC (owner approval 2026-11-17). Off unless
+// VOICE_TRANSCRIPTION_ENABLED=true; when the worker is busy / offline / fails, the staff hand-over below takes over.
+const voiceIntake = app.locals.voiceIntake = createVoiceIntake({
+  logger, danaWorkerStatus: () => require('./services/dana_studio').workerStatus(),
+  onTranscript: async job => { const r = await memberHandoff.handleTranscript(job); broadcastSse('tomer_task', { id: r?.taskId ?? null }); },
+  onFallback: async (job, reason) => { await memberHandoff.voiceFallback(job, reason); broadcastSse('tomer_task', { id: job.taskId ?? null }); },
+});
+app.locals.voiceWorkerRouter = voiceIntake.router();
+if (!process.env.TEST_NO_BIND) {
+  // after a crash or a restart: leases are returned, overdue recordings are handed to the staff, anything older than
+  // 24 hours and every leftover file is deleted. Then the same sweep every 20 seconds.
+  setTimeout(() => voiceIntake.recover().catch(err => logger.error('[voice] recovery at start failed', { error: err.message })), 30_000).unref();
+  setInterval(() => voiceIntake.tick().catch(err => logger.error('[voice] sweep failed', { error: err.message })), 20_000).unref();
+}
 const memberHandoff = app.locals.memberHandoff = createMemberHandoff({
-  gateway: arboxGateway, tomerStore, logger, alertOwner,
+  gateway: arboxGateway, tomerStore, logger, alertOwner, voiceIntake,
+  canAutoReply: phone => !['human', 'opted_out'].includes(_conversationOwner(phone)),
   // Booking / cancelling / moving a class in Arbox. Inert unless ARBOX_WRITES_ENABLED, ARBOX_WRITE_OPS and a verified
   // contract all say so (services/arbox_gateway.js); until then every request goes to the staff as a task.
   classActions: createClassActions({ gateway: arboxGateway, logger }),
@@ -3072,6 +3095,26 @@ const memberHandoff = app.locals.memberHandoff = createMemberHandoff({
     return r;
   },
 });
+/**
+ * Two things every member route shares, whichever service answers the member otherwise:
+ *   • a voice message, when local transcription is on, goes to the transcription queue (task first);
+ *   • a written answer to Tomer's "לאשר?" about a class action belongs to that pending action.
+ * Returns the hand-off result when the message was taken, null otherwise.
+ */
+async function _memberVoiceOrConfirm(msg, fromNorm, name) {
+  if (msg.type === 'audio' && voiceIntake.enabled()) {
+    const r = await memberHandoff.handleMedia({ phone: fromNorm, type: msg.type, name, caption: msg.mediaCaption ?? null, pending: _pendingMessages,
+      media: { messageId: msg.messageId ?? null, mediaUrl: msg.mediaUrl ?? null, mimeType: msg.mimeType ?? null, receivedAt: _saneDate(msg.timestamp) } });
+    broadcastSse('tomer_task', { id: r?.taskId ?? null });
+    return r;
+  }
+  if (msg.type === 'text' && msg.text?.trim() && tomerStore.getTasks({ phone: fromNorm, type: 'class_change' }).some(t => t.pendingConfirm && ['open', 'eden_assigned'].includes(t.status))) {
+    const r = await memberHandoff.handleClassRequest({ phone: fromNorm, text: msg.text, name, sentAt: _saneDate(msg.timestamp), pending: _pendingMessages });
+    if (r) broadcastSse('tomer_task', { id: r.taskId });
+    return r;
+  }
+  return null;
+}
 let memberCare = null;                                   // created right after the service (it sends through it)
 const tomerGateway = tomerTest.wrapGateway(arboxGateway);
 const tomerService = app.locals.tomerService = createTomerService({
@@ -3591,7 +3634,8 @@ async function _processTomerTestMessage(msg, fromNorm, fromIsraeli) {
     } catch (err) { logger.warn('[tomer-test] could not add a held message to the case', { error: err.message }); }
   } else if (owner !== 'opted_out') {
     try {
-      const tRes = await tomerService.handleMemberMessage({
+      const _vc = await _memberVoiceOrConfirm(msg, fromNorm, msg.name ?? null);
+      const tRes = _vc ? { outcome: 'handoff' } : await tomerService.handleMemberMessage({
         phone: fromNorm, text: msg.type === 'text' ? (msg.text ?? '') : '', type: msg.type, caption: msg.mediaCaption ?? null,
         name: msg.name ?? null, sentAt: msg.timestamp instanceof Date ? msg.timestamp : null, messageId: msg.messageId ?? null,
       });
@@ -4337,7 +4381,8 @@ async function processInboundWAMessage(msg) {
       clientMatch, intent, route, barakReply: null,
     });
     try {
-      const tRes = await tomerService.handleMemberMessage({
+      const _vc = await _memberVoiceOrConfirm(msg, fromNorm, clientMatch.arboxName ?? msg.name ?? null);
+      const tRes = _vc ? { outcome: 'handoff' } : await tomerService.handleMemberMessage({
         phone: fromNorm, text: msg.type === 'text' ? (msg.text ?? '') : '', type: msg.type,
         caption: msg.mediaCaption ?? null, name: clientMatch.arboxName ?? msg.name ?? null,
         sentAt: msg.timestamp instanceof Date ? msg.timestamp : null,
@@ -4438,7 +4483,9 @@ async function processInboundWAMessage(msg) {
       store.logEvent('client_media_in', fromNorm, { type: msg.type, name: msg.name ?? clientMatch.arboxName });
       try {
         const _mh = await memberHandoff.handleMedia({ phone: fromNorm, type: msg.type, name: clientMatch.arboxName ?? msg.name ?? null,
-          caption: msg.mediaCaption ?? null, pending: _pendingMessages });
+          caption: msg.mediaCaption ?? null, pending: _pendingMessages,
+          media: { messageId: msg.messageId ?? null, mediaUrl: msg.mediaUrl ?? null, mimeType: msg.mimeType ?? null, receivedAt: _saneDate(msg.timestamp) } });
+        broadcastSse('tomer_task', { id: _mh.taskId });
         route = 'tomer_handoff';
         barakReply = _mh.replyText;
         _replyAlreadySent = true;
@@ -4938,6 +4985,8 @@ app.post('/api/whatsapp/simulate', jsonBody, async (req, res) => {
     mediaType: type,
     mediaCaption: null,
     mediaId: null,
+    // TEST_MODE only: where the (mocked) provider serves a voice recording
+    ...(process.env.TEST_MODE === 'true' && req.body?.mediaUrl ? { mediaUrl: String(req.body.mediaUrl), mimeType: req.body.mimeType ?? null } : {}),
   };
 
   try {
@@ -5664,6 +5713,15 @@ function _caseConversation(phone) {
     })),
   };
 }
+
+// What Tomer may do by itself right now, and whether voice messages can be transcribed (authenticated).
+app.get('/api/tomer/automation-status', (_req, res) => {
+  const ops = arboxGateway.writeStatus();
+  res.json({ ok: true, voice: voiceIntake.status(),
+    arbox: { operations: ops, audience: process.env.ARBOX_WRITE_AUDIENCE === 'all' ? 'all' : 'test_phones',
+      testPhones: String(process.env.ARBOX_WRITE_TEST_PHONES ?? '').split(',').map(s => s.trim()).filter(Boolean).length,
+      anyExecutable: Object.values(ops).some(o => o.executable) } });
+});
 
 // The effective test restrictions (authenticated — it lists phone numbers).
 app.get('/api/tomer/test-mode', (_req, res) => {

@@ -6,6 +6,7 @@ const logger  = require('../utils/logger');
 const store   = require('../utils/lead_store');
 const _persist = require('../utils/persist');
 const { sendText, alertOwner } = require('../services/whatsapp.service');
+const _aiFailureAlertAt = new Map();   // lead phone → when the manager was last told that the automatic reply failed
 const { tryDeterministicWazeReply, tryDeterministicScheduleReply } = require('./deterministic_reply');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -1487,7 +1488,19 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
       reply = `מצוין — ${freshQualData.callTimeGiven} 😊 ואיך קוראים לך?`;
       setQualData(from, { nameAsked: true });
     } else {
-      reply = `שלום! נתקלנו בתקלה טכנית קטנה. הצוות שלנו יחזור אליך בהקדם 🙏`;
+      // No promise without something behind it: the manager is alerted (at most once an hour per lead) and the reply
+      // says the staff have the message only when the provider accepted that alert.
+      let told = false;
+      if (Date.now() - (_aiFailureAlertAt.get(from) ?? 0) > 60 * 60 * 1000) {
+        _aiFailureAlertAt.set(from, Date.now());
+        try {
+          const ar = await alertOwner(`⚠️ ברק — תקלה טכנית, הודעה לא נענתה`, `📱 ${from}\n💬 "${String(text ?? '').slice(0, 200)}"\nהמענה האוטומטי נכשל (${String(err.message).slice(0, 120)}). יש לענות ידנית.\n💬 https://wa.me/${from}`, { linkPreview: false });
+          told = !!(ar?.results ?? []).find(r => r.idMessage);
+        } catch { /* the reply below then promises nothing */ }
+        store.logEvent('barak_ai_failure', from, { managerAlert: told ? 'sent' : 'failed' });
+      }
+      reply = told ? `שלום! נתקלנו בתקלה טכנית קטנה 🙏 העברתי את ההודעה שלך לצוות, ויענו לך כאן.`
+        : `שלום! נתקלנו בתקלה טכנית קטנה 🙏 אפשר לכתוב לי שוב בעוד כמה דקות.`;
     }
   }
 

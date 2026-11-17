@@ -545,7 +545,7 @@ describe('4. A voice message from a member', () => {
     expect(r.route).toBe('tomer_handoff');
     const t = tasksOf(m, 'voice_message');
     expect(t).toHaveLength(1);
-    expect(t[0]).toMatchObject({ status: 'open', transcription: { attempted: false, reason: 'not_available' }, alert: { state: 'sent' }, memberReply: { state: 'sent' } });
+    expect(t[0]).toMatchObject({ status: 'open', transcription: { state: 'not_transcribed', reason: 'off' }, alert: { state: 'sent' }, memberReply: { state: 'sent' } });
     expect(t[0].detail).toMatch(/לא תומללה/);
     expect(alerts()).toHaveLength(1);
     expect(alerts()[0].subject).toMatch(/תומר: הודעה קולית — כרמית/);
@@ -574,6 +574,229 @@ describe('4. A voice message from a member', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+describe('4b. Voice messages with local transcription on the editing PC', () => {
+  const TOKEN = 'test-worker-token-0123456789abcdef';
+  const AUDIO = Buffer.from('OggS\u0000 fake opus bytes of a member recording');
+  const URL_SECRET = 'https://media.provider.example/file/SECRET-PATH-123.oga';
+  const VOICE_DIR = path.join(DATA_DIR, 'voice');
+  const W = { Authorization: `Bearer ${TOKEN}` };
+  let dl;
+  const intake = () => app.locals.voiceIntake;
+  const hook = () => { dl = jest.fn(async () => AUDIO); intake()._setDownload(dl); };
+  const audioFiles = () => { try { return fs.readdirSync(VOICE_DIR).filter(f => !f.startsWith('jobs.json')); } catch { return []; } };
+  const jobs = () => { try { return Object.values(JSON.parse(fs.readFileSync(path.join(VOICE_DIR, 'jobs.json'), 'utf8')).jobs); } catch { return []; } };
+  const poll = () => request(app).post('/api/voice/worker/lease').set(W).send({ workerId: 'w1' });
+  const workerOnline = async () => { expect((await poll()).status).toBe(204); };
+  async function voice(phone, { name = 'כרמית', mimeType = 'audio/ogg; codecs=opus', id } = {}) {
+    const res = await request(app).post('/api/whatsapp/simulate').set('Content-Type', 'application/json')
+      .send({ from: phone, text: '[הודעה קולית]', name, type: 'audio', messageId: id ?? `v-${++msgSeq}`, timestamp: new Date().toISOString(), mediaUrl: URL_SECRET, mimeType });
+    expect(res.status).toBe(200);
+    return res.body;
+  }
+  async function leaseOne() { const l = await poll(); expect(l.status).toBe(200); return l.body; }
+  const result = (l, body) => request(app).post(`/api/voice/worker/jobs/${l.job.id}/result`).set(W).set('X-Lease-Token', l.leaseToken).send(body);
+  const transcribed = (l, text) => result(l, { status: 'transcribed', text, language: 'he', duration_s: 12.4, model: 'large-v3' });
+  const minutes = n => setNow(new Date(Date.now() + n * 60000));
+  let saved;
+  beforeAll(() => { saved = { v: process.env.VOICE_TRANSCRIPTION_ENABLED, t: process.env.DANA_WORKER_TOKEN, w: process.env.VOICE_WAIT_MS };
+    process.env.VOICE_TRANSCRIPTION_ENABLED = 'true'; process.env.DANA_WORKER_TOKEN = TOKEN; delete process.env.VOICE_WAIT_MS; });
+  afterAll(() => { for (const [k, v] of [['VOICE_TRANSCRIPTION_ENABLED', saved.v], ['DANA_WORKER_TOKEN', saved.t], ['VOICE_WAIT_MS', saved.w]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } });
+  beforeEach(() => { fs.rmSync(VOICE_DIR, { recursive: true, force: true }); intake()._reset(); hook(); });
+
+  test('worker reachable: the task is opened first and says "waiting"; nobody is messaged; the transcript arrives and the request is handled like a written one', async () => {
+    const m = newMember();
+    await workerOnline();
+    const r = await voice(m);
+    expect(r.route).toBe('tomer_handoff');
+    let t = tasksOf(m, 'voice_message');
+    expect(t).toHaveLength(1);
+    expect(t[0]).toMatchObject({ status: 'open', transcription: { state: 'waiting' } });
+    expect(textsTo(m)).toHaveLength(0);
+    expect(alerts()).toHaveLength(0);
+    expect(dl).toHaveBeenCalledTimes(1);
+    expect(audioFiles()).toHaveLength(1);                                   // the server copy, until the transcript is stored
+
+    const l = await leaseOne();
+    expect(l.job).toMatchObject({ ext: 'ogg', bytes: AUDIO.length, sha256: require('crypto').createHash('sha256').update(AUDIO).digest('hex') });
+    expect(JSON.stringify(l)).not.toMatch(new RegExp(m));                   // the worker is given no phone number
+    const a = await request(app).get(`/api/voice/worker/jobs/${l.job.id}/audio`).set(W).set('X-Lease-Token', l.leaseToken).responseType('blob');
+    expect(a.status).toBe(200);
+    expect(Buffer.compare(a.body, AUDIO)).toBe(0);
+    expect((await transcribed(l, 'היי אני רשומה היום ב-18:00 ורוצה לעבור ל-17:00 תודה')).body).toMatchObject({ ok: true, state: 'transcribed' });
+
+    expect(audioFiles()).toHaveLength(0);                                   // deleted as soon as the transcript was stored
+    expect(jobs()[0]).toMatchObject({ state: 'transcribed', audioDeletedWhy: 'transcribed' });
+    expect(JSON.stringify(jobs())).not.toMatch(/רשומה/);                    // the text does not stay on the job
+    t = tasksOf(m, 'voice_message');
+    expect(t[0]).toMatchObject({ status: 'resolved', transcription: { state: 'done', unverified: true, text: expect.stringMatching(/לעבור ל-17:00/) } });
+    const c = tasksOf(m, 'class_change');
+    expect(c).toHaveLength(1);
+    expect(t[0].linkedTaskId).toBe(c[0].id);
+    expect(c[0].summary).toMatch(/מעבר מ-18:00 ל-17:00/);
+    expect(alerts()).toHaveLength(1);                                       // one alert, for the class request
+    expect(textsTo(m)).toHaveLength(1);
+    expect(lastTo(m)).toMatch(/קיבלתי את הבקשה: מעבר מ-18:00 ל-17:00 היום/);
+    expect(mockGw.writes ?? 0).toBe(0);                                     // a transcript never writes to Arbox
+  });
+
+  test('a transcript that is not a class request: the staff get it, marked unverified; the member is told who has it', async () => {
+    const m = newMember();
+    await workerOnline(); await voice(m);
+    await transcribed(await leaseOne(), 'רציתי לשאול אם אפשר לקבל חשבונית על החודש שעבר');
+    const t = tasksOf(m, 'voice_message')[0];
+    expect(t).toMatchObject({ status: 'open', alert: { state: 'sent' }, memberReply: { state: 'sent' } });
+    expect(alerts()).toHaveLength(1);
+    expect(alerts()[0].body).toMatch(/תמלול אוטומטי \(לא אומת\): "רציתי לשאול אם אפשר לקבל חשבונית/);
+    expect(lastTo(m)).toBe('קיבלתי את ההודעה הקולית 🙏 העברתי אותה לצוות, ויענו לך כאן.');
+  });
+
+  test('worker offline: nothing is downloaded; the task, the alert and the invitation to write happen at once', async () => {
+    const m = newMember();
+    await voice(m);                                                         // nobody polled
+    expect(dl).not.toHaveBeenCalled();
+    expect(audioFiles()).toHaveLength(0);
+    const t = tasksOf(m, 'voice_message')[0];
+    expect(t).toMatchObject({ status: 'open', transcription: { state: 'not_transcribed', reason: 'worker_offline' }, alert: { state: 'sent' }, memberReply: { state: 'sent' } });
+    expect(t.detail).toMatch(/מחשב התמלול אינו מחובר כרגע/);
+    expect(lastTo(m)).toMatch(/לא הצלחתי להאזין לה כרגע, אז רשמתי פנייה והעברתי אותה לצוות\.\nאם נוח לך, אפשר לכתוב לי כאן/);
+  });
+
+  test('worker busy editing for Dana: the recording is queued AND the staff are alerted at once; the late transcript is added, with no second message to the member', async () => {
+    const m = newMember();
+    const hb = await request(app).post('/api/dana/worker/heartbeat').set(W).send({ workerId: 'w1', state: 'busy', pipelineVersion: '1.5.0' });
+    expect(hb.status).toBe(200);
+    expect(intake().availability().state).toBe('busy');
+    await voice(m);
+    expect(audioFiles()).toHaveLength(1);
+    let t = tasksOf(m, 'voice_message')[0];
+    expect(t).toMatchObject({ transcription: { state: 'waiting_after_handoff', reason: 'worker_busy' }, alert: { state: 'sent' } });
+    expect(t.detail).toMatch(/עסוק כרגע בעריכת סרטון/);
+    expect(alerts()).toHaveLength(1);
+    expect(textsTo(m)).toHaveLength(1);
+    minutes(7);                                                             // the edit ended; the worker polls again
+    await transcribed(await leaseOne(), 'אני רוצה להקפיא את המנוי לשבועיים');
+    t = tasksOf(m, 'voice_message')[0];
+    expect(t).toMatchObject({ status: 'open', transcription: { state: 'done' }, alertUpdate: { state: 'sent' } });
+    expect(alerts()).toHaveLength(2);
+    expect(alerts()[1].subject).toMatch(/התמלול הגיע/);
+    expect(textsTo(m)).toHaveLength(1);                                     // she was already asked to write; nothing more
+    expect(audioFiles()).toHaveLength(0);
+    await intake().tick();
+    expect(alerts()).toHaveLength(2);
+  });
+
+  test('the transcript does not arrive in time: one hand-over to the staff, once', async () => {
+    const m = newMember();
+    await workerOnline(); await voice(m);
+    minutes(1); await intake().tick();
+    expect(alerts()).toHaveLength(0);                                       // still inside the wait
+    minutes(1.5); await intake().tick(); await intake().tick();
+    expect(alerts()).toHaveLength(1);
+    expect(textsTo(m)).toHaveLength(1);
+    expect(tasksOf(m, 'voice_message')[0]).toMatchObject({ transcription: { state: 'waiting_after_handoff', reason: 'waited_too_long' } });
+    expect(tasksOf(m, 'voice_message')[0].detail).toMatch(/התמלול לא הגיע בזמן/);
+  });
+
+  test('the worker fails: one more try, then the staff; a recording with no speech is not retried', async () => {
+    const m = newMember();
+    await workerOnline(); await voice(m);
+    expect((await result(await leaseOne(), { status: 'failed', error: { code: 'voice_asr_failed', message: 'x' } })).body.state).toBe('failed');
+    expect(alerts()).toHaveLength(0);
+    await result(await leaseOne(), { status: 'failed', error: { code: 'voice_timeout', message: 'x' } });
+    expect(alerts()).toHaveLength(1);
+    expect(audioFiles()).toHaveLength(0);
+    expect(tasksOf(m, 'voice_message')[0]).toMatchObject({ transcription: { state: 'not_transcribed', reason: 'transcription_failed' } });
+    expect((await poll()).status).toBe(204);
+
+    const m2 = newMember(); clearOut();
+    await voice(m2);
+    await result(await leaseOne(), { status: 'failed', error: { code: 'voice_no_speech', message: 'x' } });
+    expect(tasksOf(m2, 'voice_message')[0].detail).toMatch(/בהקלטה לא זוהה דיבור/);
+    expect(alerts()).toHaveLength(1);
+    expect((await poll()).status).toBe(204);
+  });
+
+  test('a worker that takes a recording and disappears: the lease returns, then the staff; the audio is gone', async () => {
+    const m = newMember();
+    await workerOnline(); await voice(m);
+    const l1 = await leaseOne();
+    minutes(5); await intake().tick();                                      // lease expired, and the wait is over
+    expect(alerts()).toHaveLength(1);
+    expect((await transcribed(l1, 'מאוחר מדי')).status).toBe(409);          // the old lease is worth nothing
+    const l2 = await leaseOne();
+    expect(l2.job.id).toBe(l1.job.id);
+    minutes(5); await intake().tick();
+    expect(jobs()[0]).toMatchObject({ state: 'failed' });
+    expect(audioFiles()).toHaveLength(0);
+    expect(alerts()).toHaveLength(1);                                       // still one hand-over
+  });
+
+  test('24 hours: the server copy is deleted whatever happened, and so is every leftover file - also after a restart', async () => {
+    const m = newMember();
+    await workerOnline(); await voice(m);
+    await leaseOne();                                                       // taken, never answered
+    fs.writeFileSync(path.join(VOICE_DIR, 'vX_interrupted.ogg.part'), 'half a download');
+    fs.writeFileSync(path.join(VOICE_DIR, 'stray.ogg'), 'belongs to no job');
+    restart(); hook();                                                      // the server crashed and came back
+    await intake().recover();
+    expect(audioFiles()).toHaveLength(1);                                   // only the job's own audio survived the sweep
+    expect(jobs()[0].state).toBe('queued');                                 // the lease was returned
+    setNow(new Date(Date.now() + 24 * 3600 * 1000 + 60000));
+    restart(); hook();
+    await intake().recover();
+    expect(audioFiles()).toHaveLength(0);
+    expect(jobs()[0]).toMatchObject({ state: 'expired', audioDeletedWhy: 'older_than_24h' });
+    expect((await poll()).status).toBe(204);
+    expect(tasksOf(m, 'voice_message')[0].alert.state).toBe('sent');        // handed to the staff, not lost
+  });
+
+  test('a chat a human owns: the transcript goes to the staff and nothing is sent to the member', async () => {
+    const m = newMember();
+    await workerOnline(); await voice(m);
+    await staffTypes(m, 'היי, אני בודקת ואחזור אלייך');
+    clearOut();
+    await transcribed(await leaseOne(), 'אני רשומה היום ב-18:00 ורוצה לעבור ל-17:00');
+    expect(textsTo(m)).toHaveLength(0);
+    expect(alerts()).toHaveLength(1);
+    expect(alerts()[0].body).toMatch(/השיחה בטיפול ידני: לא נשלחה תשובה אוטומטית/);
+    expect(tasksOf(m, 'class_change')).toHaveLength(0);
+  });
+
+  test('the same WhatsApp message delivered twice is one recording and one task', async () => {
+    const m = newMember();
+    await workerOnline();
+    await voice(m, { id: 'dup-1' });
+    // the pipeline itself drops a repeated message id; the queue would not take it either
+    await request(app).post('/api/whatsapp/simulate').set('Content-Type', 'application/json').send({ from: m, text: '[הודעה קולית]', type: 'audio', messageId: 'dup-1', mediaUrl: URL_SECRET, mimeType: 'audio/ogg' });
+    expect(await intake().receive({ phone: m, messageId: 'dup-1', mediaUrl: URL_SECRET, mimeType: 'audio/ogg' })).toMatchObject({ duplicate: true });
+    expect(dl).toHaveBeenCalledTimes(1);
+    expect(jobs()).toHaveLength(1);
+    expect(tasksOf(m, 'voice_message')).toHaveLength(1);
+  });
+
+  test('access: only the worker token, only a live lease; nothing about a recording is logged', async () => {
+    const m = newMember();
+    await workerOnline(); await voice(m);
+    expect((await request(app).post('/api/voice/worker/lease').send({})).status).toBe(401);
+    expect((await request(app).post('/api/voice/worker/lease').set({ Authorization: 'Bearer wrong-token-wrong-token-wrong' }).send({})).status).toBe(401);
+    const l = await leaseOne();
+    expect((await request(app).get(`/api/voice/worker/jobs/${l.job.id}/audio`).set(W).set('X-Lease-Token', 'x'.repeat(48))).status).toBe(404);
+    expect((await request(app).get(`/api/voice/worker/jobs/${l.job.id}/audio`)).status).toBe(401);
+    expect((await request(app).get('/api/voice/worker/jobs/..%2Fjobs.json/audio').set(W).set('X-Lease-Token', l.leaseToken)).status).toBe(404);
+    await transcribed(l, 'משפט סודי שאסור שיופיע בלוג');
+    const logger = require('../utils/logger');
+    const logged = JSON.stringify([logger.info, logger.warn, logger.error, logger.debug].flatMap(f => f.mock.calls));
+    expect(logged).not.toMatch(/SECRET-PATH-123/);
+    expect(logged).not.toMatch(/משפט סודי/);
+    expect(logged).not.toMatch(new RegExp(TOKEN));
+    const st = (await request(app).get('/api/tomer/automation-status')).body;
+    expect(st.voice).toMatchObject({ availability: { state: 'online', enabled: true }, keepHours: 24, audioOnServer: 0 });
+    expect(JSON.stringify(st.voice)).not.toMatch(new RegExp(m));
+    process.env.VOICE_TRANSCRIPTION_ENABLED = 'false';
+    try { expect((await poll()).status).toBe(404); } finally { process.env.VOICE_TRANSCRIPTION_ENABLED = 'true'; }   // switched off = the routes are gone
+  });
+});
+
 describe('5. A human who steps in pauses the automatic flow', () => {
   test('after a message typed by hand, a member\'s class request and voice message get no automatic reply and open no automatic task', async () => {
     const m = newMember();
@@ -604,6 +827,54 @@ describe('5. A human who steps in pauses the automatic flow', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+describe('5b. "The staff will get back to you" is said only with a task and an alert behind it', () => {
+  const FALSE_PROMISE = /בקשת הביטול התקבלה|נחזור אליך עם אישור|ייצור איתך קשר תוך שעה|הצוות שלנו יחזור אליך בהקדם/;
+  const anyTask = phone => tomerStore.getTasks({ phone });
+
+  test('a lead asks to cancel: nothing is confirmed, no deadline is promised, and a task plus an alert exist before the reply', async () => {
+    const lead = await newLead(); clearOut();
+    await say(lead, 'אני רוצה לבטל את השיעור של מחר');
+    expect(lastTo(lead)).not.toMatch(FALSE_PROMISE);
+    expect(lastTo(lead)).toMatch(/קיבלתי את בקשת הביטול 🙏 העברתי אותה לצוות\.\nעדיין לא בוטל דבר/);
+    const t = anyTask(lead);
+    expect(t).toHaveLength(1);
+    expect(t[0]).toMatchObject({ type: 'cancel_request', status: 'open', alert: { state: 'sent' } });
+    expect(alerts()).toHaveLength(1);
+    await say(lead, 'אז אפשר לבטל?');                                       // again: the same task, no second alert
+    expect(anyTask(lead)).toHaveLength(1);
+    expect(alerts()).toHaveLength(1);
+  });
+
+  test('when the alert is not accepted the reply does not say the staff were told, and the task shows the failure', async () => {
+    const lead = await newLead(); clearOut();
+    mockOut.failManager = true;
+    await say(lead, 'אני רוצה לבטל את השיעור של מחר');
+    expect(lastTo(lead)).toMatch(/רשמתי אותה לטיפול הצוות/);
+    expect(lastTo(lead)).not.toMatch(/העברתי אותה לצוות/);
+    expect(anyTask(lead)[0].alert.state).toBe('failed');
+    mockOut.failManager = false;
+    const before = alerts().length;
+    await app.locals.memberHandoff.retryFailedAlerts();                     // the controlled retry (other suites' failed alerts may be retried too)
+    expect(alerts().slice(before).filter(a => a.subject.includes('בקשת ביטול'))).toHaveLength(1);
+    expect(anyTask(lead)[0].alert.state).toBe('sent');
+  });
+
+  test('a request for a fixed weekly slot: no "within an hour", a task and an alert', async () => {
+    const lead = await newLead(); clearOut();
+    await say(lead, 'אפשר לשבץ אותי קבוע בימי שלישי?');
+    expect(lastTo(lead)).not.toMatch(FALSE_PROMISE);
+    expect(anyTask(lead)[0]).toMatchObject({ type: 'fixed_booking_request', alert: { state: 'sent' } });
+  });
+
+  test('a member who writes that she will not come gets no false confirmation either', async () => {
+    const m = newMember();
+    await say(m, 'לא אגיע היום לשיעור של 18:00');
+    expect(lastTo(m)).not.toMatch(FALSE_PROMISE);
+    expect(anyTask(m).length).toBeGreaterThanOrEqual(1);
+    expect(mockGw.writes ?? 0).toBe(0);
+  });
+});
+
 describe('6. The range resolver', () => {
   const ref = new Date('2026-11-16T15:48:09Z');                              // Monday 17:48 Israel time, when the lead wrote
   const f = t => { const r = callbackTime.resolveCallbackTime(t, ref); return r.ok ? callbackTime.formatCallbackTime(r.scheduledAt, r.windowEndAt) : r.reason; };

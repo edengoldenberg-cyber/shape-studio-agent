@@ -684,6 +684,8 @@ function parseGreenApiWebhook(body) {
           type: 'audio',
           text: '[הודעה קולית]',
           mediaType: 'audio', mediaCaption: null, mediaId: null,
+          // where the provider serves the recording, for local transcription (services/voice_intake.js). Never logged.
+          mediaUrl: msgData.fileMessageData?.downloadUrl ?? null, mimeType: msgData.fileMessageData?.mimeType ?? null,
         };
 
       case 'documentMessage': {

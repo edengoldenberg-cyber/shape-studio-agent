@@ -23,9 +23,10 @@ dana-worker/
     skillgen.py             library skills: draft one from the owner's instructions, choose one for a clip, report rule by rule
     editorial.py            plan → edit → review → revise loop
     run.py                  orchestrator
+    voice.py                one voice message → text (local Whisper large-v3; the recording is never kept)
   motion/gsap.min.js        GSAP 3.15.0, vendored so a graphic renders without network access (gsap.com/standard-license)
   instructions/             versioned instruction bundle built from the installed ig-* skills
-  autostart/                optional Windows auto-start (not installed)
+  autostart/                Windows auto-start at logon (install.ps1; one instance, restart after a crash)
   vendor/                   byte-exact backup of the customized caption renderer
   fixtures/                 scripted decisions used for the controlled dry run
   tests/                    unit tests (no GPU / Chrome / network)
@@ -199,12 +200,48 @@ measurement as the uncertainty. Cards are timed from that reference.
 - Everything the owner must look at is one list, `review_items`, each with a playable excerpt.
   The panel resolves the whole list with one confirmation.
 
-## Auto-start (optional, not installed)
+## Voice messages (members' WhatsApp recordings → text)
 
-`autostart/install.ps1` registers one Scheduled Task for the current user (at logon, not
-elevated). `stop.ps1` stops it, `uninstall.ps1` removes it, and a file named `STOP` in
-`work_root` makes the worker exit at its next poll and refuse to start. Preview what would be
-registered with `install.ps1 -WhatIf`.
+Approved by the owner on 2026-11-17: the existing local Whisper large-v3 transcribes voice messages for the service
+agent; no external provider is involved.
+
+- The worker asks `POST /api/voice/worker/lease` **before** it asks for an edit job, so a waiting recording is never
+  behind a new edit. A recording that arrives while an edit is running (5–9 minutes) waits; the server has its own
+  time limit and then hands the message to the staff. An older server without the route answers 404, which is ignored.
+- `handle_voice` downloads the recording to `<work_root>/voice/<job id>/`, verifies its SHA-256, runs
+  `python -m dana_pipeline.voice` as a child process (time limit `voice.timeout_s`, default 180 s) and posts
+  `{status: transcribed, text, language, duration_s, model, avg_logprob, no_speech_prob}` or `{status: failed, error}`.
+- **The recording never stays on this machine:** the job folder is deleted in a `finally` (success, failure, time-out,
+  server unreachable), and everything under `<work_root>/voice/` is deleted when the worker starts and at every
+  housekeeping, so a crash or a power loss leaves nothing behind for longer than the next start.
+- Nothing about the content is logged: only the job id, the audio duration, the seconds taken and the outcome. The
+  transcript goes to the server only; it is "automatic, unverified" text.
+- Accepted: ids `[A-Za-z0-9_-]{4,80}`, extensions ogg / oga / opus / mp3 / m4a / aac / wav / amr, at most 25 MB.
+  Anything else is refused locally with a `failed` result.
+- Measured 2026-11-17 on this machine: 20 s of ogg/opus (Dana demo material) in 5.9 s as a child process, model load included.
+
+## One worker per work_root
+
+The worker holds an operating-system lock on `<work_root>/worker.lock` for as long as it lives. A second worker on the
+same `work_root` logs "another worker already runs" and exits 0. A lock file left by a crash does not block a start
+(the lock is the OS's, not the file's existence).
+
+## Auto-start (approved by the owner 2026-11-17)
+
+`autostart/install.ps1` registers one Scheduled Task, `DanaEditingWorker`, for the current user: at logon, hidden, not
+elevated, one instance, with the production configuration (`C:\Users\owner\dana-work\worker.config.production.json`
+when it exists; `-Config` overrides). Preview with `install.ps1 -WhatIf`; `-StartNow` also starts it.
+
+- `autostart/run-worker.ps1` keeps the worker running: a crash is restarted after 30 s (growing to 5 min); five failures
+  in a row within a minute of starting end the wrapper (the task then retries 3 times, 1 minute apart).
+- A deliberate stop is respected: exit code 0 (a `STOP` file in `work_root`, or another worker holding the lock) is
+  never restarted. `stop.ps1` creates the STOP file and waits for the worker to finish its job (`-Hold` keeps it
+  stopped, `-Force` ends the task now); `uninstall.ps1` stops it the same way and removes the task.
+- Output: `<work_root>\worker.log`. The token stays in the user environment variable; no script stores it.
+- Windows power settings are not changed. While a job or a recording is processed the worker asks Windows not to
+  sleep; an idle machine still sleeps, and the server then shows the worker as offline.
+- Availability is what the server sees: `hello` at start (capabilities include `voice_transcription`) and a lease poll
+  every `poll_seconds`.
 
 ## Tests
 

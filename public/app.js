@@ -1867,6 +1867,111 @@ document.getElementById('btn-pull-arbox-leads')?.addEventListener('click', async
   finally { if (btn) { btn.disabled = false; btn.textContent = '⬇ ייבא לידים מ-Arbox'; } }
 });
 
+/* ── Rendering that does not undo what the person is doing ─────────────────────────────────────
+ * The panels redraw on a timer and on live events. swapHTML() replaces a container's content only when the content
+ * really changed, and then puts back: what was typed in a field and not saved (a field whose value differs from the value
+ * it was drawn with), ticked boxes, the forms the person opened ([data-keep-open] elements and <details>), a result
+ * message shown in the last seconds ([data-keep-msg]), the focused field with its caret, and the position on the page.
+ * Used by Barak's callbacks, Tomer's case panel and the lists (see public/tomer-panel.js). */
+function captureUi(el) {
+  const st = { fields: [], open: [], details: [], msgs: [], focus: null, scroll: [], anchor: null };
+  // a field without an id is recognised by its place among the id-less fields plus its tag / type / class
+  const sig = f => f.tagName + '|' + (f.type || '') + '|' + f.className;
+  let nth = 0;
+  el.querySelectorAll('input, textarea, select').forEach(f => {
+    const n = f.id ? null : nth++;
+    const box = f.type === 'checkbox' || f.type === 'radio';
+    const dirty = box ? f.checked !== f.defaultChecked : f.tagName === 'SELECT' ? [...f.options].some(o => o.selected !== o.defaultSelected) : f.value !== f.defaultValue;
+    if (dirty) st.fields.push({ id: f.id || null, n, sig: sig(f), box, value: f.value, checked: f.checked });
+  });
+  el.querySelectorAll('[data-keep-open][id]').forEach(b => st.open.push({ id: b.id, display: b.style.display }));
+  el.querySelectorAll('details').forEach((d, i) => { if (d.open) st.details.push(d.id || i); });
+  el.querySelectorAll('[data-keep-msg][id]').forEach(m => { if (m.textContent && Date.now() - Number(m.dataset.at || 0) < 15000) st.msgs.push({ id: m.id, text: m.textContent, css: m.style.cssText, kind: m.dataset.kind ?? null, at: m.dataset.at }); });
+  const a = document.activeElement;
+  if (a && a.id && el.contains(a)) { st.focus = { id: a.id }; try { st.focus.sel = [a.selectionStart, a.selectionEnd]; } catch { /* not a text field */ } }
+  for (let p = el; p && p !== document.body; p = p.parentElement) if (p.scrollTop) st.scroll.push([p, p.scrollTop]);
+  el.querySelectorAll('[id]').forEach(c => { if (c.scrollTop) st.scroll.push([c.id, c.scrollTop]); });
+  // the thing the eye is on: the focused field, else an open form, else the first row on the screen
+  const mark = (a && el.contains(a) && a.id ? a : null) ?? [...el.querySelectorAll('[data-keep-open][id]')].find(b => b.style.display !== 'none' && b.getClientRects().length)
+    ?? [...el.querySelectorAll('[data-keep-row]')].find(r => r.getBoundingClientRect().bottom > 0);
+  if (mark) st.anchor = { sel: mark.id ? '#' + CSS.escape(mark.id) : `[data-keep-row="${CSS.escape(mark.dataset.keepRow)}"]`, top: mark.getBoundingClientRect().top };
+  return st;
+}
+function restoreUi(el, st) {
+  const byId = id => { const x = document.getElementById(id); return x && el.contains(x) ? x : null; };
+  const loose = [...el.querySelectorAll('input:not([id]), textarea:not([id]), select:not([id])')];
+  for (const f of st.fields) {
+    const x = f.id ? byId(f.id) : loose[f.n];
+    if (!x || (!f.id && x.tagName + '|' + (x.type || '') + '|' + x.className !== f.sig)) continue;
+    if (f.box) x.checked = f.checked; else x.value = f.value;
+  }
+  for (const o of st.open) { const x = byId(o.id); if (x) x.style.display = o.display; }
+  const ds = [...el.querySelectorAll('details')];
+  for (const k of st.details) { const d = typeof k === 'number' ? ds[k] : byId(k); if (d) d.open = true; }
+  for (const m of st.msgs) { const x = byId(m.id); if (x && !x.textContent) { x.textContent = m.text; x.style.cssText = m.css; if (m.kind) x.dataset.kind = m.kind; x.dataset.at = m.at; } }
+  for (const [t, top] of st.scroll) { const x = typeof t === 'string' ? byId(t) : t; if (x) x.scrollTop = top; }
+  if (st.anchor) { const x = el.querySelector(st.anchor.sel); if (x) { const d = x.getBoundingClientRect().top - st.anchor.top; if (Math.abs(d) > 1) { const sc = scrollParent(x); sc ? (sc.scrollTop += d) : window.scrollBy(0, d); } } }
+  if (st.focus) { const x = byId(st.focus.id); if (x && document.activeElement !== x) { try { x.focus({ preventScroll: true }); if (st.focus.sel && st.focus.sel[0] != null) x.setSelectionRange(st.focus.sel[0], st.focus.sel[1]); } catch { /* not a text field */ } } }
+}
+function scrollParent(x) {
+  for (let p = x.parentElement; p && p !== document.body && p !== document.documentElement; p = p.parentElement) {
+    const o = getComputedStyle(p).overflowY;
+    if ((o === 'auto' || o === 'scroll') && p.scrollHeight > p.clientHeight + 1) return p;
+  }
+  return null;
+}
+/** Replace `el`'s content with `html` — only if it changed, and without losing drafts, open forms, focus or position. */
+function swapHTML(el, html) {
+  if (!el) return false;
+  // "unchanged" also needs the nodes this function put there to still be there (other code may have written into `el`)
+  if (el.__html === html && el.firstChild && el.firstChild === el.__first) return false;
+  const st = captureUi(el);
+  el.innerHTML = html; el.__html = html; el.__first = el.firstChild;
+  restoreUi(el, st);
+  return true;
+}
+window.swapHTML = swapHTML;
+
+/* ── Wide tables as cards on a phone ──────────────────────────────────────────────────────────
+ * Every cell of a .leads-table gets its column's heading as data-label; under 700px the stylesheet shows each row as a
+ * card with "heading: value" lines, so no column is dropped and nothing scrolls sideways. A heading-less column (the
+ * action buttons) gets an empty label and takes the full width of the card. */
+function labelTables(root = document) {
+  root.querySelectorAll('table.leads-table').forEach(t => {
+    const heads = [...t.querySelectorAll('thead th')].map(th => th.textContent.replace(/\s+/g, ' ').trim());
+    if (!heads.length) return;
+    t.querySelectorAll('tbody > tr').forEach(tr => [...tr.children].forEach((td, i) => { if (!('label' in td.dataset)) td.dataset.label = td.colSpan > 1 ? '' : (heads[i] ?? ''); }));
+  });
+}
+(function watchTables() {
+  let queued = false;
+  const run = () => { queued = false; labelTables(); };
+  new MutationObserver(() => { if (!queued) { queued = true; requestAnimationFrame(run); } }).observe(document.body, { childList: true, subtree: true });
+  labelTables();
+})();
+
+/* ── Phone keyboard ───────────────────────────────────────────────────────────────────────────
+ * When the on-screen keyboard opens, the visible part of the page shrinks. The focused field is brought back into view
+ * (also inside the side panels and dialogs, which scroll on their own), and --vvh carries the visible height so
+ * full-height panels end above the keyboard instead of under it. */
+(function phoneKeyboard() {
+  const vv = window.visualViewport;
+  const isField = e => e && (e.tagName === 'TEXTAREA' || e.tagName === 'SELECT' || (e.tagName === 'INPUT' && !['checkbox', 'radio', 'button', 'submit', 'file', 'range'].includes(e.type)));
+  const narrow = () => window.matchMedia('(max-width: 700px)').matches;
+  const setH = () => document.documentElement.style.setProperty('--vvh', (vv ? vv.height : window.innerHeight) + 'px');
+  const reveal = () => {
+    const a = document.activeElement;
+    if (!narrow() || !isField(a)) return;
+    const r = a.getBoundingClientRect(), h = vv ? vv.height : window.innerHeight;
+    if (r.top < 8 || r.bottom > h - 8) a.scrollIntoView({ block: 'center', inline: 'nearest' });
+  };
+  setH();
+  document.addEventListener('focusin', () => setTimeout(reveal, 250));
+  const onResize = () => { setH(); setTimeout(reveal, 60); };
+  if (vv) vv.addEventListener('resize', onResize);
+  window.addEventListener('resize', onResize);
+})();
+
 async function loadBarakPanel() {
   try {
     const [leadsRes, statsRes, cbRes] = await Promise.all([
@@ -1934,6 +2039,7 @@ function cbSetMsg(text, isError) {
   el.textContent = text ?? '';
   el.style.display = text ? 'block' : 'none';
   el.style.color = isError ? 'var(--hot)' : 'var(--green)';
+  el.dataset.at = String(Date.now());            // a refresh keeps a result for a few seconds (swapHTML)
 }
 
 // renderCallbackPanel accepts combined records from /api/barak/callbacks.
@@ -1946,13 +2052,12 @@ function renderCallbackPanel(callbacks) {
 
   if (!callbacks.length) {
     if (badgeEl) badgeEl.textContent = '';
-    bodyEl.innerHTML = `<div id="barak-callbacks-msg" style="display:none;padding:6px 16px;font-size:12px"></div>
-      <div class="empty-state" style="padding:12px">אין שיחות ממתינות</div>`;
+    swapHTML(bodyEl, `<div id="barak-callbacks-msg" class="cb-msg" data-keep-msg role="status" aria-live="polite" style="display:none"></div>
+      <div class="empty-state" style="padding:12px">אין שיחות ממתינות</div>`);
     return;
   }
 
   if (badgeEl) badgeEl.textContent = callbacks.length;
-  const btn = 'font-size:10px;padding:2px 6px;cursor:pointer;border-radius:3px;border:1px solid var(--border)';
 
   const rows = callbacks.map(l => {
     const qd  = l.meta?.qualData ?? {};
@@ -1986,8 +2091,8 @@ function renderCallbackPanel(callbacks) {
     const confirmedN = qd.confirmedName && qd.confirmedName.trim() ? qd.confirmedName : null;
     const dispName   = l.name && l.name.trim() ? l.name : null;
     const nameLabel  = confirmedN ? `✓ ${esc(confirmedN)}`
-      : dispName ? `${esc(dispName)} <span style="color:var(--hot);font-size:10px">(שם לא אושר)</span>`
-      : `<span style="color:var(--hot);font-size:11px">שם חסר</span>`;
+      : dispName ? `${esc(dispName)} <span class="cb-name-note">(שם לא אושר)</span>`
+      : `<span class="cb-name-note">שם חסר</span>`;
 
     const fullPhone = l.fullPhone ?? null;
     const dispPhone = fullPhone
@@ -2028,59 +2133,69 @@ function renderCallbackPanel(callbacks) {
     const aptId   = apt?.id ?? '';
     const canConfirm = apt && apt.status === 'callback_pending' && !apt.expired && apt.scheduledAt;
     const actions = aptId ? `
-      <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px" data-apt-actions="${aptId}">
-        ${canConfirm ? `<button data-cb-action="confirm" onclick="cbAction('${aptId}','confirm')" style="${btn};border-color:#22a55a;background:#22a55a;color:#fff;font-weight:600">✅ אשר שיחה</button>` : ''}
-        ${l.humanOwned && apt && !apt.expired && apt.scheduledAt && !apt.prospectSummarySent ? `<button data-cb-action="owner-summary" onclick="cbToggleOwnerSummary('${aptId}')" style="${btn};border-color:var(--accent);color:var(--accent);font-weight:600">📨 אשר ושלח סיכום ללקוח/ה</button>` : ''}
-        <button data-cb-action="complete"   onclick="cbAction('${aptId}','complete')"   style="${btn}">✔ הושלם</button>
-        <button data-cb-action="no_answer"  onclick="cbAction('${aptId}','no_answer')"  style="${btn}">📵 לא ענה</button>
-        <button data-cb-action="reschedule" onclick="cbToggleReschedule('${aptId}')"    style="${btn}">🔄 שנה מועד</button>
-        <button data-cb-action="assign"     onclick="cbAction('${aptId}','assign')"     style="${btn}">👤 נציג</button>
-        <button data-cb-action="cancel"     onclick="cbAction('${aptId}','cancel', this)" style="${btn}">🚫 בטל</button>
+      <div class="cb-actions" data-apt-actions="${aptId}">
+        ${canConfirm ? `<button class="cb-btn cb-btn-go" data-cb-action="confirm" onclick="cbAction('${aptId}','confirm')">✅ אשר שיחה</button>` : ''}
+        ${l.humanOwned && apt && !apt.expired && apt.scheduledAt && !apt.prospectSummarySent ? `<button class="cb-btn cb-btn-main" data-cb-action="owner-summary" onclick="cbToggleOwnerSummary('${aptId}')">📨 אשר ושלח סיכום ללקוח/ה</button>` : ''}
+        <button class="cb-btn" data-cb-action="complete"   onclick="cbAction('${aptId}','complete')">✔ הושלם</button>
+        <button class="cb-btn" data-cb-action="no_answer"  onclick="cbAction('${aptId}','no_answer')">📵 לא ענה</button>
+        <button class="cb-btn" data-cb-action="reschedule" onclick="cbToggleReschedule('${aptId}')">🔄 שנה מועד</button>
+        <button class="cb-btn" data-cb-action="assign"     onclick="cbToggleAssign('${aptId}')">👤 נציג</button>
+        <button class="cb-btn" data-cb-action="cancel"     onclick="cbAction('${aptId}','cancel', this)">🚫 בטל</button>
+        ${waPhone ? `<button class="cb-btn cb-only-phone" data-cb-action="history" onclick="openThread('${waPhone}')">💬 השיחה</button>` : ''}
       </div>
-      <div id="cb-owner-${aptId}" style="display:none;margin-top:6px;gap:6px;align-items:center;flex-wrap:wrap;font-size:11px">
-        <span>יישלח ללקוח/ה: <b>${apt?.scheduledLabel ? esc(apt.scheduledLabel) : ''}</b>${apt?.isWindow ? ' (כטווח שעות, בלי שעה מדויקת)' : ''}. השיחה נשארת בטיפול ידני.</span>
-        <input id="cb-owner-name-${aptId}" type="text" dir="rtl" placeholder="שם לפנייה (לא חובה)" value="${esc(qd.confirmedName ?? '')}" style="font-size:11px;padding:3px 6px;width:130px;border:1px solid var(--border);border-radius:3px">
-        <label style="display:flex;gap:3px;align-items:center"><input id="cb-owner-rem-${aptId}" type="checkbox" checked> לשלוח גם תזכורת לפני המועד</label>
-        <button data-cb-action="owner-summary-send" onclick="cbOwnerSummary('${aptId}')" style="${btn};border-color:#22a55a;background:#22a55a;color:#fff;font-weight:600">שלח</button>
+      <div id="cb-owner-${aptId}" class="cb-form" data-keep-open style="display:none">
+        <span class="cb-form-note">יישלח ללקוח/ה: <b>${apt?.scheduledLabel ? esc(apt.scheduledLabel) : ''}</b>${apt?.isWindow ? ' (כטווח שעות, בלי שעה מדויקת)' : ''}. השיחה נשארת בטיפול ידני.</span>
+        <input id="cb-owner-name-${aptId}" class="cb-input" type="text" dir="rtl" autocomplete="off" placeholder="שם לפנייה (לא חובה)" value="${esc(qd.confirmedName ?? '')}">
+        <label class="cb-check" for="cb-owner-rem-${aptId}"><input id="cb-owner-rem-${aptId}" type="checkbox" checked> לשלוח גם תזכורת לפני המועד</label>
+        <button class="cb-btn cb-btn-go" data-cb-action="owner-summary-send" onclick="cbOwnerSummary('${aptId}')">שלח</button>
       </div>
-      <div id="cb-resched-${aptId}" style="display:none;margin-top:6px;gap:4px;align-items:center">
-        <input id="cb-resched-input-${aptId}" type="text" dir="rtl" placeholder='מועד חדש — למשל "מחר ב-15:00" או "17.11 בשעה 10:30"' style="font-size:11px;padding:3px 6px;width:260px;border:1px solid var(--border);border-radius:3px">
-        <button data-cb-action="reschedule-save" onclick="cbAction('${aptId}','reschedule')" style="${btn}">שמור מועד</button>
+      <div id="cb-resched-${aptId}" class="cb-form" data-keep-open style="display:none">
+        <input id="cb-resched-input-${aptId}" class="cb-input cb-input-wide" type="text" dir="rtl" autocomplete="off" placeholder='מועד חדש — למשל "מחר ב-15:00" או "17.11 בשעה 10:30"'>
+        <button class="cb-btn" data-cb-action="reschedule-save" onclick="cbAction('${aptId}','reschedule')">שמור מועד</button>
+      </div>
+      <div id="cb-assign-${aptId}" class="cb-form" data-keep-open style="display:none">
+        <input id="cb-assign-input-${aptId}" class="cb-input" type="text" dir="ltr" autocomplete="off" autocapitalize="off" placeholder="מזהה נציג (eden / melanie / miri)">
+        <button class="cb-btn" data-cb-action="assign-save" onclick="cbAction('${aptId}','assign')">שמור נציג</button>
       </div>` : '';
 
-    return `<div class="callback-row" data-phone="${esc(fullPhone ?? '')}" data-stage="${esc(l.stage ?? '')}" data-apt-status="${esc(apt?.status ?? '')}" style="padding:10px 16px;border-bottom:1px solid var(--border)">
-      <div style="display:grid;grid-template-columns:160px 170px 1fr 56px 28px 28px 28px;gap:8px;align-items:start">
-        <div>
-          <div style="font-weight:600;font-size:13px">${nameLabel}</div>
-          <div style="font-size:11px;color:var(--muted);direction:ltr">${esc(dispPhone)}</div>
-          ${waLink ? `<a href="${waLink}" target="_blank" style="font-size:10px;color:var(--accent);text-decoration:none">💬 WhatsApp</a>` : '<span style="font-size:10px;color:var(--muted)">📵 לא זמין</span>'}
+    return `<div class="callback-row" data-keep-row="${esc(fullPhone ?? aptId)}" data-phone="${esc(fullPhone ?? '')}" data-stage="${esc(l.stage ?? '')}" data-apt-status="${esc(apt?.status ?? '')}">
+      <div class="cb-grid">
+        <div class="cb-c-who">
+          <div class="cb-name">${nameLabel}</div>
+          <div class="cb-phone">${esc(dispPhone)}</div>
+          ${waLink ? `<a class="cb-wa" href="${waLink}" target="_blank" rel="noopener">💬 WhatsApp</a>` : '<span class="cb-wa cb-wa-off">📵 לא זמין</span>'}
         </div>
-        <div>
-          <div class="cb-time" style="font-size:12px;color:var(--text);font-weight:500">${timeLabel}</div>
-          <div style="font-size:10px;color:var(--muted);margin-top:2px">נציג: ${esc(assignee)}</div>
-          <div class="cb-stage" style="font-size:11px;font-weight:600;color:${stColor};margin-top:2px">${esc(st.label)}</div>
-          ${facts.map(x => `<div class="cb-fact" style="font-size:10px;margin-top:2px;color:var(--muted)">${esc(x)}</div>`).join('')}
+        <div class="cb-c-when">
+          <div class="cb-time">${timeLabel}</div>
+          <div class="cb-assignee">נציג: ${esc(assignee)}</div>
+          <div class="cb-stage" style="color:${stColor}">${esc(st.label)}</div>
+          ${facts.map(x => `<div class="cb-fact">${esc(x)}</div>`).join('')}
         </div>
-        <div>
-          <div style="font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(convoSum)}">${readyEmoji} ${esc(convoSum || interests || '—')}</div>
-          ${l.needsAction ? `<div class="cb-needs-action" style="font-size:11px;margin-top:3px;color:var(--text)">👉 ${esc(l.needsAction)}</div>` : ''}
-          ${flagLines.map(x => `<div class="cb-flag" style="font-size:10px;margin-top:2px;color:var(--hot)">${esc(x)}</div>`).join('')}
+        <div class="cb-c-main">
+          <div class="cb-sum" title="${esc(convoSum)}">${readyEmoji} ${esc(convoSum || interests || '—')}</div>
+          ${l.needsAction ? `<div class="cb-needs-action">👉 ${esc(l.needsAction)}</div>` : ''}
+          ${flagLines.map(x => `<div class="cb-flag">${esc(x)}</div>`).join('')}
+          <div class="cb-only-phone cb-states">
+            <div>ציון ליד: <b style="color:${scoreColor}">${scoreNum}/10</b></div>
+            <div>${alertIcon} ${esc(alertTip)}</div>
+            <div>${reminderIcon} ${esc(reminderTip)}</div>
+          </div>
           ${actions}
         </div>
-        <div><span style="font-weight:700;color:${scoreColor}" title="ציון כשירות ליד (1-10)">${scoreNum}/10</span></div>
-        <div>${alertIcon}</div>
-        <div>${reminderIcon}</div>
-        <div title="היסטוריית שיחה">${waPhone ? `<button onclick="openThread('${waPhone}')" style="${btn}">💬</button>` : '<span style="color:var(--muted)">—</span>'}</div>
+        <div class="cb-only-desk"><span style="font-weight:700;color:${scoreColor}" title="ציון כשירות ליד (1-10)">${scoreNum}/10</span></div>
+        <div class="cb-only-desk">${alertIcon}</div>
+        <div class="cb-only-desk">${reminderIcon}</div>
+        <div class="cb-only-desk" title="היסטוריית שיחה">${waPhone ? `<button class="cb-btn" onclick="openThread('${waPhone}')">💬</button>` : '<span style="color:var(--muted)">—</span>'}</div>
       </div>
     </div>`;
   }).join('');
 
-  bodyEl.innerHTML = `
-    <div id="barak-callbacks-msg" style="display:none;padding:6px 16px;font-size:12px;font-weight:600"></div>
-    <div style="display:grid;grid-template-columns:160px 170px 1fr 56px 28px 28px 28px;gap:8px;padding:6px 16px;font-size:11px;font-weight:600;color:var(--muted);border-bottom:1px solid var(--border)">
+  swapHTML(bodyEl, `
+    <div id="barak-callbacks-msg" class="cb-msg" data-keep-msg role="status" aria-live="polite" style="display:none"></div>
+    <div class="cb-grid cb-head">
       <div>שם / טלפון</div><div>מועד / נציג / מצב</div><div>סיכום ופעולה נדרשת</div><div>ציון ליד</div><div title="סיכום למנהל">📨</div><div title="תזכורת לצוות">🔔</div><div>💬</div>
     </div>
-    ${rows}`;
+    ${rows}`);
 }
 
 // ── Callback action handlers ──────────────────────────────────────────────────
@@ -2092,6 +2207,20 @@ function cbToggleReschedule(aptId) {
   const open = box.style.display !== 'none';
   box.style.display = open ? 'none' : 'flex';
   if (!open) document.getElementById(`cb-resched-input-${aptId}`)?.focus();
+}
+function cbToggleAssign(aptId) {
+  const box = document.getElementById(`cb-assign-${aptId}`);
+  if (!box) return;
+  const open = box.style.display !== 'none';
+  box.style.display = open ? 'none' : 'flex';
+  if (!open) document.getElementById(`cb-assign-input-${aptId}`)?.focus();
+}
+/** After a form's action succeeded its draft is no longer a draft: empty it and close it, so the redraw does not bring it back. */
+function cbCloseForm(kind, aptId) {
+  const box = document.getElementById(`cb-${kind}-${aptId}`);
+  if (!box) return;
+  box.style.display = 'none';
+  box.querySelectorAll('input[type="text"]').forEach(i => { i.value = i.defaultValue; });
 }
 
 const CB_ACTION_OK = {
@@ -2111,6 +2240,7 @@ async function cbOwnerSummary(aptId) {
     const r = await fetch(`/api/admin/appointments/${aptId}/owner-summary`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ by: 'הבעלים (פאנל)', name, reminder }) });
     const j = await r.json().catch(() => ({}));
+    if (r.ok && j.ok) cbCloseForm('owner', aptId);
     if (r.ok && j.ok) cbSetMsg(j.alreadySent ? 'הסיכום כבר נשלח למועד הזה' + (reminder ? '; התזכורת אושרה' : '') : `הסיכום נשלח ללקוח/ה${j.state === 'queued' ? ' (ייצא בסיום שעות השקט)' : ''}${reminder ? '; התזכורת תישלח לפני המועד' : ''}`, false);
     else cbSetMsg(`הסיכום לא נשלח (${j.error || r.status}). לא נרשם כנשלח — אפשר לנסות שוב.`, true);
   } catch (e) { cbSetMsg('הסיכום לא נשלח: ' + e.message, true); }
@@ -2143,16 +2273,18 @@ async function cbAction(aptId, action, el) {
     url = `/api/admin/appointments/${aptId}/reschedule`;
     body = { rawTime };
   } else if (action === 'assign') {
-    const staffId = window.prompt('מזהה נציג (eden / melanie / miri):');
-    if (!staffId?.trim()) return;
+    const staffId = document.getElementById(`cb-assign-input-${aptId}`)?.value?.trim();
+    if (!staffId) { cbSetMsg('יש להקליד מזהה נציג', true); return; }
     url = `/api/admin/appointments/${aptId}/assign`;
-    body = { staffId: staffId.trim() };
+    body = { staffId };
   } else return;
 
   try {
     const res  = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || data.ok === false) throw new Error(data?.error ?? res.statusText);
+    if (action === 'reschedule') cbCloseForm('resched', aptId);
+    if (action === 'assign') cbCloseForm('assign', aptId);
     await loadBarakPanel();
     cbSetMsg(data.unchanged ? 'ללא שינוי — הפעולה כבר בוצעה' : (CB_ACTION_OK[action] ?? 'בוצע'), false);
   } catch (e) {
@@ -2161,14 +2293,9 @@ async function cbAction(aptId, action, el) {
 }
 
 function openThread(phone) {
-  // Open the conversations tab filtered to this phone
-  const tab = document.querySelector('[data-tab="conversations"]') ?? document.querySelector('[data-panel="conversations"]');
-  if (tab) tab.click();
-  // Brief delay to let the tab render, then filter
-  setTimeout(() => {
-    const filter = document.getElementById('conv-filter') ?? document.querySelector('input[placeholder*="חיפוש"]');
-    if (filter) { filter.value = phone.slice(-4); filter.dispatchEvent(new Event('input')); }
-  }, 200);
+  // The conversation itself: the WhatsApp tab, with this person's thread open.
+  document.querySelector('.tab-btn[data-tab="whatsapp"]')?.click();
+  selectWaThread(String(phone).replace(/[^0-9]/g, ''));
 }
 
 function renderBarakStats(d) {
@@ -2182,22 +2309,22 @@ function renderBarakStats(d) {
     { cls: '',       icon: '📊', val: d.unsyncedLeads,  label: 'לא מסונכרן' },
     d.crisisActive > 0 ? { cls: 'crisis', icon: '🚨', val: d.crisisActive, label: 'משבר' } : null,
   ].filter(Boolean);
-  el.innerHTML = cards.map(c => `
+  swapHTML(el, cards.map(c => `
     <div class="stat-card ${c.cls}">
       <div class="stat-icon">${c.icon}</div>
       <div class="stat-value">${c.val}</div>
       <div class="stat-label">${c.label}</div>
-    </div>`).join('');
+    </div>`).join(''));
 }
 
 function renderBarakTable(leads) {
   const rows  = activeFilter === 'all' ? leads : leads.filter(l => l.status === activeFilter);
   const tbody = document.getElementById('barak-leads-tbody');
   if (!rows.length) {
-    tbody.innerHTML = `<tr><td colspan="9" class="empty-state">אין לידים להצגה</td></tr>`;
+    swapHTML(tbody, `<tr><td colspan="9" class="empty-state">אין לידים להצגה</td></tr>`);
     return;
   }
-  tbody.innerHTML = rows.map(l => {
+  swapHTML(tbody, rows.map(l => {
     const tier = l.score >= 8 ? 'hot' : l.score >= 5 ? 'warm' : 'cold';
     const arbox = l.arboxSynced
       ? `<span style="color:var(--green);font-size:12px">✅ ${l.arboxId ?? ''}</span>`
@@ -2226,9 +2353,9 @@ function renderBarakTable(leads) {
       <td style="text-align:center">${l.introOfferSent ? '✅' : '—'}</td>
       <td>${arbox}</td>
       <td style="color:var(--muted)">${timeSince(l.lastActivity)}</td>
-      <td style="font-size:12px;max-width:180px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(nextAction)}">${readyEmoji} ${esc(nextAction)}</td>
+      <td class="lead-next" title="${esc(nextAction)}">${readyEmoji} ${esc(nextAction)}</td>
     </tr>`;
-  }).join('');
+  }).join(''));
 }
 
 /* Arbox sync ──────────────────────────────────────────────────────────────────*/
@@ -2929,7 +3056,7 @@ async function loadWaThreads(autoSelectFirst = true) {
     renderWaThreadStats(threadsData, statsData);
     renderWaThreadList();
     if (autoSelectFirst && !waActivePhone && waThreads.length > 0) {
-      selectWaThread(waThreads[0].phone);
+      selectWaThread(waThreads[0].phone, { auto: true });
     }
   } catch (e) { console.error('loadWaThreads', e); }
 }
@@ -2971,7 +3098,7 @@ function renderWaThreadList() {
     return;
   }
 
-  el.innerHTML = filtered.map(t => {
+  swapHTML(el, filtered.map(t => {
     const isActive  = t.phone === waActivePhone;
     const hasUnread = t.unreadCount > 0;
     const display   = t.name || t.fromIsraeli || t.phone;
@@ -2996,12 +3123,17 @@ function renderWaThreadList() {
         ${badgeCls ? `<div class="wa-thread-row3"><span class="wa-client-badge ${badgeCls}">${cm.matchType === 'member' ? '✅ לקוח' : '🎯 ליד'}</span></div>` : ''}
       </div>
     </div>`;
-  }).join('');
+  }).join(''));
 }
 
 // ── Select & open thread ──────────────────────────────────────────────────────
-async function selectWaThread(phone) {
+// On a phone the inbox is one column: the list of chats, or one chat with a "back" button. A chat the person picked
+// replaces the list; a chat selected automatically (first load) does not take the list away.
+async function selectWaThread(phone, { auto = false } = {}) {
+  const changed = waActivePhone !== phone;
   waActivePhone = phone;
+  if (changed) { const box = document.getElementById('wa-thread-messages'); if (box) { box.__html = null; box.dataset.phone = ''; } }
+  if (!auto) document.querySelector('.wa-chat-layout')?.classList.add('wa-show-thread');
   renderWaThreadList();
 
   document.getElementById('wa-chat-pane-empty')?.style.setProperty('display', 'none');
@@ -3026,6 +3158,8 @@ async function loadActiveThread(phone) {
   } catch (e) { console.error('loadActiveThread', e); }
 }
 
+function waBackToList() { document.querySelector('.wa-chat-layout')?.classList.remove('wa-show-thread'); }
+
 // ── Thread header ─────────────────────────────────────────────────────────────
 function renderWaThreadHeader(thread) {
   const el = document.getElementById('wa-thread-header');
@@ -3036,7 +3170,8 @@ function renderWaThreadHeader(thread) {
   const color   = avatarColor(display);
   const cm      = thread.clientMatch;
 
-  el.innerHTML = `
+  swapHTML(el, `
+    <button type="button" class="wa-back" id="wa-back" onclick="waBackToList()" aria-label="חזרה לרשימת השיחות">→ שיחות</button>
     <div class="wa-thdr-avatar" style="background:${color}">${initials(display)}</div>
     <div class="wa-thdr-info">
       <div class="wa-thdr-name">${esc(display)}</div>
@@ -3050,7 +3185,7 @@ function renderWaThreadHeader(thread) {
         : ''}
       <span class="wa-msg-count-badge">${thread.messages?.length ?? 0} הודעות</span>
       <a class="wa-open-link" href="https://wa.me/${thread.phone}" target="_blank">📱 פתח</a>
-    </div>`;
+    </div>`);
 }
 
 // ── Messages rendering ────────────────────────────────────────────────────────
@@ -3106,8 +3241,15 @@ function renderWaThreadMessages(messages) {
       </div>`);
   });
 
-  el.innerHTML = parts.join('');
-  el.scrollTop = el.scrollHeight;
+  // New messages scroll into view only for someone who is at the bottom (or has just opened the chat); a person reading
+  // older messages stays where they are.
+  const html = parts.join('');
+  if (el.__html === html) return;
+  const opened = el.dataset.phone !== String(waActivePhone ?? '');
+  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  const keep = el.scrollTop;
+  el.innerHTML = html; el.__html = html; el.dataset.phone = String(waActivePhone ?? '');
+  el.scrollTop = opened || atBottom ? el.scrollHeight : keep;
 }
 
 // ── Reply ─────────────────────────────────────────────────────────────────────

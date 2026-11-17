@@ -340,6 +340,11 @@ const WRITE_CONTRACTS = {
     body: a => ({ schedule_id: Number(a.scheduleId), user_id: Number(a.userId) }),
     clears: a => [`bookings:${a.userId}`, 'classes:'],
   },
+  // NOT a request: a capability switch. The owner approved (2026-11-17) that Tomer MOVES a member between classes inside
+  // the class's cancellation window. That approval is not proof that Arbox accepts the cancellation of the original
+  // class through the API at that point, nor of what it does to her sessions. `verified` is set only after one late move
+  // on the approved test member was read back (bookings and sessions). Until then a late move goes to the staff.
+  class_move_late: { verified: false, explicit: true, virtual: true, method: 'RULE', path: 'move inside the cancellation window (book new → cancel original)' },
 };
 
 // Tests may exercise the executor against a LOCAL mock with the assumed contract. This
@@ -375,6 +380,7 @@ function writeStatus() {
 async function executeWrite(op, args) {
   const c = WRITE_CONTRACTS[op];
   if (!c) throw new ArboxError('bad_args', `unknown write operation: ${op}`);
+  if (c.virtual) throw new ArboxError('bad_args', `"${op}" is a capability switch, not a request`);
   if (!writesEnabled(op)) throw new ArboxError('write_disabled', `Arbox write "${op}" is disabled (switch=${process.env.ARBOX_WRITES_ENABLED === 'true'}, contractVerified=${c.verified})`);
   const need = c.required ?? ['userId', 'membershipUserId'];
   if (need.some(k => args?.[k] === undefined || args?.[k] === null || args?.[k] === '')) throw new ArboxError('bad_args', `${need.join(' and ')} are required`);

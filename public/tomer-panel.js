@@ -53,7 +53,9 @@ function priorityHe(p) {
 function typeHe(t) {
   return {
     freeze_request:     '❄️ הקפאה',
-    cancel_request:     '🚫 ביטול מנוי',
+    cancel_request:     '🚫 בקשת ביטול',
+    fixed_booking_request: '📅 שיבוץ קבוע',
+    staff_followup:     '📌 לחזור ללקוח/ה',
     complaint:          '⚠️ תלונה',
     unsupported_action: '🔧 אין תמיכה',
     billing_question:   '💳 חיוב',
@@ -670,10 +672,65 @@ document.querySelectorAll('[data-tf]').forEach(btn => {
   });
 });
 
+// ── What was asked, what was done, what failed, what waits for Eden ─────────────
+// Every line is read from what the server recorded on the task; nothing is shown as done unless it was verified.
+const ACTION_HE = {
+  awaiting_member_confirmation: ['wait', 'ממתין לאישור בכתב של המתאמנ/ת — לא נשלח דבר ל-Arbox'],
+  not_confirmed_by_member:      ['eden', 'המתאמנ/ת לא אישר/ה בכתב — לא בוצע שינוי ב-Arbox'],
+  declined_by_member:           ['done', 'המתאמנ/ת ביטל/ה את הבקשה — לא בוצע שינוי'],
+  replaced_by_new_request:      ['done', 'הוחלפה בבקשה חדשה — לא בוצע שינוי'],
+  not_done_after_confirmation:  ['fail', 'אושר בכתב, אך לא בוצע ב-Arbox'],
+  done:                         ['done', 'בוצע ואומת ב-Arbox'],
+  nothing_changed:              ['fail', 'Arbox דחה את הבקשה — לא השתנה דבר'],
+  holds_both:                   ['fail', 'רשומה לשני השיעורים — נדרש ביטול ידני של אחד'],
+  unknown:                      ['fail', 'נשלחה בקשה ל-Arbox ותוצאתה לא אומתה — לבדוק ב-Arbox'],
+};
+const VOICE_STATE_HE = { waiting: ['wait', 'ממתינה לתמלול במחשב העריכה'], waiting_after_handoff: ['eden', 'לא תומללה בזמן — הועברה לעדן; התמלול יצורף אם יגיע'],
+  not_transcribed: ['eden', 'לא תומללה — יש להאזין בוואטסאפ'], done: ['done', 'תומללה אוטומטית (לא אומת)'] };
+function taskTrack(t) {
+  const L = [];
+  const add = (k, text) => L.push(`<div class="tw-track tw-track-${k}">${{ done: '✅', fail: '⚠️', wait: '⏳', eden: '👤' }[k]} ${esc(text)}</div>`);
+  const a = t.action && ACTION_HE[t.action.state];
+  if (a) add(a[0], a[1]);
+  if (t.action?.state === 'done' && t.action.balance && t.action.balance.check !== 'ok') add('eden', `לבדוק יתרת כניסות: ${t.action.balance.note ?? ''}`);
+  const v = t.transcription && VOICE_STATE_HE[t.transcription.state];
+  if (v) add(v[0], v[1]);
+  if (t.transcription?.text) L.push(`<div class="tw-track tw-track-quote">🎙️ "${esc(String(t.transcription.text).slice(0, 220))}"</div>`);
+  for (const [slot, name] of [['alert', 'ההתראה לעדן'], ['alertUpdate', 'עדכון התמלול לעדן']]) {
+    const al = t[slot];
+    if (!al) continue;
+    if (al.state === 'sent') add('done', `${name} נשלחה`);
+    else add('fail', `${name} לא נשלחה (${Number(al.attempts) || 1} ניסיונות${al.attempts >= 3 ? ', לא יהיה ניסיון נוסף' : ', יהיה ניסיון חוזר'})`);
+  }
+  const mr = t.memberReply;
+  if (mr) { if (mr.state === 'sent') add('done', 'התשובה ללקוח/ה נשלחה'); else if (mr.state === 'queued') add('wait', 'התשובה ללקוח/ה בתור (שעות שקטות)'); else add('fail', 'התשובה ללקוח/ה לא נשלחה'); }
+  if (['open', 'eden_assigned'].includes(t.status) && !(a && a[0] === 'wait') && !(v && v[0] === 'wait')) add('eden', 'מחכה לטיפול של עדן');
+  return L.join('');
+}
+async function loadAutomationStatus() {
+  const host = $id('tw-tasks-tbody')?.closest('.table-wrapper');
+  if (!host) return;
+  let box = $id('tw-automation-status');
+  if (!box) { box = document.createElement('div'); box.id = 'tw-automation-status'; box.className = 'tw-automation'; host.parentNode.insertBefore(box, host); }
+  try {
+    const d = await api('/api/tomer/automation-status');
+    if (!d.ok) return;
+    const av = d.voice.availability.state;
+    const voice = { online: '🟢 תמלול קולי: מחשב העריכה מחובר', busy: '🟡 תמלול קולי: מחשב העריכה עסוק בעריכה — הודעות קוליות עוברות לעדן מיד, והתמלול מצורף אחר כך',
+      offline: '🔴 תמלול קולי: מחשב העריכה לא מחובר — הודעות קוליות עוברות לעדן', off: '⚪ תמלול קולי כבוי — הודעות קוליות עוברות לעדן' }[av] ?? av;
+    const ops = d.arbox.operations, on = k => ops[k]?.executable;
+    const arbox = !d.arbox.anyExecutable ? '⚪ פעולות Arbox של תומר: כבויות — כל בקשת רישום עוברת לעדן'
+      : `🟢 פעולות Arbox פעילות: ${[on('class_book') && 'רישום', on('class_cancel') && 'ביטול', on('class_book') && on('class_cancel') && 'מעבר', on('class_move_late') && 'מעבר בתוך חלון הביטול'].filter(Boolean).join(', ')} · ${d.arbox.audience === 'all' ? 'לכל המתאמנים' : `למספרי בדיקה בלבד (${d.arbox.testPhones})`}`;
+    const html = `<div>${esc(voice)}${d.voice.waiting ? ` · ${d.voice.waiting} ממתינות` : ''}${d.voice.audioOnServer ? ` · ${d.voice.audioOnServer} הקלטות בשרת (נמחקות אחרי תמלול, ולכל היותר אחרי 24 שעות)` : ''}</div><div>${esc(arbox)}</div>`;
+    if (box.innerHTML !== html) box.innerHTML = html;
+  } catch { /* the tasks below are still shown */ }
+}
+
 async function loadTasks() {
   const tbody = $id('tw-tasks-tbody');
   if (!tbody) return;
-  tbody.innerHTML = '<tr><td colspan="7" class="empty-state">טוען...</td></tr>';
+  loadAutomationStatus();
+  if (!tbody.querySelector('tr[data-task]')) tbody.innerHTML = '<tr><td colspan="7" class="empty-state">טוען...</td></tr>';
   try {
     const url = '/api/tomer/tasks' + (_taskStatusFilter ? `?status=${_taskStatusFilter}` : '');
     const data = await api(url);
@@ -687,13 +744,11 @@ async function loadTasks() {
       tbody.innerHTML = '<tr><td colspan="7" class="empty-state">אין משימות</td></tr>';
       return;
     }
-    tbody.innerHTML = tasks.map(t => `
-      <tr class="task-row-${t.priority}">
+    const rows = tasks.map(t => `
+      <tr class="task-row-${t.priority}" data-task="${esc(t.id)}">
         <td>${esc(t.memberName ?? maskPhone(t.phone))}</td>
         <td>${typeHe(t.type)}</td>
-        <td title="${esc(t.detail ?? '')}">${esc((t.summary ?? '').slice(0, 60))}${
-          t.alert && t.alert.state === 'failed' ? ` <span class="tw-pri-high" title="${esc(t.alert.error ?? '')}">⚠️ ההתראה לעדן לא נשלחה (${Number(t.alert.attempts) || 1} ניסיונות)</span>` : ''}${
-          t.memberReply && t.memberReply.state === 'failed' ? ` <span class="tw-pri-high">⚠️ התשובה למתאמנ/ת לא נשלחה</span>` : ''}</td>
+        <td><div class="tw-track-asked">${esc((t.summary ?? '').slice(0, 110))}</div>${taskTrack(t)}</td>
         <td class="${t.priority === 'high' ? 'tw-pri-high' : ''}">${priorityHe(t.priority)}</td>
         <td><span class="badge-status-${t.status}">${statusHe(t.status)}</span></td>
         <td>${fmtDate(t.createdAt)}</td>
@@ -703,6 +758,8 @@ async function loadTasks() {
           <button class="btn-xs btn-xs-sec" onclick="viewTaskDetail('${esc(t.id)}')">פרטים</button>
         </td>
       </tr>`).join('');
+    // redrawn only when something changed, so a live update does not move the list under the reader
+    if (typeof swapHTML === 'function') swapHTML(tbody, rows); else tbody.innerHTML = rows;
   } catch (e) {
     tbody.innerHTML = `<tr><td colspan="7" class="empty-state">שגיאה: ${esc(e.message)}</td></tr>`;
   }
@@ -1254,7 +1311,7 @@ async function loadCases() {
     alertEl.innerHTML = msgs.map(m => '<div>' + esc(m) + '</div>').join('');
   }
   const EMPTY = { open: 'אין פניות פתוחות', awaiting_staff: 'אין פניות שממתינות לצוות', in_progress: 'אין פניות בטיפול', awaiting_member: 'אין פניות שממתינות לחבר/ה', resolved: 'אין פניות סגורות' };
-  list.innerHTML = d.cases.length ? d.cases.map(renderCaseCard).join('') : '<div class="tw-empty" data-state="empty">' + EMPTY[_caseFilter] + '</div>';
+  swapHTML(list, d.cases.length ? d.cases.map(renderCaseCard).join('') : '<div class="tw-empty" data-state="empty">' + EMPTY[_caseFilter] + '</div>');
 }
 
 // ── One case ────────────────────────────────────────────────────────────────
@@ -1333,7 +1390,7 @@ function renderCaseDetail(c, conv) {
       + '<div class="tw-cd-form"><label for="tw-cd-reply">הודעה לחבר/ה בשם הצוות</label>'
       + (c.conversationOwner === 'opted_out' ? '<div class="tw-cd-note">החבר/ה ביקש/ה לא לקבל הודעות — אי אפשר לשלוח מכאן.</div>'
         : '<textarea id="tw-cd-reply" class="field-input" rows="3" placeholder="ההודעה נשלחת מהוואטסאפ של הסטודיו ונרשמת כהודעת צוות"></textarea>'
-        + '<label class="tw-cd-check-label"><input type="checkbox" id="tw-cd-await"> אחרי השליחה: ממתין לתשובת החבר/ה</label>'
+        + '<label class="tw-cd-check-label" for="tw-cd-await"><input type="checkbox" id="tw-cd-await"> אחרי השליחה: ממתין לתשובת החבר/ה</label>'
         + '<div class="tw-cd-note">שליחה מעבירה את השיחה לצוות — תומר מפסיק לענות לחבר/ה עד שתשחררו את השיחה.</div>'
         + '<button type="button" class="btn btn-primary" data-act="reply">שלח לחבר/ה</button>') + '</div>'
       + '<div class="tw-cd-form"><label for="tw-cd-outcome">סגירת הפנייה — מה נעשה</label><select id="tw-cd-outcome" class="field-input">'
@@ -1352,7 +1409,7 @@ function renderCaseDetail(c, conv) {
     + (c.priority === 'high' ? '<span class="tw-chip tw-chip-bad">דחוף</span>' : '<span class="tw-chip">עדיפות רגילה</span>')
     + '<span class="tw-case-status" id="tw-cd-status-chip" data-status-chip="' + esc(c.status) + '">' + esc(CASE_STATUS_HE[c.status] || c.status) + '</span>'
     + (c.unreadMember ? '<span class="tw-chip tw-chip-info">הודעה חדשה מהחבר/ה</span>' : '') + '</div>'
-    + '<div id="tw-cd-msg" class="tw-cd-flash" role="status" aria-live="polite"></div>'
+    + '<div id="tw-cd-msg" class="tw-cd-flash" data-keep-msg role="status" aria-live="polite"></div>'
     + '<div class="tw-cd-section">'
     + row('חבר/ה', esc(c.memberName || 'שם לא ידוע') + (c.memberUserId ? ' · מזהה Arbox ' + esc(c.memberUserId) : ' · לא זוהה/תה ב-Arbox'))
     + row('טלפון', '<span dir="ltr">' + esc(c.phone) + '</span> · <a href="https://wa.me/' + esc(c.phone) + '" target="_blank" rel="noopener">פתח בוואטסאפ</a>')
@@ -1389,12 +1446,13 @@ async function openCase(id, { flash = null } = {}) {
   }
   _caseLabels = { ..._caseLabels, ...(d.categories || {}) }; _caseOutcomes = d.outcomes || _caseOutcomes;
   if (title) title.textContent = (_caseLabels[d.case.category] || 'פנייה') + ' — ' + (d.case.memberName || 'חבר/ה');
-  body.innerHTML = renderCaseDetail(d.case, d.conversation);
+  const html = renderCaseDetail(d.case, d.conversation);
+  if (same) swapHTML(body, html); else { body.innerHTML = html; body.__html = html; body.__first = body.firstChild; }
   if (flash) caseFlash(flash.text, flash.ok);
 }
 function caseFlash(text, ok = true) {
   const el = $id('tw-cd-msg'); if (!el) return;
-  el.textContent = text; el.dataset.kind = ok ? 'ok' : 'error';
+  el.textContent = text; el.dataset.kind = ok ? 'ok' : 'error'; el.dataset.at = String(Date.now());
 }
 
 async function caseAct(act, btn) {
@@ -1427,6 +1485,7 @@ async function caseAct(act, btn) {
   let ok = r.ok;
   if (r.ok && op === 'refresh-arbox' && r.arboxAvailable === false) { text = 'Arbox לא זמין כרגע — אין נתונים עדכניים'; ok = false; }
   if (r.ok && r.warning === 'sent_not_recorded') { text = 'ההודעה נשלחה, אך לא נרשמה בפנייה (שגיאת שמירה)'; ok = false; }
+  if (ok && op === 'reply') { const t = $id('tw-cd-reply'), a = $id('tw-cd-await'); if (t) t.value = ''; if (a) a.checked = false; }
   toast(text, ok);
   await Promise.all([openCase(id, { flash: { text, ok } }), loadCases()]);
 }
@@ -1476,7 +1535,8 @@ window.openTomerCase = function (id) {
   };
   try {
     const es = new EventSource('/api/whatsapp/stream');
-    es.onmessage = e => { try { if (JSON.parse(e.data).event === 'tomer_case') refresh(); } catch { /* not json */ } };
+    es.onmessage = e => { try { const ev = JSON.parse(e.data).event; if (ev === 'tomer_case') refresh();
+      if (ev === 'tomer_task' && document.querySelector('.tab-btn[data-tab="tomer"].active') && document.querySelector('.tw-tab.active')?.dataset.pane === 'tasks') loadTasks(); } catch { /* not json */ } };
   } catch { /* the refresh button still works */ }
 })();
 
@@ -1631,7 +1691,9 @@ function renderCareEntitlements(o) {
     + '</div>').join('');
 }
 
-async function loadCare() {
+/** keep = a refresh (drafts typed in the forms stay); keep:false = right after an action, when the forms must show what the server now holds. */
+async function loadCare({ keep = true } = {}) {
+  const put = (el, html) => { if (!el) return; if (keep) swapHTML(el, html); else { el.innerHTML = html; el.__html = html; el.__first = el.firstChild; } };
   const box = $id('tc-programs'); if (!box) return;
   if (!_care) box.innerHTML = '<div class="tw-empty" data-state="loading">טוען…</div>';
   const o = await caseApi('/api/tomer/care/overview');
@@ -1643,10 +1705,10 @@ async function loadCare() {
   if (o.testMode.mode === 'test_only') msgs.push('מצב בדיקה: הודעות יזומות יכולות להגיע רק אל ' + (o.testMode.allowlist.join(', ') || 'אף מספר') + '. חברים אחרים מופיעים בתצוגה המקדימה כ"חסום — מצב בדיקה".');
   if (!o.autoReply) msgs.push('מענה אוטומטי בוואטסאפ כבוי — הודעות לא יישלחו.');
   if (banner) { banner.hidden = !msgs.length; banner.innerHTML = msgs.map(m => '<div>' + esc(m) + '</div>').join(''); }
-  box.innerHTML = renderCarePrograms(o);
-  $id('tc-settings').innerHTML = renderCareSettings(o);
-  $id('tc-pauses').innerHTML = renderCarePauses(o);
-  $id('tc-entitlements').innerHTML = renderCareEntitlements(o);
+  put(box, renderCarePrograms(o));
+  put($id('tc-settings'), renderCareSettings(o));
+  put($id('tc-pauses'), renderCarePauses(o));
+  put($id('tc-entitlements'), renderCareEntitlements(o));
   const on = o.programs.filter(p => p.enabled).length; const b = $id('tw-badge-care'); if (b) b.textContent = on ? String(on) : '';
   loadCareEpisodes();
 }
@@ -1733,7 +1795,7 @@ async function careAct(act, btn) {
   btn.disabled = false;
   if (!r) return;
   careFlash(r.ok ? okText : careErr(r) + (r.blocks ? ': ' + r.blocks.map(b => b.text).join(' · ') : '') + (r.reasons ? ': ' + r.reasons.map(x => x.text).join(' · ') : ''), r.ok);
-  await loadCare();
+  await loadCare({ keep: false });
   if (act.startsWith('freeze-')) await loadAbsenceReport();
 }
 
@@ -1745,7 +1807,7 @@ async function saveCareSettings(btn) {
   const r = await caseApi('/api/tomer/care/settings', { method: 'POST', body: { groupLink: $id('tc-group-link').value, paymentResolution: $id('tc-payment-text').value, billingDataConfirmed: $id('tc-billing-ok').checked, policy, by: careBy() } });
   btn.disabled = false;
   careFlash(r.ok ? 'ההגדרות נשמרו' : careErr(r), r.ok);
-  if (r.ok) await loadCare();
+  if (r.ok) await loadCare({ keep: false });
 }
 
 async function loadAbsenceReport() {

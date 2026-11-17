@@ -13,6 +13,8 @@ Security model
     pipeline (`python -m dana_pipeline.run`) with paths it built itself.
   * The token (env var named by `token_env`) is valid only for /api/dana/worker/*.
   * Every transfer is verified by SHA-256 in both directions.
+  * Voice messages (/api/voice/worker/*, same token): the recording is on this machine only while it is
+    transcribed, and neither the recording nor its text is ever written to a log.
 """
 import argparse
 import hashlib
@@ -41,6 +43,8 @@ AUDIO_EXT = {"mp3", "wav", "m4a", "aac", "ogg", "flac"}
 UPLOAD_ORDER = ["package.json", "checks.json", "captions.json", "editorial.json", "transcript_source.json", "transcript_final.json",
                 "cover.jpg", "compare_frames.jpg", "compare_clip.mp4", "readable_compare.mp4", "story_part_1.mp4", "story_part_2.mp4", "story_part_3.mp4", "story_part_4.mp4", "final.mp4"]
 TRANSFER_ATTEMPTS = 3
+VOICE_EXT = {"ogg", "oga", "opus", "mp3", "m4a", "aac", "wav", "amr"}
+VOICE_MAX_BYTES = 25 * 1024 * 1024
 
 
 class Api:
@@ -313,6 +317,7 @@ def housekeeping(cfg):
     audio files cached for the worker are kept. Returns what was removed, for the log."""
     root, days = Path(cfg["paths"]["work_root"]) / "jobs", float(cfg.get("keep_job_dirs_days", 5))
     removed, freed = 0, 0
+    purge_voice(cfg)                               # no job is running while housekeeping runs: any recording left here is a leftover
     if not root.is_dir() or days <= 0:
         return removed, freed
     limit = time.time() - days * 86400
@@ -339,6 +344,7 @@ def capabilities(cfg):
     paths = cfg.get("paths") or {}
     hf = paths.get("hyperframes") or shutil.which("hyperframes.cmd") or shutil.which("hyperframes")
     return {"content_model": {"enabled": bool(cfg["judgement"]["claude"].get("enabled")) and cfg["judgement"]["adapter"] == "claude", "model": cfg["judgement"]["claude"].get("model")},
+            "voice_transcription": {"available": True, "timeout_s": float((cfg.get("voice") or {}).get("timeout_s", 180))},
             "transcription": {"model": cfg["asr"]["model"], "device": cfg["asr"]["device"], "second_pass": bool(cfg["judgement"].get("second_pass"))},
             "face_detection": bool(paths.get("face_model") and Path(paths["face_model"]).is_file()),
             # prepared, not active: whether the connection is switched on and whether a key is PRESENT on this machine - never the key itself
@@ -417,6 +423,162 @@ def handle_reference(api, cfg, cfg_path, leased):
         src.unlink(missing_ok=True)                 # the reference file itself is not kept on the editing machine
 
 
+# ── Voice messages (a member's WhatsApp recording → text, for the service agent) ─────────────────────────────────────
+# The recording exists on this machine only between the download and the end of the transcription: it is deleted in a
+# `finally`, and anything a crash or a power loss left behind is deleted when the worker starts and at every housekeeping.
+# Nothing about the content is logged: only the job id, the duration, the seconds taken and the outcome.
+def voice_root(cfg):
+    return Path(cfg["paths"]["work_root"]) / "voice"
+
+
+def purge_voice(cfg):
+    """Delete every local copy of a recording (and its transcript file). Returns how many job folders were removed."""
+    root, n = voice_root(cfg), 0
+    if not root.is_dir():
+        return 0
+    for d in list(root.iterdir()):
+        try:
+            if d.is_dir():
+                shutil.rmtree(d)
+            else:
+                d.unlink()
+            n += 1
+        except OSError:
+            continue
+    return n
+
+
+def voice_command(cfg_path, audio, out):
+    """The only program started for a voice message: this worker's own transcriber, with paths the worker built."""
+    return [sys.executable, "-X", "utf8", "-m", "dana_pipeline.voice", "--config", str(cfg_path), "--audio", str(audio), "--out", str(out)]
+
+
+def run_voice(cfg, cfg_path, audio, out):
+    """Transcribe in a child process with a time limit. -> (result dict, None) | (None, {"code", "message"})."""
+    limit = float((cfg.get("voice") or {}).get("timeout_s", 180))
+    try:
+        proc = subprocess.run(voice_command(cfg_path, audio, out), cwd=str(HERE), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=limit)
+    except subprocess.TimeoutExpired:
+        return None, {"code": "voice_timeout", "message": f"transcription did not finish in {limit:.0f} s"}
+    except OSError as e:
+        return None, {"code": "voice_asr_failed", "message": f"the transcriber could not be started: {type(e).__name__}"}
+    try:
+        res = json.loads(Path(out).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, {"code": "voice_asr_failed", "message": f"the transcriber exited {proc.returncode} without a result"}
+    if proc.returncode == 0 and isinstance(res.get("text"), str) and res["text"].strip():
+        return res, None
+    err = res.get("error") if isinstance(res.get("error"), dict) else {}
+    return None, {"code": str(err.get("code") or "voice_asr_failed")[:60], "message": str(err.get("message") or f"the transcriber exited {proc.returncode}")[:300]}
+
+
+def handle_voice(api, cfg, cfg_path, leased, runner=None):
+    """Download one recording, transcribe it locally, post the text (or the failure) and delete the local copy - always."""
+    job, lease = leased.get("job") or {}, leased.get("leaseToken")
+    jid, h, t0 = str(job.get("id") or ""), {"X-Lease-Token": lease or ""}, time.time()
+
+    def post(body):
+        try:
+            code, _ = api.call("POST", f"/api/voice/worker/jobs/{jid}/result", body, h)
+            return code
+        except (urllib.error.URLError, OSError) as e:
+            return f"unreachable ({type(e).__name__})"
+
+    if not SAFE_ID.match(jid):
+        log("voice: a job with an invalid id was refused")
+        return False
+    ext, sha, size = str(job.get("ext") or "").lower(), str(job.get("sha256") or ""), job.get("bytes")
+    if ext not in VOICE_EXT or not re.fullmatch(r"[0-9a-f]{64}", sha) or (isinstance(size, int) and size > VOICE_MAX_BYTES):
+        code = post({"status": "failed", "error": {"code": "voice_invalid", "message": "job fields failed validation on the worker"}})
+        log(f"voice {jid}: refused (invalid fields) → {code}")
+        return False
+    d = voice_root(cfg) / jid
+    try:
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(parents=True)
+        audio, out = d / f"audio.{ext}", d / "result.json"
+        digest, got = hashlib.sha256(), 0
+        with api._req("GET", f"/api/voice/worker/jobs/{jid}/audio", headers=h, timeout=60) as r, open(audio, "wb") as f:
+            for chunk in iter(lambda: r.read(1 << 16), b""):
+                got += len(chunk)
+                if got > VOICE_MAX_BYTES:
+                    raise PipelineError("voice_invalid", "the recording is larger than the limit")
+                f.write(chunk)
+                digest.update(chunk)
+        if digest.hexdigest() != sha:
+            raise PipelineError("voice_transfer_failed", "the downloaded recording does not match its hash", True)
+        res, err = (runner or run_voice)(cfg, cfg_path, audio, out)
+        if err:
+            raise PipelineError(err["code"], err["message"])
+        code = post({"status": "transcribed", "text": res["text"], "language": res.get("language"), "duration_s": res.get("duration_s"),
+                     "model": res.get("model"), "avg_logprob": res.get("avg_logprob"), "no_speech_prob": res.get("no_speech_prob")})
+        log(f"voice {jid}: transcribed ({res.get('duration_s')} s of audio, {time.time() - t0:.1f} s) → {code}")
+        return code == 200
+    except urllib.error.HTTPError as e:
+        code = post({"status": "failed", "error": {"code": "voice_transfer_failed", "message": f"download refused: HTTP {e.code}"}}) if e.code not in (401, 404, 409) else "lease lost"
+        log(f"voice {jid}: download refused HTTP {e.code} → {code}")
+    except (PipelineError, urllib.error.URLError, OSError) as e:
+        c, m = (e.code, e.message) if isinstance(e, PipelineError) else ("voice_transfer_failed", type(e).__name__)
+        code = post({"status": "failed", "error": {"code": c, "message": m}})
+        log(f"voice {jid}: {c} ({time.time() - t0:.1f} s) → {code}")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)        # the recording and its transcript never stay on this machine
+        if d.exists():
+            log(f"voice {jid}: the local copy could not be deleted now; it is deleted at the next housekeeping / start")
+    return False
+
+
+def poll_voice(api, cfg, cfg_path):
+    """Is a voice message waiting? It is taken BEFORE any edit job. 204 = nothing; 404 = an older server (ignored)."""
+    code, body = api.call("POST", "/api/voice/worker/lease", {"workerId": api.worker_id})
+    if code == 200 and body and body.get("job"):
+        keep_awake(True)
+        try:
+            handle_voice(api, cfg, cfg_path, body)
+        finally:
+            keep_awake(False)
+        return True
+    if code not in (200, 204, 404):
+        log(f"voice lease: HTTP {code}")
+    return False
+
+
+# ── One worker per work_root ─────────────────────────────────────────────────────────────────────────────────────────
+_LOCK = None
+
+
+def single_instance(cfg):
+    """Hold an OS lock on <work_root>/worker.lock for the life of the process. A second worker on the same work_root gets
+    False. The lock is the operating system's, not the file's existence: after a crash or a power loss it is simply free."""
+    global _LOCK
+    path = Path(cfg["paths"]["work_root"]) / "worker.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(path, "a+b")
+    try:
+        f.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return False
+    _LOCK = f
+    return True
+
+
+def release_instance():
+    global _LOCK
+    if _LOCK is not None:
+        try:
+            _LOCK.close()
+        finally:
+            _LOCK = None
+
+
 def hello(api, cfg, once=False, wait_s=30, sleep=time.sleep):
     """Announce the worker. After a power loss the machine can be up before the network or the server is: an unreachable
     server is waited for (the STOP file still ends the wait), it does not end the worker. A server that ANSWERS and refuses
@@ -455,6 +617,12 @@ def main():
     if (Path(cfg["paths"]["work_root"]) / "STOP").exists():
         log("STOP file present — worker does not start (delete the file to allow it)")
         return 0
+    if not single_instance(cfg):
+        log(f"another worker already runs on {cfg['paths']['work_root']} — this one exits")
+        return 0
+    left = purge_voice(cfg)                         # recordings a crash or a power loss left behind
+    if left:
+        log(f"start: deleted {left} leftover voice folder(s)")
     api = Api(cfg["server_url"], token, cfg.get("worker_id") or "worker")
     code, body = hello(api, cfg, a.once)
     if code is None:
@@ -481,11 +649,18 @@ def main():
                 api.call("POST", "/api/dana/worker/heartbeat", {"workerId": api.worker_id, "state": "low_disk", "pipelineVersion": PIPELINE_VERSION, "disk": disk})
             except (urllib.error.URLError, OSError):
                 pass
+            try:
+                poll_voice(api, cfg, a.config)      # a recording is small: it is still transcribed while edits wait for disk
+            except (urllib.error.URLError, OSError):
+                pass
             if a.once:
                 return 0
             time.sleep(60)
             continue
         try:
+            # a member's voice message is never behind a new edit
+            if poll_voice(api, cfg, a.config):
+                continue
             code, body = api.call("POST", "/api/dana/worker/lease", {"workerId": api.worker_id, "pipelineVersion": PIPELINE_VERSION})
             if code == 200 and body and body.get("job"):
                 log(f"job {body['job']['id']} leased (attempt {body['job'].get('attempt')})")
