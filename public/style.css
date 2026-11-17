@@ -3186,15 +3186,20 @@ input:checked + .toggle-slider::before { transform: translateX(16px); }
   .tw-two-col { grid-template-columns: 1fr; }
   .tc-actions { min-width: 0; } .tc-policy { grid-template-columns: 1fr; } .tc-pause-form .field-input { max-width: none; flex: 1 1 100%; }
   .tc-hour { width: 84px; }
-  .tw-chat-bubble { left: 12px; bottom: calc(12px + env(safe-area-inset-bottom)); }
-  .tw-chat-panel { left: 8px; right: 8px; width: auto; bottom: calc(68px + env(safe-area-inset-bottom)); max-height: calc(var(--vvh, 100dvh) - 90px); overflow-y: auto; }
+  /* on a phone the chat button is part of the page (at the end of Tomer's screen), not a bubble floating over it */
+  .tw-chat-bubble { position: static; width: auto; height: auto; min-height: 44px; border-radius: 12px; margin: 16px 12px 8px; padding: 8px 14px; gap: 8px; font-size: 16px; box-shadow: none; }
+  .tw-chat-bubble::after { content: 'שיחה עם תומר'; font-size: 15px; font-weight: 600; }
+  .tw-chat-bubble:hover { transform: none; }
+  .tw-chat-panel { left: 8px; right: 8px; width: auto; bottom: calc(8px + env(safe-area-inset-bottom)); max-height: calc(var(--vvh, 100dvh) - 24px); overflow-y: auto; }
 
   /* dialogs and toasts */
   .modal-overlay { padding: 10px; align-items: flex-end; }
   .modal-box { max-width: 100%; max-height: calc(var(--vvh, 100dvh) - 20px); margin-bottom: env(safe-area-inset-bottom); }
   .modal-header { padding: 8px 12px; } .modal-body { padding: 12px; } .modal-footer { padding: 10px 12px; flex-wrap: wrap; }
   .modal-footer .btn, .modal-footer button { flex: 1 1 40%; }
-  .toast { left: 12px; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom)); max-width: none; font-size: 14px; pointer-events: none; }
+  /* a result message appears as a slim strip at the very top, never over the fields, the buttons at the bottom or the
+     keyboard; it does not take touches, so whatever is under it stays usable */
+  .toast { left: 8px; right: 8px; top: calc(6px + env(safe-area-inset-top)); bottom: auto; max-width: none; font-size: 14px; line-height: 1.35; padding: 8px 12px; border-radius: 10px; pointer-events: none; opacity: .96; z-index: 5000; }
 
   /* WhatsApp inbox: the list of chats, or one chat */
   .wa-stats-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
@@ -3226,3 +3231,4 @@ input:checked + .toggle-slider::before { transform: translateX(16px); }
 .tw-track-eden { color: #1d4ed8; }
 .tw-track-quote { color: var(--muted); font-style: italic; }
 .tw-automation { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--border, #e5e7eb); border-radius: 10px; background: var(--card, #fff); font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+#tc-absence[aria-busy="true"] { opacity: .55; transition: opacity .15s; }

@@ -166,7 +166,8 @@ try {
   const rendered = await waitFor(() => evalJs(`document.querySelectorAll('.callback-row').length === 3`), { timeoutMs: 20000, intervalMs: 150 });
   check('browser: /#barak opens the Barak tab and renders 3 callback rows', rendered === true,
     JSON.stringify({ rows: await evalJs(`document.querySelectorAll('.callback-row').length`), active: await evalJs(`document.querySelector('.tab-btn.active')?.dataset.tab`), hash: await evalJs('location.hash'), pageErrors }));
-  check('browser: Barak tab is the active tab', await evalJs(`document.querySelector('.tab-btn.active')?.dataset.tab`) === 'barak');
+  // the rows can be drawn a moment before the hash is applied to the tab bar: what matters is that the tab ends up active
+  check('browser: Barak tab is the active tab', (await waitFor(() => evalJs(`document.querySelector('.tab-btn.active')?.dataset.tab === 'barak'`), { timeoutMs: 5000, intervalMs: 100 })) === true);
   check('browser: badge shows 3', (await evalJs(`document.getElementById('barak-callbacks-badge').textContent`)) === '3');
 
   // ── Row A: complete request ─────────────────────────────────────────────────

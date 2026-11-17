@@ -35,7 +35,8 @@ function loadJSON(filePath, fallback) {
 }
 
 let STAFF_DIR   = loadJSON(STAFF_PATH,   { instructors: [] });
-let SUB_PKG     = loadJSON(PKG_PATH,     { trial: null, packages: [], _universal_access: '' });
+// prices: what the owner saved on the persistent volume, else the shipped default (utils/pricing.js)
+let SUB_PKG     = require('../utils/pricing').load();
 let CLASSES_DATA = loadJSON(CLASSES_PATH, { classes: [], _universal_access: '' });
 
 // Build a compact staff context string injected into every Barak AI call
@@ -108,10 +109,13 @@ function reloadKnowledge({ staffData, pkgData, classesData } = {}) {
   }
 
   if (pkgData) {
-    fs.writeFileSync(PKG_PATH, JSON.stringify(pkgData, null, 2), 'utf8');
-    SUB_PKG = pkgData;
+    // saved under DATA_DIR (the persistent volume in production), where every agent reads the approved prices from
+    const _pkgFile = path.join((process.env.DATA_DIR ?? path.join(__dirname, '../data')).replace(/[/\\]$/, ''), 'subscription_packages.json');
+    fs.mkdirSync(path.dirname(_pkgFile), { recursive: true });
+    fs.writeFileSync(_pkgFile, JSON.stringify(pkgData, null, 2), 'utf8');
+    SUB_PKG = require('../utils/pricing').load();
   } else {
-    SUB_PKG = loadJSON(PKG_PATH, SUB_PKG);
+    SUB_PKG = require('../utils/pricing').load();
   }
 
   if (classesData) {

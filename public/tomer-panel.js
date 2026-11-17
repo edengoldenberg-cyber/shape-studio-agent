@@ -1795,8 +1795,10 @@ async function careAct(act, btn) {
   btn.disabled = false;
   if (!r) return;
   careFlash(r.ok ? okText : careErr(r) + (r.blocks ? ': ' + r.blocks.map(b => b.text).join(' · ') : '') + (r.reasons ? ': ' + r.reasons.map(x => x.text).join(' · ') : ''), r.ok);
-  await loadCare({ keep: false });
-  if (act.startsWith('freeze-')) await loadAbsenceReport();
+  // A refused action changed nothing on the server: what was ticked or typed meanwhile must survive the refresh
+  // (before 2026-11-17 the forms were rebuilt here and a tick made right after an error message was lost).
+  await loadCare({ keep: !r.ok });
+  if (act.startsWith('freeze-') && r.ok) await loadAbsenceReport();   // the report (and the form inside it) is rebuilt only when something changed
 }
 
 async function saveCareSettings(btn) {
@@ -1811,8 +1813,12 @@ async function saveCareSettings(btn) {
 }
 
 async function loadAbsenceReport() {
-  const el = $id('tc-absence'); el.innerHTML = '<div class="tw-empty" data-state="loading">קורא נתונים מ-Arbox…</div>';
+  const el = $id('tc-absence');
+  // the placeholder replaces the card only when there is nothing in it yet: a form that is being filled in is not torn down while the data loads
+  if (!el.querySelector('#tc-freeze, table')) el.innerHTML = '<div class="tw-empty" data-state="loading">קורא נתונים מ-Arbox…</div>';
+  el.setAttribute('aria-busy', 'true');                     // what is shown stays readable (dimmed) until the fresh data replaces it
   const d = await caseApi('/api/tomer/care/absence-report');
+  el.removeAttribute('aria-busy');
   if (!d.ok) { el.innerHTML = '<div class="tw-state-error" data-state="error">לא ניתן להפיק את הדוח — ' + (d.error === 'arbox_unavailable' ? 'Arbox לא זמין' : esc(careErr(d))) + '</div>'; return; }
   const attOk = d.sources.attendance && d.sources.attendance.ok;
   const rows = d.rows.filter(r => r.daysAbsent === null || r.daysAbsent >= 5);

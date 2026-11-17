@@ -149,7 +149,8 @@ try {
   await click('#tc-approval [data-care="policy-approve"]');
   check('approval without the approver name is refused', !!(await flashed('error', /שם המאשר/)) && (await overview()).policyApproval.approved === false);
   await fill('#tc-approver', 'בעלים (בדיקה)');
-  await click('#tc-approve-ok');
+  // the tick made before the refused attempt must still be there: a refused action does not wipe what was entered
+  check('a refused action keeps what was ticked and typed (no need to tick again)', (await evalJs(`document.getElementById('tc-approve-ok').checked`)) === true);
   await click('#tc-approval [data-care="policy-approve"]');
   check('panel approval is recorded with the approver, the time and the approved values; programs are no longer blocked by it',
     !!(await flashed('ok', /מדיניות הקשר אושרה/)) && (await until(`document.querySelector('#tc-approval')?.dataset.approval === 'approved'`)) === true
@@ -185,11 +186,9 @@ try {
   await fill(`${R1} .tc-fz-by`, 'עדן (בדיקה)');
   await click(`${R1} [data-care="freeze-review-save"]`);
   check('a freeze review without evidence is refused', !!(await flashed('error', /מה נבדק ואיפה/)) && (await overview()).freeze.reviews.length === 0);
-  await until(`!!document.querySelector(${q(R1)})`);
-  await click(`${R1} .tc-freeze-form summary`);
-  await setVal(`${R1} .tc-fz-status`, 'not_frozen');
+  // the refused attempt changed nothing: the form is still open with what was chosen and typed, and only the missing evidence is added
+  check('a refused review keeps the open form, the chosen status and the reviewer name', (await evalJs(`(() => { const tr = document.querySelector(${q(R1)}); return !!tr && tr.querySelector('.tc-freeze-form').open === true && tr.querySelector('.tc-fz-status').value === 'not_frozen' && tr.querySelector('.tc-fz-by').value === 'עדן (בדיקה)'; })()`)) === true);
   await fill(`${R1} .tc-fz-note`, 'כרטיס החברה ב-Arbox: אין הקפאה פעילה');
-  await fill(`${R1} .tc-fz-by`, 'עדן (בדיקה)');
   await click(`${R1} [data-care="freeze-review-save"]`);
   check('a staff review of one member is saved and shown with reviewer, evidence and expiry; only that member becomes "not frozen"',
     !!(await flashed('ok', /בדיקת ההקפאה נשמרה/)) && (await until(`document.querySelector(${q(R1 + ' [data-freeze]')})?.dataset.freeze === 'not_frozen'`)) === true
@@ -298,7 +297,7 @@ try {
   // ── reports ────────────────────────────────────────────────────────────────
   await click('#tc-absence-load');
   check('absence report: rows with last verified attendance, days, future booking, last outreach, response, owner, next action',
-    (await until(`!!document.querySelector('#tc-absence tr[data-abs="1"]')`)) === true
+    (await until(`!!document.querySelector('#tc-absence tr[data-abs="1"]') && document.getElementById('tc-absence').getAttribute('aria-busy') !== 'true'`)) === true
     && await (async () => { const a = await txt('#tc-absence tr[data-abs="1"]'), b = await txt('#tc-absence tr[data-abs="2"]'), n = await txt('#tc-absence tr[data-abs="4"]');
       return a.includes(dmy(day(-7))) && /7 ימים בלי אימון/.test(a) && /חופשה \/ היעדרות/.test(a) && /בהשהיה עד/.test(a) && b.includes(dmy(day(2))) && /רשום\/ה לאימון/.test(b) && /טרם הגיע\/ה/.test(n); })(), await txt('#tc-absence'));
   await click('#tc-visibility-load');

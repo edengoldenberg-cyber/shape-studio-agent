@@ -60,6 +60,7 @@ const tomerTest                        = require('./services/tomer_test_mode');
 const { createMemberHandoff }          = require('./services/member_handoff');
 const { createClassActions }           = require('./services/class_actions');
 const { createVoiceIntake }            = require('./services/voice_intake');
+const pricing                          = require('./utils/pricing');
 const careStore                        = require('./utils/member_care_store');
 const contactPolicy                    = require('./services/contact_policy');
 const { createMemberCare }             = require('./services/member_care');
@@ -668,6 +669,8 @@ const CODE_FEATURES = [
   'class_move_confirm_v1', // services/class_actions.js + member_handoff.js — a class move/booking is written to Arbox only after the member's written confirmation; late move = separate capability; test-phone audience
   'voice_local_transcription_v1', // services/voice_intake.js — voice messages transcribed by the local editing worker; audio deleted after the transcript and within 24 h
   'mobile_panels_v1',     // Barak + Tomer panels usable on a phone (360–430 px)
+  'voice_routing_v2',     // a transcript enters the sender's regular conversation (Tomer's service / Barak); leads' voice messages are transcribed too
+  'price_guard_v1',       // utils/pricing.js — prices only from the approved source; a membership question is matched to the package asked about and never answered with the trial offer
   'strict_callback_time', // utils/callback_time.js — no default hour, no AI date guessing
   'apt_persist_strict',   // appointment_store update/updateBatch throw + roll back on failed write
   'staff_confirm_lifecycle', // confirm / outcome endpoints enforce transitions
@@ -2456,12 +2459,21 @@ async function buildSchedulingReply(intent, msg, clientMatch, { noMatchPassthrou
     }
     // Fall through to tomerAgent.chat so the AI can compose a natural answer
     // using SUBSCRIPTION_CONTEXT already injected into barak's system messages
-    return await tomerAgent.chat(
+    // A question about the PRICE of a membership is answered from the approved prices only (utils/pricing.js):
+    // the saved prices, or "I do not have an up-to-date price" with an offer of a representative - never the
+    // introductory offer in its place, and never a figure the model produced. (Production 2026-11-17: this branch
+    // answered "כמה עולה מנוי" with "2 אימונים ב-60 ₪".)
+    const _pt = pricing.topic(msgText);
+    if (_pt === 'membership') return pricing.guard(msgText, '', {}).reply;
+    const _subAi = await tomerAgent.chat(
       `המשתמש שאל: "${msgText}"\n\n` +
       `ענה בעברית על מבנה המנויים של Shape Studio לפי הנתונים הבאים:\n\n${subCtx}\n\n` +
       `כלל חשוב: כל מנוי כולל גישה לכל סוגי האימונים. ציין זאת בתשובה. ` +
-      `אם המחיר לא מצוין (null) — ציין "אשמח לחבר אותך עם נציג שייתן לך את הפרטים". עד 4 שורות.`
+      `אם המחיר לא מצוין (null) — ציין "אשמח לחבר אותך עם נציג שייתן לך את הפרטים". אל תציין מחיר שאינו בנתונים. עד 4 שורות.`
     );
+    const _subG = pricing.guard(msgText, _subAi, {});
+    if (_subG.changed) logger.info('[pipeline] price guard replaced a subscription answer', { topic: _subG.topic, reason: _subG.reason });
+    return _subG.reply;
   }
 
   // A cancellation or a fixed weekly slot is done by the staff. Nothing is confirmed and no deadline is promised:
@@ -3084,6 +3096,7 @@ if (!process.env.TEST_NO_BIND) {
 const memberHandoff = app.locals.memberHandoff = createMemberHandoff({
   gateway: arboxGateway, tomerStore, logger, alertOwner, voiceIntake,
   canAutoReply: phone => !['human', 'opted_out'].includes(_conversationOwner(phone)),
+  routeText: t => _routeTranscript(t),
   // Booking / cancelling / moving a class in Arbox. Inert unless ARBOX_WRITES_ENABLED, ARBOX_WRITE_OPS and a verified
   // contract all say so (services/arbox_gateway.js); until then every request goes to the staff as a task.
   classActions: createClassActions({ gateway: arboxGateway, logger }),
@@ -3101,6 +3114,22 @@ const memberHandoff = app.locals.memberHandoff = createMemberHandoff({
  *   • a written answer to Tomer's "לאשר?" about a class action belongs to that pending action.
  * Returns the hand-off result when the message was taken, null otherwise.
  */
+/**
+ * A transcript enters the conversation exactly as a written message from the same sender would: the same ownership
+ * gates, the same identity routing (Tomer's service for a member, Barak for a lead), the same replies. It is marked
+ * fromVoice so that it can start a class request but never confirm one. -> { answered, held, route, taskId }
+ */
+async function _routeTranscript({ phone, name, text, messageId, receivedAt }) {
+  const r = await processInboundWAMessage({ from: phone, name: name ?? null, text, messageId: `${messageId}:transcript`, timestamp: _saneDate(receivedAt),
+    type: 'text', mediaType: 'text', mediaCaption: null, mediaId: null, fromVoice: true });
+  const route = r?.route ?? null;
+  broadcastSse('message', { phone, name: name ?? null, route });
+  const held = /hold|opted_out|spam|staff_bypass|attribution/.test(String(route));
+  const tomerOutcome = /^tomer_(.+)$/.exec(String(route))?.[1] ?? null;
+  const answered = !held && (tomerOutcome ? !['silent', 'error', 'duplicate', 'not_enabled', 'opted_out'].includes(tomerOutcome) : !!r?.barakReply);
+  const linked = answered ? tomerStore.getTasks({ phone, type: 'class_change' }).find(t => ['open', 'eden_assigned'].includes(t.status)) : null;
+  return { answered, held, route, taskId: linked?.id ?? null };
+}
 async function _memberVoiceOrConfirm(msg, fromNorm, name) {
   if (msg.type === 'audio' && voiceIntake.enabled()) {
     const r = await memberHandoff.handleMedia({ phone: fromNorm, type: msg.type, name, caption: msg.mediaCaption ?? null, pending: _pendingMessages,
@@ -3108,7 +3137,7 @@ async function _memberVoiceOrConfirm(msg, fromNorm, name) {
     broadcastSse('tomer_task', { id: r?.taskId ?? null });
     return r;
   }
-  if (msg.type === 'text' && msg.text?.trim() && tomerStore.getTasks({ phone: fromNorm, type: 'class_change' }).some(t => t.pendingConfirm && ['open', 'eden_assigned'].includes(t.status))) {
+  if (msg.type === 'text' && !msg.fromVoice && msg.text?.trim() && tomerStore.getTasks({ phone: fromNorm, type: 'class_change' }).some(t => t.pendingConfirm && ['open', 'eden_assigned'].includes(t.status))) {
     const r = await memberHandoff.handleClassRequest({ phone: fromNorm, text: msg.text, name, sentAt: _saneDate(msg.timestamp), pending: _pendingMessages });
     if (r) broadcastSse('tomer_task', { id: r.taskId });
     return r;
@@ -4420,7 +4449,7 @@ async function processInboundWAMessage(msg) {
     if (msg.type === 'text' && msg.text?.trim() && !(intent === 'schedule_query' && isWeeklyTimetableQuery(msg.text))) {
       try {
         _handoff = await memberHandoff.handleClassRequest({ phone: fromNorm, text: msg.text, name: clientMatch.arboxName ?? msg.name ?? null,
-          sentAt: _saneDate(msg.timestamp), pending: _pendingMessages });
+          sentAt: _saneDate(msg.timestamp), pending: _pendingMessages, fromVoice: !!msg.fromVoice });
       } catch (err) {
         logger.error('[member-handoff] class request handling failed — falling back to the previous flow', { from: fromNorm, error: err.message });
       }
@@ -4508,7 +4537,22 @@ async function processInboundWAMessage(msg) {
     // ════════════════════════════════════════════════════════════════════════
     route = 'barak';
 
-    if (isSchedulingMsg) {
+    // A lead's voice message: transcribed locally like a member's (same queue, same deletion rules, same worker
+    // token). The transcript then comes back through this pipeline as the lead's message and Barak answers it.
+    let _leadVoice = null;
+    if (msg.type === 'audio' && voiceIntake.enabled()) {
+      try {
+        _leadVoice = await memberHandoff.handleMedia({ phone: fromNorm, type: msg.type, name: msg.name ?? null, caption: msg.mediaCaption ?? null, pending: _pendingMessages, agent: 'barak',
+          media: { messageId: msg.messageId ?? null, mediaUrl: msg.mediaUrl ?? null, mimeType: msg.mimeType ?? null, receivedAt: _saneDate(msg.timestamp) } });
+        route = 'barak_voice'; barakReply = _leadVoice.replyText; _replyAlreadySent = true;
+        broadcastSse('tomer_task', { id: _leadVoice.taskId });
+      } catch (err) {
+        logger.error('[pipeline] lead voice message handling failed — falling back to the previous flow', { from: fromNorm, error: err.message });
+      }
+    }
+    if (_leadVoice) {
+      // taken: nothing else answers a recording
+    } else if (isSchedulingMsg) {
       // Scheduling query from a lead: Barak uses Arbox live data
       const timetableUrlBarak = getActiveTimetableUrl();
       if (intent === 'schedule_query' && isWeeklyTimetableQuery(msg.text)) {

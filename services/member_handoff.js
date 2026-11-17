@@ -83,7 +83,7 @@ function matchHour(hr, starts) {
 }
 
 function createMemberHandoff(deps) {
-  const { gateway, tomerStore, alertOwner, sendText, logger, now = () => new Date(), classActions = null, voiceIntake = null, canAutoReply = () => true } = deps;
+  const { gateway, tomerStore, alertOwner, sendText, logger, now = () => new Date(), classActions = null, voiceIntake = null, canAutoReply = () => true, routeText = null } = deps;
   const tail = p => String(p).slice(-4);
   const local = p => String(p).startsWith('972') ? '0' + String(p).slice(3) : String(p);
   const openTask = (phone, type) => tomerStore.getTasks({ phone, type }).find(t => !['resolved', 'closed', 'done'].includes(t.status)) ?? null;
@@ -392,8 +392,8 @@ function createMemberHandoff(deps) {
    */
   async function escalateMedia(task, { voice, label, type, caption = null, why = null, pending = null, replyToMember = true }) {
     const who = task.memberName ?? local(task.phone);
-    const alert = await sendAlert(task, `🎙️ תומר: ${label} — ${who}`, [`👤 ${who}`, `📱 ${local(task.phone)}`, ...String(task.detail ?? '').split('\n'),
-      replyToMember ? `המתאמנ/ת קיבל/ה הודעה שהפנייה נרשמה והוזמנ/ה לכתוב.` : `לא נשלחה תשובה אוטומטית למתאמנ/ת.`, `מזהה פנייה: ${task.id}`, `💬 https://wa.me/${task.phone}`].join('\n'));
+    const alert = await sendAlert(task, `🎙️ ${task.agent === 'barak' ? 'ברק' : 'תומר'}: ${label} — ${who}`, [`👤 ${who}`, `📱 ${local(task.phone)}`, ...String(task.detail ?? '').split('\n'),
+      replyToMember ? `השולח/ת קיבל/ה הודעה שהפנייה נרשמה והוזמנ/ה לכתוב.` : `לא נשלחה תשובה אוטומטית.`, `מזהה פנייה: ${task.id}`, `💬 https://wa.me/${task.phone}`].join('\n'));
     if (!replyToMember) return { alert, replyText: null, sendState: 'not_sent' };
     const passed = alert.state === 'sent' ? 'רשמתי פנייה והעברתי אותה לצוות' : 'רשמתי פנייה לטיפול הצוות';
     const replyText = voice ? `קיבלתי את ההודעה הקולית 🙏 ${why === 'off' ? 'אני לא מאזין להקלטות' : 'לא הצלחתי להאזין לה כרגע'}, אז ${passed}.\nאם נוח לך, אפשר לכתוב לי כאן בקצרה במה מדובר, וכך אוכל לעזור מהר יותר.`
@@ -409,10 +409,11 @@ function createMemberHandoff(deps) {
    * opened FIRST, so a recording never exists without one. Otherwise - and whenever the worker is busy editing - the
    * staff are alerted and the member is invited to write, at once.
    */
-  async function handleMedia({ phone, type, name = null, caption = null, pending = null, media = null }) {
+  async function handleMedia({ phone, type, name = null, caption = null, pending = null, media = null, agent = 'tomer' }) {
     const voice = /audio|voice|ptt/i.test(String(type));
     const tType = voice ? 'voice_message' : 'media_message';
     const label = voice ? 'הודעה קולית' : `קובץ (${type})`;
+    const fromWho = agent === 'barak' ? 'מליד' : 'ממתאמנ/ת';
     const existing = openTask(phone, tType);
     if (existing && !(voice && voiceIntake)) {
       tomerStore.updateTask(existing.id, { detail: `${existing.detail}\n+ ${label} נוספ/ת ב-${now().toISOString()}${caption ? ` — "${String(caption).slice(0, 120)}"` : ''}`, received: (existing.received ?? 1) + 1 });
@@ -421,9 +422,9 @@ function createMemberHandoff(deps) {
     const who = name ?? local(phone);
     let task = existing, isNew = false;
     if (!task) {
-      task = tomerStore.createTask({ type: tType, phone, memberName: who, summary: `${label} ממתאמנ/ת`, priority: 'normal', memberMessage: caption ?? `[${label}]`,
+      task = tomerStore.createTask({ type: tType, phone, memberName: who, summary: `${label} ${fromWho}`, priority: 'normal', memberMessage: caption ?? `[${label}]`,
         detail: [voice ? 'הודעה קולית התקבלה.' : 'הקובץ לא נקרא אוטומטית, ולכן תוכן הבקשה אינו ידוע.', caption ? `כיתוב: "${String(caption).slice(0, 200)}"` : null].filter(Boolean).join('\n') });
-      task = tomerStore.updateTask(task.id, { received: 1 });
+      task = tomerStore.updateTask(task.id, { received: 1, agent });
       isNew = true;
     } else task = tomerStore.updateTask(task.id, { received: (task.received ?? 1) + 1, detail: `${task.detail}\n+ ${label} נוספת ב-${now().toISOString()}` });
 
@@ -436,7 +437,7 @@ function createMemberHandoff(deps) {
     if (q.queued && q.availability === 'online') {
       // the worker is polling: the transcript is expected within seconds. Nothing is said to anyone yet; if it does
       // not arrive within the wait limit, voiceFallback() below alerts the staff and asks the member to write.
-      tomerStore.updateTask(task.id, { summary: `${label} ממתאמנ/ת — ממתינה לתמלול`, transcription: { state: 'waiting', jobId: q.job.id, since: now().toISOString() } });
+      tomerStore.updateTask(task.id, { summary: `${label} ${fromWho} — ממתינה לתמלול`, transcription: { state: 'waiting', jobId: q.job.id, since: now().toISOString() } });
       logger.info('[member-handoff] voice message queued for transcription', { tail: tail(phone), taskId: task.id, jobId: q.job.id });
       return { handled: true, taskId: task.id, isNew, alert: null, replyText: null, sendState: 'waiting_transcription', jobId: q.job.id };
     }
@@ -444,7 +445,7 @@ function createMemberHandoff(deps) {
     if (existing?.alert && !q.queued) {                       // a further recording on a task the staff already know about
       return { handled: true, taskId: task.id, isNew: false, alert: existing.alert, replyText: null, sendState: 'not_sent_already_answered' };
     }
-    task = tomerStore.updateTask(task.id, { summary: `${label} ממתאמנ/ת — לא טופלה אוטומטית`,
+    task = tomerStore.updateTask(task.id, { summary: `${label} ${fromWho} — לא טופלה אוטומטית`,
       detail: [task.detail, voice ? `ההודעה הקולית לא תומללה: ${VOICE_WHY[reason] ?? reason}. תוכן הבקשה אינו ידוע.` : null, 'נדרש: להאזין / לפתוח בוואטסאפ ולענות.'].filter(Boolean).join('\n'),
       transcription: voice ? { state: q.queued ? 'waiting_after_handoff' : 'not_transcribed', reason, jobId: q.job?.id ?? null, at: now().toISOString() } : null });
     if (q.queued) await voiceIntake.markFallback(q.job.id, 'worker_busy_handled');   // marks the job; the alert below is the hand-over
@@ -458,44 +459,62 @@ function createMemberHandoff(deps) {
     const task = tomerStore.getTasks({ phone: job.phone, type: 'voice_message' }).find(t => t.id === job.taskId);
     if (!task || ['resolved', 'closed', 'done'].includes(task.status)) return;
     const first = !task.alert;
-    const t2 = tomerStore.updateTask(task.id, { summary: 'הודעה קולית ממתאמנ/ת — לא טופלה אוטומטית',
+    const t2 = tomerStore.updateTask(task.id, { summary: `הודעה קולית ${task.agent === 'barak' ? 'מליד' : 'ממתאמנ/ת'} — לא טופלה אוטומטית`,
       detail: `${task.detail}\nההודעה הקולית לא תומללה: ${VOICE_WHY[reason] ?? reason}. תוכן הבקשה אינו ידוע.\nנדרש: להאזין בוואטסאפ ולענות.`,
       transcription: { state: reason === 'waited_too_long' ? 'waiting_after_handoff' : 'not_transcribed', reason, jobId: job.id, at: now().toISOString() } });
     if (first) await escalateMedia(t2, { voice: true, label: 'הודעה קולית', type: 'audio', why: reason, replyToMember: canAutoReply(job.phone) });
   }
 
   /**
-   * voice_intake → a transcript arrived. It is DATA from an automatic, unverified transcription: it can route the
-   * request and tell the staff what it is about; it can start a class request (the member then confirms the exact
-   * action in TEXT); it can never confirm anything and nothing in it is treated as an instruction to this system.
+   * voice_intake → a transcript arrived. It is DATA from an automatic, unverified transcription; nothing in it is an
+   * instruction to this system, and it can never confirm an Arbox action (the member confirms in TEXT).
+   *
+   * The transcript is handed to the SAME conversation flow a written message would get (routeText: Tomer's service
+   * for a member, Barak for a lead). When that flow answered, the voice task is closed - no second task, no alert.
+   * The staff are alerted only when a person is needed: the chat is human-owned, the transcription is doubtful,
+   * the flow did not answer, or the staff were already asked to listen (worker busy / late transcript).
    */
   async function handleTranscript(job) {
     const text = String(job.transcript?.text ?? '').trim();
     const task = tomerStore.getTasks({ phone: job.phone, type: 'voice_message' }).find(t => t.id === job.taskId);
     if (!task || !text) return { handled: false };
     const closed = ['resolved', 'closed', 'done'].includes(task.status);
-    const tr = { state: 'done', text, unverified: true, language: job.transcript.language ?? null, seconds: job.transcript.duration_s ?? null, model: job.transcript.model ?? null, at: now().toISOString(), jobId: job.id };
+    const lp = job.transcript.avg_logprob;
+    const doubtful = (Number.isFinite(lp) && lp < -1.0) || text.replace(/[^\p{L}\p{N}]/gu, '').length < 4;
+    const tr = { state: 'done', text, unverified: true, doubtful, language: job.transcript.language ?? null, seconds: job.transcript.duration_s ?? null, model: job.transcript.model ?? null, at: now().toISOString(), jobId: job.id };
     let t2 = tomerStore.updateTask(task.id, { transcription: tr, memberMessage: `[הודעה קולית] ${text.slice(0, 500)}`,
-      detail: `${task.detail}\nתמלול אוטומטי (לא אומת): "${text.slice(0, 600)}"`, ...(closed ? {} : { summary: 'הודעה קולית ממתאמנ/ת — תומללה' }) });
+      detail: `${task.detail}\nתמלול אוטומטי (לא אומת): "${text.slice(0, 600)}"`, ...(closed ? {} : { summary: `הודעה קולית ${task.agent === 'barak' ? 'מליד' : 'ממתאמנ/ת'} — תומללה` }) });
     if (closed) return { handled: true, taskId: task.id, late: true };
-    const who = t2.memberName ?? local(job.phone);
+    const who = t2.memberName ?? local(job.phone), ag = task.agent === 'barak' ? 'ברק' : 'תומר';
     const body = extra => [`👤 ${who}`, `📱 ${local(job.phone)}`, `🎙️ תמלול אוטומטי (לא אומת): "${text.slice(0, 500)}"`, ...extra, `מזהה פנייה: ${task.id}`, `💬 https://wa.me/${job.phone}`].join('\n');
-    // the staff were already alerted (and the member already asked to write): the transcript is added for them, nothing else
-    if (job.fallback || t2.alert) { await sendAlert(t2, `🎙️ תומר — התמלול הגיע: ${who}`, body(['התמלול צורף לפנייה שכבר נפתחה. לא נשלחה הודעה נוספת למתאמנ/ת.']), 'alertUpdate'); return { handled: true, taskId: task.id, late: true }; }
-    if (!canAutoReply(job.phone)) { await sendAlert(t2, `🎙️ תומר: הודעה קולית — ${who}`, body(['השיחה בטיפול ידני: לא נשלחה תשובה אוטומטית.'])); return { handled: true, taskId: task.id, silent: true }; }
-    // a class request spoken aloud: the same flow as a written one, except that it always ends in a written confirmation
-    if (detect(text)) {
-      const r = await handleClassRequest({ phone: job.phone, text, name: t2.memberName ?? null, fromVoice: true });
-      if (r?.handled) {
-        tomerStore.updateTask(task.id, { linkedTaskId: r.taskId });
-        tomerStore.resolveTask(task.id, { resolutionNote: `תומללה וטופלה כבקשת שיעור (פנייה ${r.taskId})`, resolvedBy: 'tomer' });
-        return { handled: true, taskId: task.id, classTaskId: r.taskId };
+    // the staff were already alerted (and the sender already asked to write): the transcript is added for them, nothing else
+    if (job.fallback || t2.alert) { await sendAlert(t2, `🎙️ ${ag} — התמלול הגיע: ${who}`, body(['התמלול צורף לפנייה שכבר נפתחה. לא נשלחה הודעה נוספת.']), 'alertUpdate'); return { handled: true, taskId: task.id, late: true }; }
+    if (!canAutoReply(job.phone)) { await sendAlert(t2, `🎙️ ${ag}: הודעה קולית — ${who}`, body(['השיחה בטיפול ידני: לא נשלחה תשובה אוטומטית.'])); return { handled: true, taskId: task.id, silent: true }; }
+    let routed = null, why = doubtful ? 'התמלול אינו ודאי מספיק כדי לענות לפיו' : null;
+    if (!doubtful) {
+      if (routeText) {
+        try { routed = await routeText({ phone: job.phone, name: t2.memberName ?? null, text, messageId: job.messageId ?? job.id, receivedAt: job.receivedAt }); }
+        catch (err) { logger.error('[member-handoff] the transcript could not be routed', { tail: tail(job.phone), error: err.message }); why = 'תקלה בניתוב התמלול למסלול השיחה'; }
+      } else if (detect(text)) {                        // no router (isolated use): a class request still gets its own flow
+        const r = await handleClassRequest({ phone: job.phone, text, name: t2.memberName ?? null, fromVoice: true });
+        if (r?.handled) routed = { answered: true, route: 'tomer_handoff', taskId: r.taskId };
       }
     }
-    const alert = await sendAlert(t2, `🎙️ תומר: הודעה קולית — ${who}`, body(['המתאמנ/ת קיבל/ה הודעה שהפנייה אצל הצוות.']));
+    if (routed?.answered) {
+      tomerStore.updateTask(task.id, { linkedTaskId: routed.taskId ?? null, routedTo: routed.route ?? null });
+      tomerStore.resolveTask(task.id, { resolutionNote: `תומללה וטופלה במסלול השיחה הרגיל (${routed.route ?? '—'})${routed.taskId ? ` · פנייה ${routed.taskId}` : ''}`, resolvedBy: task.agent === 'barak' ? 'barak' : 'tomer' });
+      logger.info('[member-handoff] voice transcript handled by the regular flow', { tail: tail(job.phone), taskId: task.id, route: routed.route ?? null, chars: text.length });
+      return { handled: true, taskId: task.id, route: routed.route ?? null, classTaskId: routed.taskId ?? null };
+    }
+    if (routed?.held) {                                   // the conversation is on hold (a human owns it, opted out…): the staff only
+      await sendAlert(t2, `🎙️ ${ag}: הודעה קולית — ${who}`, body([`השיחה אינה במענה אוטומטי (${routed.route ?? 'מושהית'}): לא נשלחה תשובה.`]));
+      return { handled: true, taskId: task.id, silent: true };
+    }
+    why = why ?? 'המענה האוטומטי לא ענה על ההודעה';
+    const alert = await sendAlert(t2, `🎙️ ${ag}: הודעה קולית — ${who}`, body([`למה זה אצלך: ${why}.`, 'השולח/ת קיבל/ה הודעה שהפנייה אצל הצוות.']));
     const replyText = `קיבלתי את ההודעה הקולית 🙏 ${alert.state === 'sent' ? 'העברתי אותה לצוות' : 'רשמתי אותה לטיפול הצוות'}, ויענו לך כאן.`;
     const sendState = await reply(job.phone, replyText, t2, null);
-    logger.info('[member-handoff] voice transcript handed to the staff', { tail: tail(job.phone), taskId: task.id, alert: alert.state, sendState, chars: text.length });
+    logger.info('[member-handoff] voice transcript handed to the staff', { tail: tail(job.phone), taskId: task.id, alert: alert.state, sendState, chars: text.length, doubtful });
     return { handled: true, taskId: task.id, alert, sendState };
   }
 

@@ -6,6 +6,7 @@ const logger  = require('../utils/logger');
 const store   = require('../utils/lead_store');
 const _persist = require('../utils/persist');
 const { sendText, alertOwner } = require('../services/whatsapp.service');
+const pricing = require('../utils/pricing');
 const _aiFailureAlertAt = new Map();   // lead phone → when the manager was last told that the automatic reply failed
 const { tryDeterministicWazeReply, tryDeterministicScheduleReply } = require('./deterministic_reply');
 
@@ -27,8 +28,9 @@ const SYSTEM_PROMPT = fs.readFileSync(
 // without a server restart. Returns a markdown-formatted pricing block.
 function buildPricingContext() {
   try {
-    const DATA_DIR = (process.env.DATA_DIR ?? path.join(__dirname, '../data')).replace(/\/$/, '');
-    const pkg = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'subscription_packages.json'), 'utf8'));
+    // the approved prices: what the owner saved, else the shipped default (utils/pricing.js). Never the model's memory.
+    const pkg = pricing.load();
+    if (pkg._source === 'none') throw new Error('no approved price source');
     const lines = [];
     if (pkg.trial) {
       lines.push(`הצעת היכרות: ${pkg.trial.entries} אימונים ב-${pkg.trial.price_ils} ₪ — ${pkg.trial.description}`);
@@ -39,7 +41,7 @@ function buildPricingContext() {
       lines.push(`${p.name}: ${p.price_ils} ₪ לחודש — ${p.description}`);
     }
     if (unconfigured.length > 0 && configured.length === 0) {
-      lines.push(`חבילות חודשיות: המחיר תלוי בתדירות. הצוות ישמח לפרט — לא מפורסם אונליין.`);
+      lines.push(`מחיר מנוי / חבילה חודשית: לא ידוע לך. אם שואלים כמה עולה מנוי — אמור/י שאין לך מחיר מעודכן והצע/י שנציג יחזור עם המחיר. אסור לענות על שאלת מנוי במחיר של הצעת ההיכרות.`);
     } else if (unconfigured.length > 0) {
       lines.push(`חבילות נוספות: פנה/י לצוות לפרטים.`);
     }
@@ -1434,6 +1436,13 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
     const hasPersistedCallback = !!_openCb && _openCb.scheduledAt instanceof Date
       && !isNaN(_openCb.scheduledAt.getTime()) && _openCb.scheduledAt.getTime() > Date.now();
     reply = postProcessReply(reply, freshQualData, assets, { hasPersistedCallback, userText: text });
+    // Prices come from the approved source only, and a membership question is not answered with the trial offer.
+    const _pg = pricing.guard(text, reply, { callbackArranged: hasPersistedCallback });
+    if (_pg.changed) {
+      logger.info('[lead_agent] price guard replaced the reply', { from, topic: _pg.topic, reason: _pg.reason });
+      store.logEvent('price_guard', from, { topic: _pg.topic, reason: _pg.reason });
+      reply = _pg.reply;
+    }
 
     // ── State flags: set ONLY when AI reply confirms the action happened ──────
     //

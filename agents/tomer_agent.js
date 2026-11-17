@@ -274,6 +274,11 @@ async function handleInboundMember({ name, text, phone, clientMatch = {}, _pendi
     return { reply: null, decision: 'silence', reason: 'ai-decided', taskCreated };
   }
 
+  // Prices come from the approved source only (utils/pricing.js): a figure the model produced is never sent, and a
+  // membership-price question is not answered with the introductory offer.
+  const _pg = require('../utils/pricing').guard(msgText, reply, {});
+  if (_pg.changed) { logger.info('[tomer_agent] price guard replaced the reply', { topic: _pg.topic, reason: _pg.reason }); reply = _pg.reply; }
+
   // ── Stale gate ────────────────────────────────────────────────────────────
   if (_pendingMessages?.has(phone)) {
     logger.info('[tomer_agent] Stale reply suppressed', { phone });

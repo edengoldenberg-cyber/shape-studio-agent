@@ -319,6 +319,36 @@ describe('2. Barak — the price question, the next step, and a callback given a
     expect(lastTo(lead)).not.toMatch(/נציג יחזור אליך ויעזור/);              // the offer is not repeated after she agreed
   });
 
+  test('a MEMBERSHIP price question is never answered with the trial offer: no approved membership price → says so and offers a representative', async () => {
+    const lead = await newLead();
+    clearOut();
+    mockAi.queue.push('הצעת ההיכרות שלנו היא 2 אימונים ב-60 ₪, ללא התחייבות. אם יש לך שאלות נוספות אני כאן!');   // the production miss
+    await say(lead, 'כמה עולה מנוי לפילאטיס מכשירים?');
+    expect(lastTo(lead)).toBe('אין לי כאן מחיר מעודכן למנוי, ואני לא רוצה לתת לך מספר לא מדויק 🙏\nרוצה שנציג יחזור אליך עם המחירים המדויקים?');
+    const r = await say(lead, 'כן');
+    expect(r.route).toBe('callback_time_requested');                         // the offer leads into the callback flow
+  });
+
+  test('a price the model made up is never sent; with approved membership prices the answer is built from them', async () => {
+    const lead = await newLead();
+    clearOut();
+    mockAi.queue.push('המנוי החודשי עולה 450 ₪ לחודש 🙂');                   // not in any approved source
+    await say(lead, 'מה המחיר של מנוי חודשי?');
+    expect(lastTo(lead)).not.toMatch(/450/);
+    expect(lastTo(lead)).toMatch(/אין לי כאן מחיר מעודכן למנוי/);
+    const lead2 = await newLead();
+    clearOut();
+    const pkgFile = path.join(DATA_DIR, 'subscription_packages.json');
+    fs.writeFileSync(pkgFile, JSON.stringify({ trial: { entries: 2, price_ils: 60, commitment: false }, packages: [{ name: '8 כניסות לחודש', price_ils: 390 }, { name: 'ללא הגבלה', price_ils: null }] }));
+    try {
+      mockAi.queue.push('הצעת ההיכרות שלנו היא 2 אימונים ב-60 ₪.');
+      await say(lead2, 'כמה עולה מנוי?');
+      expect(lastTo(lead2)).toMatch(/8 כניסות לחודש — 390 ₪ לחודש/);          // the owner's saved price
+      expect(lastTo(lead2)).not.toMatch(/ללא הגבלה/);                         // a package without a price is not quoted
+      expect(lastTo(lead2)).not.toMatch(/היכרות/);
+    } finally { fs.unlinkSync(pkgFile); }
+  });
+
   test('the range is stored with an explicit Israel date, confirmed to the lead as a range, and the manager gets ONE summary', async () => {
     const lead = await newLead();
     await say(lead, 'אשמח שיחזרו אליי');
@@ -648,6 +678,68 @@ describe('4b. Voice messages with local transcription on the editing PC', () => 
     expect(alerts()).toHaveLength(1);
     expect(alerts()[0].body).toMatch(/תמלול אוטומטי \(לא אומת\): "רציתי לשאול אם אפשר לקבל חשבונית/);
     expect(lastTo(m)).toBe('קיבלתי את ההודעה הקולית 🙏 העברתי אותה לצוות, ויענו לך כאן.');
+  });
+
+  test('a member\'s spoken question that Tomer can answer is answered by the regular flow: no alert, the voice task is closed, no second task', async () => {
+    const m = newMember();
+    await workerOnline(); await voice(m);
+    mockAi.queue.push('תשובת מודל שאינה ממקור מאושר ואסור שתישלח');
+    await transcribed(await leaseOne(), 'היי רציתי לשאול מתי יש שיעורים היום');
+    expect(textsTo(m)).toHaveLength(1);
+    // the answer is to what was asked (today's classes), and its fact is what the timetable read from Arbox holds for
+    // that day - in this harness the Arbox timetable is empty, so the true answer is that there are none - not a model's text
+    expect(lastTo(m)).toMatch(/^אין שיעורים בשני 16\.11\./);
+    expect(lastTo(m)).not.toMatch(/תשובת מודל/);
+    expect(alerts()).toHaveLength(0);                                       // nothing needed a person
+    const t = tasksOf(m, 'voice_message');
+    expect(t).toHaveLength(1);
+    expect(t[0]).toMatchObject({ status: 'resolved', routedTo: 'tomer', transcription: { state: 'done', doubtful: false } });
+    expect(tomerStore.getTasks({ phone: m }).filter(x => x.status !== 'resolved')).toHaveLength(0);
+  });
+
+  test('a doubtful transcription is not answered from: the staff get it with the reason', async () => {
+    const m = newMember();
+    await workerOnline(); await voice(m);
+    mockAi.queue.push('תשובה שאסור שתישלח');
+    await result(await leaseOne(), { status: 'transcribed', text: 'מתי יש שיעורים מחר או ש', language: 'he', duration_s: 3, model: 'large-v3', avg_logprob: -1.4 });
+    expect(lastTo(m)).toBe('קיבלתי את ההודעה הקולית 🙏 העברתי אותה לצוות, ויענו לך כאן.');
+    expect(alerts()).toHaveLength(1);
+    expect(alerts()[0].body).toMatch(/התמלול אינו ודאי מספיק כדי לענות לפיו/);
+    expect(tasksOf(m, 'voice_message')[0]).toMatchObject({ status: 'open', transcription: { doubtful: true } });
+    mockAi.queue.length = 0;
+  });
+
+  test('a LEAD\'s voice message: same queue and deletion; the transcript enters Barak\'s conversation and Barak answers - one reply, no alert, no open task', async () => {
+    const lead = await newLead(); clearOut();
+    await workerOnline();
+    const r = await voice(lead, { name: 'מיכל' });
+    expect(r.route).toBe('barak_voice');
+    expect(textsTo(lead)).toHaveLength(0);
+    expect(audioFiles()).toHaveLength(1);
+    expect(tasksOf(lead, 'voice_message')[0]).toMatchObject({ status: 'open', agent: 'barak', transcription: { state: 'waiting' } });
+    // the model answers a MEMBERSHIP question with the trial offer - exactly the miss seen in production. It must not be sent.
+    mockAi.queue.push('הצעת ההיכרות שלנו היא 2 אימונים ב-60 ₪, ללא התחייבות.');
+    await transcribed(await leaseOne(), 'היי כמה עולה מנוי לפילאטיס מכשירים');
+    expect(audioFiles()).toHaveLength(0);
+    expect(textsTo(lead)).toHaveLength(1);
+    // the answer is about what was asked: no membership price is approved, so it says so and offers a representative
+    expect(lastTo(lead)).toBe('אין לי כאן מחיר מעודכן למנוי, ואני לא רוצה לתת לך מספר לא מדויק 🙏\nרוצה שנציג יחזור אליך עם המחירים המדויקים?');
+    expect(lastTo(lead)).not.toMatch(/60|היכרות|ניסיון/);
+    expect(alerts()).toHaveLength(0);
+    const t = tasksOf(lead, 'voice_message');
+    expect(t).toHaveLength(1);
+    expect(t[0]).toMatchObject({ status: 'resolved', routedTo: 'barak' });
+    expect(store.getLead(lead).history.some(h => /כמה עולה מנוי/.test(h.content ?? ''))).toBe(true);   // it is part of the lead's conversation
+  });
+
+  test('a lead\'s voice message while the worker is offline: a task, an alert marked as Barak\'s, and an invitation to write', async () => {
+    const lead = await newLead(); clearOut();
+    await voice(lead, { name: 'מיכל' });
+    expect(dl).not.toHaveBeenCalled();
+    expect(alerts()).toHaveLength(1);
+    expect(alerts()[0].subject).toMatch(/ברק: הודעה קולית — מיכל/);
+    expect(tasksOf(lead, 'voice_message')[0].summary).toMatch(/מליד/);
+    expect(lastTo(lead)).toMatch(/לא הצלחתי להאזין לה כרגע/);
   });
 
   test('worker offline: nothing is downloaded; the task, the alert and the invitation to write happen at once', async () => {
