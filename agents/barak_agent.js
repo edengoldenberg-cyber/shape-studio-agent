@@ -21,9 +21,12 @@ const BARAK_PROMPT = BUSINESS_CONTEXT + '\n\n---\n\n' + fs.readFileSync(
 // Loaded from disk at startup; hot-reloadable at runtime via reloadKnowledge().
 // All context strings are module-level lets so the AI always sees the latest data.
 
-const STAFF_PATH   = path.join(__dirname, '../data/staff_directory.json');
-const PKG_PATH     = path.join(__dirname, '../data/subscription_packages.json');
-const CLASSES_PATH = path.join(__dirname, '../data/classes_knowledge.json');
+// Owner-saved knowledge lives under DATA_DIR (the persistent volume in production). The repository's data/ folder is
+// not part of a deployment, so reading or saving there lost the instructors and the class descriptions (2026-11-17).
+const KNOWLEDGE_DIR = (process.env.DATA_DIR ?? path.join(__dirname, '../data')).replace(/[/\\]$/, '');
+const STAFF_PATH   = path.join(KNOWLEDGE_DIR, 'staff_directory.json');
+const PKG_PATH     = path.join(KNOWLEDGE_DIR, 'subscription_packages.json');
+const CLASSES_PATH = path.join(KNOWLEDGE_DIR, 'classes_knowledge.json');
 
 function loadJSON(filePath, fallback) {
   try {
@@ -102,6 +105,7 @@ let CLASSES_CONTEXT      = buildClassesContext();
  */
 function reloadKnowledge({ staffData, pkgData, classesData } = {}) {
   if (staffData) {
+    fs.mkdirSync(KNOWLEDGE_DIR, { recursive: true });
     fs.writeFileSync(STAFF_PATH, JSON.stringify(staffData, null, 2), 'utf8');
     STAFF_DIR = staffData;
   } else {
@@ -119,6 +123,7 @@ function reloadKnowledge({ staffData, pkgData, classesData } = {}) {
   }
 
   if (classesData) {
+    fs.mkdirSync(KNOWLEDGE_DIR, { recursive: true });
     fs.writeFileSync(CLASSES_PATH, JSON.stringify(classesData, null, 2), 'utf8');
     CLASSES_DATA = classesData;
   } else {
