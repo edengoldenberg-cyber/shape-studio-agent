@@ -58,6 +58,9 @@ function typeHe(t) {
     unsupported_action: '🔧 אין תמיכה',
     billing_question:   '💳 חיוב',
     other:              '📋 כללי',
+    class_change:       '🔁 שינוי רישום לשיעור',
+    voice_message:      '🎙️ הודעה קולית',
+    media_message:      '📎 קובץ',
   }[t] ?? t ?? '—';
 }
 async function api(url, opts = {}) {
@@ -688,7 +691,9 @@ async function loadTasks() {
       <tr class="task-row-${t.priority}">
         <td>${esc(t.memberName ?? maskPhone(t.phone))}</td>
         <td>${typeHe(t.type)}</td>
-        <td title="${esc(t.detail ?? '')}">${esc((t.summary ?? '').slice(0, 60))}</td>
+        <td title="${esc(t.detail ?? '')}">${esc((t.summary ?? '').slice(0, 60))}${
+          t.alert && t.alert.state === 'failed' ? ` <span class="tw-pri-high" title="${esc(t.alert.error ?? '')}">⚠️ ההתראה לעדן לא נשלחה (${Number(t.alert.attempts) || 1} ניסיונות)</span>` : ''}${
+          t.memberReply && t.memberReply.state === 'failed' ? ` <span class="tw-pri-high">⚠️ התשובה למתאמנ/ת לא נשלחה</span>` : ''}</td>
         <td class="${t.priority === 'high' ? 'tw-pri-high' : ''}">${priorityHe(t.priority)}</td>
         <td><span class="badge-status-${t.status}">${statusHe(t.status)}</span></td>
         <td>${fmtDate(t.createdAt)}</td>

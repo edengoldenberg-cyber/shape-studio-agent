@@ -63,6 +63,7 @@ const REGULAR_RE = /קבוע(?:ה|ים|ות)?(?![א-ת])/;
 
 const CLASS_WORD = /שיעור|אימון|פילאטיס|מכשירים|רפורמר|reformer|כ[ו]?ח(?![א-ת])|בר(?![א-ת])|barre|יוגה|קנגו|טונינג|toning|all in|חיטוב|סטרנג|strength/i;
 const BOOK_RE    = /תרשמ[יו]?\s*אותי|תרשום אותי|לרשום אותי|להירשם|להרשם|ארשם|אירשם|לשבץ|תשבצ[יו]?|שבצ[יו]? אותי|שבץ אותי|תכניס[יו]? אותי|להכניס אותי|לשריין|תשמר[יו]? לי מקום|שמור לי מקום|רוצה מקום|להצטרף ל(?:שיעור|אימון)|לקבוע (?:שיעור|אימון)|להזמין (?:שיעור|אימון|מקום)/;
+const MOVE_BETWEEN_RE = /(נרשמתי|רשומה?|שובצתי|משובצ(?:ת|ים)?|קבעתי|שיבצתי)[^.?!\n]{0,45}(רוצה|אפשר|מבקשת?|צריכה?|אשמח|מעדיפה?)[^.?!\n]{0,25}(לבוא|להגיע|לעבור|להחליף|לשנות|להעביר|במקום)/;
 const RESCHED_RE = /להעביר (?:אותי|את ה)|תעביר[יו]? אותי|לעבור ל|אעבור ל|להחליף (?:את ה)?(?:שיעור|אימון)|להזיז|לשנות (?:את ה)?(?:שיעור|אימון|שעה|יום)|במקום (?:ה)?(?:שיעור|אימון)|להחליף ל/;
 const CLS_CANCEL_RE = /לבטל|תבטל[יו]?|בטל[יו]? (?:לי|אותי)|להוריד אותי|תוריד[יו]? אותי|להסיר אותי מ(?:ה)?(?:שיעור|אימון)|לא (?:אגיע|אוכל להגיע|אספיק|אצליח להגיע|מגיע(?:ה)?|יכול(?:ה)? להגיע|אהיה)|לא יכול(?:ה)?\s+(?:היום|מחר|הערב|הבוקר)|מבטל(?:ת)?/;
 const CANCELLED_REPORT_RE = /(?<![א-ת])(?:ביטלתי|כבר ביטלתי|הורדתי את עצמי|ביטלנו)(?![א-ת])/;
@@ -116,6 +117,8 @@ function classify(rawText, { hasOpenCase = false } = {}) {
 
   // Classes.
   if (WAITLIST_RE.test(t)) return out('waitlist', 'waitlist wording');
+  // "נרשמתי לשש ואני רוצה לבוא ב-17:00": registered for one class and wants another one - a move, not a question
+  if (MOVE_BETWEEN_RE.test(t)) return out('class_reschedule', 'registered for one class, wants another');
   if (MY_BOOK_RE.test(t)) return out('my_bookings', 'asks what they are booked for');
   if (REGULAR_RE.test(t) && (BOOK_RE.test(t) || CLS_CANCEL_RE.test(t) || RESCHED_RE.test(t) || CLASS_WORD.test(t))) return out('regular_booking', 'standing (fixed) booking change');
   if (MISSED_RE.test(t)) return out('class_missed', 'reports a missed class');
