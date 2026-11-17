@@ -454,6 +454,57 @@ function createCallbackService(deps) {
     return { captured: true, unchanged: false, isReschedule: r.isReschedule, apt: openCallback(phone), manager: fin.manager ?? null, prospect: fin.prospect ?? null, error: fin.error ?? null };
   }
 
+  // ── 2c. The owner approves a message to the lead of a human-owned conversation ──
+  /**
+   * A callback was arranged by hand, so nothing automatic was sent to the lead (rule 5). From the panel the owner can
+   * approve ONE summary to the lead, and optionally the scheduled reminder, for THIS request at THIS time:
+   *   • the conversation stays human-owned: the lead's status is not touched and Barak answers nothing there;
+   *   • the time is exactly what is stored - a range of hours is sent as a range, never as an appointed hour;
+   *   • the name the owner confirms is used (or none); the WhatsApp profile name is never sent on its own authority;
+   *   • the approval is persisted BEFORE the send; a send the provider did not accept is recorded as failed and can
+   *     be pressed again; a send that was accepted is never repeated for the same time (durable dedup).
+   * A new time (reschedule) needs a new approval: the approval is bound to the scheduled time.
+   */
+  async function ownerSendSummary(aptId, { by, name = null, reminder = false } = {}) {
+    const who = String(by ?? '').trim().slice(0, 60);
+    if (!who) return { ok: false, error: 'by_required', status: 400 };
+    const apt0 = aptStore.get(aptId);
+    if (!apt0 || !aptStore.ACTIVE_STATUSES.has(apt0.status)) return { ok: false, error: 'not_open', status: 409 };
+    if (!isFuture(apt0)) return { ok: false, error: 'callback_expired', status: 409 };
+    const phone = apt0.leadPhone, lead = getLead(phone);
+    if (!lead) return { ok: false, error: 'lead_not_found', status: 404 };
+    if (lead.status === 'opted_out') return { ok: false, error: 'opted_out', status: 409 };
+    const clean = String(name ?? '').trim().replace(/\s+/g, ' ').slice(0, 40);
+    const iso = apt0.scheduledAt.toISOString();
+    let apt;
+    try {
+      apt = aptStore.update(aptId, { ownerApproved: { by: who, at: new Date().toISOString(), forTime: iso, reminder: reminder === true, name: clean || null },
+        ...(clean ? { leadName: clean, nameProvisional: false } : {}) });
+    } catch (err) { logger.error('[callback] owner approval not persisted — nothing sent', { aptId, error: err.message }); return { ok: false, error: 'persist_failed', status: 500 }; }
+    if (clean) { patchLead(phone, { name: clean }, { qualData: { ...(lead.meta?.qualData ?? {}), confirmedName: clean, nameConfirmed: true, nameConfirmedBy: who } }); persist.saveLeads(store); }
+
+    if (alreadyNotified(apt, 'prospect_summary').has(phone)) {
+      store.logEvent('owner_summary_already_sent', phone, { aptId, by: who, reminder: reminder === true });
+      return { ok: true, alreadySent: true, state: 'accepted', reminder: reminder === true, apt: aptStore.get(aptId) };
+    }
+    const fmt = fmtApt(apt);
+    const text = [clean ? `${firstName(clean)}, רשמנו את בקשת השיחה שלך ✅` : `רשמנו את בקשת השיחה שלך ✅`, `📞 ${fmt}`,
+      apt.windowEndAt ? `נציג מהצוות של Shape Studio יצור איתך קשר בטווח השעות הזה.` : `נציג מהצוות של Shape Studio יצור איתך קשר.`].join('\n');
+    let state = 'failed', idMessage = null, error = null;
+    markBotSent(phone);
+    try {
+      const r = await sendText(phone, text);
+      if (r?.idMessage && !r.blocked) { state = 'accepted'; idMessage = r.idMessage; recordNotified(apt, 'prospect_summary', [phone]); }
+      else if (r?.queued) { state = 'queued'; recordNotified(apt, 'prospect_summary', [phone]); }
+      else error = r?.blocked ? 'blocked' : 'no_provider_id';
+    } catch (err) { error = err.message; }
+    try { apt = aptStore.update(aptId, { ownerSummary: { state, idMessage, error, at: new Date().toISOString(), by: who, text } }); }
+    catch (err) { logger.error('[callback] owner summary state not persisted', { aptId, error: err.message }); }
+    store.logEvent('owner_summary_sent', phone, { aptId, by: who, state, reminder: reminder === true, humanOwned: lead.status === 'human_owns' });
+    logger.info('[callback] owner-approved summary to the lead', { aptId, state, reminder: reminder === true, humanOwned: lead.status === 'human_owns' });
+    return { ok: state !== 'failed', state, error, idMessage, reminder: reminder === true, text, apt };
+  }
+
   // ── 3. Prospect replies about an open callback ──────────────────────────────
 
   /**
@@ -630,7 +681,9 @@ function createCallbackService(deps) {
     const res = resolveCallbackTime(rawTime, new Date());
     if (!res.ok) return { ok: false, error: 'invalid_time', reason: res.reason, clarification: res.clarification, apt };
     const oldTime = validDate(apt.scheduledAt) ? fmtApt(apt) : (apt.rawTime ?? null);
-    const updated = aptStore.reschedule(id, { rawTime: String(rawTime).trim(), scheduledAt: res.scheduledAt }); // throws on failure
+    let updated = aptStore.reschedule(id, { rawTime: String(rawTime).trim(), scheduledAt: res.scheduledAt }); // throws on failure
+    // the window belongs to the time: a new time carries its own range, or none (a stale range must never be shown)
+    updated = aptStore.update(id, { windowEndAt: validDate(res.windowEndAt) ? res.windowEndAt.toISOString() : null });
     cancelCalendarEvent(apt).catch(() => {});
     if (getLead(apt.leadPhone)) {
       const cur = getLead(apt.leadPhone).meta ?? {};
@@ -706,6 +759,12 @@ function createCallbackService(deps) {
           scheduledLabel:        validDate(open.scheduledAt) ? fmtApt(open) : null,
           isWindow:              !!open.windowEndAt,                  // the prospect gave a range of hours, not an appointed hour
           capturedDuring:        open.capturedDuring ?? null,          // 'human_hold' = arranged by hand in the chat
+          nameProvisional:       open.nameProvisional === true,
+          leadName:              open.leadName ?? null,
+          // the owner's approval of a message to the lead is bound to the scheduled time: a new time needs a new approval
+          ownerApproved:         open.ownerApproved && validDate(open.scheduledAt) && open.ownerApproved.forTime === open.scheduledAt.toISOString() ? open.ownerApproved : null,
+          ownerSummary:          open.ownerSummary ?? null,
+          prospectSummarySent:   validDate(open.scheduledAt) ? alreadyNotified(open, 'prospect_summary').has(lead.phone) : false,
           expired:               validDate(open.scheduledAt) ? open.scheduledAt.getTime() <= now : false,
           assignedStaffId:       open.assignedStaffId,
           staffConfirmedAt:      open.staffConfirmedAt ?? null,
@@ -730,7 +789,7 @@ function createCallbackService(deps) {
   }
 
   return {
-    acceptTime, finalize, captureWhileHumanOwned, handleAvailabilityReply, cancelForOptOut,
+    acceptTime, finalize, captureWhileHumanOwned, ownerSendSummary, handleAvailabilityReply, cancelForOptOut,
     staffConfirm, staffOutcome, staffReschedule, panelRows,
     openCallback, isFuture, setLeadStatus,
     STOP_STATUSES, CALLBACK_STATUSES,

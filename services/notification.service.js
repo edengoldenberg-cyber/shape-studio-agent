@@ -374,7 +374,7 @@ async function sendProspectReminder(apt, name, formattedTime) {
   if (!apt.leadPhone) {
     return { ok: false, idMessage: null, error: 'no_lead_phone' };
   }
-  const msg = `היי ${name}, תזכורת לבקשת השיחה שלך עם Shape Studio — ${formattedTime} 📞\nעדיין נוח לך לדבר בשעה הזו?`;
+  const msg = `היי ${name}, תזכורת לבקשת השיחה שלך עם Shape Studio — ${formattedTime} 📞\n${apt.windowEndAt ? 'עדיין נוח לך בטווח השעות הזה?' : 'עדיין נוח לך לדבר בשעה הזו?'}`;
   try {
     const res = await sendText(apt.leadPhone, msg);
     if (res?.blocked) return { ok: false, idMessage: null, error: 'blocked (TEST_MODE allowlist)' };

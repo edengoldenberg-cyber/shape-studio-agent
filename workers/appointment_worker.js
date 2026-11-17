@@ -179,14 +179,17 @@ async function runProspectReminderPass(store) {
     // a human owns or to someone who opted out — whatever the appointment state.
     const lead = store?.getLead(apt.leadPhone);
     const st   = lead?.status;
-    if (st === 'human_owns' || st === 'opted_out' || st === 'converted_member') {
+    // The one exception to "nothing automatic in a human-owned conversation": the owner approved a reminder for THIS
+    // request at THIS time from the panel (ownerApproved is bound to the scheduled time; a reschedule clears it).
+    const ownerOk = st === 'human_owns' && apt.ownerApproved?.reminder === true && apt.ownerApproved.forTime === apt.scheduledAt.toISOString();
+    if (!ownerOk && (st === 'human_owns' || st === 'opted_out' || st === 'converted_member')) {
       logger.info('[apt-worker] Prospect reminder skipped', { aptId: apt.id, leadPhone: apt.leadPhone, status: st });
       store?.logEvent(`prospect_reminder_suppressed_${st}`, apt.leadPhone, { aptId: apt.id });
       continue;
     }
     const fullName      = lead?.meta?.qualData?.confirmedName ?? apt.leadName ?? '';
     const name          = String(fullName).trim().split(/\s+/)[0] || 'שלום';
-    const formattedTime = formatCallbackTime(apt.scheduledAt);
+    const formattedTime = formatCallbackTime(apt.scheduledAt, apt.windowEndAt ?? null);       // a range stays a range
     const result        = await sendProspectReminder(apt, name, formattedTime);
     if (result.ok && result.idMessage) {
       aptStore.update(apt.id, {

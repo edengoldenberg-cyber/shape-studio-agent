@@ -144,13 +144,14 @@ jest.mock('../utils/demo_capture', () => ({ record: jest.fn(), isActive: jest.fn
 
 // ── Harness ────────────────────────────────────────────────────────────────
 const request = require('supertest');
-let app, store, aptStore, callbackTime, tomerStore;
+let app, store, aptStore, callbackTime, tomerStore, worker;
 function restart() {
   jest.resetModules();
   store        = require('../utils/lead_store');
   aptStore     = require('../utils/appointment_store');
   callbackTime = require('../utils/callback_time');
   tomerStore   = require('../utils/tomer_store');
+  worker       = require('../workers/appointment_worker');
   app          = require('../server');
 }
 const T0 = new Date('2026-11-16T08:00:00.000Z');                 // Monday 16.11.2026 10:00 Israel time
@@ -453,6 +454,85 @@ describe('3. A callback arranged BY HAND while a human owns the conversation (wh
     expect(r.route).toBe('human_owns_hold');
     expect(openApt(lead)).toBeFalsy();
     expect(alerts()).toHaveLength(0);
+    expect(textsTo(lead)).toHaveLength(0);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+describe('3b. The owner approves a summary and a reminder to the lead from the panel', () => {
+  const post = (url, body = {}) => request(app).post(url).send(body).set('Content-Type', 'application/json');
+  async function captured() {
+    const lead = await newLead();
+    await staffTypes(lead, 'מתי יהיה לך נוח שניצור קשר?');
+    await say(lead, 'מחר אני פנויה בין 14:00-16:00', { name: 'Yael' });
+    clearOut();
+    return { lead, apt: openApt(lead) };
+  }
+  const row = async lead => (await request(app).get('/api/barak/callbacks')).body.callbacks.find(c => c.fullPhone === lead);
+
+  test('ONE summary goes to the lead with the range she gave - not an hour; the chat stays human-owned and Barak stays silent', async () => {
+    const { lead, apt } = await captured();
+    expect((await post(`/api/admin/appointments/${apt.id}/owner-summary`, { name: 'יעל' })).status).toBe(400);            // who approved is required
+    expect(await row(lead)).toMatchObject({ humanOwned: true, apt: { capturedDuring: 'human_hold', isWindow: true, prospectSummarySent: false, ownerApproved: null } });
+    const r = await post(`/api/admin/appointments/${apt.id}/owner-summary`, { by: 'עדן', name: 'יעל', reminder: true });
+    expect(r.body).toMatchObject({ ok: true, state: 'accepted', reminder: true });
+    expect(textsTo(lead)).toHaveLength(1);
+    expect(lastTo(lead)).toBe('יעל, רשמנו את בקשת השיחה שלך ✅\n📞 יום שלישי, 17.11.2026 בין 14:00 ל-16:00\nנציג מהצוות של Shape Studio יצור איתך קשר בטווח השעות הזה.');
+    expect(lastTo(lead)).not.toMatch(/בשעה/);                                // no hour was made up from the range
+    expect(store.getLead(lead).status).toBe('human_owns');
+    expect(await row(lead)).toMatchObject({ humanOwned: true, apt: { prospectSummarySent: true, ownerApproved: { by: 'עדן', reminder: true } } });
+    await say(lead, 'תודה רבה');
+    expect(textsTo(lead)).toHaveLength(1);                                    // nothing automatic answers her
+    // pressed again: nothing is sent twice
+    expect((await post(`/api/admin/appointments/${apt.id}/owner-summary`, { by: 'עדן', name: 'יעל', reminder: true })).body).toMatchObject({ ok: true, alreadySent: true });
+    expect(textsTo(lead)).toHaveLength(1);
+  });
+
+  test('the approved reminder is timed from the start of the range and worded as a range; without an approval none is sent', async () => {
+    const a = await captured(), b = await captured();
+    await post(`/api/admin/appointments/${a.apt.id}/owner-summary`, { by: 'עדן', name: 'יעל', reminder: true });
+    clearOut();
+    setNow(il(2026, 11, 17, 13, 40));                                        // 20 minutes before the range starts
+    await worker.runCycle(store);
+    const rem = textsTo(a.lead).filter(t => /תזכורת לבקשת השיחה/.test(t.text));
+    expect(rem).toHaveLength(1);
+    expect(rem[0].text).toMatch(/יום שלישי, 17\.11\.2026 בין 14:00 ל-16:00 📞\nעדיין נוח לך בטווח השעות הזה\?/);
+    expect(textsTo(b.lead)).toHaveLength(0);                                  // human-owned and not approved: silence, as before
+    await worker.runCycle(store);
+    expect(textsTo(a.lead).filter(t => /תזכורת/.test(t.text))).toHaveLength(1);        // once
+    expect(store.getLead(a.lead).status).toBe('human_owns');
+  });
+
+  test('a summary without the reminder sends no reminder; a new time needs a new approval', async () => {
+    const { lead, apt } = await captured();
+    await post(`/api/admin/appointments/${apt.id}/owner-summary`, { by: 'עדן', reminder: false });
+    expect(lastTo(lead)).toMatch(/^רשמנו את בקשת השיחה שלך ✅/);              // no name was confirmed, so none is used
+    await staffTypes(lead, 'אפשר גם מועד אחר לשיחה אם נוח לך');
+    await say(lead, 'בעצם עדיף מחר בין 10:00 ל-12:00');
+    expect(openApt(lead).id).toBe(apt.id);
+    expect((await row(lead)).apt).toMatchObject({ ownerApproved: null, prospectSummarySent: false });         // the approval was for the old time
+    clearOut();
+    setNow(il(2026, 11, 17, 9, 40));
+    await worker.runCycle(store);
+    expect(textsTo(lead)).toHaveLength(0);
+  });
+
+  test('a send the provider did not accept is reported as failed, shown in the panel, and can be sent again - once', async () => {
+    const { lead, apt } = await captured();
+    mockOut.failTextTo = lead;
+    const r = await post(`/api/admin/appointments/${apt.id}/owner-summary`, { by: 'עדן', name: 'יעל', reminder: true });
+    expect([r.status, r.body.ok, r.body.state]).toEqual([502, false, 'failed']);
+    expect((await row(lead)).apt).toMatchObject({ prospectSummarySent: false, ownerSummary: { state: 'failed' } });
+    mockOut.failTextTo = null;
+    expect((await post(`/api/admin/appointments/${apt.id}/owner-summary`, { by: 'עדן', name: 'יעל', reminder: true })).body.state).toBe('accepted');
+    expect(textsTo(lead)).toHaveLength(1);
+  });
+
+  test('refused for a closed or expired request and for a lead who opted out', async () => {
+    const { lead, apt } = await captured();
+    setNow(il(2026, 11, 17, 16, 30));
+    expect((await post(`/api/admin/appointments/${apt.id}/owner-summary`, { by: 'עדן' })).body.error).toBe('callback_expired');
+    expect((await post(`/api/admin/appointments/nope/owner-summary`, { by: 'עדן' })).body.error).toBe('not_open');
     expect(textsTo(lead)).toHaveLength(0);
   });
 });

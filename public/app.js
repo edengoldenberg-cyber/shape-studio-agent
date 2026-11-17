@@ -2018,6 +2018,11 @@ function renderCallbackPanel(callbacks) {
         : '🙋 ליד: טרם נשלחה תזכורת');
     }
     if (l.humanOwned) facts.push('🤝 בטיפול אנושי — הבוט לא שולח הודעות');
+    if (apt?.capturedDuring === 'human_hold') facts.push('✍️ תואם ידנית בצ׳אט');
+    if (apt?.isWindow) facts.push('🕑 טווח שעות שהליד מסר/ה — לא שעה שנקבעה');
+    if (apt?.prospectSummarySent) facts.push(`📨 סיכום נשלח ללקוח/ה${apt.ownerApproved ? ` באישור ${apt.ownerApproved.by}` : ''}`);
+    else if (apt?.ownerSummary?.state === 'failed') facts.push('❌ שליחת הסיכום ללקוח/ה נכשלה — אפשר לשלוח שוב');
+    if (apt?.ownerApproved?.reminder && !apt.prospectReminderSent) facts.push('⏰ תזכורת ללקוח/ה מאושרת ותישלח לפני המועד');
     const flagLines = (l.flags ?? []).map(f => CB_FLAG_LABELS[f] ?? f);
 
     const aptId   = apt?.id ?? '';
@@ -2025,11 +2030,18 @@ function renderCallbackPanel(callbacks) {
     const actions = aptId ? `
       <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px" data-apt-actions="${aptId}">
         ${canConfirm ? `<button data-cb-action="confirm" onclick="cbAction('${aptId}','confirm')" style="${btn};border-color:#22a55a;background:#22a55a;color:#fff;font-weight:600">✅ אשר שיחה</button>` : ''}
+        ${l.humanOwned && apt && !apt.expired && apt.scheduledAt && !apt.prospectSummarySent ? `<button data-cb-action="owner-summary" onclick="cbToggleOwnerSummary('${aptId}')" style="${btn};border-color:var(--accent);color:var(--accent);font-weight:600">📨 אשר ושלח סיכום ללקוח/ה</button>` : ''}
         <button data-cb-action="complete"   onclick="cbAction('${aptId}','complete')"   style="${btn}">✔ הושלם</button>
         <button data-cb-action="no_answer"  onclick="cbAction('${aptId}','no_answer')"  style="${btn}">📵 לא ענה</button>
         <button data-cb-action="reschedule" onclick="cbToggleReschedule('${aptId}')"    style="${btn}">🔄 שנה מועד</button>
         <button data-cb-action="assign"     onclick="cbAction('${aptId}','assign')"     style="${btn}">👤 נציג</button>
         <button data-cb-action="cancel"     onclick="cbAction('${aptId}','cancel', this)" style="${btn}">🚫 בטל</button>
+      </div>
+      <div id="cb-owner-${aptId}" style="display:none;margin-top:6px;gap:6px;align-items:center;flex-wrap:wrap;font-size:11px">
+        <span>יישלח ללקוח/ה: <b>${apt?.scheduledLabel ? esc(apt.scheduledLabel) : ''}</b>${apt?.isWindow ? ' (כטווח שעות, בלי שעה מדויקת)' : ''}. השיחה נשארת בטיפול ידני.</span>
+        <input id="cb-owner-name-${aptId}" type="text" dir="rtl" placeholder="שם לפנייה (לא חובה)" value="${esc(qd.confirmedName ?? '')}" style="font-size:11px;padding:3px 6px;width:130px;border:1px solid var(--border);border-radius:3px">
+        <label style="display:flex;gap:3px;align-items:center"><input id="cb-owner-rem-${aptId}" type="checkbox" checked> לשלוח גם תזכורת לפני המועד</label>
+        <button data-cb-action="owner-summary-send" onclick="cbOwnerSummary('${aptId}')" style="${btn};border-color:#22a55a;background:#22a55a;color:#fff;font-weight:600">שלח</button>
       </div>
       <div id="cb-resched-${aptId}" style="display:none;margin-top:6px;gap:4px;align-items:center">
         <input id="cb-resched-input-${aptId}" type="text" dir="rtl" placeholder='מועד חדש — למשל "מחר ב-15:00" או "17.11 בשעה 10:30"' style="font-size:11px;padding:3px 6px;width:260px;border:1px solid var(--border);border-radius:3px">
@@ -2086,6 +2098,27 @@ const CB_ACTION_OK = {
   confirm: 'השיחה אושרה', complete: 'השיחה סומנה כהושלמה', no_answer: 'נרשם: לא ענה',
   cancel: 'בקשת השיחה בוטלה', reschedule: 'המועד עודכן', assign: 'הנציג עודכן',
 };
+
+function cbToggleOwnerSummary(aptId) {
+  const box = document.getElementById(`cb-owner-${aptId}`);
+  if (box) box.style.display = box.style.display === 'none' ? 'flex' : 'none';
+}
+/** The owner approves one summary (and optionally the reminder) to the lead of a human-owned conversation. */
+async function cbOwnerSummary(aptId) {
+  const name = document.getElementById(`cb-owner-name-${aptId}`)?.value?.trim() ?? '';
+  const reminder = !!document.getElementById(`cb-owner-rem-${aptId}`)?.checked;
+  try {
+    const r = await fetch(`/api/admin/appointments/${aptId}/owner-summary`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ by: 'הבעלים (פאנל)', name, reminder }) });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && j.ok) cbSetMsg(j.alreadySent ? 'הסיכום כבר נשלח למועד הזה' + (reminder ? '; התזכורת אושרה' : '') : `הסיכום נשלח ללקוח/ה${j.state === 'queued' ? ' (ייצא בסיום שעות השקט)' : ''}${reminder ? '; התזכורת תישלח לפני המועד' : ''}`, false);
+    else cbSetMsg(`הסיכום לא נשלח (${j.error || r.status}). לא נרשם כנשלח — אפשר לנסות שוב.`, true);
+  } catch (e) { cbSetMsg('הסיכום לא נשלח: ' + e.message, true); }
+  const msgEl = document.getElementById('barak-callbacks-msg'), shown = msgEl ? [msgEl.textContent, msgEl.style.color] : null;
+  await loadBarakPanel();
+  const again = document.getElementById('barak-callbacks-msg');
+  if (again && shown && shown[0]) { again.textContent = shown[0]; again.style.color = shown[1]; again.style.display = 'block'; }
+}
 
 async function cbAction(aptId, action, el) {
   if (!aptId) return;

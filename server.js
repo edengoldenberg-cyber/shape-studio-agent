@@ -58,6 +58,7 @@ const arboxGateway                     = require('./services/arbox_gateway');
 const serviceCases                     = require('./utils/service_case_store');
 const tomerTest                        = require('./services/tomer_test_mode');
 const { createMemberHandoff }          = require('./services/member_handoff');
+const { createClassActions }           = require('./services/class_actions');
 const careStore                        = require('./utils/member_care_store');
 const contactPolicy                    = require('./services/contact_policy');
 const { createMemberCare }             = require('./services/member_care');
@@ -3060,6 +3061,9 @@ let _tomerOpenAI = null;
 // message becomes a durable staff task with a manager alert and an honest reply. Read-only towards Arbox.
 const memberHandoff = app.locals.memberHandoff = createMemberHandoff({
   gateway: arboxGateway, tomerStore, logger, alertOwner,
+  // Booking / cancelling / moving a class in Arbox. Inert unless ARBOX_WRITES_ENABLED, ARBOX_WRITE_OPS and a verified
+  // contract all say so (services/arbox_gateway.js); until then every request goes to the staff as a task.
+  classActions: createClassActions({ gateway: arboxGateway, logger }),
   sendText: async (to, text) => {
     if (process.env.WHATSAPP_AUTO_REPLY !== 'true') return { blocked: true };
     _markBotSent(to);
@@ -6636,6 +6640,18 @@ app.post('/api/admin/appointments/:id/confirm', jsonBody, (req, res) => {
     if (!r.ok) return _aptFail(res, r);
     if (!r.unchanged) logger.info('[api] Appointment confirmed by staff', { aptId: r.apt.id, phone: r.apt.leadPhone });
     res.json({ ok: true, unchanged: !!r.unchanged, appointment: r.apt });
+  } catch (err) { _aptPersistFail(res, req.params.id, err); }
+});
+
+// POST /api/admin/appointments/:id/owner-summary — the owner approves ONE summary to the lead (and, optionally, the
+//   scheduled reminder) for a callback arranged by hand. The conversation stays human-owned; a range of hours is sent
+//   as a range; a send the provider did not accept is reported as failed (502) and can be pressed again.
+app.post('/api/admin/appointments/:id/owner-summary', jsonBody, async (req, res) => {
+  try {
+    const r = await callbackSvc.ownerSendSummary(req.params.id, { by: req.body?.by, name: req.body?.name, reminder: req.body?.reminder === true });
+    if (!r.ok && r.status) return res.status(r.status).json({ ok: false, error: r.error });
+    broadcastSse('appointment_updated', { aptId: req.params.id });
+    res.status(r.ok ? 200 : 502).json({ ok: r.ok, state: r.state, alreadySent: !!r.alreadySent, reminder: r.reminder, error: r.error ?? null, text: r.text ?? null });
   } catch (err) { _aptPersistFail(res, req.params.id, err); }
 });
 
