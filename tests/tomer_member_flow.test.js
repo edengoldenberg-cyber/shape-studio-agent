@@ -394,53 +394,77 @@ describe('B. Verified Arbox reads', () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-describe('C. Classes: self-service + verification from Arbox', () => {
-  test('booking: resolves the class, never claims to book, verifies only after Arbox shows it', async () => {
+describe('C. Classes: a request to book / cancel / move goes to the class flow (Arbox facts, written confirmation, staff task)', () => {
+  // Since 2026-11-17 a class request in the member route is an ACTION: when Arbox writes are permitted Tomer asks for a
+  // written "כן" and carries it out; when they are not, ONE staff task is opened and the manager is alerted ONCE.
+  const taskAlerts = () => mockOut.alerts.filter(a => /תומר/.test(a.subject));
+  const writesOn = () => { process.env.ARBOX_WRITES_ENABLED = 'true'; process.env.ARBOX_TEST_ASSUME_CONTRACT = 'true'; process.env.ARBOX_WRITE_OPS = 'class_book,class_cancel'; process.env.ARBOX_WRITE_AUDIENCE = 'all'; };
+  afterEach(() => { delete process.env.ARBOX_WRITE_OPS; delete process.env.ARBOX_WRITE_AUDIENCE; });
+
+  test('booking while Arbox writes are off: facts from Arbox, ONE staff task and ONE alert, the member is not told she is booked', async () => {
     const m = member();
     await say(m.phone, 'תרשמי אותי למחר ב-9 לפילאטיס');
-    expect(lastTo(m.phone)).toMatch(/אני לא יכול לבצע רישום במקומך/);
-    expect(lastTo(m.phone)).toContain('https://book.example.test/c/2');
-    expect(lastTo(m.phone)).toMatch(/רשומים 7 מתוך 10/);
-    await say(m.phone, 'נרשמתי');
-    expect(lastTo(m.phone)).toMatch(/עדיין לא רואה ב-Arbox רישום/);
-    book(m, cls(2));
-    await say(m.phone, 'נרשמתי');
-    expect(lastTo(m.phone)).toMatch(/מאומת ✅ לפי Arbox את רשומה: פילאטיס מכשירים — יום שלישי, 17\.11\.2026 בשעה 09:00/);
+    expect(lastTo(m.phone)).toMatch(/קיבלתי את הבקשה: רישום ל-09:00/);
+    expect(lastTo(m.phone)).toMatch(/3 מקומות פנויים/);
+    expect(lastTo(m.phone)).toMatch(/העברתי את הבקשה לצוות/);
+    expect(lastTo(m.phone)).toMatch(/עדיין לא נרשמת/);
+    expect(lastTo(m.phone)).not.toMatch(FALSE_CONFIRM);
+    expect(taskAlerts()).toHaveLength(1);
+    expect(taskAlerts()[0].subject).toMatch(/רישום לשיעור/);
+    expect(taskAlerts()[0].body).toMatch(/לא בוצע שום שינוי ב-Arbox/);
+    await say(m.phone, 'תרשמי אותי למחר ב-9 לפילאטיס');            // the same request again
+    expect(taskAlerts()).toHaveLength(1);
     expect(arbox.writes()).toHaveLength(0);
   });
 
-  test('booking a full class states it is full (real count)', async () => {
+  test('a full class is reported as full from the real count', async () => {
     const m = member();
     await say(m.phone, 'תרשמי אותי למחר ב-19 לפילאטיס');
-    expect(lastTo(m.phone)).toMatch(/השיעור מלא \(10\/10\), ו-2 ברשימת המתנה/);
+    expect(lastTo(m.phone)).toMatch(/הוא מלא כרגע/);
+    expect(arbox.writes()).toHaveLength(0);
   });
 
-  test('ambiguous class → asks which one; the choice continues the flow', async () => {
+  test('no hour given → ONE focused question; the answer completes the SAME request', async () => {
     const m = member();
     await say(m.phone, 'תרשמי אותי לפילאטיס מחר');
-    expect(lastTo(m.phone)).toMatch(/לאיזה מהם\?\n1\. .*09:00.*\n2\. .*19:00/s);
-    await say(m.phone, '1');
-    expect(lastTo(m.phone)).toContain('https://book.example.test/c/2');
+    expect(lastTo(m.phone)).toMatch(/לאיזו שעה לרשום אותך\?/);
+    await say(m.phone, 'ב-9');
+    expect(lastTo(m.phone)).toMatch(/רישום ל-09:00/);
+    const tasks = (await get('/api/tomer/tasks')).body.tasks.filter(t => t.phone === m.phone && t.type === 'class_change');
+    expect(tasks).toHaveLength(1);
   });
 
-  test('already booked → says so from Arbox', async () => {
+  test('writes permitted: the EXACT action is shown and nothing is sent to Arbox before a written "כן"; "לא" changes nothing', async () => {
+    writesOn();
+    const m = member();
+    await say(m.phone, 'תרשמי אותי למחר ב-9 לפילאטיס');
+    expect(lastTo(m.phone)).toMatch(/רק לוודא לפני שאני משנה ב-Arbox/);
+    expect(lastTo(m.phone)).toMatch(/רישום לפילאטיס מכשירים ב-09:00/);
+    expect(lastTo(m.phone)).toMatch(/לאשר\?/);
+    expect(arbox.writes()).toHaveLength(0);
+    expect(taskAlerts()).toHaveLength(0);
+    await say(m.phone, 'לא');
+    expect(lastTo(m.phone)).toMatch(/לא שיניתי דבר/);
+    expect(arbox.writes()).toHaveLength(0);
+  });
+
+  test('writes permitted, already booked to that class: no confirmation is asked, the reason reaches the staff', async () => {
+    writesOn();
     const m = member(); book(m, cls(2));
     await say(m.phone, 'תרשמי אותי למחר ב-9 לפילאטיס');
-    expect(lastTo(m.phone)).toMatch(/את כבר רשומה ✅/);
+    expect(lastTo(m.phone)).toMatch(/כבר קיים ב-Arbox רישום לשיעור המבוקש/);
+    expect(lastTo(m.phone)).not.toMatch(/לאשר\?/);
+    expect(arbox.writes()).toHaveLength(0);
   });
 
-  test('class cancellation: booking stays until Arbox records the cancellation', async () => {
+  test('class cancellation while writes are off: the booking is found in Arbox, the member is told it is NOT cancelled, the staff are alerted', async () => {
     const m = member(); book(m, cls(1));
-    await say(m.phone, 'לא אספיק להגיע היום');
-    expect(lastTo(m.phone)).toMatch(/כח — יום שני, 16\.11\.2026 בשעה 19:00/);
-    expect(lastTo(m.phone)).toMatch(/הרישום עדיין קיים/);
+    await say(m.phone, 'תבטלי לי את השיעור של היום ב-19');
+    expect(lastTo(m.phone)).toMatch(/יש לך רישום לכח ב-19:00/);
+    expect(lastTo(m.phone)).toMatch(/הרישום שלך לא בוטל/);
     expect(lastTo(m.phone)).not.toMatch(FALSE_CONFIRM);
-    await say(m.phone, 'ביטלתי');
-    expect(lastTo(m.phone)).toMatch(/לפי Arbox הרישום עדיין קיים/);
-    arbox.state.bookings.length = 0;
-    arbox.state.cancellations.push({ user_id: m.userId, schedule_id: 1, date: TODAY, start_time: '19:00:00', class_name: 'כח', cancelled_time: '2026-11-16 10:01:00' });
-    await say(m.phone, 'ביטלתי');
-    expect(lastTo(m.phone)).toMatch(/מאומת ✅ לפי Arbox נרשם ביטול של:\n• כח/);
+    expect(taskAlerts()).toHaveLength(1);
+    expect(arbox.writes()).toHaveLength(0);
   });
 
   test('"cannot come" with no booking → nothing to cancel (no invented cancellation)', async () => {
@@ -449,15 +473,14 @@ describe('C. Classes: self-service + verification from Arbox', () => {
     expect(lastTo(m.phone)).toMatch(/לא מצאתי רישום שלך/);
   });
 
-  test('reschedule: book the new class first, verify, only then cancel the old one', async () => {
+  test('move while writes are off: the existing booking is stated to be unchanged, one task, one alert', async () => {
     const m = member(); book(m, cls(1));
-    await say(m.phone, 'אפשר להעביר אותי למחר ב-9 לפילאטיס?');
-    expect(lastTo(m.phone)).toMatch(/קודם להירשם לשיעור החדש, ורק אחרי שהרישום נקלט — לבטל את הישן/);
-    await say(m.phone, 'נרשמתי');
-    expect(lastTo(m.phone)).toMatch(/עדיין לא רואה/);           // old booking untouched, nothing claimed
-    book(m, cls(2));
-    await say(m.phone, 'נרשמתי');
-    expect(lastTo(m.phone)).toMatch(/מאומת ✅.*\nעכשיו אפשר לבטל את הרישום הישן/s);
+    await say(m.phone, 'נרשמתי להיום ב-19 ואני רוצה לעבור למחר ב-9');
+    expect(lastTo(m.phone)).toMatch(/קיבלתי את הבקשה: מעבר/);
+    expect(lastTo(m.phone)).toMatch(/הרישום הקיים שלך לא השתנה/);
+    expect(taskAlerts()).toHaveLength(1);
+    expect(taskAlerts()[0].subject).toMatch(/מעבר לשיעור אחר/);
+    expect(arbox.writes()).toHaveLength(0);
   });
 
   test('waitlist: states the limits, shows real standby count', async () => {

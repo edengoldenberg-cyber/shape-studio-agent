@@ -285,7 +285,9 @@ app.use((_req, res, next) => {
 // ── Global request logger — catches EVERY hit including Meta's verifier ───────
 // If Meta's request reaches this server you will see it here before any route.
 app.use((req, _res, next) => {
-  logger.info(`INCOMING ${req.method} ${req.originalUrl}`, {
+  // the path only: a query string can carry a secret (webhook verify tokens)
+  logger.info(`INCOMING ${req.method} ${req.path}`, {
+    queryKeys: Object.keys(req.query ?? {}).slice(0, 12),
     ip:      req.headers['x-forwarded-for'] ?? req.ip,
     ua:      (req.headers['user-agent'] ?? '').slice(0, 100),
     host:    req.headers['host'],
@@ -1361,8 +1363,7 @@ app.get('/api/leads/webhook', (req, res) => {
   // ── Diagnostic log — visible in your terminal when Meta clicks Verify ────────
   logger.info('META LEADS WEBHOOK HIT', {
     method:    req.method,
-    url:       req.originalUrl,
-    query:     req.query,
+    path:      req.path,                       // not the full URL or the query: they carry the verify token
     headers: {
       host:                req.headers['host'],
       'user-agent':        req.headers['user-agent'],
@@ -1371,9 +1372,8 @@ app.get('/api/leads/webhook', (req, res) => {
     checks: {
       mode_ok:      mode === 'subscribe',
       token_ok:     token === expected,
-      token_got:    token,
-      token_expect: expected,
-      challenge:    challenge,
+      token_present: !!token,
+      challenge_present: !!challenge,
     },
   });
 
@@ -1391,7 +1391,8 @@ app.get('/api/leads/webhook', (req, res) => {
     return res.end(body);
   }
 
-  logger.warn('Meta leads webhook REJECTED', { mode, token, expected });
+  // the received and the expected verify token are secrets: only whether they were present is logged
+  logger.warn('Meta leads webhook REJECTED', { mode, tokenPresent: !!token, expectedConfigured: !!expected });
   res.writeHead(403); res.end();
 });
 
@@ -4410,10 +4411,25 @@ async function processInboundWAMessage(msg) {
       clientMatch, intent, route, barakReply: null,
     });
     try {
-      const _vc = await _memberVoiceOrConfirm(msg, fromNorm, clientMatch.arboxName ?? msg.name ?? null);
-      const tRes = _vc ? { outcome: 'handoff' } : await tomerService.handleMemberMessage({
+      const _mName = clientMatch.arboxName ?? msg.name ?? null;
+      let _vc = await _memberVoiceOrConfirm(msg, fromNorm, _mName);
+      // A request to book / cancel / move a class is an ACTION in Arbox: it goes to the class flow (facts read from
+      // Arbox, the member's written "כן", a verified write when permitted, otherwise one staff task and one alert) -
+      // the same flow the previous member route used. Everything else is the service's.
+      if (!_vc && msg.type === 'text' && msg.text?.trim() && !(intent === 'schedule_query' && isWeeklyTimetableQuery(msg.text))) {
+        try {
+          _vc = await memberHandoff.handleClassRequest({ phone: fromNorm, text: msg.text, name: _mName,
+            sentAt: _saneDate(msg.timestamp), pending: _pendingMessages, fromVoice: !!msg.fromVoice });
+        } catch (err) {
+          logger.error('[member-handoff] class request handling failed — the service handles the message', { from: fromNorm, error: err.message });
+        }
+      }
+      if (_vc?.replyText && ['sent', 'queued'].includes(_vc.sendState)) {
+        try { inbox.pushOutbound({ phone: fromNorm, name: _mName, text: _vc.replyText, agentId: 'tomer', meta: { agent: 'tomer', handler: 'class_request', trigger: 'member_message', caseId: _vc.taskId ?? null, sendState: _vc.sendState } }); } catch { /* the thread is a view */ }
+      }
+      const tRes = _vc ? { outcome: 'handoff', category: _vc.kind ?? null } : await tomerService.handleMemberMessage({
         phone: fromNorm, text: msg.type === 'text' ? (msg.text ?? '') : '', type: msg.type,
-        caption: msg.mediaCaption ?? null, name: clientMatch.arboxName ?? msg.name ?? null,
+        caption: msg.mediaCaption ?? null, name: _mName,
         sentAt: msg.timestamp instanceof Date ? msg.timestamp : null,
         messageId: msg.messageId ?? null,
       });
