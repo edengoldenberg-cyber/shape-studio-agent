@@ -634,7 +634,10 @@ function createTomerService(deps) {
       'עובדות מאומתות:',
       `- כתובת: ${STUDIO_ADDRESS}`,
       a.wazeUrl ? `- קישור Waze: ${a.wazeUrl}` : null,
-      '- הרשמה וביטול שיעורים נעשים על ידי החבר/ה באפליקציית Arbox; תומר לא יכול לבצע אותם.',
+      // must agree with what the class flow really does right now (services/member_handoff.js + class_actions.js)
+      (() => { let on = false; try { on = gateway.writesEnabled?.('class_book') === true; } catch { /* treated as off */ }
+        return on ? '- רישום, ביטול ומעבר שיעור: החבר/ה כותב/ת לתומר את היום והשעה, ותומר מבצע רק אחרי אישור בכתב; אפשר גם לבצע לבד באפליקציית Arbox.'
+                  : '- רישום, ביטול ומעבר שיעור: אפשר לבצע לבד באפליקציית Arbox; בקשה שנכתבת לתומר (יום ושעה) מועברת לצוות, ותומר אינו מבצע אותה בעצמו.'; })(),
       '- הקפאה, ביטול וחידוש מנוי, זיכויים ושינויי חיוב דורשים את אישור הצוות.',
     ].filter(Boolean).join('\n');
     let out = null;

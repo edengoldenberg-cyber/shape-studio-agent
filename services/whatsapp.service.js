@@ -232,15 +232,21 @@ async function alertOwner(subject, body, { skipPhones = new Set(), linkPreview =
 /**
  * Release all queued messages (called at 08:30 by cron job in server.js).
  */
-async function releaseQueuedMessages() {
-  if (quietQueue.length === 0) return;
+async function releaseQueuedMessages(stillAllowed = null) {
+  if (quietQueue.length === 0) return { sent: 0, dropped: 0 };
   logger.info(`Releasing ${quietQueue.length} queued messages`);
-
+  let sent = 0, dropped = 0;
   while (quietQueue.length > 0) {
     const { to, text } = quietQueue.shift();
+    // the state of the conversation is checked now, not when the message was queued
+    let ok = true;
+    try { if (typeof stillAllowed === 'function') ok = stillAllowed(to) !== false; } catch { ok = false; }
+    if (!ok) { dropped++; logger.info('Queued message dropped — the conversation changed hands overnight', { tail: String(to).slice(-4) }); continue; }
     const morning = `בוקר טוב ☀️\n\n${text}`;
     await _dispatch(to, morning);
+    sent++;
   }
+  return { sent, dropped };
 }
 
 // ── Demo phone bypass ─────────────────────────────────────────────────────────

@@ -367,6 +367,43 @@ describe('B. through the member hand-off: what the member and the staff are told
     expect(w.s.writes).toHaveLength(2);                                     // nothing further was sent
   });
 
+  test('the "כן" is used once, for the action that was shown, and by the member it was shown to', async () => {
+    const w = world();
+    await w.say(ASK);
+    await w.say('כן');
+    const writes = w.s.writes.length, sent = w.sent.length;
+    expect(await w.say('כן')).toBeNull();                                   // a second "כן" confirms nothing
+    expect(w.s.writes).toHaveLength(writes);
+    expect(w.sent).toHaveLength(sent);
+    // another member's "כן" has no question to answer: nothing is written for her and nothing of the first member's is touched
+    expect(await w.h.handleClassRequest({ phone: '972500000002', text: 'כן', sentAt: w.clock.t })).toBeNull();
+    expect(w.s.writes).toHaveLength(writes);
+    expect(w.tasks).toHaveLength(1);
+  });
+
+  test('a staff takeover between the question and the "כן": nothing is written, the request goes to the staff', async () => {
+    const { s, gw } = fakeArbox();
+    const tasks = [], sent = [], alerts = []; let seq = 0, owned = false;
+    const tomerStore = {
+      getTasks: ({ phone, type } = {}) => tasks.filter(t => (!phone || t.phone === phone) && (!type || t.type === type)),
+      getOpenTasks: () => tasks.filter(t => t.status === 'open'),
+      createTask: t => { const x = { id: `t${++seq}`, status: 'open', createdAt: NOW.toISOString(), updatedAt: NOW.toISOString(), ...t }; tasks.push(x); return x; },
+      updateTask: (id, u) => Object.assign(tasks.find(t => t.id === id), u, { updatedAt: NOW.toISOString() }),
+      resolveTask: (id, r) => Object.assign(tasks.find(t => t.id === id), { status: 'resolved', ...r }),
+      appendAudit: () => {},
+    };
+    const h = createMemberHandoff({ gateway: gw, tomerStore, logger: require('../utils/logger'), now: () => NOW, classActions: actionsOn(gw), canAutoReply: () => !owned,
+      alertOwner: async (subject, body) => { alerts.push({ subject, body }); return { results: [{ phone: 'mgr', idMessage: `A${alerts.length}` }] }; },
+      sendText: async (to, text) => { sent.push({ to, text }); return { idMessage: `M${sent.length}` }; } });
+    await h.handleClassRequest({ phone: P, text: ASK, sentAt: NOW });
+    owned = true;                                                           // the staff took the conversation over
+    const r = await h.handleClassRequest({ phone: P, text: 'כן', sentAt: NOW });
+    expect(s.writes).toHaveLength(0);
+    expect(r.action?.state).not.toBe('done');
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0].body).toMatch(/טיפול ידני/);
+  });
+
   test('done and verified: the member is told it was done; the task is recorded as closed and nobody is alerted', async () => {
     const w = world();
     await w.say(ASK);

@@ -307,7 +307,10 @@ function createMemberHandoff(deps) {
           logger.info('[member-handoff] class action planned — waiting for the member\'s written confirmation', { tail: tail(phone), kind, taskId: task.id, late: !!pl.late, fromVoice: !!fromVoice, sendState: st });
           return { handled: true, kind, taskId: task.id, isNew, missing: null, alert: null, replyText: askText, sendState: st, facts: f, request: rq, action: { state: 'awaiting_member_confirmation' } };
         }
-        action = { plan: pl, result: pl.ok ? await classActions.execute(pl) : null };
+        // the last moment before a request leaves for Arbox: if the staff took the conversation over while the facts
+        // were being read, nothing is written - the request goes to them
+        if (pl.ok && !canAutoReply(phone)) action = { plan: { ok: false, reason: 'conversation_taken_over', text: 'השיחה עברה לטיפול ידני של הצוות לפני הביצוע, ולכן לא נשלחה בקשה ל-Arbox.' }, result: null };
+        else action = { plan: pl, result: pl.ok ? await classActions.execute(pl) : null };
       } catch (err) {
         logger.error('[member-handoff] class action failed before any request — handing over to the staff', { tail: tail(phone), error: err.message });
         action = { plan: { ok: false, reason: 'error', text: `תקלה פנימית לפני שליחת בקשה ל-Arbox (${err.message})` }, result: null };

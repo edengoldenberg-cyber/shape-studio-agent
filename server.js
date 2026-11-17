@@ -1572,7 +1572,13 @@ cron.schedule('15 9 * * *', async () => {
 cron.schedule('30 8 * * *', async () => {
   logger.info('Cron: releasing quiet-hours queue');
   try {
-    await releaseQueuedMessages();
+    // A message queued last night is sent only if the conversation is still the agent's: not taken over by the
+    // staff, not opted out, and not a lead who became a member in the meantime (their agent is no longer Barak).
+    await releaseQueuedMessages(to => {
+      const st = store.getLead(to)?.status ?? null;
+      if (['human_owns', 'opted_out', 'attribution_review', 'converted_member'].includes(st)) { store.logEvent('queued_message_dropped', to, { status: st }); return false; }
+      return true;
+    });
   } catch (err) {
     logger.error('Cron: releaseQueuedMessages failed', { error: err.message });
   }
@@ -3046,6 +3052,21 @@ const callbackSvc = createCallbackService({
 // In test_only mode (the default) the new flow exists only for the allowlisted phones;
 // every other member keeps the routing production had before it (see tomer_test_mode.js).
 const _tomerSwitch = () => process.env.TOMER_SERVICE_ENABLED !== 'false';
+/** Is an AUTOMATIC message to this phone forbidden right now? (a human owns the conversation, or authorship of the last outgoing message is unresolved) */
+function _ownerBlocksAutoSend(phone) { const o = _conversationOwner(phone); return o === 'human' || o === 'attribution_review'; }
+/**
+ * Did this member write to us in the last half hour? The quiet-hours exemption of the member service exists ONLY to
+ * answer a request the member has just sent; it must never let an unprompted (proactive) message out at night.
+ */
+function _memberWroteRecently(phone, withinMs = 30 * 60 * 1000) {
+  const msgs = (inbox.getThread ? inbox.getThread(phone) : null)?.messages ?? [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].direction !== 'in') continue;
+    const t = new Date(msgs[i].timestamp).getTime();
+    return Number.isFinite(t) && Date.now() - t <= withinMs;
+  }
+  return false;
+}
 const _tomerOn = phone => _tomerSwitch() && tomerTest.isAllowed(phone);
 
 // ── Test identity (route-overridden phone) ────────────────────────────────────
@@ -3103,8 +3124,17 @@ const memberHandoff = app.locals.memberHandoff = createMemberHandoff({
   classActions: createClassActions({ gateway: arboxGateway, logger }),
   sendText: async (to, text) => {
     if (process.env.WHATSAPP_AUTO_REPLY !== 'true') return { blocked: true };
+    // the same late check as the Tomer service: nothing automatic after a staff takeover
+    if (_ownerBlocksAutoSend(to)) {
+      logger.info('[member-handoff] reply withheld — the conversation was taken over while it was being prepared', { tail: String(to).slice(-4) });
+      store.logEvent('reply_suppressed_late', to, { agent: 'member_handoff', owner: _conversationOwner(to) });
+      return { blocked: true, ownerChanged: true };
+    }
     _markBotSent(to);
-    const r = await sendText(to, text);
+    // A member is answered directly, like every Tomer reply (no "נחזור אליך מחר בבוקר" and no overnight queue: the
+    // written confirmation of a class action is valid for 30 minutes). A lead keeps Barak's quiet hours.
+    const direct = process.env.TOMER_QUIET_HOURS !== 'true' && _memberWroteRecently(to) && (store.getLead(to)?.status === 'converted_member' || _isKnownMemberPhone(to));
+    const r = await sendText(to, text, { bypassQuietHours: direct });
     if (r?.idMessage) _recordBotSend(r.idMessage, to);
     return r;
   },
@@ -3163,11 +3193,25 @@ const tomerService = app.locals.tomerService = createTomerService({
       return { blocked: true, notAllowed: true };
     }
     if (!opts.staff && process.env.WHATSAPP_AUTO_REPLY !== 'true') return { blocked: true };
+    // Ownership is checked AGAIN here, at the moment of sending: a staff member may have taken the conversation over
+    // (a reply typed on the studio phone, or from the panel) while Tomer was reading Arbox or waiting for the model.
+    if (!opts.staff && _ownerBlocksAutoSend(to)) {
+      logger.info('[tomer] reply withheld — the conversation was taken over while the answer was being prepared', { tail: String(to).slice(-4), owner: _conversationOwner(to) });
+      store.logEvent('reply_suppressed_late', to, { agent: 'tomer', owner: _conversationOwner(to) });
+      return { blocked: true, ownerChanged: true };
+    }
     _markBotSent(to);
     // Tomer only ever ANSWERS a member who has just written, so its replies are not held
     // for quiet hours: the shared quiet-hours path would send "נחזור אליך מחר בבוקר" (a
     // promise Tomer must not make) and keep the real answer in an in-memory queue that a
     // restart loses. TOMER_QUIET_HOURS=true restores the shared quiet-hours behaviour.
+    // During quiet hours only an ANSWER goes out: to a member who wrote in the last half hour, or a human reply from
+    // the panel. An automatic message nobody asked for (a proactive programme, a late follow-up) is not sent at night
+    // and is not queued with Barak's "נחזור אליך מחר בבוקר" either - it is refused, and the caller records that.
+    if (!opts.staff && !opts.bypassQuietHours && !_memberWroteRecently(to) && require('./utils/time').isQuietHours()) {
+      logger.info('[tomer] unprompted message refused during quiet hours', { tail: String(to).slice(-4) });
+      return { blocked: true, quietHours: true };
+    }
     const _direct = !!opts.bypassQuietHours || process.env.TOMER_QUIET_HOURS !== 'true';
     const r = await sendText(to, text, { bypassQuietHours: _direct, linkPreview: opts.linkPreview !== false });
     // Registered so the provider's echo of this send is not mistaken for a phone-side reply.
