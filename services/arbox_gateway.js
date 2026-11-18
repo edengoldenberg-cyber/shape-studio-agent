@@ -359,7 +359,11 @@ const WRITE_CONTRACTS = {
   // the class's cancellation window. That approval is not proof that Arbox accepts the cancellation of the original
   // class through the API at that point, nor of what it does to her sessions. `verified` is set only after one late move
   // on the approved test member was read back (bookings and sessions). Until then a late move goes to the staff.
-  class_move_late: { verified: false, explicit: true, virtual: true, method: 'RULE', path: 'move inside the cancellation window (book new → cancel original)' },
+  // VERIFIED against the real Arbox on 2026-11-18 18:44 with the owner's test member (user 12622086), by his approval:
+  //   booked 2026-11-18 20:00 (8 h window, 76 minutes before the start) → MOVE: bookSession 2026-11-19 17:00 → 200, read back;
+  //   cancelUserBooking of the 20:00 class INSIDE its cancellation window → 200, read back. Membership unchanged, no charge.
+  //   Not visible through the API, and so not verified: whether Arbox marks such a cancellation as "late" on the member's card.
+  class_move_late: { verified: true, explicit: true, virtual: true, method: 'RULE', path: 'move inside the cancellation window (book new → cancel original)' },
 };
 
 // Tests may exercise the executor against a LOCAL mock with the assumed contract. This

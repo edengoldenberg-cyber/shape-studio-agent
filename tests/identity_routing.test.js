@@ -789,6 +789,27 @@ describe('Registration carried out in Arbox for the test phone only', () => {
     expect(tasksOf(OTHER).filter(t => t.status === 'open')).toHaveLength(1);
   });
 
+  test('opened to every identified member (owner, 2026-11-18): an ordinary member is asked to confirm the exact action; an outside-club member still goes to the staff', async () => {
+    setup();
+    process.env.ARBOX_WRITE_AUDIENCE = 'all'; delete process.env.ARBOX_WRITE_TEST_PHONES;
+    const AGG = '972507140003';
+    plan(person({ role: 'aggregatorMember', phone: '0' + AGG.slice(3), first: 'גלית' }));
+    try {
+      await say(OTHER, 'תרשמי אותי לALL IN היום ב-18');
+      expect(last(OTHER)).toMatch(/רק לוודא לפני שאני משנה ב-Arbox:\nרישום לALL IN ב-18:00[\s\S]*לאשר\?/);
+      expect(arbox.writes()).toHaveLength(0);                                     // nothing before her written "כן"
+      await say(OTHER, 'כן');
+      expect(posts(/bookSession/)).toHaveLength(1);
+      expect(last(OTHER)).toMatch(/בוצע ✅ נרשמת לALL IN ב-18:00 היום\.\nאימתתי את זה עכשיו מול Arbox\./);
+      const r = await say(AGG, 'תרשמי אותי לאימון כוח היום ב-19');
+      expect(r.route).toMatch(/^tomer/);
+      expect(last(AGG)).not.toMatch(/לאשר\?|בוצע ✅/);
+      expect(last(AGG)).toMatch(/העברתי את הבקשה לצוות\.[\s\S]*עדיין לא נרשמת/);
+      expect(posts(/bookSession/)).toHaveLength(1);                               // no write for the outside-club member
+      expect(tasksOf(AGG).filter(t => t.status === 'open')).toHaveLength(1);
+    } finally { delete process.env.ARBOX_WRITE_AUDIENCE; }
+  });
+
   test('Arbox answers 500 (as it did once on 2026-11-18): nothing is claimed, nothing is sent again, the staff are told the exact state', async () => {
     setup();
     await say(TESTER, 'תרשום אותי לALL IN היום ב-18');

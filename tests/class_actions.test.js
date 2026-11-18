@@ -489,9 +489,9 @@ describe('A. the gateway: the exact request, and the three switches', () => {
     // since 2026-11-18 booking and cancelling a class are verified against Arbox (owner's test member); being verified is
     // still not enough: the operation must be named, and the switch must be on
     expect(g.writeStatus().class_cancel).toMatchObject({ contractVerified: true, needsAllowList: true, namedInAllowList: false, executable: false });
-    expect(g.writeStatus().class_move_late).toMatchObject({ contractVerified: false, executable: false });
+    expect(g.writeStatus().class_move_late).toMatchObject({ contractVerified: true, executable: false });      // verified on 2026-11-18 18:44; still off unless named
     delete process.env.ARBOX_TEST_ASSUME_CONTRACT; process.env.ARBOX_WRITE_OPS = 'class_book,class_cancel,class_move_late,membership_hold,membership_cancel'; g = fresh();
-    expect(['class_book', 'class_cancel', 'class_move_late', 'membership_hold', 'membership_cancel'].map(op => g.writesEnabled(op))).toEqual([true, true, false, false, false]);   // naming an unverified operation does not open it
+    expect(['class_book', 'class_cancel', 'class_move_late', 'membership_hold', 'membership_cancel'].map(op => g.writesEnabled(op))).toEqual([true, true, true, false, false]);   // naming an unverified operation (freeze, membership cancel) does not open it
     delete process.env.ARBOX_WRITES_ENABLED; g = fresh();
     expect(g.writesEnabled('class_book')).toBe(false);                     // verified and named, switch off → off
     expect(seen).toHaveLength(0);                                          // none of this sent anything

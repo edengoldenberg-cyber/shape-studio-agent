@@ -59,6 +59,7 @@ const REASON_HE = {
   current_started:           'השיעור שממנו מבקשים לעבור כבר התחיל.',
   same_class:                'השיעור המבוקש הוא השיעור שהיא כבר רשומה אליו.',
   not_in_test_audience:      'פעולות הרישום של תומר פתוחות כרגע למספרי בדיקה בלבד.',
+  external_member:           'חבר/ת מועדון חיצוני: רישום, ביטול ומעבר נעשים על ידי הצוות.',
 };
 
 const digits = p => String(p ?? '').replace(/[^\d]/g, '');
@@ -85,6 +86,10 @@ function createClassActions({ gateway, logger, now = () => new Date(), sleep = m
     if (!need.every(enabled)) return refuse('writes_disabled');
     if (!audience(phone)) return refuse('not_in_test_audience');
     if (!member?.userId) return refuse('member_not_identified');
+    // Owner policy (2026-11-18): for members of an outside club (and any row that is not a studio client) Tomer does not
+    // write to Arbox - the request goes to the staff. A member whose role was not read is not refused here: identity
+    // itself is checked above and by the caller.
+    if (member.role && member.role !== 'client') return refuse('external_member');
     const steps = [];
     let membershipUserId = null, late = false;
 
