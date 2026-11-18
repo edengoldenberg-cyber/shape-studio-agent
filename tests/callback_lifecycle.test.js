@@ -1893,6 +1893,17 @@ describe('14. The conversation of 2026-11-18 21:08: a price question while a cal
     expect(lastTo(phone)).toMatch(/אין לי כאן מחיר מעודכן[\s\S]*ולגבי השיחה: יום רביעי, 18\.11\.2026 בשעה 21:20 — לאשר\?$/);
     expect(openApt(phone)).toBeFalsy();
 
+    // a question about something else: answered by the ordinary route, the waiting time is kept and asked about again
+    n = textsTo(phone).length;
+    mockAi.queue.push('יש חניה חינם ממש ליד הסטודיו 🙂');
+    setNow(at(150)); r = await say(phone, 'ויש אצלכם חניה?', { at: at(150) });
+    expect(r.route).toBe('barak');
+    expect(textsTo(phone)).toHaveLength(n + 1);
+    expect(lastTo(phone)).toBe('יש חניה חינם ממש ליד הסטודיו 🙂\nולגבי השיחה: יום רביעי, 18.11.2026 בשעה 21:20 — לאשר?');
+    expect(store.getLead(phone).meta.pendingCallbackConfirm.at).toBe(il(2026, 11, 18, 21, 20).toISOString());
+    expect(openApt(phone)).toBeFalsy();
+    expect(alerts()).toHaveLength(0);
+
     // the confirmation: now the request is saved, for exactly that moment
     n = textsTo(phone).length;
     setNow(at(155)); r = await say(phone, 'כן', { at: at(155) });
@@ -1905,6 +1916,11 @@ describe('14. The conversation of 2026-11-18 21:08: a price question while a cal
     setNow(at(165)); await say(phone, 'פרסלי', { at: at(165) });
     expect(summaries()).toHaveLength(1);
     expect(summaries()[0].body).toMatch(/21:20/);
+    expect(store.getLead(phone).meta.pendingCallbackConfirm ?? null).toBeNull();
+    expect(aptStore.getAll().filter(a => a.leadPhone === phone)).toHaveLength(1);       // one request
+    setNow(at(175)); await say(phone, 'כן', { at: at(175) });                           // a late extra "כן" creates nothing
+    expect(aptStore.getAll().filter(a => a.leadPhone === phone)).toHaveLength(1);
+    expect(summaries()).toHaveLength(1);                                               // one summary
 
     // the location went out once in the whole conversation
     expect(wazeTo(phone)).toHaveLength(1);
@@ -1986,6 +2002,47 @@ describe('14. The conversation of 2026-11-18 21:08: a price question while a cal
     setNow(at(90 + 11 * 60)); r = await say(p2, 'כן', { at: at(90 + 11 * 60) });     // confirmed after the moment has passed
     expect(lastTo(p2)).toMatch(/המועד הזה כבר עבר/);
     expect(openApt(p2)).toBeFalsy();
+  });
+
+  test('the address is asked while a time waits: one location message, the time is kept; when the moment passes a new time is asked for', async () => {
+    const phone = await upToInvitation();
+    setNow(at(80)); await say(phone, 'כן בבקשה', { at: at(80) });
+    setNow(at(90)); await say(phone, 'עוד עשר דקות', { at: at(90) });                  // 21:10:06 → 21:20
+    const w = wazeTo(phone).length, n = textsTo(phone).length;
+    setNow(at(100)); await say(phone, 'מה הכתובת שלכם?', { at: at(100) });
+    expect(textsTo(phone)).toHaveLength(n + 1);
+    expect(wazeTo(phone)).toHaveLength(w + 1);
+    expect(lastTo(phone)).toMatch(/^דרך השדה 12, פרדס חנה-כרכור 🗺️\nhttps:\/\/waze\.com\/\S+\nולגבי השיחה: יום רביעי, 18\.11\.2026 בשעה 21:20 — לאשר\?$/);
+    expect(openApt(phone)).toBeFalsy();
+    setNow(at(110)); const r = await say(phone, 'מאשר', { at: at(110) });
+    expect(r.route).toBe('appointment_created');
+    expect(openApt(phone).scheduledAt.toISOString()).toBe(il(2026, 11, 18, 21, 20).toISOString());
+
+    const p2 = await upToInvitation();
+    setNow(at(80)); await say(p2, 'כן בבקשה', { at: at(80) });
+    setNow(at(90)); await say(p2, 'עוד עשר דקות', { at: at(90) });
+    mockAi.queue.push('יש חניה חינם ממש ליד הסטודיו 🙂');
+    setNow(at(90 + 12 * 60)); await say(p2, 'ויש אצלכם חניה?', { at: at(90 + 12 * 60) });   // the moment has passed meanwhile
+    expect(lastTo(p2)).toBe('יש חניה חינם ממש ליד הסטודיו 🙂\nהמועד שכתבת לשיחה כבר עבר 🙂 מתי נוח לך שנחזור אליך? (יום ושעה)');
+    expect(store.getLead(p2).meta.pendingCallbackConfirm ?? null).toBeNull();
+    expect(openApt(p2)).toBeFalsy();
+  });
+
+  test('quiet hours: a reply to the person who has just written is sent; a proactive message waits, and nothing is promised', async () => {
+    const wa = jest.requireActual('../services/whatsapp.service');
+    const demo = require('../utils/demo_capture');
+    setNow(il(2026, 11, 18, 23, 5));
+    demo.record.mockClear();
+    wa.markInbound('quiet-in-1', '972000000001');                                     // the pipeline is handling her message
+    const reply = await wa.sendText('972000000001', 'רק לוודא: יום חמישי, 19.11.2026 בשעה 10:00.\nלאשר?');
+    expect(reply.queued).toBeUndefined();
+    expect(reply.idMessage).toMatch(/^demo-/);                                         // went out (to the demo sink)
+    const proactive = await wa.sendText('972000000002', 'תזכורת יזומה');              // somebody who did not write now
+    expect(proactive.queued).toBe(true);
+    const sentTexts = demo.record.mock.calls.map(c => c[1]?.preview ?? '');
+    expect(sentTexts).toHaveLength(1);                                                 // only the reply went out
+    expect(sentTexts.join(' ')).not.toMatch(/מחר בבוקר|קיבלנו את הודעתך/);
+    wa.markInbound('quiet-in-none', null);
   });
 
   test('"every membership includes every kind of class" is not said while the owner has not approved it', async () => {

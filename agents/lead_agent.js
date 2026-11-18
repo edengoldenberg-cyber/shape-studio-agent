@@ -1429,6 +1429,7 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
       store.logEvent('reply_suppressed_stale', from, { path: 'deterministic', preview: deterministicResult.reply.slice(0, 60) });
       return { reply: deterministicResult.reply, score: 0, status: 'cold', sendState: 'skipped_stale' };
     }
+    deterministicResult.reply = withPendingCallback(from, deterministicResult.reply);
     try {
       await sendText(from, deterministicResult.reply);
     } catch (sendErr) {
@@ -1643,6 +1644,7 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
     return { reply, score, status: _preSendSt, sendState: 'skipped_status_changed' };
   }
 
+  reply = withPendingCallback(from, reply);
   let sendState = 'sent';
   try {
     await sendText(from, reply);
@@ -1813,6 +1815,25 @@ function recordSchedulingExchange(phone, userText, agentReply) {
  * the AI having used one exact proposal phrase.
  */
 const INVITE_CONTEXT_RE = /שיחה|נציג|יחזור אליך|יחזרו אליך|לחזור אליך|נחזור אליך|יתקשר|להתקשר|מתי נוח|באיזו שעה|איזה שעה|מתי אפשר/;
+/**
+ * A relative time ("עוד עשר דקות") that waits for the lead's confirmation is kept while other questions are answered:
+ * the answer ends with the same question again, so the last thing asked is always the confirmation. When the moment
+ * has passed, the waiting time is dropped and a new one is asked for. Nothing is saved here.
+ */
+function withPendingCallback(phone, reply) {
+  const lead = store.getLead(phone);
+  const p = lead?.meta?.awaitingCallbackTime === true ? lead.meta.pendingCallbackConfirm : null;
+  if (!p?.at || !reply || /לאשר\?\s*$/.test(String(reply))) return reply;
+  const at = new Date(p.at);
+  const body = String(reply).replace(/\n?המיקום מתאים לך\?\s*$/, '').trimEnd();     // one question at the end, not two
+  if (!(at.getTime() > Date.now())) {
+    store.upsertLead(phone, { meta: { ...lead.meta, pendingCallbackConfirm: null } });
+    store.logEvent('callback_relative_time_expired', phone, { at: p.at });
+    return `${body}\nהמועד שכתבת לשיחה כבר עבר 🙂 מתי נוח לך שנחזור אליך? (יום ושעה)`;
+  }
+  return `${body}\nולגבי השיחה: ${require('../utils/callback_time').formatCallbackTime(at)} — לאשר?`;
+}
+
 function isCallbackInviteContext(phone) {
   const lead = store.getLead(phone);
   if (!lead) return false;
@@ -1823,5 +1844,5 @@ function isCallbackInviteContext(phone) {
   return !!lastAssistant && INVITE_CONTEXT_RE.test(String(lastAssistant.content ?? ''));
 }
 
-module.exports = { buildKnowledgeContext, isCallbackInviteContext, handleInbound, clearSession, generateLeadBrief, sendIntroOffer, getLastDebugContext, recordSchedulingExchange, computeLeadProfile, TIME_PATTERN, TIME_REJECTION_RE, extractNameFromMessage, postProcessReply, CALLBACK_NEXT_STEP };
+module.exports = { buildKnowledgeContext, withPendingCallback, isCallbackInviteContext, handleInbound, clearSession, generateLeadBrief, sendIntroOffer, getLastDebugContext, recordSchedulingExchange, computeLeadProfile, TIME_PATTERN, TIME_REJECTION_RE, extractNameFromMessage, postProcessReply, CALLBACK_NEXT_STEP };
 

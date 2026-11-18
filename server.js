@@ -4000,8 +4000,11 @@ async function handleLeadCallbackFlow({ msg, fromNorm, fromIsraeli, clientMatch,
       patchMeta({ pendingCallbackConfirm: null });
       return finish('callback_time_requested', `אין בעיה 🙂 מתי נוח לך שנחזור אליך? (יום ושעה)`, { routeIntent: 'representative' });
     }
-    // a new time replaces the one that waited; any other message that is not about the price drops it (not a confirmation)
-    if (hasTime || !_priceTopic) patchMeta({ pendingCallbackConfirm: null });
+    // The time that waits is replaced only by a new time, and dropped only by an explicit refusal of the call or when
+    // it has passed. Any other message (the address, a class, anything) is answered by the ordinary route and the
+    // same question is asked again at the end of that answer (lead_agent.withPendingCallback) - it is not a
+    // confirmation, and nothing is saved.
+    if (hasTime || CALL_DECLINED_RE.test(text)) patchMeta({ pendingCallbackConfirm: null });
   }
 
   if (_priceTopic && !isRequest && (awaiting || _accepts)) {
@@ -4107,7 +4110,7 @@ async function processInboundWAMessage(msg) {
   const fromIsraeli = e164ToIsraeli(fromNorm);
 
   // every reply sent while this message is handled is tied to it: the same text is never sent twice for one message
-  try { require('./services/whatsapp.service').markInbound?.(msg.messageId); } catch { /* the guard is optional */ }
+  try { require('./services/whatsapp.service').markInbound?.(msg.messageId, fromNorm); } catch { /* the guard is optional */ }
 
   // ── Deduplication: skip if Green API already delivered this messageId ────────
   if (_isDuplicateInbound(msg.messageId)) {
@@ -5279,6 +5282,7 @@ async function processInboundWAMessage(msg) {
         });
     } else {
       try {
+        barakReply = leadAgent.withPendingCallback(fromNorm, barakReply);   // a time that waits for confirmation is asked about again
         const sendResult = await sendText(fromNorm, barakReply);
         if (sendResult?.idMessage) _recordBotSend(sendResult.idMessage, fromNorm);
         _markReplied(fromNorm); // start cooldown window so a quick follow-up doesn't double-fire

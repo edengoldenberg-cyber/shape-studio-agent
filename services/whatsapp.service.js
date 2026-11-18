@@ -179,7 +179,7 @@ const quietQueue = [];
 const { AsyncLocalStorage } = require('async_hooks');
 const _inboundCtx = new AsyncLocalStorage();
 /** Called by the pipeline when it starts handling an inbound message: sends made from here on belong to it. */
-function markInbound(messageId) { if (messageId) _inboundCtx.enterWith({ id: String(messageId) }); }
+function markInbound(messageId, from = null) { if (messageId) _inboundCtx.enterWith({ id: String(messageId), from: from ? String(from) : null }); }
 const DUP_SEND_WINDOW_MS = 20 * 1000;
 const DUP_INBOUND_TTL_MS = 10 * 60 * 1000;
 const _recentSends = new Map();
@@ -197,9 +197,14 @@ async function sendText(to, text, { bypassQuietHours = false, linkPreview = true
     return { duplicate: true, idMessage: null };
   }
   if (!bypassQuietHours && isQuietHours()) {
+    // Quiet hours stop PROACTIVE messages. A reply to a message this person has just written is not one: it is sent,
+    // so the conversation (and a request for a call at a permitted future time) continues at night as well.
+    const _ctx = _inboundCtx.getStore();
+    if (_ctx?.from && _ctx.from === String(to)) return _dispatch(to, text, { linkPreview });
+    // Anything else waits for the morning release. Nothing is sent now: "נחזור אליך מחר בבוקר" was a promise nobody
+    // had made (owner, 2026-11-18) - quiet hours are not a commitment to call back.
     logger.info('Quiet hours active — queuing message', { to });
     quietQueue.push({ to, text, queuedAt: new Date() });
-    await _dispatch(to, `קיבלנו את הודעתך 🙂 נחזור אליך מחר בבוקר. ערב טוב!`);
     return { queued: true, releaseAt: nextMorningRelease() };
   }
   return _dispatch(to, text, { linkPreview });
