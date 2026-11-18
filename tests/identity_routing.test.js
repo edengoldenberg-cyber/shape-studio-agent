@@ -808,3 +808,147 @@ describe('Registration carried out in Arbox for the test phone only', () => {
     expect(mockOut.alerts.length).toBeGreaterThanOrEqual(1);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Third live test, 2026-11-18 13:20–13:22 (writes on for the test phone). The booking was real and verified:
+//   "תרשום אותי ליוגה בשעה 8:30" → "ביום שישי ב8:30" → "כן" → booked in Arbox, read back.
+//   "תבטל אותי מהשיעור בבקשה"            → "no booking today", handed to the staff
+//   "תבטל אותי מהיוגה ביום שישי בבקשה"   → Arbox was read and DID return the booking (08:30) - and Tomer still said it
+//                                           was not found, because a booking was recognised only by an hour in the message.
+describe('Book → cancel on the wrong day → the right day → cancelled (live failure 2026-11-18 13:22)', () => {
+  const P = '972507150001';
+  const store2 = () => require('../utils/tomer_store');
+  const tasksOf = p => store2().getTasks({ phone: p, type: 'class_change' });
+  const openOf = p => tasksOf(p).filter(t => t.status === 'open');
+  const last = p => textsTo(p).at(-1) ?? '';
+  const posts = re => arbox.writes().filter(w => re.test(w.path));
+  const row = (id, date, start, name, registered, cap) => ({ schedule_id: id, date, start_time: start, end_time: `${String(Number(start.slice(0, 2)) + 1).padStart(2, '0')}:${start.slice(3)}`, session_name: name, staff_member: { name: 'רעיה לוי' }, max_participants: cap, registration_count: registered, disable_cancellation_time: 12, enable_late_cancellation: 1 });   // the cancellation rule, as the real Arbox rows carry it
+  const FRI = day(4);                                                              // T0 is Monday 2026-11-16 10:00 → Friday 2026-11-20
+  let uid2;
+  function setup({ writes = true, phone = P } = {}) {
+    world();
+    for (const t of store2().getOpenTasks()) store2().resolveTask(t.id, { resolutionNote: 'test reset', resolvedBy: 'test' });
+    uid2 = person({ phone: '0' + phone.slice(3), first: 'בדיקה' });
+    plan(uid2, { start: day(0), end: null });
+    arbox.state.schedule.push(row(51, day(0), '09:15', 'אימון כח', 5, 10), row(52, day(0), '18:00', 'ALL IN', 3, 10), row(53, FRI, '08:30', 'יוגה', 2, 10), row(54, FRI, '10:30', 'אימון כח', 6, 10));
+    // the baseline of the live test: a booking today in a class that already took place
+    arbox.state.bookings.push({ user_id: uid2, date: day(0), time: '09:15', class_name: 'אימון כח', staff_member: 'רעיה לוי', check_in: 'No', sessions_left: null, membership_type_name: 'מנוי חודשי' });
+    if (writes) { process.env.ARBOX_WRITES_ENABLED = 'true'; process.env.ARBOX_WRITE_OPS = 'class_book,class_cancel'; process.env.ARBOX_WRITE_TEST_PHONES = phone; }
+    delete process.env.ARBOX_WRITE_AUDIENCE;
+  }
+  afterEach(() => { delete process.env.ARBOX_WRITES_ENABLED; delete process.env.ARBOX_WRITE_OPS; delete process.env.ARBOX_WRITE_TEST_PHONES; });
+  const fri = b => b.user_id === uid2 && b.date === FRI && b.time === '08:30';
+
+  test('the whole sequence: book → "כן" → read back → cancel with no day → the Friday booking is found → "כן" → cancelled and read back', async () => {
+    setup();
+    await say(P, 'תרשום אותי ליוגה בשעה 8:30');
+    expect(last(P)).toMatch(/לא מצאתי ב-Arbox שיעור כזה ב-08:30 היום\./);            // today there is no yoga
+    expect(last(P)).toMatch(/עדיין לא נרשמת לשום שיעור/);
+    await say(P, 'ביום שישי ב8:30');
+    expect(last(P)).toMatch(/רק לוודא לפני שאני משנה ב-Arbox:\nרישום ליוגה ב-08:30, ביום שישי 20\.11\.\nלאשר\?/);
+    await say(P, 'כן');
+    expect(last(P)).toMatch(/בוצע ✅ נרשמת ליוגה ב-08:30 ביום שישי 20\.11\.\nאימתתי את זה עכשיו מול Arbox\./);
+    expect(arbox.state.bookings.filter(fri)).toHaveLength(1);                      // the evidence: this member, this day, this hour
+    expect(posts(/bookSession/)).toHaveLength(1);
+    const alertsAfterBooking = mockOut.alerts.length;
+
+    // immediately after the write: the cancellation reads the member's bookings afresh and finds the booking just made
+    await say(P, 'תבטל אותי מהשיעור בבקשה');
+    expect(last(P)).toMatch(/רק לוודא לפני שאני משנה ב-Arbox:\nביטול הרישום ליוגה ב-08:30, ביום שישי 20\.11\.\nלאשר\?/);
+    expect(last(P)).not.toMatch(/לא מצאתי|לצוות/);
+    expect(posts(/cancelUserBooking/)).toHaveLength(0);                            // nothing is cancelled before the written "כן"
+    expect(arbox.state.bookings.filter(fri)).toHaveLength(1);
+    await say(P, 'כן');
+    expect(posts(/cancelUserBooking/)).toHaveLength(1);
+    expect(posts(/cancelUserBooking/)[0].body).toMatchObject({ user_id: uid2, schedule_id: 53 });
+    expect(last(P)).toMatch(/בוצע ✅ הרישום שלך ל-08:30 ביום שישי 20\.11 בוטל\.\nאימתתי את זה עכשיו מול Arbox\./);
+    expect(arbox.state.bookings.filter(fri)).toHaveLength(0);                      // removed in Arbox
+    expect(arbox.state.bookings.filter(b => b.user_id === uid2)).toHaveLength(1);  // the baseline booking was not touched
+    expect(openOf(P)).toHaveLength(0);                                             // nothing is left with the staff
+    expect(mockOut.alerts.length).toBe(alertsAfterBooking);                        // and they were not alerted
+  });
+
+  test('a cancellation "for today" does not cancel Friday: today\'s class has started, the Friday booking is offered and asked about; "כן" identifies it, a second "כן" confirms the action', async () => {
+    setup();
+    arbox.state.bookings.push({ user_id: uid2, date: FRI, time: '08:30', class_name: 'יוגה', staff_member: 'רעיה לוי', check_in: 'No', sessions_left: null, membership_type_name: 'מנוי חודשי' });
+    const cancelTasksBefore = tasksOf(P).filter(x => x.kind === 'cancel').length;   // the task file is shared by the suite
+    await say(P, 'תבטל אותי מהשיעור היום בבקשה');
+    const t = last(P);
+    expect(t).toMatch(/בדקתי ב-Arbox ולא מצאתי רישום שלך היום\./);
+    expect(t).toMatch(/אימון כח של היום ב-09:15 כבר התחיל, אז אין מה לבטל בו\./);
+    expect(t).toMatch(/יש לך רישום ליוגה ביום שישי 20\.11 ב-08:30\. אליו התכוונת\?/);
+    expect(t).toMatch(/שום דבר לא בוטל\./);
+    expect(t).not.toMatch(/לצוות|הרישום שלך לא בוטל עד/);
+    expect(posts(/cancelUserBooking/)).toHaveLength(0);
+    expect(mockOut.alerts).toHaveLength(0);                                        // a clarification: the staff are not alerted
+    expect(openOf(P)).toHaveLength(1);
+    expect(openOf(P)[0]).toMatchObject({ kind: 'cancel', missing: 'which_class' });
+    await say(P, 'כן');                                                            // "yes, that one" - identifies the booking
+    expect(last(P)).toMatch(/ביטול הרישום ליוגה ב-08:30, ביום שישי 20\.11\.\nלאשר\?/);
+    expect(posts(/cancelUserBooking/)).toHaveLength(0);
+    await say(P, 'כן');                                                            // the written confirmation of the exact action
+    expect(posts(/cancelUserBooking/)).toHaveLength(1);
+    expect(last(P)).toMatch(/הרישום שלך ל-08:30 ביום שישי 20\.11 בוטל/);
+    expect(openOf(P)).toHaveLength(0);
+    expect(tasksOf(P).filter(x => x.kind === 'cancel').length - cancelTasksBefore).toBe(1);   // one request with its history, not two
+  });
+
+  test.each([
+    'תבטל אותי מהיוגה ביום שישי בבקשה',
+    'תבטלי לי את היוגה',
+    'אני לא אגיע ביום שישי',
+    'תבטל לי את השיעור של שישי ב-8:30',
+    'לבטל את הרישום ליוגה בשישי',
+  ])('an explicit cancellation in other words — "%s" — finds the Friday booking and asks to confirm exactly it', async q => {
+    setup();
+    arbox.state.bookings.push({ user_id: uid2, date: FRI, time: '08:30', class_name: 'יוגה', staff_member: 'רעיה לוי', check_in: 'No', sessions_left: null, membership_type_name: 'מנוי חודשי' });
+    await say(P, q);
+    expect(last(P)).toMatch(/ביטול הרישום ליוגה ב-08:30, ביום שישי 20\.11\.\nלאשר\?/);
+    expect(posts(/cancelUserBooking/)).toHaveLength(0);
+    expect(mockOut.alerts).toHaveLength(0);
+  });
+
+  test('"לא" to "אליו התכוונת?" cancels nothing and closes the question; several bookings → she is asked which', async () => {
+    setup();
+    arbox.state.bookings.push({ user_id: uid2, date: FRI, time: '08:30', class_name: 'יוגה', staff_member: 'רעיה לוי', check_in: 'No', sessions_left: null, membership_type_name: 'מנוי חודשי' });
+    await say(P, 'תבטל אותי מהשיעור היום');
+    await say(P, 'לא');
+    expect(last(P)).toMatch(/לא ביטלתי דבר/);
+    expect(openOf(P)).toHaveLength(0);
+    arbox.state.bookings.push({ user_id: uid2, date: FRI, time: '10:30', class_name: 'אימון כח', staff_member: 'רעיה לוי', check_in: 'No', sessions_left: null, membership_type_name: 'מנוי חודשי' });
+    await say(P, 'תבטל אותי ביום שישי');
+    expect(last(P)).toMatch(/מצאתי כמה רישומים שמתאימים:\n• יוגה ביום שישי 20\.11 ב-08:30\n• אימון כח ביום שישי 20\.11 ב-10:30\nאיזה מהם לבטל\?/);
+    await say(P, 'את האימון כוח');
+    expect(last(P)).toMatch(/ביטול הרישום לאימון כח ב-10:30, ביום שישי 20\.11\.\nלאשר\?/);
+    expect(posts(/cancelUserBooking/)).toHaveLength(0);
+  });
+
+  test('Arbox cannot be read: it is said as "could not check" and goes to the staff — never "no booking"; no booking at all is said only when Arbox shows none', async () => {
+    setup();
+    arbox.state.bookings.length = 0;
+    await say(P, 'תבטל אותי מהיוגה ביום שישי');
+    expect(last(P)).toMatch(/בדקתי ב-Arbox ואין לך כרגע רישום עתידי לשיעור, כך שאין מה לבטל\./);
+    expect(last(P)).not.toMatch(/לא בוטל עד/);
+    expect(openOf(P)).toHaveLength(0);
+    expect(mockOut.alerts).toHaveLength(0);
+    arbox.mode.down = true; gateway.clearCache();
+    await say(P, 'תבטל אותי מהיוגה ביום שישי');
+    arbox.mode.down = false; gateway.clearCache();
+    const t = last(P);
+    expect(t).not.toMatch(/אין לך כרגע רישום|לא מצאתי רישום/);
+    expect(t).toMatch(/לא הצלחתי|אין לי כרגע גישה/);
+  });
+
+  test('writes off (every other member): the Friday booking is found and the request goes to the staff, saying the booking is still there', async () => {
+    setup({ writes: false, phone: '972507150002' });
+    const Q = '972507150002';
+    arbox.state.bookings.push({ user_id: uid2, date: FRI, time: '08:30', class_name: 'יוגה', staff_member: 'רעיה לוי', check_in: 'No', sessions_left: null, membership_type_name: 'מנוי חודשי' });
+    await say(Q, 'תבטל אותי מהיוגה ביום שישי בבקשה');
+    const t = last(Q);
+    expect(t).toMatch(/בדקתי ב-Arbox: יש לך רישום ליוגה ב-08:30 ביום שישי 20\.11\./);
+    expect(t).toMatch(/העברתי את הבקשה לצוות\.\nהרישום שלך לא בוטל עד שהצוות יאשר לך כאן\./);
+    expect(t).not.toMatch(/לא מצאתי/);
+    expect(arbox.writes()).toHaveLength(0);
+    expect(mockOut.alerts).toHaveLength(1);
+  });
+});

@@ -497,14 +497,18 @@ describe('C. Classes: a request to book / cancel / move goes to the class flow (
   test('"cannot come" with no booking → nothing to cancel (no invented cancellation)', async () => {
     const m = member();
     await say(m.phone, 'לא יכולה להגיע מחר לשיעור');
-    expect(lastTo(m.phone)).toMatch(/לא מצאתי רישום שלך/);
+    // since 2026-11-18 the member's upcoming bookings are read: with none at all she is told so, and no staff task is opened
+    expect(lastTo(m.phone)).toMatch(/אין לך כרגע רישום עתידי לשיעור, כך שאין מה לבטל/);
+    expect(lastTo(m.phone)).not.toMatch(/לא בוטל עד|העברתי את הבקשה/);
   });
 
   test('move while writes are off: the existing booking is stated to be unchanged, one task, one alert', async () => {
     const m = member(); book(m, cls(1));
     await say(m.phone, 'נרשמתי להיום ב-19 ואני רוצה לעבור למחר ב-9');
     expect(lastTo(m.phone)).toMatch(/קיבלתי את הבקשה: מעבר/);
-    expect(lastTo(m.phone)).toMatch(/הרישום הקיים שלך לא השתנה/);
+    // since 2026-11-18: never "no booking was found" together with "your existing booking" in one reply
+    expect(lastTo(m.phone)).toMatch(/לא השתנה/);
+    expect(/לא מצאתי רישום/.test(lastTo(m.phone)) && /הרישום הקיים שלך/.test(lastTo(m.phone))).toBe(false);
     expect(taskAlerts()).toHaveLength(1);
     expect(taskAlerts()[0].subject).toMatch(/מעבר לשיעור אחר/);
     expect(arbox.writes()).toHaveLength(0);

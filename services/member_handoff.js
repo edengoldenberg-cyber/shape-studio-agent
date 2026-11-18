@@ -225,6 +225,84 @@ function createMemberHandoff(deps) {
     return { handled: true, kind: `question_${ask}`, taskId: existing.id, isNew: false, missing: existing.missing ?? null, alert: null, replyText, sendState };
   }
 
+  /**
+   * A cancellation that cannot be carried on yet: she is told what Arbox shows and asked what she meant. Nothing is
+   * cancelled, the staff are not alerted (the sweep alerts once if she does not answer), and "no booking" is said only
+   * when Arbox was read and shows none.
+   */
+  async function clarifyCancel(pk, { phone, text, name, ref, existing, pending }) {
+    const who = name ?? local(phone);
+    const t5 = x => String(x.time).slice(0, 5);
+    const dayOf = d => dayText({ date: d }, ref);
+    const one = x => `${x.className ?? 'שיעור'} ${dayOf(x.date)} ב-${t5(x)}`;
+    const lines = [];
+    const startedNote = (pk.startedToday ?? []).length && (!pk.day || pk.day === pk.today) ? `${pk.startedToday.map(x => `${x.className ?? 'השיעור'} של היום ב-${t5(x)}`).join(', ')} כבר התחיל, אז אין מה לבטל בו.` : null;
+    if (pk.state === 'none') {
+      const txt = ['בדקתי ב-Arbox ואין לך כרגע רישום עתידי לשיעור, כך שאין מה לבטל.', startedNote, 'אם משהו לא מסתדר, אפשר לכתוב לי ואעביר לצוות.'].filter(Boolean).join(' ');
+      let st = 'failed';
+      try { const r = pending?.has?.(phone) ? null : await sendText(phone, txt); st = r?.idMessage && !r.blocked ? 'sent' : r?.queued ? 'queued' : 'failed'; } catch { /* reported as failed */ }
+      tomerStore.appendAudit({ phone, memberName: who, event: 'member_handoff_reply', requestPreview: String(text).slice(0, 100), tomerAction: 'handoff:cancel — no upcoming booking in Arbox', replyPreview: txt.slice(0, 100), owner: 'tomer', sendState: st });
+      if (existing?.kind === 'cancel' && existing.missing) tomerStore.resolveTask(existing.id, { resolutionNote: 'אין ב-Arbox רישום עתידי לבטל', resolvedBy: 'tomer' });
+      return { handled: true, kind: 'cancel', taskId: null, isNew: false, missing: null, alert: null, replyText: txt, sendState: st };
+    }
+    const opts = pk.options.slice(0, 6);
+    if (pk.state === 'other' && pk.hadFilter) lines.push(`בדקתי ב-Arbox ולא מצאתי רישום שלך ${pk.day ? dayOf(pk.day) : 'שמתאים למה שכתבת'}.`);
+    if (startedNote) lines.push(startedNote);
+    const suggest = opts.length === 1 ? { date: opts[0].date, time: t5(opts[0]), className: opts[0].className ?? null } : null;
+    if (suggest) lines.push(`יש לך רישום ל${one(opts[0])}. אליו התכוונת?`);
+    else lines.push(`${pk.state === 'many' ? 'מצאתי כמה רישומים שמתאימים' : 'הרישומים הקרובים שלך'}:\n${opts.map(x => `• ${one(x)}`).join('\n')}\nאיזה מהם לבטל?`);
+    lines.push('שום דבר לא בוטל.');
+    const txt = lines.join(' ').replace(/ \n/g, '\n');
+    const detail = [`בקשה: ביטול רישום — בבירור מול המתאמנ/ת`, `רישומים עתידיים ב-Arbox: ${pk.upcoming.map(x => `${x.className ?? 'שיעור'} ${x.date} ${t5(x)}`).join(' | ')}`, `חסר: איזה רישום לבטל — המתאמנ/ת נשאל/ה`, `קריאות Arbox (קריאה בלבד): resolveMember → found · getBookings (14 יום) → ${pk.upcoming.length} עתידיים`].join('\n');
+    const ctx = { date: suggest?.date ?? null, time: suggest?.time ?? null, options: [], target: null, suggest, bookings: opts.map(x => ({ date: x.date, time: t5(x), className: x.className ?? null })) };
+    let task, isNew = false;
+    if (existing?.kind === 'cancel') task = tomerStore.updateTask(existing.id, { summary: `${KIND_HE.cancel} — בבירור מול המתאמנ/ת`, detail, memberMessage: text, missing: 'which_class', kind: 'cancel', pendingConfirm: null, ctx });
+    else {
+      task = tomerStore.createTask({ type: 'class_change', phone, memberName: who, arboxId: null, summary: `${KIND_HE.cancel} — בבירור מול המתאמנ/ת`, detail, memberMessage: text, priority: 'normal' });
+      task = tomerStore.updateTask(task.id, { kind: 'cancel', missing: 'which_class', ctx });
+      isNew = true;
+    }
+    const sendState = await reply(phone, txt, task, pending);
+    logger.info('[member-handoff] cancellation is being clarified with the member - nothing cancelled, nobody alerted', { tail: tail(phone), taskId: task.id, state: pk.state, upcoming: pk.upcoming.length, sendState });
+    return { handled: true, kind: 'cancel', taskId: task.id, isNew, missing: 'which_class', alert: null, replyText: txt, sendState };
+  }
+
+  /**
+   * Which booking does the member ask to cancel? Decided from her upcoming bookings as Arbox shows them now (a fresh
+   * read of the next 14 days), narrowed by whatever the message states: a day, an hour, a class type.
+   *   one        exactly one booking fits - that is the one (its own date is used from here on)
+   *   many       several fit - she is asked which
+   *   other      nothing fits what she wrote, but she has other upcoming bookings - she is asked whether she meant them
+   *   none       she has no upcoming booking at all
+   *   unreadable Arbox could not be read - never reported as "no booking"
+   * (Live test 2026-11-18 13:22: "תבטל אותי מהיוגה ביום שישי" - the booking WAS read from Arbox, and was still
+   * reported as not found, because a booking was recognised only by an hour written in the message.)
+   */
+  async function pickBookingToCancel(phone, text, ref, only = null) {
+    let member;
+    try { const r = await gateway.resolveMember(phone); if (r.status !== 'found') return { state: 'unreadable', why: `identity ${r.status}` }; member = r.member; }
+    catch (err) { return { state: 'unreadable', why: err.message }; }
+    const p = ilParts(ref), today = ilDateString(p), nowHm = hhmm(p.hour, p.minute);
+    const to = new Date(Date.parse(`${today}T00:00:00Z`) + 14 * 86400000).toISOString().slice(0, 10);
+    let all;
+    try { all = (await gateway.getBookings(member.userId, { from: today, to, fresh: true })).bookings; }
+    catch (err) { return { state: 'unreadable', why: err.message }; }
+    const t5 = x => String(x.time).slice(0, 5);
+    const upcoming = all.filter(x => x.date > today || t5(x) > nowHm);
+    const startedToday = all.filter(x => x.date === today && t5(x) <= nowHm);
+    if (only) { const hit = upcoming.find(x => x.date === only.date && t5(x) === String(only.time).slice(0, 5)); return hit ? { state: 'one', booking: hit, upcoming } : { state: upcoming.length ? 'other' : 'none', options: upcoming, upcoming, startedToday, day: null, hadFilter: true }; }
+    const dt = extractDayAndTime(text, ref), day = dt.day ? ilDateString(dt.day) : null, hrs = hoursIn(text), hint = typeHint(text);
+    let c = upcoming;
+    if (day) c = c.filter(x => x.date === day);
+    if (hrs.length) c = c.filter(x => matchHour(hrs[hrs.length - 1], [x.time]).matched);
+    if (hint) c = c.filter(x => hint[1].test(x.className ?? ''));
+    const hadFilter = !!(day || hrs.length || hint);
+    if (c.length === 1) return { state: 'one', booking: c[0], upcoming };
+    if (c.length > 1) return { state: 'many', options: c, upcoming };
+    if (!upcoming.length) return { state: 'none', startedToday, day, today };
+    return { state: 'other', options: upcoming, upcoming, startedToday, day, today, hadFilter };
+  }
+
   /** The facts of one class request, read from Arbox. Nothing is written. */
   async function readFacts(phone, text, ref, fixedDate = null, { membership = false } = {}) {
     const dt = extractDayAndTime(text, ref);
@@ -253,7 +331,13 @@ function createMemberHandoff(deps) {
   }
 
   /** Which class she is in, and which one she asks for — from the hours in the message and what Arbox shows. */
-  function resolveRequest(kind, text, f, latest = null) {
+  function resolveRequest(kind, text, f, latest = null, forced = null) {
+    // a cancellation of a booking that was already identified among the member's real bookings
+    if (kind === 'cancel' && forced) {
+      const t = String(forced.time).slice(0, 5);
+      const bk = (f.bookings ?? []).find(x => x.date === forced.date && String(x.time).slice(0, 5) === t) ?? null;
+      return { current: { h: Number(t.slice(0, 2)), min: Number(t.slice(3, 5)), matched: true, booking: bk }, target: null, missing: null };
+    }
     const hrs = hoursIn(text);
     const bookStarts = (f.bookings ?? []).map(b => b.time), classStarts = (f.classes ?? []).map(c => c.start);
     let current = null, target = null;
@@ -346,6 +430,19 @@ function createMemberHandoff(deps) {
     if (!kind && !answeredPending && recent && existing.ctx && turn.ask && !fromVoice) return answerAbout(turn.ask, { phone, text, existing, ref, pending });
     // the answer to what Tomer asked — an hour, or the class type — within the hour after the question. Never a question.
     if (!kind && existing?.missing && recent && turn.answerish && (hoursIn(text).length || (existing.kind === 'book' && typeHint(text)))) kind = existing.kind;
+    // the answer to "אליו התכוונת?" / "איזה מהם לבטל?" in a cancellation that is being clarified
+    let forcedCancel = null;
+    if (!kind && !answeredPending && recent && existing?.kind === 'cancel' && existing.missing === 'which_class' && turn.answerish) {
+      const t = String(text ?? '').trim();
+      if (NO_RE.test(t)) {
+        tomerStore.resolveTask(existing.id, { resolutionNote: 'המתאמנ/ת ענה/תה שלא לבטל — לא נשלחה בקשה ל-Arbox', resolvedBy: 'tomer' });
+        const txt = 'בסדר, לא ביטלתי דבר. הרישומים שלך נשארו כמו שהם 🙏';
+        const st = await reply(phone, txt, existing, pending);
+        return { handled: true, kind: 'cancel', taskId: existing.id, isNew: false, missing: null, alert: null, replyText: txt, sendState: st };
+      }
+      if (existing.ctx?.suggest && YES_RE.test(t)) { kind = 'cancel'; forcedCancel = existing.ctx.suggest; }
+      else if (hoursIn(t).length || typeHint(t) || extractDayAndTime(t, ref).day) kind = 'cancel';
+    }
     if (!kind) return null;
     if (existing && existing.kind !== kind && !existing.missing) existing = null;
 
@@ -353,8 +450,16 @@ function createMemberHandoff(deps) {
     // are kept, the newest message wins for what it states. A message that names its own day stands on its own.
     const carry = !pc && !!existing && kind === 'book' && existing.kind === 'book' && (!!existing.missing || (recent && !!existing.ctx && !extractDayAndTime(text, ref).day));
     const fullText = pc ? existing.memberMessage : (existing?.missing || carry) ? `${existing.memberMessage} ${text}` : text;
-    const f = await readFacts(phone, fullText, ref, pc?.date ?? null, { membership: kind === 'book' });
-    const rq = pc ? fromPending(pc, f) : resolveRequest(kind, fullText, f, (existing?.missing || carry) ? text : null);
+    // ── a cancellation: the booking is found among her real upcoming bookings BEFORE anything else ──
+    let cancelOf = null;
+    if (kind === 'cancel' && !pc) {
+      const pk = await pickBookingToCancel(phone, text, ref, forcedCancel);
+      if (pk.state === 'one') cancelOf = pk.booking;
+      else if (pk.state !== 'unreadable') return clarifyCancel(pk, { phone, text, name, ref, existing, pending });
+      // unreadable: goes on to the staff below, told as "could not check" - never as "no booking"
+    }
+    const f = await readFacts(phone, fullText, ref, cancelOf?.date ?? pc?.date ?? null, { membership: kind === 'book' });
+    const rq = pc ? fromPending(pc, f) : resolveRequest(kind, fullText, f, (existing?.missing || carry) ? text : null, cancelOf);
     const ctxRec = { date: f.date, time: rq.target ? hhmm(rq.target.h, rq.target.min) : null,
       options: (rq.target?.options ?? []).map(o => ({ scheduleId: o.scheduleId, start: o.start, name: o.name })),
       target: rq.target?.cls ? { scheduleId: rq.target.cls.scheduleId, time: hhmm(rq.target.h, rq.target.min), name: rq.target.cls.name } : null };
@@ -519,7 +624,8 @@ function createMemberHandoff(deps) {
       (res || (action?.plan && !action.plan.ok && !NO_PERMISSION.has(action.plan.reason)))
         ? `${res ? 'ניסיתי לבצע את זה ב-Arbox ולא הצלחתי' : `לא ביצעתי את זה בעצמי: ${action.plan.text}`} ${alert?.state === 'sent' ? 'העברתי את הבקשה לצוות.' : 'רשמתי את הבקשה לטיפול הצוות.'}`
         : alert?.state === 'sent' ? `אין לי הרשאה לשנות רישום בעצמי, אז העברתי את הבקשה לצוות.` : `אין לי הרשאה לשנות רישום בעצמי, אז רשמתי את הבקשה לטיפול הצוות.`,
-      kind === 'move' ? `הרישום הקיים שלך לא השתנה: הוא נשאר במקומו עד שהצוות יאשר לך כאן את המעבר.` : kind === 'cancel' ? `הרישום שלך לא בוטל עד שהצוות יאשר לך כאן.` : `עדיין לא נרשמת: הצוות יאשר לך כאן.`].join('\n');
+      kind === 'move' ? (cur?.booking || f.bookings === null ? `הרישום הקיים שלך לא השתנה: הוא נשאר במקומו עד שהצוות יאשר לך כאן את המעבר.` : `שום רישום לא השתנה.`)
+        : kind === 'cancel' ? (cur?.booking ? `הרישום שלך לא בוטל עד שהצוות יאשר לך כאן.` : `שום רישום לא בוטל.`) : `עדיין לא נרשמת: הצוות יאשר לך כאן.`].join('\n');
     const sendState = await reply(phone, replyText, task, pending);
     logger.info('[member-handoff] class request recorded for the staff', { tail: tail(phone), kind, taskId: task.id, isNew, missing: rq.missing, alert: alert?.state ?? null, sendState, arbox: f.calls });
     return { handled: true, kind, taskId: task.id, isNew, missing: rq.missing, alert, replyText, sendState, facts: f, request: rq };
