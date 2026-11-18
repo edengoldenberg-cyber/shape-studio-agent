@@ -169,6 +169,10 @@ describe('a WhatsApp conversation is not necessarily a sales lead', () => {
     const k2 = classifyAll([...batch], { peek, getThread: p => (p === replied.phone ? realIn : null) });
     expect(k2.get(replied.phone).kind).not.toBe('test');
     expect(threads.size).toBe(1);
+    // production 2026-11-18: a minute after the directory was read its answers are marked stale — the kind must not flip
+    const staleKinds = classifyAll(batch, { peek: () => id('unknown', { stale: true, ageMs: 5 * 60000 }), getThread: () => null });
+    expect([...staleKinds.values()].map(k => k.kind)).toEqual(['test', 'test', 'test', 'test', 'test']);
+    expect([...classifyAll(batch, { peek: () => id('unavailable', { stale: true }), getThread: () => null }).values()].map(k => k.kind)).toEqual(Array(5).fill('unclear'));
     // four such records are not a batch
     expect([...classifyAll(batch.slice(0, 4), { peek, getThread: () => null }).values()].every(k => k.kind !== 'test')).toBe(true);
   });

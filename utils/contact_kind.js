@@ -44,7 +44,9 @@ const realInbound = thread => (thread?.messages ?? []).some(m => m.direction ===
 function testBatch(leads, { peek, getThread }) {
   const cand = leads.filter(l => {
     const id = peek(l.phone);
-    return id?.category === 'unknown' && !id.stale && !realInbound(getThread(l.phone));
+    // "stale" is not a condition here: the directory counts as stale 60 seconds after it was read, and a copy too old to
+    // rely on is already answered as 'unavailable'. With it, the same record was a test at startup and a lead a minute later.
+    return id?.category === 'unknown' && !realInbound(getThread(l.phone));
   });
   const out = new Set(cand.filter(l => !validIsraeliMobile(l.phone)).map(l => l.phone));
   const times = cand.map(l => ({ phone: l.phone, t: new Date(l.firstSeen).getTime() })).filter(x => Number.isFinite(x.t)).sort((a, b) => a.t - b.t);
