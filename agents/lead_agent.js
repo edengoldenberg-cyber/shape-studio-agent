@@ -7,6 +7,7 @@ const store   = require('../utils/lead_store');
 const _persist = require('../utils/persist');
 const { sendText, alertOwner } = require('../services/whatsapp.service');
 const pricing = require('../utils/pricing');
+const salesRefusal = require('../utils/sales_refusal');
 const _aiFailureAlertAt = new Map();   // lead phone → when the manager was last told that the automatic reply failed
 const { tryDeterministicWazeReply, tryDeterministicScheduleReply } = require('./deterministic_reply');
 
@@ -299,8 +300,12 @@ function postProcessReply(reply, qualData, assets, ctx = {}) {
       out = kept.join('').trim();
       ppChanges.push('generic_closer_stripped');
     }
-    const settled = ctx?.hasPersistedCallback || qualData.callTimeGiven || qualData.callProposed || qualData.callbackDeclined || qualData.locationViable === false;
-    if (!settled && ctx?.userText && SALES_QUESTION_RE.test(ctx.userText) && !/\?/.test(out) && !INVITE_CONTEXT_RE.test(out)) {
+    const settled = ctx?.hasPersistedCallback || qualData.callTimeGiven || qualData.callProposed || qualData.callbackDeclined || qualData.locationViable === false
+      || qualData.registrationDeclined === true;
+    // Production, 2026-11-17: "תודה רבה על הניסיון" after "החלטתי לא להרשם" matched SALES_QUESTION_RE through the word
+    // "ניסיון" and the offer of a representative was added to a goodbye. A thank-you or a refusal is not a sales question.
+    const isAsk = ctx?.userText && SALES_QUESTION_RE.test(ctx.userText) && !salesRefusal.isCourtesy(ctx.userText) && !salesRefusal.isRefusal(ctx.userText);
+    if (!settled && isAsk && !/\?/.test(out) && !INVITE_CONTEXT_RE.test(out)) {
       out = `${out.trimEnd()}\n${CALLBACK_NEXT_STEP}`;
       ppChanges.push('next_step_offered');
     }
@@ -322,6 +327,15 @@ function postProcessReply(reply, qualData, assets, ctx = {}) {
       out = stripped;
     }
   }
+
+  // 4. After an explicit refusal to register no reply carries an offer of a call, a representative, a trial or
+  //    registration - whoever wrote it (the model or a rule above).
+  if (qualData.registrationDeclined === true) {
+    const cleaned = salesRefusal.stripOffers(out);
+    if (cleaned !== out) { ppChanges.push('offer_removed_after_refusal'); out = cleaned; }
+  }
+  // 5. Neutral wording: no "את/ה", "מחפש/ת" - the gender is not known and is not guessed.
+  { const neutral = salesRefusal.neutralWording(out); if (neutral !== out) { ppChanges.push('slash_wording_neutralised'); out = neutral; } }
 
   // Record for demo inspector
   _lastDebugCtx = { ...(_lastDebugCtx ?? {}), postProcess: { changes: ppChanges, clean: ppChanges.length === 0 } };
@@ -513,8 +527,8 @@ function buildStageContext(completedTurns, qualData, msgCount) {
       ``,
       knownSection,
       ``,
-      `REFRAME: "את/ה צודק/ת שכדאי להשוות. מה שאנחנו עושים שונה: כיתות של עד 8 אנשים`,
-      `על ציוד Reformer מקצועי, עם מדריך/ה שרואה אותך בכל תנועה."`,
+      `REFRAME: "נכון שכדאי להשוות. מה שאנחנו עושים שונה: כיתות של עד 8 אנשים`,
+      `על ציוד Reformer מקצועי, עם ליווי צמוד בכל תנועה."`,
       `Then ask ONE of: "כמה פעמים בשבוע חשבת להגיע?" OR propose a brief call.`,
       `FORBIDDEN: exact NIS, competitor names, "אין לי מידע על מחירים".`,
     ].join('\n');
@@ -689,6 +703,11 @@ function setQualData(phone, updates) {
 // Gives the team panel a one-glance summary without reading the conversation.
 
 function computeLeadProfile(lead, qualData, history) {
+  if (qualData.registrationDeclined === true) {
+    return { readiness: 'LOW', readinessEvidence: 'הודעה מפורשת על החלטה לא להירשם', qualificationReason: 'החליט/ה לא להירשם'.replace('/ה', ''),
+      nextBestAction: 'אין פעולה — בלי הצעות ובלי מעקב אוטומטי. שאלה חדשה תיענה.', appointmentState: 'declined', preferredCallTime: null,
+      interests: qualData.fitnessInterest ?? qualData.goal ?? null, location: qualData.location ?? null, updatedAt: new Date().toISOString() };
+  }
   const { scoreReadiness } = handoffService;
   const readiness = scoreReadiness(history ?? [], qualData);
 
@@ -1174,7 +1193,7 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
   const FRUSTRATION_RE = /תפסיק[יו]?|עצר[ו]?|מה זה בכלל|מה קורה פה|רובוט|בוט|מכונה|לא לאיים|מחריד|מה הבעיה|אל תשלח[יו]? יותר|לא רוצה לקבל הודעות|STOP\b|stop\b|אדם אמיתי|נציג אנושי|לא עונה לשאלה|לא מקשיב[ה]?|לא שומע[ת]?|שטויות|להציק|אל תציק|תעיף.*בוט|הסר.*בוט|בלי.*בוט|לא.*צריך.*בוט|תסגור.*בוט|תבטל.*בוט|עצור.*אוטומט/i;
   if (FRUSTRATION_RE.test(text)) {
     logger.warn('[lead_agent] Frustration detected', { from, preview: text.slice(0, 60) });
-    const frustMsg = `מצטער/ת! מעביר אותך עכשיו לנציג מהצוות שייצור קשר ישירות 😊`;
+    const frustMsg = `סליחה על זה! מעביר אותך עכשיו לנציג מהצוות שייצור קשר ישירות 😊`;
     await sendText(from, frustMsg).catch(() => {});
     // Use human_owns instead of deleting — preserves history for staff and survives restart.
     const existing2 = store.getLead(from) ?? {};
@@ -1405,7 +1424,11 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
     return { reply: deterministicResult.reply, score, status };
   }
 
-  const turnSystemPrompt = buildTurnSystemPrompt(completedTurns, freshQualData, name, from, msgCount);
+  const turnSystemPrompt = buildTurnSystemPrompt(completedTurns, freshQualData, name, from, msgCount)
+    + (freshQualData.registrationDeclined === true
+      ? '\n\n[REGISTRATION DECLINED] The lead said explicitly that they decided NOT to register. Answer only what was asked now, briefly and warmly. Do NOT offer a call, a representative, a trial lesson or registration, and do NOT ask qualification questions. End without a question.'
+      : '')
+    + '\n\nWORDING — ABSOLUTE RULE: never write slash forms such as "את/ה", "מחפש/ת", "תחליט/י". The lead\'s gender is unknown unless their own words show it: use neutral Hebrew ("מה מעניין אותך?", "אפשר ל...", "איך אפשר לעזור?") and never guess a gender.';
   const messagesForApi   = [
     { role: 'system', content: turnSystemPrompt },
     ...history,
@@ -1443,6 +1466,11 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
       store.logEvent('price_guard', from, { topic: _pg.topic, reason: _pg.reason });
       reply = _pg.reply;
     }
+    if (freshQualData.registrationDeclined === true) {
+      const _clean = salesRefusal.stripOffers(reply, 'אין לי כאן מידע מעודכן על זה 🙏');
+      if (_clean !== reply) { store.logEvent('offer_removed_after_refusal', from, {}); reply = _clean; }
+    }
+    reply = salesRefusal.neutralWording(reply);
 
     // ── State flags: set ONLY when AI reply confirms the action happened ──────
     //
@@ -1610,6 +1638,7 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
  * Highest weight goes to call-commitment signals.
  */
 function scoreLeadFromHistory(history, qualData = {}) {
+  if (qualData.registrationDeclined === true) return 2;     // decided not to register: never 'warm' or 'hot'
   const fullText = history.map(m => m.content).join(' ').toLowerCase();
   let score = 4; // baseline
 
@@ -1666,8 +1695,8 @@ async function sendIntroOffer(to, name) {
   const firstName = name?.split(' ')[0] ?? null;
   const greeting  = firstName ? `${firstName}, ` : '';
   const message =
-    `${greeting}אם תרצה/י לנסות לפני הכל — יש לנו הצעת היכרות למצטרפים חדשים.\n\n` +
-    `*2 אימונים לבחירה ב-60 ש״ח.* בלי התחייבות, פשוט תרגיש/י מה המקום נותן ותחליט/י.\n\n` +
+    `${greeting}אם מתאים לך לנסות לפני הכל — יש לנו הצעת היכרות למצטרפים חדשים.\n\n` +
+    `*2 אימונים לבחירה ב-60 ש״ח.* בלי התחייבות, אפשר להרגיש מה המקום נותן ולהחליט.\n\n` +
     `מעניין אותך? 💪`;
   await sendText(to, message);
 }

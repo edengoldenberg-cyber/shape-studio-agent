@@ -152,7 +152,8 @@ class LeadStore {
     const SKIP = new Set(['converted_member', 'opted_out', 'human_owns',
                           'call_scheduled', 'callback_requested', 'escalated', 'crisis',
                           'call_completed', 'call_cancelled', 'call_no_answer']);
-    return this.getAllLeads().filter(l => !SKIP.has(l.status));
+    // An explicit decision not to register stops every automated follow-up for that interest (owner rule 2026-11-18).
+    return this.getAllLeads().filter(l => !SKIP.has(l.status) && l.meta?.qualData?.registrationDeclined !== true);
   }
 
   getHotLeads()   { return this.getActiveLeads().filter(l => l.score >= 8); }

@@ -1447,3 +1447,135 @@ describe('11. Quiet hours (22:00–08:00 Israel) are in force', () => {
     expect(summaries()).toHaveLength(1);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Production, 2026-11-17 (historical conversation, replayed with invented phones): "אני בסוף החלטתי לא להרשם" →
+// a polite goodbye → "תודה רבה על הניסיון" → "…רוצה שנציג יחזור אליך ויעזור לבחור את האימון המתאים?". The offer was
+// added by a fixed rule in the code. Owner rules 2026-11-18, each checked through the real pipeline, in sequence.
+describe('12. An explicit refusal to register', () => {
+  const qd = phone => store.getLead(phone).meta.qualData ?? {};
+  const OFFER = /נציג|שיחה|ניסיון|להירשם|יחזור אליך|מתי נוח/;
+
+  test('refusal → goodbye → thanks: no offer of a representative, no model call, no manager message, no request created', async () => {
+    const phone = await newLead();
+    clearOut();
+    const ai = mockAi.calls, aptsBefore = diskApts().length;
+    const a = await say(phone, 'אני בסוף החלטתי לא להרשם');
+    expect(a.route).toBe('registration_declined');
+    expect(lastTo(phone)).toBe('תודה על העדכון 🙏 שיהיה בהצלחה!');
+    expect(qd(phone)).toMatchObject({ registrationDeclined: true, callbackDeclined: true, callProposed: false });
+    expect(store.getLead(phone)).toMatchObject({ status: 'cold' });
+    expect(store.getLead(phone).score).toBeLessThanOrEqual(2);
+
+    const b = await say(phone, 'תודה רבה על הניסיון');
+    expect(b.route).toBe('declined_courtesy');
+    expect(lastTo(phone)).toBe('בשמחה 🙏');
+    const c = await say(phone, '🙏');
+    expect(c.route).toBe('declined_silent');
+    expect(c.barakReply).toBeNull();
+
+    expect(textsTo(phone)).toHaveLength(2);
+    for (const t of textsTo(phone)) { expect(t.text).not.toMatch(OFFER); expect(t.text).not.toMatch(/\?/); }
+    expect(mockAi.calls).toBe(ai);
+    expect(alerts()).toHaveLength(0);
+    expect(diskApts().length).toBe(aptsBefore);
+    expect(store.getLead(phone).meta.awaitingCallbackTime).not.toBe(true);
+  });
+
+  test('the fixed "next step" rule itself: a thank-you that contains "ניסיון" gets no offer, even without a refusal', async () => {
+    const phone = await newLead();
+    clearOut();
+    mockAi.queue.push('בשמחה 😊 המשך יום נפלא.');
+    await say(phone, 'תודה רבה על הניסיון');
+    expect(lastTo(phone)).toBe('בשמחה 😊 המשך יום נפלא.');
+  });
+
+  test('refusal → back after several days with a thank-you, across a restart: the sale is not reopened and nothing follows up', async () => {
+    const phone = await newLead();
+    await say(phone, 'החלטתי בסוף שלא להמשיך');
+    clearOut();
+    setNow(il(2026, 11, 21, 10, 0));                          // five days later
+    restart();
+    expect(qd(phone).registrationDeclined).toBe(true);        // the decision survived the restart
+    expect(store.getSendableLeads().map(l => l.phone)).not.toContain(phone);
+    expect(store.getDormantLeads(3).map(l => l.phone)).not.toContain(phone);
+    const ai = mockAi.calls;
+    const r = await say(phone, 'היי, תודה רבה על הכל');
+    expect(r.route).toBe('declined_courtesy');
+    expect(lastTo(phone)).toBe('בשמחה 🙏');
+    await worker.runCycle(store);
+    expect(textsTo(phone)).toHaveLength(1);
+    expect(mockAi.calls).toBe(ai);
+    expect(alerts()).toHaveLength(0);
+  });
+
+  test('refusal → a new question about a price: the question is answered, with no offer added by the price guard', async () => {
+    const phone = await newLead();
+    await say(phone, 'אני בסוף החלטתי לא להרשם');
+    clearOut();
+    const r = await say(phone, 'רק שאלה, כמה עולה מנוי חודשי?');
+    expect(r.barakReply).toBeTruthy();
+    expect(lastTo(phone)).toMatch(/מחיר/);                    // the answer about the price (here: no approved price is saved)
+    expect(lastTo(phone)).not.toMatch(/נציג|יחזור אליך|\?/);
+    expect(qd(phone).registrationDeclined).toBe(true);        // a question does not reopen the sale
+  });
+
+  test('refusal → another new question: the model answers it and an offer it adds is removed', async () => {
+    const phone = await newLead();
+    await say(phone, 'לא מעוניינת, תודה');
+    clearOut();
+    mockAi.queue.push('יש חניה חופשית ממש ליד הסטודיו 🙂 רוצה שנתאם לך שיעור ניסיון?');
+    await say(phone, 'יש אצלכם חניה ליד?');
+    expect(lastTo(phone)).toBe('יש חניה חופשית ממש ליד הסטודיו 🙂');
+  });
+
+  test('refusal → an explicit request for a call: arranging a call is possible again', async () => {
+    const phone = await newLead();
+    await say(phone, 'אני בסוף החלטתי לא להרשם');
+    clearOut();
+    const r = await say(phone, 'חשבתי על זה שוב, אשמח שיחזרו אליי');
+    expect(qd(phone).registrationDeclined).toBe(false);
+    expect(r.route).not.toMatch(/declined/);
+    expect(lastTo(phone)).toMatch(/מתי|שעה/);                 // the callback flow asks for a time
+    await say(phone, 'מחר ב-10:30');
+    await say(phone, 'דנה');
+    expect(openApt(phone)).toMatchObject({ status: 'callback_pending' });
+    expect(summaries()).toHaveLength(1);
+  });
+
+  test('a refusal while a callback request is open is handled by the callback flow, and no offer follows', async () => {
+    const phone = await leadWithCallback({ timeText: 'מחר ב-10:30' });
+    clearOut();
+    await say(phone, 'בסוף החלטתי לא להרשם, אפשר לבטל');
+    expect(qd(phone).registrationDeclined).toBe(true);
+    for (const t of textsTo(phone)) expect(t.text).not.toMatch(/רוצה שנציג|שיעור ניסיון/);
+    clearOut();
+    await say(phone, 'תודה רבה');
+    for (const t of textsTo(phone)) expect(t.text).not.toMatch(OFFER);
+  });
+
+  test('a staff member took the conversation: the pause holds — a refusal, thanks and a question get no automatic reply', async () => {
+    const phone = await newLead();
+    const t = await post(`/api/leads/${phone}/takeover`, { reason: 'manual', staffName: 'eden' });
+    expect(t.body.status).toBe('human_owns');
+    clearOut();
+    const ai = mockAi.calls;
+    for (const text of ['אני בסוף החלטתי לא להרשם', 'תודה רבה על הניסיון', 'כמה עולה מנוי?', 'אשמח שיחזרו אליי']) {
+      const r = await say(phone, text);
+      expect([text, r.route]).toEqual([text, 'human_owns_hold']);
+    }
+    expect(mockOut.texts).toHaveLength(0);
+    expect(mockAi.calls).toBe(ai);
+    expect(store.getLead(phone).status).toBe('human_owns');
+    expect(qd(phone).registrationDeclined).not.toBe(true);    // the staff member owns the conversation and its conclusions
+  });
+
+  test('wording: a reply of the model with "את/ה" / "מחפש/ת" is sent in neutral Hebrew', async () => {
+    const phone = await newLead();
+    clearOut();
+    mockAi.queue.push('הכל בסדר, קורה לכולנו 😊 איך אפשר לעזור לך היום? יש משהו מסוים שאת/ה מחפש/ת?');
+    await say(phone, 'היי היתה לי בעיה עם הטלפון סורי שלא עניתי');
+    expect(lastTo(phone)).not.toMatch(/[א-ת]\/[התי]/);
+    expect(lastTo(phone)).toContain('שמעניין אותך');
+  });
+});

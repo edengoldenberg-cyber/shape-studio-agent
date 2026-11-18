@@ -52,6 +52,9 @@ async function detectAndMarkConversions(store, memberCache, normalizeToE164, _au
   for (const u of arboxMembers) {
     if (!u.phone) continue;
     const norm = normalizeToE164(u.phone);
+    // Production, 2026-11-17: an Arbox row with role 'lead' (someone who came to a trial lesson) and the owner's own
+    // 'staffMember' row are active=1 too, and were marked "converted to member". Only a client or an aggregator converts.
+    if (u.user_role === 'lead' || u.user_role === 'staffMember') continue;
     if (norm && (u.active === 1 || u.user_role === 'aggregatorMember')) {
       arboxByPhone.set(norm, u);
     }

@@ -61,6 +61,7 @@ const { createMemberHandoff }          = require('./services/member_handoff');
 const { createClassActions }           = require('./services/class_actions');
 const { createVoiceIntake }            = require('./services/voice_intake');
 const pricing                          = require('./utils/pricing');
+const salesRefusal                     = require('./utils/sales_refusal');
 const careStore                        = require('./utils/member_care_store');
 const contactPolicy                    = require('./services/contact_policy');
 const { createMemberCare }             = require('./services/member_care');
@@ -678,7 +679,7 @@ const CODE_FEATURES = [
   'staff_confirm_lifecycle', // confirm / outcome endpoints enforce transitions
   'current_callback_latest', // a lead's current callback = its most recent request only
   'quiet_hours_restored',    // utils/time.isQuietHours active again (22:00–08:00 Israel)
-  'dana_rating_v1', 'system_status_v1',          // Dana studio: rating of a stored file, review history, score with evidence, apply-improvements guard
+  'dana_rating_v1', 'system_status_v1', 'sales_refusal_v1',          // Dana studio: rating of a stored file, review history, score with evidence, apply-improvements guard
 ];
 app.get('/api/version', (_req, res) => {
   res.json({
@@ -3458,6 +3459,69 @@ function _isManualCallbackAnswer(phone, msg) {
 }
 
 const _INVITE_ACCEPT_RE = /^(?:כן|בטח|ברור|אשמח|בשמחה|יאללה|סבבה|מעולה|אוקיי?|אוקי|בסדר|נשמע טוב|מתאים|yes|ok|sure)(?:[\s,.!]|$)/i;
+/**
+ * An explicit decision NOT to register, and the messages that follow it (utils/sales_refusal.js; owner rules 2026-11-18).
+ * Runs for a lead after the human-ownership / opt-out gates and BEFORE the callback flow and the AI:
+ *   refusal   → the state is stored (no offers, no call arranging, no automated follow-up), one short fixed reply
+ *   courtesy  → "thanks" / emoji after a refusal: one short reply, never an offer; after that, silence
+ *   reopen    → an explicit request for a call or to register: the state is cleared and the ordinary flow continues
+ *   question  → the ordinary flow answers it; offers are stripped from whatever it produces
+ * Returns a pipeline result when the message was handled here, otherwise null. Arbox is never touched.
+ */
+async function handleSalesRefusal({ msg, fromNorm, fromIsraeli, clientMatch, intent }) {
+  const text = (msg.text ?? '').trim();
+  if (!text) return null;
+  const lead = store.getLead(fromNorm);
+  const qd   = lead?.meta?.qualData ?? {};
+  const d = salesRefusal.decide(text, { declined: qd.registrationDeclined === true, courtesyAnswered: qd.declineCourtesyAnswered === true }, _saneDate(msg.timestamp).toISOString());
+  if (d.action === 'none' || d.action === 'question') return null;
+
+  const openCb = aptStore.getActiveCallback(fromNorm);
+  if (d.patch) {
+    if (!store.getLead(fromNorm)) store.upsertLead(fromNorm, { name: msg.name ?? undefined });
+    const cur = store.getLead(fromNorm);
+    store.upsertLead(fromNorm, { meta: { ...(cur.meta ?? {}), ...(d.action === 'refusal' ? { awaitingCallbackTime: false } : {}), qualData: { ...(cur.meta?.qualData ?? {}), ...d.patch } } });
+  }
+  if (d.action === 'reopen') {
+    store.logEvent('registration_reopened', fromNorm, { preview: text.slice(0, 80) });
+    persist.saveLeads(store);
+    return null;                                             // the callback flow / the AI take it from here
+  }
+  if (d.action === 'refusal') {
+    store.logEvent('registration_declined', fromNorm, { preview: text.slice(0, 80) });
+    logger.info('[pipeline] explicit refusal to register — offers and follow-ups stopped', { from: fromNorm });
+    const cur = store.getLead(fromNorm);
+    const keep = ['human_owns', 'opted_out', 'converted_member', 'callback_requested', 'call_scheduled'].includes(cur.status);
+    store.upsertLead(fromNorm, keep ? { score: Math.min(cur.score ?? 0, 2) } : { score: Math.min(cur.score ?? 0, 2), status: 'cold' });
+    // An open callback request is the prospect's to cancel through the callback flow, which records it on the request.
+    if (openCb) { persist.saveLeads(store); return null; }
+  }
+
+  const reply = d.reply ?? null;
+  const route = d.action === 'refusal' ? 'registration_declined' : d.action === 'courtesy' ? 'declined_courtesy' : 'declined_silent';
+  let sent = false;
+  if (reply && process.env.WHATSAPP_AUTO_REPLY === 'true' && !_pendingMessages.has(fromNorm)) {
+    _markBotSent(fromNorm);
+    try {
+      const r = await sendText(fromNorm, reply);
+      if (r?.idMessage) _recordBotSend(r.idMessage, fromNorm);
+      _markReplied(fromNorm);
+      sent = true;
+    } catch (err) { logger.warn('[pipeline] refusal reply send failed', { from: fromNorm, route, error: err.message }); }
+  }
+  if (reply) leadAgent.recordSchedulingExchange(fromNorm, text, reply);
+  const cur2 = store.getLead(fromNorm);
+  if (cur2) store.upsertLead(fromNorm, { messageCount: (cur2.messageCount ?? 0) + 1, name: cur2.name ?? msg.name ?? undefined });
+  store.logEvent(route, fromNorm, { sent });
+  const entry = inbox.push({
+    from: fromNorm, fromIsraeli, name: msg.name ?? null, text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
+    receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null, clientMatch, intent, route, barakReply: reply,
+  });
+  persist.saveLeads(store);
+  persist.saveInbox(inbox);
+  return { inboxEntry: entry, clientMatch, intent, route, barakReply: reply };
+}
+
 async function handleLeadCallbackFlow({ msg, fromNorm, fromIsraeli, clientMatch, intent, phase }) {
   const lead   = store.getLead(fromNorm);
   const status = lead?.status ?? null;
@@ -4357,6 +4421,9 @@ async function processInboundWAMessage(msg) {
   //     AI pipeline. Handles every message from a lead that already has a callback in
   //     progress (reminder replies, reschedule, cancellation, name capture, new time…).
   if (!isExistingClient) {
+    // 2c-refusal. An explicit refusal to register, and thanks / a new request after it (before the callback flow and the AI).
+    const _refused = await handleSalesRefusal({ msg, fromNorm, fromIsraeli, clientMatch, intent });
+    if (_refused) return _refused;
     const _cbActive = await handleLeadCallbackFlow({ msg, fromNorm, fromIsraeli, clientMatch, intent, phase: 'active' });
     if (_cbActive) return _cbActive;
   }
@@ -4394,7 +4461,7 @@ async function processInboundWAMessage(msg) {
 
       let _unclassifiedReply = null;
       if (!_alreadyGreeted && process.env.WHATSAPP_AUTO_REPLY === 'true') {
-        _unclassifiedReply = 'שלום! 😊 קיבלנו את הודעתך. כדי שנוכל לעזור — ספר/י לנו מה מחפש/ת.';
+        _unclassifiedReply = 'שלום! 😊 קיבלנו את הודעתך. כדי שנוכל לעזור — במה אפשר לעזור?';
         _markBotSent(fromNorm);
         const _ucSendRes = await sendText(fromNorm, _unclassifiedReply).catch(() => null);
         if (_ucSendRes?.idMessage) _recordBotSend(_ucSendRes.idMessage, fromNorm);
@@ -4881,6 +4948,16 @@ async function processInboundWAMessage(msg) {
       timetableImgUrl  = null;
       timetable2ImgUrl = null;
     }
+  }
+
+  // Every reply to a lead that is sent from here (schedule answers, price answers, the callback flow's texts) passes
+  // the same two gates as the AI's replies: no offer after an explicit refusal to register, and neutral wording.
+  if (barakReply && !isExistingClient && !_replyAlreadySent) {
+    if (store.getLead(fromNorm)?.meta?.qualData?.registrationDeclined === true) {
+      const _clean = salesRefusal.stripOffers(barakReply, 'אין לי כאן מידע מעודכן על זה 🙏');
+      if (_clean !== barakReply) { store.logEvent('offer_removed_after_refusal', fromNorm, { route }); barakReply = _clean; }
+    }
+    barakReply = salesRefusal.neutralWording(barakReply);
   }
 
   if (barakReply && process.env.WHATSAPP_AUTO_REPLY === 'true' && !_replyAlreadySent) {
