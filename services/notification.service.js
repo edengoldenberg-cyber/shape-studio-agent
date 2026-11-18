@@ -209,7 +209,7 @@ async function notifyStaffCallbackConfirmed(apt, assignedStaff, icsDownloadUrl, 
 async function sendStaffReminder(apt, assignedStaff, { skipPhones = new Set() } = {}) {
   // Displayed time comes from the persisted scheduledAt, in Asia/Jerusalem.
   const hasTime   = apt.scheduledAt instanceof Date && !isNaN(apt.scheduledAt.getTime());
-  const timeLabel = hasTime ? formatCallbackTime(apt.scheduledAt, apt.windowEndAt ?? null) : formatTime(apt.scheduledAt, apt.rawTime);
+  const timeLabel = hasTime ? formatCallbackTime(apt.scheduledAt, apt.windowEndAt ?? null, apt.availability ?? null) : formatTime(apt.scheduledAt, apt.rawTime);
   const lead      = apt.leadName || (String(apt.leadPhone).startsWith('972') ? '0' + String(apt.leadPhone).slice(3) : apt.leadPhone);
 
   // Actual minutes remaining so the text matches the real timing.
@@ -374,7 +374,7 @@ async function sendProspectReminder(apt, name, formattedTime) {
   if (!apt.leadPhone) {
     return { ok: false, idMessage: null, error: 'no_lead_phone' };
   }
-  const msg = `היי ${name}, תזכורת לבקשת השיחה שלך עם Shape Studio — ${formattedTime} 📞\n${apt.windowEndAt ? 'עדיין נוח לך בטווח השעות הזה?' : 'עדיין נוח לך לדבר בשעה הזו?'}`;
+  const msg = `היי ${name}, תזכורת לבקשת השיחה שלך עם Shape Studio — ${formattedTime} 📞\n${apt.availability ? 'עדיין נוח לך?' : apt.windowEndAt ? 'עדיין נוח לך בטווח השעות הזה?' : 'עדיין נוח לך לדבר בשעה הזו?'}`;
   try {
     const res = await sendText(apt.leadPhone, msg);
     if (res?.blocked) return { ok: false, idMessage: null, error: 'blocked (TEST_MODE allowlist)' };

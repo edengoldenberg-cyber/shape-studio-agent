@@ -2126,7 +2126,8 @@ function renderCallbackPanel(callbacks) {
     }
     if (l.humanOwned) facts.push('🤝 בטיפול אנושי — הבוט לא שולח הודעות');
     if (apt?.capturedDuring === 'human_hold') facts.push('✍️ תואם ידנית בצ׳אט');
-    if (apt?.isWindow) facts.push('🕑 טווח שעות שהליד מסר/ה — לא שעה שנקבעה');
+    if (apt?.availability) facts.push('🕑 אילוץ זמינות שהליד מסר/ה (' + (apt.availability === 'after' ? 'רק אחרי השעה' : 'רק עד השעה') + ') — לא מועד שנקבע');
+    else if (apt?.isWindow) facts.push('🕑 טווח שעות שהליד מסר/ה — לא שעה שנקבעה');
     if (apt?.prospectSummarySent) facts.push(`📨 סיכום נשלח ללקוח/ה${apt.ownerApproved ? ` באישור ${apt.ownerApproved.by}` : ''}`);
     else if (apt?.ownerSummary?.state === 'failed') facts.push('❌ שליחת הסיכום ללקוח/ה נכשלה — אפשר לשלוח שוב');
     if (apt?.ownerApproved?.reminder && !apt.prospectReminderSent) facts.push('⏰ תזכורת ללקוח/ה מאושרת ותישלח לפני המועד');
@@ -2146,7 +2147,7 @@ function renderCallbackPanel(callbacks) {
         ${waPhone ? `<button class="cb-btn cb-only-phone" data-cb-action="history" onclick="openThread('${waPhone}')">💬 השיחה</button>` : ''}
       </div>
       <div id="cb-owner-${aptId}" class="cb-form" data-keep-open style="display:none">
-        <span class="cb-form-note">יישלח ללקוח/ה: <b>${apt?.scheduledLabel ? esc(apt.scheduledLabel) : ''}</b>${apt?.isWindow ? ' (כטווח שעות, בלי שעה מדויקת)' : ''}. השיחה נשארת בטיפול ידני.</span>
+        <span class="cb-form-note">יישלח ללקוח/ה: <b>${apt?.scheduledLabel ? esc(apt.scheduledLabel) : ''}</b>${apt?.availability ? ' (כאילוץ זמינות, בלי שעה שנקבעה)' : apt?.isWindow ? ' (כטווח שעות, בלי שעה מדויקת)' : ''}. השיחה נשארת בטיפול ידני.</span>
         <input id="cb-owner-name-${aptId}" class="cb-input" type="text" dir="rtl" autocomplete="off" placeholder="שם לפנייה (לא חובה)" value="${esc(qd.confirmedName ?? '')}">
         <label class="cb-check" for="cb-owner-rem-${aptId}"><input id="cb-owner-rem-${aptId}" type="checkbox" checked> לשלוח גם תזכורת לפני המועד</label>
         <button class="cb-btn cb-btn-go" data-cb-action="owner-summary-send" onclick="cbOwnerSummary('${aptId}')">שלח</button>

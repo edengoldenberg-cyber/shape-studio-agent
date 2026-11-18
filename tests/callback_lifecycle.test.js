@@ -601,7 +601,7 @@ describe('4. Date and time handling', () => {
     ['מחר',                  /באיזו שעה/],
     ['30.02 בשעה 10',        /לא קיים בלוח השנה/],
     ['יום שני 17.11 ב-10',   /17\.11 יוצא ביום שלישי/],
-    ['מחר ב-23:30',          /08:00–22:00/],
+    ['מחר ב-23:30',          /לא אוכל לרשום בקשת שיחה/],
   ])('pipeline: "%s" → clarification, no appointment, no model call', async (text, re) => {
     const phone = await newLead();
     await say(phone, 'אשמח שיחזרו אליי');
@@ -968,6 +968,73 @@ describe('6. Reminders (real worker cycle)', () => {
       for (const p of [fresh, oldMovedByLead, oldMovedByStaff]) expect([p, staffRemindersFor(p).length, prospectReminders(p).length]).toEqual([p, 1, 1]);
       for (const p of [oldOpen, oldExpired]) expect([p, staffRemindersFor(p).length, prospectReminders(p).length]).toEqual([p, 0, 0]);
     } finally { delete process.env.CALLBACK_REMINDER_SINCE; }
+  });
+
+  // Owner correction, 2026-11-18: "אחרי" / "עד" are constraints on availability, kept apart from an appointed hour;
+  // no hours of activity are promised; a time in English is asked about, never stored from a guess.
+  test('"after 16:00": stored and confirmed as a constraint; the lead and the manager are reminded once', async () => {
+    setNow(il(2026, 11, 16, 9, 0));
+    const phone = await leadWithCallback({ timeText: 'היום אחרי 16:00' });
+    const apt = openApt(phone);
+    expect(apt).toMatchObject({ status: 'callback_pending', availability: 'after' });
+    expect(apt.windowEndAt ?? null).toBeNull();
+    expect(apt.scheduledAt.toISOString()).toBe(il(2026, 11, 16, 16, 0).toISOString());
+    const toLead = textsTo(phone).map(t => t.text).join('\n');
+    expect(toLead).toContain('יום שני, 16.11.2026 אחרי 16:00');
+    expect(toLead).toContain('רשמנו את הזמינות שלך');
+    expect(toLead).not.toMatch(/בשעה 16:00|בטווח השעות|22:00|08:00/);
+    const mgr = summaries().filter(a => a.body.includes('אחרי 16:00'));
+    expect(mgr).toHaveLength(1);
+    expect(mgr[0].body).toContain('אילוץ זמינות');
+    expect((await panelRow(phone)).apt).toMatchObject({ availability: 'after', isWindow: true });
+
+    clearOut();
+    setNow(il(2026, 11, 16, 15, 35));
+    await worker.runCycle(store); await worker.runCycle(store);
+    expect(staffRemindersFor(phone)).toHaveLength(1);
+    expect(staffRemindersFor(phone)[0].text).toContain('אחרי 16:00');
+    expect(prospectReminders(phone)).toHaveLength(1);
+    expect(prospectReminders(phone)[0].text).toContain('אחרי 16:00');
+    expect(prospectReminders(phone)[0].text).not.toMatch(/בשעה הזו|בטווח השעות/);
+  });
+
+  test('"until 12:00": stored as a constraint; the manager is reminded, the lead is not reminded that the time is ending', async () => {
+    setNow(il(2026, 11, 16, 9, 0));
+    const phone = await leadWithCallback({ timeText: 'היום עד 12:00' });
+    expect(openApt(phone)).toMatchObject({ availability: 'until' });
+    expect(textsTo(phone).map(t => t.text).join('\n')).toContain('יום שני, 16.11.2026 עד 12:00');
+    clearOut();
+    setNow(il(2026, 11, 16, 11, 35));
+    await worker.runCycle(store);
+    expect(staffRemindersFor(phone)).toHaveLength(1);
+    expect(staffRemindersFor(phone)[0].text).toContain('עד 12:00');
+    expect(prospectReminders(phone)).toHaveLength(0);
+  });
+
+  test('a constraint replaced by an appointed hour is no longer a constraint (and the other way round)', async () => {
+    setNow(il(2026, 11, 16, 9, 0));
+    const phone = await leadWithCallback({ timeText: 'היום אחרי 16:00' });
+    await say(phone, 'אפשר שיחזרו אליי היום ב-17:00?');
+    expect(openApt(phone).availability ?? null).toBeNull();
+    expect(lastTo(phone)).toContain('בשעה 17:00');
+    await say(phone, 'בעצם היום עד 15:00');
+    expect(openApt(phone)).toMatchObject({ availability: 'until' });
+    expect(lastTo(phone)).toContain('עד 15:00');
+  });
+
+  test('a time written in English: nothing is stored, the lead is asked to write it in numbers, then it is stored', async () => {
+    setNow(il(2026, 11, 16, 9, 0));
+    const phone = await newLead();
+    await say(phone, 'אשמח שיחזרו אליי');
+    const before = diskApts().length;
+    await say(phone, 'tomorrow between 14:00 and 16:00');
+    expect(openApt(phone) ?? null).toBeNull();
+    expect(diskApts().length).toBe(before);
+    expect(lastTo(phone)).toMatch(/במספרים/);
+    expect(summaries().filter(a => a.body.includes(phone.slice(-7)))).toHaveLength(0);
+    await say(phone, '17.11 14:00-16:00');
+    expect(openApt(phone).scheduledAt.toISOString()).toBe(il(2026, 11, 17, 14, 0).toISOString());
+    expect(openApt(phone).windowEndAt).toBe(il(2026, 11, 17, 16, 0).toISOString());
   });
 
   test('the baseline and the test allow-list combine; a baseline that cannot be read closes reminders', async () => {

@@ -96,7 +96,11 @@ function isValidYmd(year, month0, day) {
  * With `windowEnd` (the prospect gave a RANGE of hours): "יום ראשון, 15.11.2026 בין 14:00 ל-16:00".
  * A range is the prospect's availability, never an appointed hour, and is always written as a range.
  */
-function formatCallbackTime(date, windowEnd = null) {
+/**
+ * `availability` ('after' | 'until'): the prospect gave a CONSTRAINT, not a time ("אחרי 16:00", "עד 12:00"). It is
+ * written exactly as a constraint — never as an appointed hour and never as a range with an end nobody gave.
+ */
+function formatCallbackTime(date, windowEnd = null, availability = null) {
   const d = date instanceof Date ? date : new Date(date);
   if (isNaN(d.getTime())) return '';
   const p  = ilParts(d);
@@ -108,6 +112,8 @@ function formatCallbackTime(date, windowEnd = null) {
     if (q.year === p.year && q.month === p.month && q.day === p.day)
       return `יום ${HE_WEEKDAY_NAMES[p.weekday]}, ${dd}.${mm}.${p.year} בין ${hh}:${mi} ל-${String(q.hour).padStart(2, '0')}:${String(q.minute).padStart(2, '0')}`;
   }
+  if (availability === 'after') return `יום ${HE_WEEKDAY_NAMES[p.weekday]}, ${dd}.${mm}.${p.year} אחרי ${hh}:${mi}`;
+  if (availability === 'until') return `יום ${HE_WEEKDAY_NAMES[p.weekday]}, ${dd}.${mm}.${p.year} עד ${hh}:${mi}`;
   return `יום ${HE_WEEKDAY_NAMES[p.weekday]}, ${dd}.${mm}.${p.year} בשעה ${hh}:${mi}`;
 }
 
@@ -128,8 +134,6 @@ function withinHours(h, m, { start, end }) {
 
 // ── Clarification texts (truthful next steps — never a commitment) ────────────
 function clarify(reason, ctx = {}) {
-  const hrs = ctx.hours ?? callingHours();
-  const range = `${String(hrs.start).padStart(2, '0')}:00–${String(hrs.end).padStart(2, '0')}:00`;
   switch (reason) {
     case 'missing_hour':
       return `באיזו שעה נוח לך? 🙂 (למשל 10:00 או 17:30)`;
@@ -147,12 +151,14 @@ function clarify(reason, ctx = {}) {
       return `המועד הזה כבר עבר 🙂 מתי יהיה לך נוח שנחזור אליך? (יום ושעה)`;
     case 'too_far':
       return `אפשר לתאם שיחה לשבועות הקרובים 🙂 איזה יום ושעה מתאימים לך?`;
+    // The window used here is the system's quiet-hours setting (when nothing automatic is sent). It is NOT a calling
+    // policy the owner approved, so no hours are stated or promised to the prospect.
     case 'outside_hours':
-      return `אפשר לתאם שיחה בין השעות ${range} 🙂 איזו שעה מתאימה לך?`;
+      return `בשעה הזו לא אוכל לרשום בקשת שיחה 🙂 איזו שעה אחרת במהלך היום נוחה לך?`;
     case 'range_unclear':
       return `לא הצלחתי להבין את טווח השעות 🙂 בין איזו שעה לאיזו שעה נוח לך? (למשל "מחר בין 14:00 ל-16:00")`;
-    case 'range_outside_hours':
-      return `אנחנו מתקשרים בין השעות ${range} 🙂 איזה טווח בתוך השעות האלה נוח לך?`;
+    case 'english_time':
+      return `כדי שלא אטעה במועד — אפשר לכתוב את התאריך והשעה במספרים? למשל: 19.11 בשעה 14:00, או 19.11 בין 14:00 ל-16:00 🙂\nSo I don't get it wrong - could you write the date and time in numbers? For example: 19.11 14:00-16:00`;
     default:
       return `מתי יהיה לך נוח שנחזור אליך? (יום ושעה, למשל "מחר ב-10:00")`;
   }
@@ -282,7 +288,9 @@ function extractHour(t, { dayKnown = false } = {}) {
   if (!(h >= 0 && h <= 23) || !(min >= 0 && min <= 59)) return { found: true, valid: false };
 
   const explicit24 = h >= 13 || h === 0;
-  return { found: true, valid: true, h, min, explicit24, qualifierPm, qualifierAm };
+  // "בלילה" with a small hour is after midnight ("2 בלילה" = 02:00, "12 בלילה" = 00:00) - never the afternoon
+  const night = /(?<![א-ת])(?:ב|ל)?לילה(?![א-ת])/.test(t);
+  return { found: true, valid: true, h, min, explicit24, qualifierPm, qualifierAm, night };
 }
 
 /**
@@ -295,7 +303,8 @@ function resolveMeridiem(hour, hours) {
   if (hour.explicit24) {
     return withinHours(h, min, hours) ? { h } : { reason: 'outside_hours' };
   }
-  if (hour.qualifierPm && h < 12) h += 12;
+  if (hour.night && (h <= 5 || h === 12)) { if (h === 12) h = 0; }          // before 2026-11-18: "2 בלילה" → 14:00
+  else if (hour.qualifierPm && h < 12) h += 12;
   else if (hour.qualifierAm) { /* as written */ }
   else {
     // No qualifier: accept the reading that falls inside calling hours.
@@ -363,10 +372,10 @@ function extractWindow(text) {
   return w && (w.startH >= 13 || w.endH >= 13) && w.startH < w.endH ? w : null;
 }
 
-// An OPEN-ENDED range: "אחרי 16:00" (from then until the calling hours end) / "עד 12:00", "לפני 12" (from the start of
-// the calling hours, or from now, until then). The missing side is the calling hours themselves — the real limit of
-// when the studio calls — never an hour the prospect did not give. A bare number counts only at the end of a clause
-// ("אחרי 2 אימונים" is not an hour).
+// A CONSTRAINT on availability: "אחרי 16:00" / "עד 12:00", "לפני 12". The prospect gave one side only. It is kept as
+// exactly that — `availability: 'after' | 'until'` with the hour that was given — and is never completed into a range
+// (the system has no approved calling hours to complete it with) nor treated as an appointed hour. A bare number counts
+// only at the end of a clause ("אחרי 2 אימונים" is not an hour).
 const OPEN_TAIL = '(?=\\s*(?:$|[,.!?)]|בבוקר|בערב|בלילה|בצהריים|אחה"צ|אחר|אחרי|בדיוק|אם|זה|מתאים|נוח|טוב|בסדר|אפשר|יהיה|בבקשה|תודה))';
 const OPEN_HOUR = `(?:ה?שעה\\s*)?-?\\s*(?:(\\d{1,2}[:.]\\d{2})|(\\d{1,2}|${HOUR_WORD_ALT})(?![${HEB}\\d:.])(?:\\s*(וחצי|ורבע)(?![${HEB}]))?${OPEN_TAIL})`;
 const OPEN_RES = [
@@ -386,41 +395,38 @@ function extractOpenEnded(text) {
 const pad2 = n => String(n).padStart(2, '0');
 const hourText = (h, m, written) => (written || h >= 13 || m ? `${pad2(h)}:${pad2(m)}` : String(h));
 
+// A time written in English. The resolver reads Hebrew and numbers; before 2026-11-18 "tomorrow between 14:00 and
+// 16:00" was stored as TODAY at 14:00 (the day word was not understood and the first number was taken). Until there
+// is a reliable reading, such a message is answered with a request to write the date and time in numbers.
+const ENGLISH_TIME = /\b(?:tomorrow|today|tonight|noon|midnight|next\s+week|this\s+(?:morning|afternoon|evening|week)|in\s+the\s+(?:morning|afternoon|evening)|(?:mon|tues|wednes|thurs|fri|satur|sun)day)\b|\b(?:at|between|after|before|until|till|from|around|by)\s+\d|\bo'?clock\b|\b(?:an?|one|two|\d+)\s+(?:hours?|minutes?)\b/i;
+const isEnglishTime = text => ENGLISH_TIME.test(String(text ?? ''));
+
 function resolveCallbackTime(rawText, ref = new Date(), opts = {}) {
   const hours = opts.hours ?? callingHours();
   const text = normalize(rawText);
+  if (isEnglishTime(text)) return fail('english_time');
   const w = extractWindow(text);
   if (w) {
     // The range is replaced by its START hour and resolved by the ordinary strict rules (so "בין 2 ל-4" becomes the
-    // afternoon exactly as "ב-2" would). The end is then placed after the resolved start, on the same day.
+    // afternoon exactly as "ב-2" would). The end is then placed after the resolved start, on the same day. The end is
+    // kept as the prospect gave it: a range is not cut or refused against hours the owner has not defined.
     const res = resolveSingleTime(text.replace(w.match, ` ב-${hourText(w.startH, w.startM, w.startExplicit)} `), ref, opts);
     if (!res.ok) return res;
     const p = ilParts(res.scheduledAt);
     let endH = w.endH;
     while (endH * 60 + w.endM <= p.hour * 60 + p.minute && endH + 12 <= 23) endH += 12;
     if (endH * 60 + w.endM <= p.hour * 60 + p.minute) return fail('range_unclear');
-    if (endH > hours.end || (endH === hours.end && w.endM > 0)) return fail('range_outside_hours', { hours });
     return { ...res, windowEndAt: ilDate(p.year, p.month, p.day, endH, w.endM) };
   }
   const o = extractOpenEnded(text);
   if (!o) return resolveSingleTime(text, ref, opts);
-  const refDate = ref instanceof Date ? ref : new Date(ref);
+  // the hour is read by the ordinary rules (day, morning / evening, not in the past); "until" may name the last minute
+  // of the window in which a request can be registered
   const single = text.replace(o.match, ` ב-${hourText(o.h, o.m, o.written)} `);
-  if (o.kind === 'after') {
-    const res = resolveSingleTime(single, ref, opts);
-    if (!res.ok) return res;
-    const p = ilParts(res.scheduledAt);
-    return { ...res, windowEndAt: ilDate(p.year, p.month, p.day, hours.end, 0) };
-  }
-  // "until X": X may be the very end of the calling hours, which is not a callable START hour
-  const res = resolveSingleTime(single, ref, { ...opts, hours: { start: hours.start, end: Math.min(hours.end + 1, 24) } });
+  const res = resolveSingleTime(single, ref, o.kind === 'until' ? { ...opts, hours: { start: hours.start, end: Math.min(hours.end + 1, 24) } } : opts);
   if (!res.ok) return res;
-  const e = ilParts(res.scheduledAt);
-  if (e.hour * 60 + e.minute > hours.end * 60) return fail('outside_hours', { hours });
-  let start = ilDate(e.year, e.month, e.day, hours.start, 0);
-  if (start.getTime() <= refDate.getTime()) start = new Date(Math.ceil((refDate.getTime() + 60000) / 1800000) * 1800000);   // from now, on the half hour
-  if (start.getTime() >= res.scheduledAt.getTime()) return fail(e.hour * 60 + e.minute <= hours.start * 60 ? 'outside_hours' : 'past', { hours });
-  return { ...res, scheduledAt: start, windowEndAt: res.scheduledAt };
+  if (o.kind === 'until') { const e = ilParts(res.scheduledAt); if (e.hour * 60 + e.minute > hours.end * 60) return fail('outside_hours'); }
+  return { ...res, availability: o.kind };
 }
 
 function resolveSingleTime(rawText, ref = new Date(), opts = {}) {
@@ -558,6 +564,7 @@ function hasTimeSignal(rawText) {
   if (extractExplicitDate(t).found) return true;
   if (extractWeekday(t) !== null) return true;
   if (heWord('מחרתיים').test(t) || heWord('מחר').test(t) || heWord('היום').test(t)) return true;
+  if (isEnglishTime(t)) return true;                       // answered with a request to write it in numbers
   if (/(?:ב)?עוד\s+(?:חצי\s+שעה|שעה|שעתיים|\d{1,3}\s+(?:דקות|שעות))/.test(t)) return true;
   const hr = extractHour(t);
   return hr.found || !!hr.qualifierAm || !!hr.qualifierPm;

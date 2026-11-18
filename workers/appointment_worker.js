@@ -205,7 +205,10 @@ async function runProspectReminderPass(store) {
     }
     const fullName      = lead?.meta?.qualData?.confirmedName ?? apt.leadName ?? '';
     const name          = String(fullName).trim().split(/\s+/)[0] || 'שלום';
-    const formattedTime = formatCallbackTime(apt.scheduledAt, apt.windowEndAt ?? null);       // a range stays a range
+    // 'until 12:00' has no start: its scheduledAt is the END of the prospect's availability, so a reminder half an
+    // hour before it would be a reminder that the time is almost over. The prospect is not reminded; the staff are.
+    if (apt.availability === 'until') continue;
+    const formattedTime = formatCallbackTime(apt.scheduledAt, apt.windowEndAt ?? null, apt.availability ?? null);   // a range stays a range, a constraint a constraint
     const result        = await sendProspectReminder(apt, name, formattedTime);
     if (result.ok && result.idMessage) {
       aptStore.update(apt.id, {

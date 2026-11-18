@@ -71,6 +71,11 @@
   .actions button { flex:1; max-width:360px; padding:10px 6px; font-size:15px; }
   #banner { position:sticky; top:50px; z-index:6; background:#7a1f00; color:#fff; font-weight:600; font-size:14px; padding:8px 14px; text-align:center; border-bottom:2px solid #ffb300; }
   .embed header a { display:none; } .embed body { background:transparent; }
+  /* A short screen (an on-screen keyboard is open, or a phone held sideways): the player no longer sticks to the top,
+     where it covered the field being typed in and the step buttons (logged-in production check, 2026-11-18). A field
+     that receives focus is scrolled clear of the top bar and of the fixed action bar. */
+  @media (max-width: 979px) and (max-height: 560px) { #playerbox { position:static; box-shadow:none; } }
+  @media (max-width: 979px) { input, textarea, select, button, summary { scroll-margin-top:72px; scroll-margin-bottom:96px; } }
   /* phone: every control is at least 44px high (found in the logged-in production check, 2026-11-18) */
   @media (max-width: 979px) { button.sm { min-height:44px; } input[type=text], input[type=datetime-local], input[type=number], select { min-height:44px; }
     header a[href="/"], a[href="/"] { display:inline-flex; align-items:center; justify-content:center; min-width:44px; min-height:44px; } }

@@ -996,23 +996,60 @@ describe('6. The range resolver', () => {
     expect(f('מחר בין 14:00–16:00')).toBe('יום שלישי, 17.11.2026 בין 14:00 ל-16:00');
     expect(f('מחר מהשעה 9 עד השעה 11')).toBe('יום שלישי, 17.11.2026 בין 09:00 ל-11:00');
   });
-  test('"after" and "until" are open ranges bounded by the calling hours, not an appointed hour', () => {
-    expect(f('מחר אחרי 16:00')).toBe('יום שלישי, 17.11.2026 בין 16:00 ל-22:00');
-    expect(f('מחר רק אחרי ארבע')).toBe('יום שלישי, 17.11.2026 בין 16:00 ל-22:00');
-    expect(f('מחר עד 12:00')).toBe('יום שלישי, 17.11.2026 בין 08:00 ל-12:00');
-    expect(f('מחר לפני 12')).toBe('יום שלישי, 17.11.2026 בין 08:00 ל-12:00');
-    expect(f('מחר עד 22:00')).toBe('יום שלישי, 17.11.2026 בין 08:00 ל-22:00');
-    expect(f('היום עד 20:00')).toBe('יום שני, 16.11.2026 בין 18:00 ל-20:00');          // from now (17:48), on the half hour
-    expect(f('היום עד 17:00')).toBe('past');
-    expect(f('מחר עד 7 בבוקר')).toBe('outside_hours');
-    expect(f('מחר עד 7')).toBe('יום שלישי, 17.11.2026 בין 08:00 ל-19:00');               // 7 without a qualifier is the evening, as for a single hour
+  // Owner correction, 2026-11-18: 08:00-22:00 is the system's quiet-hours window, not a calling policy the owner
+  // approved. "after" / "until" are kept as CONSTRAINTS (one side only), a range is kept as the prospect gave it, and
+  // no hours of activity are stated to the prospect.
+  const fa = t => { const r = callbackTime.resolveCallbackTime(t, ref); return r.ok ? callbackTime.formatCallbackTime(r.scheduledAt, r.windowEndAt, r.availability) : r.reason; };
+  test('"after" and "until" are availability constraints: one side, no invented other side, not an appointed hour', () => {
+    const r = t => callbackTime.resolveCallbackTime(t, ref);
+    expect(r('מחר אחרי 16:00')).toMatchObject({ ok: true, availability: 'after' });
+    expect(r('מחר אחרי 16:00').windowEndAt).toBeUndefined();
+    expect(fa('מחר אחרי 16:00')).toBe('יום שלישי, 17.11.2026 אחרי 16:00');
+    expect(fa('מחר רק אחרי ארבע')).toBe('יום שלישי, 17.11.2026 אחרי 16:00');
+    expect(r('מחר עד 12:00')).toMatchObject({ ok: true, availability: 'until' });
+    expect(r('מחר עד 12:00').windowEndAt).toBeUndefined();
+    expect(fa('מחר עד 12:00')).toBe('יום שלישי, 17.11.2026 עד 12:00');
+    expect(fa('מחר לפני 12')).toBe('יום שלישי, 17.11.2026 עד 12:00');
+    expect(fa('היום עד 20:00')).toBe('יום שני, 16.11.2026 עד 20:00');
+    expect(fa('היום עד 17:00')).toBe('past');
+    // an appointed hour and a range are told apart from a constraint
+    expect(r('מחר ב-16:00').availability).toBeUndefined();
+    expect(r('מחר בין 14:00 ל-16:00').availability).toBeUndefined();
+    expect(fa('מחר ב-16:00')).toBe('יום שלישי, 17.11.2026 בשעה 16:00');
   });
-  test('a range that cannot be placed is asked about, never guessed', () => {
+  test('a range is kept as given; one that cannot be placed is asked about; no hours of activity are stated', () => {
     const r = t => callbackTime.resolveCallbackTime(t, ref);
     expect(r('מחר בין 16:00 ל-14:00')).toMatchObject({ ok: false, reason: 'range_unclear' });
-    expect(r('מחר בין 20:00 ל-23:00')).toMatchObject({ ok: false, reason: 'range_outside_hours' });
-    expect(r('מחר בין 20:00 ל-23:00').clarification).toMatch(/08:00–22:00/);
-    expect(r('מחר בין 20:00 ל-22:00')).toMatchObject({ ok: true });
+    expect(fa('מחר בין 20:00 ל-23:00')).toBe('יום שלישי, 17.11.2026 בין 20:00 ל-23:00');
+    expect(fa('מחר בין 20:00 ל-22:00')).toBe('יום שלישי, 17.11.2026 בין 20:00 ל-22:00');
+    for (const t of ['מחר ב-23:30', 'מחר ב-02:00 בלילה', 'מחר בין 16:00 ל-14:00', 'מחר', 'tomorrow at 3']) {
+      const out = r(t);
+      expect([t, out.ok]).toEqual([t, false]);
+      expect([t, /\d{1,2}:00\s*[–-]\s*\d{1,2}:00|08:00|22:00/.test(out.clarification.split('\n')[0].replace(/למשל.*$/, ''))]).toEqual([t, false]);
+    }
+    expect(r('מחר ב-23:30')).toMatchObject({ ok: false, reason: 'outside_hours' });
+    // "at night" with a small hour is after midnight, not the afternoon ("2 בלילה" was stored as 14:00)
+    expect(r('מחר ב-2 בלילה')).toMatchObject({ ok: false, reason: 'outside_hours' });
+    expect(r('מחר ב-12 בלילה')).toMatchObject({ ok: false, reason: 'outside_hours' });
+    expect(fa('מחר ב-9 בלילה')).toBe('יום שלישי, 17.11.2026 בשעה 21:00');
+    expect(fa('מחר ב-10 בלילה')).toBe('outside_hours');
+  });
+  // Before 2026-11-18 "tomorrow between 14:00 and 16:00" was stored as TODAY at 14:00.
+  test('a time written in English is never stored from a guess: the prospect is asked to write it in numbers', () => {
+    const r = t => callbackTime.resolveCallbackTime(t, ref);
+    for (const t of ['tomorrow between 14:00 and 16:00', 'Tomorrow at 3pm', 'today after 5', 'call me on Monday morning', 'next week', 'at 10 please',
+                     'between 2 and 4', 'tonight', 'in the afternoon', 'thursday 14:00', 'in 2 hours', 'מחר at 15:00']) {
+      expect([t, r(t).ok, r(t).reason]).toEqual([t, false, 'english_time']);
+      expect([t, callbackTime.hasTimeSignal(t)]).toEqual([t, true]);
+    }
+    expect(r('tomorrow at 3pm').clarification).toMatch(/במספרים/);
+    expect(r('tomorrow at 3pm').clarification).toMatch(/in numbers/);
+    // what the clarification asks for is understood, and English words that are not about time change nothing
+    expect(fa('17.11 14:00-16:00')).toBe('יום שלישי, 17.11.2026 בין 14:00 ל-16:00');
+    expect(fa('17.11 15:00')).toBe('יום שלישי, 17.11.2026 בשעה 15:00');
+    expect(fa('ok מחר ב-15:00 thanks')).toBe('יום שלישי, 17.11.2026 בשעה 15:00');
+    expect(fa('מחר 5 pm')).toBe('יום שלישי, 17.11.2026 בשעה 17:00');
+    expect(callbackTime.hasTimeSignal('what happens after the trial lesson?')).toBe(false);
   });
   test('numbers that are not hours are not read as a range', () => {
     const r = t => callbackTime.resolveCallbackTime(t, ref);

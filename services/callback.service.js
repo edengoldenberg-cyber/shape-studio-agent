@@ -36,7 +36,12 @@ const AVAIL_CANCEL_RE     = /לבטל|אבטל|מבטל|תבטלו|לא\s*רוצ
 
 function validDate(d) { return d instanceof Date && !isNaN(d.getTime()); }
 /** The time of an appointment as it is shown to anyone: an hour, or the RANGE the prospect gave (never an appointed hour). */
-function fmtApt(apt) { return formatCallbackTime(apt.scheduledAt, apt.windowEndAt ?? null); }
+function fmtApt(apt) { return formatCallbackTime(apt.scheduledAt, apt.windowEndAt ?? null, apt.availability ?? null); }
+/** What is promised to the prospect about the time: an appointed hour, a range they gave, or only a constraint they gave. */
+function contactLine(apt) {
+  if (apt.availability) return `רשמנו את הזמינות שלך. נציג מהצוות של Shape Studio יחזור אליך.`;
+  return apt.windowEndAt ? `נציג מהצוות של Shape Studio יצור איתך קשר בטווח השעות הזה.` : `נציג מהצוות של Shape Studio יצור איתך קשר.`;
+}
 function firstName(n) { return String(n ?? '').trim().split(/\s+/)[0] || null; }
 function localPhone(p) { return String(p).startsWith('972') ? '0' + String(p).slice(3) : String(p); }
 
@@ -149,13 +154,14 @@ function createCallbackService(deps) {
     let apt, isReschedule = false;
     try {
       const windowEndAt = validDate(res.windowEndAt) ? res.windowEndAt.toISOString() : null;
+      const availability = res.availability ?? null;            // 'after' | 'until': a constraint, not an appointed hour
       if (isFuture(open)) {
-        if (open.scheduledAt.getTime() === res.scheduledAt.getTime() && (open.windowEndAt ?? null) === windowEndAt) {
+        if (open.scheduledAt.getTime() === res.scheduledAt.getTime() && (open.windowEndAt ?? null) === windowEndAt && (open.availability ?? null) === availability) {
           return { ok: true, apt: open, isReschedule: false, unchanged: true };
         }
         // the SAME request is moved: the store clears the reminder flags of the old time, so no old reminder can fire
         apt = aptStore.reschedule(open.id, { rawTime, scheduledAt: res.scheduledAt });
-        apt = aptStore.update(apt.id, { windowEndAt });
+        apt = aptStore.update(apt.id, { windowEndAt, availability });
         isReschedule = true;
       } else {
         // No open callback, or the open one already expired without an outcome: the
@@ -170,7 +176,7 @@ function createCallbackService(deps) {
           durationMin:     getDurationMin(),
           assignedStaffId: getStaffId(),
         });
-        if (windowEndAt) apt = aptStore.update(apt.id, { windowEndAt });
+        if (windowEndAt || availability) apt = aptStore.update(apt.id, { windowEndAt, availability });
       }
     } catch (err) {
       logger.error('[callback] appointment NOT persisted — no confirmation will be sent', { phone, source, error: err.message });
@@ -250,7 +256,7 @@ function createCallbackService(deps) {
       isReschedule ? `${name}, עדכנו את בקשת השיחה שלך ✅` : `${name}, קיבלנו את בקשת השיחה שלך ✅`,
       `📞 ${fmt}`,
       // a range of hours is the prospect's availability: it is confirmed as a range, never as an appointed hour
-      apt.windowEndAt ? `נציג מהצוות של Shape Studio יצור איתך קשר בטווח השעות הזה.` : `נציג מהצוות של Shape Studio יצור איתך קשר.`,
+      contactLine(apt),
     ].join('\n');
   }
 
@@ -263,7 +269,7 @@ function createCallbackService(deps) {
       isReschedule ? `🔄 שינוי מועד שיחה — ${name}` : `📞 בקשת שיחה חדשה — ${name}`,
       `📅 ${fmt}`,
       prev ? `↩️ מועד קודם: ${prev}` : null,
-      apt.windowEndAt ? `🕑 הליד מסר/ה טווח שעות, לא שעה מדויקת` : null,
+      apt.availability ? `🕑 הליד מסר/ה אילוץ זמינות (${apt.availability === 'after' ? 'רק אחרי השעה הזו' : 'רק עד השעה הזו'}), לא מועד שנקבע` : apt.windowEndAt ? `🕑 הליד מסר/ה טווח שעות, לא שעה מדויקת` : null,
       `📱 ${localPhone(phone)}`,
       qd.lastTopic ? `💬 נושא הפנייה: ${qd.lastTopic}` : null,
       apt.capturedDuring === 'human_hold' ? `✋ השיחה בטיפול ידני: לא נשלח אישור אוטומטי לליד` : null,
@@ -489,7 +495,7 @@ function createCallbackService(deps) {
     }
     const fmt = fmtApt(apt);
     const text = [clean ? `${firstName(clean)}, רשמנו את בקשת השיחה שלך ✅` : `רשמנו את בקשת השיחה שלך ✅`, `📞 ${fmt}`,
-      apt.windowEndAt ? `נציג מהצוות של Shape Studio יצור איתך קשר בטווח השעות הזה.` : `נציג מהצוות של Shape Studio יצור איתך קשר.`].join('\n');
+      contactLine(apt)].join('\n');
     let state = 'failed', idMessage = null, error = null;
     markBotSent(phone);
     try {
@@ -683,7 +689,7 @@ function createCallbackService(deps) {
     const oldTime = validDate(apt.scheduledAt) ? fmtApt(apt) : (apt.rawTime ?? null);
     let updated = aptStore.reschedule(id, { rawTime: String(rawTime).trim(), scheduledAt: res.scheduledAt }); // throws on failure
     // the window belongs to the time: a new time carries its own range, or none (a stale range must never be shown)
-    updated = aptStore.update(id, { windowEndAt: validDate(res.windowEndAt) ? res.windowEndAt.toISOString() : null });
+    updated = aptStore.update(id, { windowEndAt: validDate(res.windowEndAt) ? res.windowEndAt.toISOString() : null, availability: res.availability ?? null });
     cancelCalendarEvent(apt).catch(() => {});
     if (getLead(apt.leadPhone)) {
       const cur = getLead(apt.leadPhone).meta ?? {};
@@ -757,7 +763,10 @@ function createCallbackService(deps) {
           rawTime:               open.rawTime,
           scheduledAt:           open.scheduledAt,
           scheduledLabel:        validDate(open.scheduledAt) ? fmtApt(open) : null,
-          isWindow:              !!open.windowEndAt,                  // the prospect gave a range of hours, not an appointed hour
+          isWindow:              !!open.windowEndAt || !!open.availability,
+          availability:          open.availability ?? null,          // 'after' | 'until': a constraint the prospect gave
+          // (kept under isWindow too: neither is an appointed hour)
+                  // the prospect gave a range of hours, not an appointed hour
           capturedDuring:        open.capturedDuring ?? null,          // 'human_hold' = arranged by hand in the chat
           nameProvisional:       open.nameProvisional === true,
           leadName:              open.leadName ?? null,

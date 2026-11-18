@@ -166,6 +166,49 @@ try {
         const d = await evalJs(`({ title: document.getElementById('title')?.innerText ?? '', steps: [...document.querySelectorAll('#steps button, #steps li')].map(e => e.innerText.replace(/\\s+/g, ' ').trim()).filter(Boolean).slice(0, 12), video: document.querySelectorAll('#detail video').length, videoErr: [...document.querySelectorAll('#detail video')].filter(v => v.error).length, rating: /הדירוג הסופי של דנה/.test(document.getElementById('detail').innerText), actions: [...document.querySelectorAll('#actions button')].map(b => b.innerText.trim() + (b.disabled ? ' (מושבת)' : '')), errors: [...document.querySelectorAll('#detail .bad, #notice.bad')].map(e => e.innerText.replace(/\\s+/g, ' ').slice(0, 120)).filter(Boolean).slice(0, 6) })`);
         if (W === WIDTHS[0]) { console.log('  steps: ' + d.steps.join(' | ')); console.log('  actions: ' + d.actions.join(' | ')); console.log(`  video elements: ${d.video} (with a load error: ${d.videoErr}); rating card: ${d.rating}`); if (d.errors.length) console.log('  marked as bad: ' + d.errors.join(' || ')); }
         check(`${W} dana project: the video player is present and did not fail to load`, d.video === 0 || d.videoErr === 0, `players ${d.video}, failed ${d.videoErr}`);
+        // The fixed action bar at the bottom (#actions) is exempt from the "nothing floats" rule, so it is checked on its
+        // own: it must not hide content, actions or fields — at the end of the page, for every control when it is
+        // brought into view, and with the screen shortened as it is under an on-screen keyboard (an emulation: headless
+        // Chrome has no real keyboard, and a real phone may also move the bar).
+        const barCheck = async (label, H) => {
+          await cdp('Emulation.setDeviceMetricsOverride', { width: W, height: H, deviceScaleFactor: 2, mobile: true });
+          await sleep(400);
+          const r = await evalJs(`(async () => {
+            const bar = document.getElementById('actions'); const vis = e => { if (!e.getClientRects().length) return false; const cs = getComputedStyle(e); if (cs.visibility === 'hidden' || cs.display === 'none') return false; const b = e.getBoundingClientRect(); return b.width > 0 && b.height > 0; };
+            const name = e => (e.tagName.toLowerCase() + (e.id ? '#' + e.id : '') + ' "' + (e.innerText || e.placeholder || e.name || '').replace(/\\s+/g, ' ').trim().slice(0, 30) + '"');
+            if (!bar || !vis(bar) || getComputedStyle(bar).position !== 'fixed') return { fixed: false };
+            const out = { fixed: true, vh: innerHeight, barH: Math.round(bar.getBoundingClientRect().height), hidden: [], unreachable: [], endGap: null, focusHidden: [] };
+            const detail = document.getElementById('detail');
+            const controls = [...detail.querySelectorAll('button, a[href], input:not([type=hidden]), textarea, select, summary, video, [role=button]')].filter(e => vis(e) && !bar.contains(e) && !e.disabled);
+            for (const e of controls) {
+              e.scrollIntoView({ block: 'center' }); await new Promise(r => requestAnimationFrame(() => r()));
+              const b = e.getBoundingClientRect(), top = bar.getBoundingClientRect().top;
+              if (b.bottom > top + 1 && b.top < innerHeight) out.hidden.push(name(e) + ' bottom ' + Math.round(b.bottom) + ' > bar ' + Math.round(top));
+              else { const x = Math.min(Math.max(b.left + b.width / 2, 1), innerWidth - 1), y = Math.min(Math.max(b.top + Math.min(b.height / 2, 20), 1), innerHeight - 1); const t = document.elementFromPoint(x, y);
+                     if (!t || !(t === e || e.contains(t) || t.contains(e) || t.closest('label')?.contains(e))) out.unreachable.push(name(e) + ' → ' + (t ? name(t) : 'nothing')); }
+            }
+            for (const e of controls.filter(e => e.matches('input:not([type=checkbox]):not([type=radio]):not([type=file]), textarea, select'))) {
+              e.focus(); await new Promise(r => setTimeout(r, 120));
+              const b = e.getBoundingClientRect(), top = bar.getBoundingClientRect().top;
+              if (b.top < 0 || b.bottom > top + 1) out.focusHidden.push(name(e) + ' ' + Math.round(b.top) + '–' + Math.round(b.bottom) + ' (bar at ' + Math.round(top) + ')');
+              e.blur();
+            }
+            scrollTo(0, document.documentElement.scrollHeight); await new Promise(r => requestAnimationFrame(() => r()));
+            const last = [...detail.querySelectorAll('*')].filter(e => vis(e) && !bar.contains(e) && !e.children.length).map(e => e.getBoundingClientRect().bottom).reduce((m, v) => Math.max(m, v), 0);
+            out.endGap = Math.round(bar.getBoundingClientRect().top - last);
+            out.controls = controls.length; scrollTo(0, 0);
+            return out; })()`);
+          if (!r.fixed) { console.log(`  (${label}: the action bar is not fixed on this screen)`); return; }
+          console.log(`  ${label}: screen ${r.vh}px, bar ${r.barH}px (${Math.round(100 * r.barH / r.vh)}% of the screen), ${r.controls} controls, space between the last content and the bar at the end of the page: ${r.endGap}px`);
+          check(`${label}: at the end of the page the bar does not cover the last content`, r.endGap >= 0, `overlap ${-r.endGap}px`);
+          check(`${label}: no button, link or field is under the bar when brought into view`, r.hidden.length === 0, r.hidden.slice(0, 5).join(' | '));
+          check(`${label}: every control can be touched (nothing lies over it)`, r.unreachable.length === 0, r.unreachable.slice(0, 5).join(' | '));
+          check(`${label}: a focused field is on screen and above the bar`, r.focusHidden.length === 0, r.focusHidden.slice(0, 5).join(' | '));
+        };
+        await barCheck(`${W} dana action bar`, 800);
+        await barCheck(`${W} dana action bar, screen shortened as under a keyboard`, 420);
+        await cdp('Emulation.setDeviceMetricsOverride', { width: W, height: 800, deviceScaleFactor: 2, mobile: true });
+        await sleep(300);
         await audit(`${W} dana project`, W);
         await shot(`prod-dana-${W}-2-project`, true);
       }

@@ -3550,7 +3550,7 @@ async function handleLeadCallbackFlow({ msg, fromNorm, fromIsraeli, clientMatch,
 
     const route = r.isReschedule ? 'appointment_rescheduled' : 'appointment_created';
     const routeIntent = r.isReschedule ? 'reschedule_time' : 'callback_time';
-    const fmt = callbackTime.formatCallbackTime(r.apt.scheduledAt, r.apt.windowEndAt ?? null);
+    const fmt = callbackTime.formatCallbackTime(r.apt.scheduledAt, r.apt.windowEndAt ?? null, r.apt.availability ?? null);
     const name = store.getLead(fromNorm)?.meta?.qualData?.confirmedName ?? null;
 
     if (name) {
@@ -3653,7 +3653,7 @@ async function handleLeadCallbackFlow({ msg, fromNorm, fromIsraeli, clientMatch,
     // 6. Asking for a call again.
     if (isRequest) {
       if (future) {
-        const fmt = callbackTime.formatCallbackTime(apt.scheduledAt, apt.windowEndAt ?? null);
+        const fmt = callbackTime.formatCallbackTime(apt.scheduledAt, apt.windowEndAt ?? null, apt.availability ?? null);
         store.logEvent('post_call_representative_acknowledged', fromNorm, { existingAptId: apt.id });
         return finish('post_call_rep_acknowledged',
           `רשומה אצלנו בקשת שיחה: ${fmt} 😊\nאם המועד לא נוח — כתבו לי יום ושעה אחרים ואעדכן.`);

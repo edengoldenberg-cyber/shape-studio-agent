@@ -143,7 +143,7 @@ async function build(d = {}) {
     if (!mgr.length) return { state: 'fail', detail: 'לא הוגדר מספר מנהל להתראות (NOTIFY_PHONES).', action: 'להגדיר NOTIFY_PHONES.' };
     const pend = d.aptStore?.getCallbackPending ? d.aptStore.getCallbackPending() : [];
     const late = pend.filter(a => a.scheduledAt && new Date(a.scheduledAt).getTime() < now);
-    const base = `בקשת חזרה נשמרת עם שעה מפורשת או עם טווח שעות ("מחר בין 14:00 ל-16:00") — שעה אינה מומצאת; הלקוח מקבל סיכום אחד והמנהל (${mgr.map(tail).join(', ')}) התראה אחת.`;
+    const base = `בקשת חזרה נשמרת עם שעה מפורשת או עם טווח שעות ("מחר בין 14:00 ל-16:00") או כאילוץ זמינות ("אחרי 16:00", "עד 12:00") — שעה אינה מומצאת, ושעות פעילות אינן מובטחות ללקוח; הלקוח מקבל סיכום אחד והמנהל (${mgr.map(tail).join(', ')}) התראה אחת.`;
     if (late.length) return { state: 'limited', detail: `${base} ${late.length} בקשות חזרה שמועדן עבר ועדיין פתוחות.`, action: 'לסגור בפאנל ברק (בוצעה / אין מענה / בוטלה).' };
     return { state: 'live', detail: `${base} ${pend.length} בקשות ממתינות.` };
   });
