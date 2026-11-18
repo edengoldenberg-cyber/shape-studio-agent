@@ -959,3 +959,103 @@ describe('Book → cancel on the wrong day → the right day → cancelled (live
     expect(mockOut.alerts).toHaveLength(1);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Production, 2026-11-18 16:23 — a new number wrote "היי אשמח לקבל פרטים נוספים על הסטודיו" and got
+// "שלום! 😊 קיבלנו את הודעתך. כדי שנוכל לעזור — במה אפשר לעזור?". Cause (from the log): the message held none of the
+// "sales intent" words, so it was held as an UNCLASSIFIED contact and got that fixed greeting; Barak was never called.
+// And the restored class list was not part of Barak's lead conversation.
+describe('A lead asks for details about the studio (production 2026-11-18 16:23)', () => {
+  const json = (url, body) => request(app).post(url).send(body ?? {}).set('Content-Type', 'application/json');
+  const last = p => textsTo(p).at(-1) ?? '';
+  const NAMES = ['פילאטיס מכשירים', 'אימון כוח', 'Pilates Barre', 'ALL IN', 'Concept Toning', 'Ashtanga Yoga', 'Kangoo Jumps'];
+  async function withKnowledge() {
+    world();
+    for (const type of ['classes', 'staff']) { await json('/api/admin/knowledge/restore', { type }); await json('/api/admin/knowledge/confirm', { type }); }
+  }
+  function withoutKnowledge() {
+    for (const f of ['staff_directory.json', 'classes_knowledge.json']) { try { fs.unlinkSync(path.join(DATA_DIR, f)); } catch { /* absent */ } }
+    world();
+    require('../agents/barak_agent').reloadKnowledge({ staffData: { instructors: [] }, classesData: { classes: [] } });
+  }
+  let n = 0; const phone = () => `97250716${String(++n).padStart(4, '0')}`;
+
+  test.each([
+    'היי אשמח לקבל פרטים נוספים על הסטודיו',
+    'אשמח לשמוע על המקום',
+    'מה אתם מציעים?',
+    'היי, מתעניינת',
+    'אפשר פרטים בבקשה?',
+    'ספרו לי קצת על הסטודיו',
+  ])('"%s" → Barak answers: a short introduction from the verified class list and ONE focused question', async text => {
+    await withKnowledge();
+    const P = phone(), calls = mockAi.calls;
+    const r = await say(P, text);
+    expect(r.route).not.toBe('unclassified');
+    const t = last(P);
+    expect(t).toMatch(/^היי 😊 כאן ברק מ-Shape Studio\.\nיש אצלנו /);
+    for (const name of NAMES) expect(t).toContain(name);                           // what the studio really has, nothing else
+    expect(t).toMatch(/מה הכי מעניין אותך — פילאטיס מכשירים, אימון כוח או משהו אחר\?$/);
+    expect((t.match(/\?/g) ?? []).length).toBe(1);                                 // one question
+    expect(t).not.toMatch(/במה אפשר לעזור|קיבלנו את הודעתך|₪|ש"ח|מחיר/);
+    expect(mockAi.calls).toBe(calls);                                              // it does not depend on the model
+    expect(textsTo(P)).toHaveLength(1);
+  });
+
+  test('no verified class list is loaded: nothing is invented and the lead is not asked to explain himself again; it is recorded for the panel', async () => {
+    withoutKnowledge();
+    const P = phone();
+    await say(P, 'היי אשמח לקבל פרטים נוספים על הסטודיו');
+    const t = last(P);
+    expect(t).toBe('היי 😊 כאן ברק מ-Shape Studio, שמח שפנית.\nכדי שאכוון אותך נכון — איזה סוג אימון מעניין אותך?');
+    expect(t).not.toMatch(/במה אפשר לעזור|פילאטיס|יוגה|₪/);
+    expect(require('../utils/lead_store').getEvents?.({ type: 'studio_intro_partial' })?.length ?? 1).toBeGreaterThan(0);
+    const st = (await request(app).get('/api/admin/knowledge/status')).body.summary;
+    expect(st.rows.find(x => x.id === 'classes').state).toBe('empty');             // and the panel says the list is missing
+  });
+
+  test('the model is down: the introduction still goes out (it never needed the model)', async () => {
+    await withKnowledge();
+    const OpenAI = require('openai');
+    const P = phone(), before = mockAi.calls;
+    mockAi.fallback = null;                                                        // a model answer of null would break a model-made reply
+    await say(P, 'אשמח לשמוע על המקום');
+    mockAi.fallback = 'היי! אשמח לעזור 😊 מה מחפשים?';
+    expect(last(P)).toMatch(/כאן ברק מ-Shape Studio\.\nיש אצלנו /);
+    expect(last(P)).not.toMatch(/תקלה/);
+    expect(mockAi.calls).toBe(before);
+    expect(typeof OpenAI).toBe('function');
+  });
+
+  test('a request that already names something is answered by the usual conversation, with the verified lists in Barak\'s context; the introduction is given once', async () => {
+    await withKnowledge();
+    const ctx = require('../agents/lead_agent').buildKnowledgeContext();
+    expect(ctx).toMatch(/VERIFIED STUDIO FACTS/);
+    expect(ctx).toMatch(/Class types at the studio: פילאטיס מכשירים, אימון כוח, Pilates Barre, ALL IN/);
+    expect(ctx).toMatch(/Instructors: /);
+    expect(ctx).toMatch(/Never invent a class, an instructor, a price/);
+    const P = phone(), calls = mockAi.calls;
+    await say(P, 'אשמח לקבל פרטים על פילאטיס מכשירים');
+    expect(mockAi.calls).toBe(calls + 1);                                          // the model, not the fixed greeting and not the general introduction
+    expect(last(P)).not.toMatch(/קיבלנו את הודעתך|כאן ברק מ-Shape Studio\.\nיש אצלנו/);
+    const Q = phone();
+    await say(Q, 'מה אתם מציעים?');
+    const c2 = mockAi.calls;
+    await say(Q, 'אפשר עוד פרטים?');
+    expect(mockAi.calls).toBe(c2 + 1);                                             // the second time the conversation goes on - the introduction is not repeated
+    expect(textsTo(Q).filter(x => /כאן ברק מ-Shape Studio\.\nיש אצלנו/.test(x))).toHaveLength(1);
+  });
+
+  test('with no verified lists Barak\'s context says so and forbids naming classes', () => {
+    withoutKnowledge();
+    expect(require('../agents/lead_agent').buildKnowledgeContext()).toMatch(/No verified list of class types or instructors is loaded\. Do not name any class type or instructor/);
+  });
+
+  test('a bare greeting and a supplier\'s pitch are still not treated as leads', async () => {
+    await withKnowledge();
+    const A = phone(), B = phone();
+    expect((await say(A, 'היי')).route).toBe('unclassified');
+    expect((await say(B, 'שלום, אשמח להציע לכם שירותי ניקיון לסטודיו, אפשר פרטים למי לפנות?')).route).toBe('unclassified');
+    expect(last(B)).not.toMatch(/כאן ברק מ-Shape Studio/);
+  });
+});

@@ -820,4 +820,7 @@ module.exports = {
   reloadKnowledge,
   getRawKnowledge,
   setKnowledgeFilter,
+  // what the agents may state right now: saved AND (confirmed by the owner OR seen in the live Arbox schedule)
+  usableClassNames:      () => usableClasses().map(c => c.name_he).filter(Boolean),
+  usableInstructorNames: () => usableInstructors().map(s => s.name_he).filter(Boolean),
 };

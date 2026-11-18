@@ -4671,7 +4671,9 @@ async function processInboundWAMessage(msg) {
     // inbox first; a neutral greeting gives them the chance to clarify.
     // Weight-loss phrases: "להוריד 20 קילו" / "לרדת במשקל" are fitness-specific in this context.
     const SALES_INTENT_RE = /פילאטיס|כושר|שיעור|אימו[נן]|להצטרף|מנוי|להתנסות|ניסיון|רפורמר|בארה|קנגו|yoga|יוגה|בריאות|ירידה.*משקל|להוריד.*(?:קילו|משקל)|לרדת.*(?:קילו|משקל|במשקל)|חיזוק|גמישות|שייפ\s*סטודיו|מחיר|כמה.*עולה|שעות.*פעילות|לוח.*שיעורים|מערכת\s*שעות|הצעת\s+היכרות|60\s+ש|60\s+₪/i;
-    const _hasSalesIntent = SALES_INTENT_RE.test(msg.text ?? '');
+    // … and an explicit request to hear about the studio ("אשמח לקבל פרטים על הסטודיו", "מה אתם מציעים?") is exactly
+    // that interest, though it names no class: it used to get the fixed "במה אפשר לעזור?" (production, 2026-11-18 16:23)
+    const _hasSalesIntent = SALES_INTENT_RE.test(msg.text ?? '') || require('./utils/studio_intro').isInfoRequest(msg.text ?? '');
 
     if (!_hasLeadHistory && !_hasSalesIntent && msg.type === 'text') {
       const _alreadyGreeted = _tomerStore.hasGreetedUnclassified(fromNorm);

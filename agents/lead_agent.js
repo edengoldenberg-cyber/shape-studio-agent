@@ -13,6 +13,7 @@ const { tryDeterministicWazeReply, tryDeterministicScheduleReply } = require('./
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const studioAssets  = require('../utils/studio_assets');
+const studioIntro = require('../utils/studio_intro');
 const memoryService = require('../services/memory.service');
 const handoffService = require('../services/handoff.service');
 const memberCache   = require('../utils/member_cache');
@@ -59,6 +60,20 @@ function buildPricingContext() {
  * Returns a short markdown section with the studio's live asset URLs.
  * Called on every prompt build so dashboard edits take effect immediately.
  */
+/** The class types and instructors the agents may state now (owner-saved lists, verified against the live schedule). */
+function studioKnowledge() {
+  try { const bk = require('./barak_agent'); return { classNames: bk.usableClassNames(), instructorNames: bk.usableInstructorNames() }; }
+  catch (err) { logger.warn('[lead_agent] studio knowledge not available', { error: err.message }); return { classNames: [], instructorNames: [] }; }
+}
+function buildKnowledgeContext() {
+  const k = studioKnowledge();
+  if (!k.classNames.length && !k.instructorNames.length) return '## STUDIO FACTS\nNo verified list of class types or instructors is loaded. Do not name any class type or instructor; ask what kind of training interests them.';
+  return ['## VERIFIED STUDIO FACTS (the studio\'s own lists, checked against the live schedule)',
+    k.classNames.length ? `- Class types at the studio: ${k.classNames.join(', ')}` : '- Class types: no verified list — do not name any.',
+    k.instructorNames.length ? `- Instructors: ${k.instructorNames.join(', ')}` : '- Instructors: no verified list — do not name any.',
+    'Name ONLY class types and instructors from these lists. Never invent a class, an instructor, a price, a schedule or how many places are free.'].join('\n');
+}
+
 function buildAssetContext() {
   const assets = studioAssets.getAssets();
 
@@ -419,6 +434,7 @@ function buildTurnSystemPrompt(completedTurns, qualData, name, from, msgCount) {
       `Phone: ${from}.`,
       ``,
       buildAssetContext(),
+      buildKnowledgeContext(),
       buildPricingContext(),
       _buildLanguageRule(qualData),
     ].join('\n');
@@ -429,7 +445,7 @@ function buildTurnSystemPrompt(completedTurns, qualData, name, from, msgCount) {
   const memSection   = memBlock ? `\n\n${memBlock}` : '';
   const pricingCtx   = buildPricingContext();
   const pricingSection = pricingCtx ? `\n\n${pricingCtx}` : '';
-  return `${SYSTEM_PROMPT}\n\n${buildAssetContext()}${pricingSection}${memSection}\n\n---\n\n## Current Turn Instruction\n\n${buildStageContext(completedTurns, qualData, msgCount)}`;
+  return `${SYSTEM_PROMPT}\n\n${buildAssetContext()}\n\n${buildKnowledgeContext()}${pricingSection}${memSection}\n\n---\n\n## Current Turn Instruction\n\n${buildStageContext(completedTurns, qualData, msgCount)}`;
 }
 
 // Universal rules injected into every stage context.
@@ -1447,7 +1463,18 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
   // concurrent events (human takeover, newer inbound) during "generation".
   if (process.env.TEST_AI_DELAY_MS) await new Promise(r => setTimeout(r, Number(process.env.TEST_AI_DELAY_MS)));
   let reply;
+  // A general request to hear about the studio, before any interest was named: a short introduction from the verified
+  // knowledge and ONE focused question. Deterministic - it neither waits for the model nor fails with it.
+  const _intro = (!freshQualData.fitnessInterest && completedTurns <= 1 && studioIntro.isInfoRequest(text) && !studioIntro.isSpecific(text)
+    && !history.some(m => m.role === 'assistant' && /כאן ברק מ-Shape Studio/.test(m.content ?? ''))) ? studioIntro.build(studioKnowledge()) : null;
+  if (_intro) {
+    _lastDebugCtx = { path: 'studio_intro', completedTurns, partial: _intro.partial, postProcess: { changes: [], clean: true } };
+    store.logEvent(_intro.partial ? 'studio_intro_partial' : 'studio_intro', from, { classes: _intro.used.length });
+    if (_intro.partial) logger.warn('[lead_agent] a lead asked about the studio and no verified class list is loaded - the introduction names nothing', { from });
+  }
   try {
+    if (_intro) reply = _intro.text;
+    else {
     const completion = await openai.chat.completions.create({
       model:       process.env.OPENAI_MODEL ?? 'gpt-4o',
       messages:    messagesForApi,
@@ -1455,6 +1482,7 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
       max_tokens:  350,   // was 200 — Hebrew address + Waze URL alone is ~80 tokens
     });
     reply = completion.choices[0].message.content.trim();
+    }
 
     // ── Post-processor: enforce output invariants ─────────────────────────────
     // Runs after every AI reply to catch failures the model missed:
@@ -1780,5 +1808,5 @@ function isCallbackInviteContext(phone) {
   return !!lastAssistant && INVITE_CONTEXT_RE.test(String(lastAssistant.content ?? ''));
 }
 
-module.exports = { isCallbackInviteContext, handleInbound, clearSession, generateLeadBrief, sendIntroOffer, getLastDebugContext, recordSchedulingExchange, computeLeadProfile, TIME_PATTERN, TIME_REJECTION_RE, extractNameFromMessage, postProcessReply, CALLBACK_NEXT_STEP };
+module.exports = { buildKnowledgeContext, isCallbackInviteContext, handleInbound, clearSession, generateLeadBrief, sendIntroOffer, getLastDebugContext, recordSchedulingExchange, computeLeadProfile, TIME_PATTERN, TIME_REJECTION_RE, extractNameFromMessage, postProcessReply, CALLBACK_NEXT_STEP };
 
