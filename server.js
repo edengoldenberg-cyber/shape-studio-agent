@@ -204,6 +204,25 @@ function _autoAddKnownMember(phone, name) {
  * @param {'startup'|'cron_15min'|string} source - label for logs/events
  * @returns {number}
  */
+/**
+ * Stored lead records are brought back in line with the evidence (utils/lead_reconcile.js): a member mark that the
+ * Arbox evidence does not support is removed, and a refusal that exists only in the history is recorded. Runs at
+ * startup and after every sync, so neither can bring a wrong state back. Sends nothing, deletes nothing.
+ */
+function _reconcileLeads(source = 'unknown') {
+  try {
+    const out = require('./utils/lead_reconcile').reconcile({ store, identity, inbox, aptStore, logger, computeProfile: leadAgent.computeLeadProfile });
+    if (out.corrected.length || out.refusals.length) {
+      persist.saveLeads(store);
+      broadcastSse('leads_updated', { source: `reconcile_${source}`, corrected: out.corrected.length, refusals: out.refusals.length });
+    }
+    if (out.corrected.length || out.refusals.length || source === 'startup') {
+      logger.info('[lead-reconcile] done', { source, checked: out.checked, corrected: out.corrected.length, review: out.review.length, refusals: out.refusals.length, deferred: out.deferred });
+    }
+    return out;
+  } catch (err) { logger.error('[lead-reconcile] failed', { source, error: err.message }); return null; }
+}
+
 function _purgeKnownMembersFromLeadStore(source = 'unknown') {
   const leads = store.getAllLeads();
   if (!leads.length) return 0;
@@ -213,6 +232,9 @@ function _purgeKnownMembersFromLeadStore(source = 'unknown') {
     if (!lead.phone) continue;
     if (lead.status === 'converted_member') continue; // already done
     if (!phoneRegistry.isMember(lead.phone)) continue;
+    // a record under a stop-status that already carries the member mark needs nothing: re-stamping it every 15 minutes
+    // rewrote its dates and logged 27 "reclassified" lines per run
+    if (lead.meta?.isConfirmedMember === true && ['opted_out', 'human_owns', 'attribution_review'].includes(lead.status)) continue;
 
     store.reclassifyAsConvertedMember(lead.phone, { name: lead.name ?? null, source });
     store.logEvent('member_reclassified_from_leads', lead.phone, {
@@ -679,7 +701,7 @@ const CODE_FEATURES = [
   'staff_confirm_lifecycle', // confirm / outcome endpoints enforce transitions
   'current_callback_latest', // a lead's current callback = its most recent request only
   'quiet_hours_restored',    // utils/time.isQuietHours active again (22:00–08:00 Israel)
-  'dana_rating_v1', 'system_status_v1', 'sales_refusal_v1',          // Dana studio: rating of a stored file, review history, score with evidence, apply-improvements guard
+  'dana_rating_v1', 'system_status_v1', 'sales_refusal_v1', 'sales_refusal_v2', 'lead_reconcile_v1',          // Dana studio: rating of a stored file, review history, score with evidence, apply-improvements guard
 ];
 app.get('/api/version', (_req, res) => {
   res.json({
@@ -1570,6 +1592,7 @@ cron.schedule('*/15 * * * *', async () => {
     await _retryFailedCallbackSummaries().catch(err => logger.warn('Cron: callback summary retry failed', { error: err.message }));
     await memberHandoff.retryFailedAlerts().catch(err => logger.warn('Cron: member hand-off alert retry failed', { error: err.message }));
     const purged = _purgeKnownMembersFromLeadStore('cron_15min');
+    _reconcileLeads('cron_15min');
     if (purged > 0) {
       persist.saveLeads(store);
       broadcastSse('leads_updated', { purged, source: 'cron_15min' });
@@ -1587,7 +1610,8 @@ cron.schedule('*/15 * * * *', async () => {
 cron.schedule('15 9 * * *', async () => {
   logger.info('Cron: running conversion detector');
   try {
-    const result = await detectAndMarkConversions(store, memberCache, normalizeToE164, _autoAddKnownMember);
+    const result = await detectAndMarkConversions(store, memberCache, normalizeToE164, _autoAddKnownMember, identity);
+    _reconcileLeads('conversion_detector');
     if (result.converted > 0) {
       logger.info('Cron: conversion detector found new members', result);
       alertOwner(
@@ -2465,7 +2489,7 @@ async function buildSchedulingReply(intent, msg, clientMatch, { noMatchPassthrou
         const bio = s.bio ? `\n  ${s.bio}` : '';
         return `• *${s.name_he}* — ${specs}${flags ? ` ${flags}` : ''}${bio}`;
       }).join('\n');
-      return `יש לנו מדריכ/ה מתאים/ה:\n\n${lines}\n\nרוצה לתאם שיעור?`;
+      return `מהצוות שלנו, מי שמתאים לזה:\n\n${lines}\n\nרוצה לתאם שיעור?`;
     }
     // No match in directory.
     // For new leads (noMatchPassthrough=true): return null so Barak AI handles
@@ -2575,7 +2599,7 @@ async function buildSchedulingReply(intent, msg, clientMatch, { noMatchPassthrou
     if (instructorOnly) {
       // Asked specifically about an instructor — answer only that
       const lines = displayClasses.map(c =>
-        `• ${c.start} | ${c.name}\n  מדריך/ה: *${c.staff}*`
+        `• ${c.start} | ${c.name}\n  בהדרכת *${c.staff}*`
       ).join('\n');
       return `ב${dayLabel}:\n\n${lines}`;
     }
@@ -2583,7 +2607,7 @@ async function buildSchedulingReply(intent, msg, clientMatch, { noMatchPassthrou
     // General schedule listing
     const lines = displayClasses.map(c => {
       const cap = capacityFor(c.name);
-      return `• ${c.start}–${c.end} | ${c.name}\n  מדריך/ה: ${c.staff} | ${cap} מקומות`;
+      return `• ${c.start}–${c.end} | ${c.name}\n  בהדרכת ${c.staff} | ${cap} מקומות`;
     }).join('\n');
 
     // Only add a name greeting if this is a filtered (personal) query, not a full listing
@@ -2591,7 +2615,7 @@ async function buildSchedulingReply(intent, msg, clientMatch, { noMatchPassthrou
       ? `ב${dayLabel} 🏋️\n\n`
       : `שיעורי ה${dayLabel} ב-Shape Studio 🏋️\n\n`;
 
-    return `${preamble}${lines}\n\nרוצה מקום? ענה/י עם שם השיעור 💪`;
+    return `${preamble}${lines}\n\nרוצה מקום? אפשר לענות עם שם השיעור 💪`;
   }
 
   return null;
@@ -3460,45 +3484,86 @@ function _isManualCallbackAnswer(phone, msg) {
 
 const _INVITE_ACCEPT_RE = /^(?:כן|בטח|ברור|אשמח|בשמחה|יאללה|סבבה|מעולה|אוקיי?|אוקי|בסדר|נשמע טוב|מתאים|yes|ok|sure)(?:[\s,.!]|$)/i;
 /**
- * An explicit decision NOT to register, and the messages that follow it (utils/sales_refusal.js; owner rules 2026-11-18).
- * Runs for a lead after the human-ownership / opt-out gates and BEFORE the callback flow and the AI:
- *   refusal   → the state is stored (no offers, no call arranging, no automated follow-up), one short fixed reply
- *   courtesy  → "thanks" / emoji after a refusal: one short reply, never an offer; after that, silence
- *   reopen    → an explicit request for a call or to register: the state is cleared and the ordinary flow continues
- *   question  → the ordinary flow answers it; offers are stripped from whatever it produces
+ * An explicit decision NOT to register / "do not call me", and the messages that follow it (utils/sales_refusal.js;
+ * owner rules 2026-11-18). Runs for a lead — text or a voice transcript alike — after the human-ownership / opt-out
+ * gates and BEFORE the callback flow and the AI:
+ *   refusal           → stored with its time, source and context; offers, call arranging and automated follow-ups
+ *                       stop; an open callback request is cancelled (managers told once); one short fixed reply
+ *   refusal_question  → the same state, and the question is answered by the ordinary flow with offers stripped
+ *   no_call           → "אל תתקשרו אליי": no callback is created or kept, one short fixed reply
+ *   courtesy / silent → thanks / an emoji after a refusal: one short reply without an offer, then nothing
+ *   reopen            → an explicit request for a call or to register: a new interest is recorded, the ordinary flow continues
+ *   question          → the ordinary flow answers; offers are stripped from whatever it produces
+ * A record written before the refusal field existed is read from its stored history first.
  * Returns a pipeline result when the message was handled here, otherwise null. Arbox is never touched.
  */
 async function handleSalesRefusal({ msg, fromNorm, fromIsraeli, clientMatch, intent }) {
   const text = (msg.text ?? '').trim();
   if (!text) return null;
-  const lead = store.getLead(fromNorm);
-  const qd   = lead?.meta?.qualData ?? {};
-  const d = salesRefusal.decide(text, { declined: qd.registrationDeclined === true, courtesyAnswered: qd.declineCourtesyAnswered === true }, _saneDate(msg.timestamp).toISOString());
-  if (d.action === 'none' || d.action === 'question') return null;
+  const sentAt = _saneDate(msg.timestamp);
+  let lead = store.getLead(fromNorm);
+  let qd   = lead?.meta?.qualData ?? {};
 
-  const openCb = aptStore.getActiveCallback(fromNorm);
+  // An old record: the refusal is in the history but no field says so. The history is the evidence.
+  if (lead && qd.registrationDeclined === undefined && !qd.registrationReopenedAt) {
+    const st = salesRefusal.stateFromHistory((lead.history ?? []).filter(m => m.role === 'user').map(m => String(m.content ?? '')));
+    if (st.declined) {
+      store.upsertLead(fromNorm, { meta: { ...(lead.meta ?? {}), qualData: { ...qd, registrationDeclined: true, registrationDeclinedAt: null, registrationDeclinedText: st.text,
+        registrationDeclinedSource: 'history', registrationDeclinedRecordedAt: new Date().toISOString(), declineCourtesyAnswered: st.courtesyAfter, callbackDeclined: true, callProposed: false } } });
+      store.logEvent('registration_declined_backfilled', fromNorm, { source: 'history' });
+      lead = store.getLead(fromNorm); qd = lead.meta.qualData;
+    }
+  }
+
+  const d = salesRefusal.decide(text, { declined: qd.registrationDeclined === true, courtesyAnswered: qd.declineCourtesyAnswered === true, noCall: qd.doNotCall === true }, sentAt.toISOString());
+  if (d.action === 'none') return null;
+  if (d.action === 'question' && !d.patch) return null;
+
+  const isRefusalNow = d.action === 'refusal' || d.action === 'refusal_question';
+  const isNoCallNow  = d.patch?.doNotCall === true && qd.doNotCall !== true;
   if (d.patch) {
     if (!store.getLead(fromNorm)) store.upsertLead(fromNorm, { name: msg.name ?? undefined });
     const cur = store.getLead(fromNorm);
-    store.upsertLead(fromNorm, { meta: { ...(cur.meta ?? {}), ...(d.action === 'refusal' ? { awaitingCallbackTime: false } : {}), qualData: { ...(cur.meta?.qualData ?? {}), ...d.patch } } });
+    const history = cur.history ?? [];
+    const lastBot = [...history].reverse().find(m => m.role === 'assistant')?.content ?? null;
+    const record = isRefusalNow
+      ? { registrationDeclinedSource: msg.fromVoice ? 'voice_transcript' : 'whatsapp_text', registrationDeclinedMessageId: msg.messageId ?? null,
+          registrationDeclinedContext: lastBot ? String(lastBot).slice(0, 200) : null, registrationDeclinedRecordedAt: new Date().toISOString() }
+      : d.action === 'reopen' ? { registrationReopenedSource: msg.fromVoice ? 'voice_transcript' : 'whatsapp_text', registrationReopenedMessageId: msg.messageId ?? null }
+      : isNoCallNow ? { doNotCallSource: msg.fromVoice ? 'voice_transcript' : 'whatsapp_text', doNotCallMessageId: msg.messageId ?? null } : {};
+    store.upsertLead(fromNorm, { meta: { ...(cur.meta ?? {}), ...(isRefusalNow || isNoCallNow ? { awaitingCallbackTime: false } : {}), qualData: { ...(cur.meta?.qualData ?? {}), ...d.patch, ...record } } });
   }
   if (d.action === 'reopen') {
-    store.logEvent('registration_reopened', fromNorm, { preview: text.slice(0, 80) });
+    store.logEvent('registration_reopened', fromNorm, { preview: text.slice(0, 80), source: msg.fromVoice ? 'voice_transcript' : 'whatsapp_text' });
+    logger.info('[pipeline] explicit request after a refusal — a new interest is opened', { from: fromNorm });
+    const cur = store.getLead(fromNorm);
+    try { store.upsertLead(fromNorm, { meta: { ...(cur.meta ?? {}), qualProfile: leadAgent.computeLeadProfile(cur, cur.meta?.qualData ?? {}, cur.history ?? []) } }); } catch { /* display aid */ }
     persist.saveLeads(store);
     return null;                                             // the callback flow / the AI take it from here
   }
-  if (d.action === 'refusal') {
-    store.logEvent('registration_declined', fromNorm, { preview: text.slice(0, 80) });
-    logger.info('[pipeline] explicit refusal to register — offers and follow-ups stopped', { from: fromNorm });
+
+  if (isRefusalNow || isNoCallNow) {
+    store.logEvent(isRefusalNow ? 'registration_declined' : 'do_not_call', fromNorm, { preview: text.slice(0, 80), source: msg.fromVoice ? 'voice_transcript' : 'whatsapp_text' });
+    logger.info(isRefusalNow ? '[pipeline] explicit refusal to register — offers and follow-ups stopped' : '[pipeline] "do not call" — no callback will be created', { from: fromNorm });
+    // An open callback request belongs to the interest that was just closed: cancelled by the prospect, reminders stop.
+    if (aptStore.getActiveCallback(fromNorm)) {
+      try {
+        const c = await callbackSvc.cancelByProspect({ phone: fromNorm, text, sentAt, why: isRefusalNow ? 'registration_declined' : 'do_not_call', displayName: msg.name ?? null });
+        if (c.cancelled) broadcastSse('appointment_updated', { phone: fromNorm, aptId: c.apt?.id ?? null });
+      } catch (err) { logger.error('[pipeline] cancelling the open callback after a refusal failed', { from: fromNorm, error: err.message }); }
+    }
+    if (isRefusalNow) {
+      const cur = store.getLead(fromNorm);
+      const keep = ['human_owns', 'opted_out', 'converted_member', 'callback_requested', 'call_scheduled', 'call_cancelled'].includes(cur.status);
+      store.upsertLead(fromNorm, keep ? { score: Math.min(cur.score ?? 0, 2) } : { score: Math.min(cur.score ?? 0, 2), status: 'cold' });
+    }
     const cur = store.getLead(fromNorm);
-    const keep = ['human_owns', 'opted_out', 'converted_member', 'callback_requested', 'call_scheduled'].includes(cur.status);
-    store.upsertLead(fromNorm, keep ? { score: Math.min(cur.score ?? 0, 2) } : { score: Math.min(cur.score ?? 0, 2), status: 'cold' });
-    // An open callback request is the prospect's to cancel through the callback flow, which records it on the request.
-    if (openCb) { persist.saveLeads(store); return null; }
+    try { store.upsertLead(fromNorm, { meta: { ...(cur.meta ?? {}), qualProfile: leadAgent.computeLeadProfile(cur, cur.meta?.qualData ?? {}, cur.history ?? []) } }); } catch { /* display aid */ }
   }
+  if (d.action === 'refusal_question' || d.action === 'question') { persist.saveLeads(store); return null; }   // the ordinary flow answers the question
 
   const reply = d.reply ?? null;
-  const route = d.action === 'refusal' ? 'registration_declined' : d.action === 'courtesy' ? 'declined_courtesy' : 'declined_silent';
+  const route = d.action === 'refusal' ? 'registration_declined' : d.action === 'no_call' ? 'do_not_call' : d.action === 'courtesy' ? 'declined_courtesy' : 'declined_silent';
   let sent = false;
   if (reply && process.env.WHATSAPP_AUTO_REPLY === 'true' && !_pendingMessages.has(fromNorm)) {
     _markBotSent(fromNorm);
@@ -3512,7 +3577,7 @@ async function handleSalesRefusal({ msg, fromNorm, fromIsraeli, clientMatch, int
   if (reply) leadAgent.recordSchedulingExchange(fromNorm, text, reply);
   const cur2 = store.getLead(fromNorm);
   if (cur2) store.upsertLead(fromNorm, { messageCount: (cur2.messageCount ?? 0) + 1, name: cur2.name ?? msg.name ?? undefined });
-  store.logEvent(route, fromNorm, { sent });
+  store.logEvent(`${route}_reply`, fromNorm, { sent });
   const entry = inbox.push({
     from: fromNorm, fromIsraeli, name: msg.name ?? null, text: msg.text ?? '', messageId: msg.messageId, timestamp: msg.timestamp,
     receivedAt: new Date(), mediaType: msg.type, mediaCaption: null, mediaId: null, clientMatch, intent, route, barakReply: reply,
@@ -3520,6 +3585,33 @@ async function handleSalesRefusal({ msg, fromNorm, fromIsraeli, clientMatch, int
   persist.saveLeads(store);
   persist.saveInbox(inbox);
   return { inboxEntry: entry, clientMatch, intent, route, barakReply: reply };
+}
+
+/**
+ * A conversation the staff were handling by hand BEFORE the system could see it (manual replies are recognised from
+ * the outgoing webhook since 2026-11-13; older ones exist only in the synced history). Production, 2026-11-09: a lead
+ * answered the owner's hand-typed offer of a call and the bot replied as to a stranger.
+ * The evidence must be reliable: the LAST outgoing message of the thread was typed on the studio phone (WhatsApp ids of
+ * phone-typed messages start with "2A" and are 20 characters; ids of messages sent through the API — the agents, Arbox
+ * reminders — start with "3EB0"), it is recent, and nobody released the conversation after it. A thread whose last
+ * outgoing message came through the API proves nothing and changes nothing.
+ * Returns the evidence, or null.
+ */
+const PRIOR_MANUAL_MAX_DAYS = 30;
+function _priorManualConversation(phone) {
+  const lead = store.getLead(phone);
+  if (lead && ['human_owns', 'opted_out', 'attribution_review'].includes(lead.status)) return null;
+  const th = inbox.getThread(phone);
+  const outs = (th?.messages ?? []).filter(m => m.direction === 'out');
+  const last = outs[outs.length - 1];
+  if (!last) return null;
+  const id = String(last.id ?? '');
+  if (!(id.startsWith('2A') && id.length === 20)) return null;
+  const at = new Date(last.timestamp).getTime();
+  if (!Number.isFinite(at) || Date.now() - at > PRIOR_MANUAL_MAX_DAYS * 86400000) return null;
+  const released = lead?.meta?.humanReleasedAt ? new Date(lead.meta.humanReleasedAt).getTime() : 0;
+  if (released && released >= at) return null;                 // the staff handed the conversation back after that message
+  return { messageId: id, at: new Date(at).toISOString() };
 }
 
 async function handleLeadCallbackFlow({ msg, fromNorm, fromIsraeli, clientMatch, intent, phase }) {
@@ -3979,7 +4071,9 @@ async function processInboundWAMessage(msg) {
   }
 
   // 2. Intent detection (only meaningful for text messages)
-  const intent = msg.type === 'text' ? detectSchedulingIntent(msg.text) : 'general';
+  // Several intentions in one message: a clause that only states a refusal ("החלטתי לא להירשם, אבל כמה עולה …?") is not
+  // part of what is being asked, and must not decide how the question is routed.
+  const intent = msg.type === 'text' ? detectSchedulingIntent(salesRefusal.questionPart(msg.text)) : 'general';
 
   // Lead reschedule requests are handled by handleLeadCallbackFlow (below, AFTER the
   // human_owns / opted_out gates) — never before ownership has been checked.
@@ -4269,6 +4363,15 @@ async function processInboundWAMessage(msg) {
   //
   //   call_scheduled / callback_requested: handled context-aware below — not an early return
   //   because reschedule / schedule-query / opt-out must still be processed.
+  if (!isExistingClient) {
+    const _pm = _priorManualConversation(fromNorm);
+    if (_pm) {
+      _manualTakeover(fromNorm, { reason: 'prior_manual_conversation', staffName: null });
+      const _cur = store.getLead(fromNorm);
+      if (_cur) store.upsertLead(fromNorm, { meta: { ...(_cur.meta ?? {}), humanOwnsEvidence: { kind: 'last_outgoing_typed_on_phone', ..._pm } } });
+      logger.info('[pipeline] the staff had the last word in this conversation — it stays with the staff', { from: fromNorm, at: _pm.at });
+    }
+  }
   {
     const _stopRec    = store.getLead(fromNorm);
     const _stopStatus = _stopRec?.status;
@@ -4953,7 +5056,8 @@ async function processInboundWAMessage(msg) {
   // Every reply to a lead that is sent from here (schedule answers, price answers, the callback flow's texts) passes
   // the same two gates as the AI's replies: no offer after an explicit refusal to register, and neutral wording.
   if (barakReply && !isExistingClient && !_replyAlreadySent) {
-    if (store.getLead(fromNorm)?.meta?.qualData?.registrationDeclined === true) {
+    const _rqd = store.getLead(fromNorm)?.meta?.qualData ?? {};
+    if (_rqd.registrationDeclined === true || _rqd.doNotCall === true) {
       const _clean = salesRefusal.stripOffers(barakReply, 'אין לי כאן מידע מעודכן על זה 🙏');
       if (_clean !== barakReply) { store.logEvent('offer_removed_after_refusal', fromNorm, { route }); barakReply = _clean; }
     }
@@ -5198,6 +5302,8 @@ app.post('/api/whatsapp/simulate', jsonBody, async (req, res) => {
     mediaId: null,
     // TEST_MODE only: where the (mocked) provider serves a voice recording
     ...(process.env.TEST_MODE === 'true' && req.body?.mediaUrl ? { mediaUrl: String(req.body.mediaUrl), mimeType: req.body.mimeType ?? null } : {}),
+    // TEST_MODE only: the text is the transcript of a voice message (as _routeTranscript marks it)
+    ...(process.env.TEST_MODE === 'true' && req.body?.fromVoice === true ? { fromVoice: true } : {}),
   };
 
   try {
@@ -5819,7 +5925,7 @@ app.post('/api/tomer/action', jsonBody, async (req, res) => {
     onboarding: `${hi}! 🌱 שמחים שהצטרפת לשייפ סטודיו!\nאיך הולך עד כה? יש שאלות על השיעורים או הלוח? אנחנו כאן בשבילך 💪`,
     churn_risk: `${hi}! ⭐ לא ראינו אותך${ctx?.daysSince ? ` כבר ${ctx.daysSince} ימים` : ' קצת זמן'}.\nהכל בסדר? נשמח לראות אותך בסטודיו שוב 🤸‍♀️`,
     renewal:    `${hi}! 💳 המנוי שלך${ctx?.daysLeft != null ? ` פג בעוד ${ctx.daysLeft} ימים` : ' עומד לפוג בקרוב'}.\nרוצה לחדש? נשמח לעזור 😊`,
-    birthday:   `${hi}! 🎉 יום הולדת שמח!!\nשמחים שאת/ה חלק ממשפחת שייפ סטודיו. יום האימון הבא עלינו 🎂💪`,
+    birthday:   `${hi}! 🎉 יום הולדת שמח!!\nשמחים על הזכות להתאמן יחד במשפחת שייפ סטודיו — יום האימון הבא עלינו 🎂💪`,
     win_back:   `${hi}! 🔄 פספסנו אותך בשייפ סטודיו!\nמה דעתך לחזור? יש לנו הצעה מיוחדת לחברים חוזרים 🌟`,
   };
 
@@ -7630,6 +7736,7 @@ app.listen(PORT, async () => {
       broadcastSse('leads_updated', { purged: startupPurged, source: 'startup' });
       logger.info('[startup] Purged stale member-lead records', { purged: startupPurged });
     }
+    _reconcileLeads('startup');
   }
 
   // ── Periodic save: flush both stores to disk every 60 seconds ──────────────
@@ -7692,4 +7799,6 @@ module.exports = app;
 // Exposed for tests only: the real startup-recovery routine (production runs it from
 // the listen callback).
 module.exports._recoverClosingSummaries = _recoverClosingSummaries;
+module.exports._reconcileLeads = _reconcileLeads;
+module.exports._purgeKnownMembersFromLeadStore = _purgeKnownMembersFromLeadStore;
 

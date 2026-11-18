@@ -102,6 +102,10 @@ try {
     await sleep(2500);
     const cb = await evalJs(`({ rows: document.querySelectorAll('.callback-row').length, leads: document.querySelectorAll('.leads-table tbody tr').length })`);
     console.log(`  (callback rows: ${cb.rows}, table rows: ${cb.leads})`);
+    // refusal / classification notes in the leads table (types and the non-personal part of the text only)
+    const notes = await evalJs(`[...document.querySelectorAll('#barak-leads-tbody .lead-note')].map(n => n.dataset.note + ': ' + n.innerText.replace(/"[^"]*"/g, '"…"').replace(/\s+/g, ' ').slice(0, 150))`);
+    if (W === WIDTHS[0]) { console.log(`  lead notes: ${notes.length}`); for (const n of notes) console.log('    ' + n); }
+    check(`${W} barak: refusal / classification notes are inside the screen`, await evalJs(`[...document.querySelectorAll('#barak-leads-tbody .lead-note')].every(n => { const r = n.getBoundingClientRect(); return r.width > 0 && (r.right <= innerWidth + 1 || !!n.closest('.table-wrap, .table-scroll, [style*="overflow"]')) ; })`));
     await audit(`${W} barak`, W);
     await shot(`prod-barak-${W}-1-top`);
     if (cb.rows) { await evalJs(`document.querySelector('.callback-row').scrollIntoView({ block: 'start' })`); await shot(`prod-barak-${W}-2-callback`); }

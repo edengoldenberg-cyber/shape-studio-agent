@@ -65,7 +65,7 @@ function tryDeterministicWazeReply(text, assets) {
   const waze    = assets?.wazeUrl ?? null;
 
   const reply = waze
-    ? `${address} 🗺️\n${waze}\nהמיקום מתאים לך? תרצה/י לתאם ביקור אימון?`
+    ? `${address} 🗺️\n${waze}\nהמיקום מתאים לך?`
     : `${address} 🗺️\nאשלח לך קישור ניווט ישיר — המיקום מתאים לך?`;
 
   return { reply, type: 'waze_deterministic' };
@@ -112,7 +112,7 @@ function tryDeterministicScheduleReply(text, assets) {
   // No image configured — honest fallback that keeps the conversation moving
   // without making a promise we cannot keep.
   return {
-    reply: `הלוח שלנו משתנה תדיר 😊 ספר/י לי איזה יום ושעה בדרך כלל עובדים לך — ואמצא לך מה יש.`,
+    reply: `הלוח שלנו משתנה תדיר 😊 אפשר לכתוב לי איזה יום ושעה בדרך כלל עובדים לך — ואמצא לך מה יש.`,
     type:  'schedule_deterministic_no_image',
   };
 }

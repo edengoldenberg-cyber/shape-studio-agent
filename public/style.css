@@ -3258,3 +3258,8 @@ input:checked + .toggle-slider::before { transform: translateX(16px); }
 .tab-btn .tab-alert { display: inline-block; min-width: 18px; padding: 0 5px; margin-inline-start: 6px; border-radius: 999px;
                       background: #dc2626; color: #fff; font-size: 11px; font-weight: 700; line-height: 18px; text-align: center; }
 [data-loading="1"] { opacity: .35; }
+/* a lead's refusal / classification note, inside the next-action cell */
+.lead-note { margin-top: 6px; padding: 6px 8px; border-radius: 8px; font-size: 12px; line-height: 1.5; white-space: normal; overflow-wrap: anywhere; }
+.lead-note.declined { background: #fee2e2; color: #7f1d1d; }
+.lead-note.review   { background: #dbeafe; color: #1e3a8a; }
+.lead-note.fixed    { background: #e5e7eb; color: #374151; }

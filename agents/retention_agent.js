@@ -107,7 +107,7 @@ function day1Message(name) {
 }
 
 function week1Message(name) {
-  return `${name}, שבוע ראשון מאחורינו! 💪 איך את/ה מרגיש/ה? יש שיעור שכבר אהבת במיוחד?`;
+  return `${name}, שבוע ראשון מאחורינו! 💪 איך ההרגשה? יש שיעור שכבר אהבת במיוחד?`;
 }
 
 function week2Message(name) {
@@ -123,14 +123,14 @@ function month1Message(name) {
 }
 
 function winBackMessage(name) {
-  return `${name}, חסרת לנו! 🌟 הבנו שהתעסוקה גוברת לפעמים — זה בסדר גמור. הכל בסדר? נשמח לראות אותך חוזר/ת כשנוח לך. רוצה שאמצא זמן מתאים השבוע?`;
+  return `${name}, חסרת לנו! 🌟 הבנו שהתעסוקה גוברת לפעמים — זה בסדר גמור. הכל בסדר? נשמח לראות אותך שוב כשנוח לך. רוצה שאמצא זמן מתאים השבוע?`;
 }
 
 function reminder24h(name, className, classTime) {
   const timeStr = classTime.toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Jerusalem' });
   return (
     `${name}, תזכורת ידידותית — מחר יש לך *${className}* בשעה *${timeStr}* בShape Studio 🙌\n\n` +
-    `ענה/י ✅ לאישור, או שלח/י הודעה אם משהו השתנה. מחכים לך!`
+    `אפשר לענות ✅ לאישור, או לכתוב אם משהו השתנה. מחכים לך!`
   );
 }
 

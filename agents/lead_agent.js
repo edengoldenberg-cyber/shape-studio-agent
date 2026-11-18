@@ -42,16 +42,16 @@ function buildPricingContext() {
       lines.push(`${p.name}: ${p.price_ils} ₪ לחודש — ${p.description}`);
     }
     if (unconfigured.length > 0 && configured.length === 0) {
-      lines.push(`מחיר מנוי / חבילה חודשית: לא ידוע לך. אם שואלים כמה עולה מנוי — אמור/י שאין לך מחיר מעודכן והצע/י שנציג יחזור עם המחיר. אסור לענות על שאלת מנוי במחיר של הצעת ההיכרות.`);
+      lines.push(`מחיר מנוי / חבילה חודשית: לא ידוע לך. אם שואלים כמה עולה מנוי — יש לומר שאין לך מחיר מעודכן ולהציע שנציג יחזור עם המחיר. אסור לענות על שאלת מנוי במחיר של הצעת ההיכרות.`);
     } else if (unconfigured.length > 0) {
-      lines.push(`חבילות נוספות: פנה/י לצוות לפרטים.`);
+      lines.push(`חבילות נוספות: פרטים אצל הצוות.`);
     }
     if (pkg._universal_access) {
       lines.push(`גישה: ${pkg._universal_access}`);
     }
     return lines.length > 0 ? `## מחירים ומנויים\n${lines.join('\n')}` : '';
   } catch {
-    return '## מחירים ומנויים\nלפרטי מחיר — פנה/י לצוות ישירות.';
+    return '## מחירים ומנויים\nלפרטי מחיר — אצל הצוות.';
   }
 }
 
@@ -301,10 +301,13 @@ function postProcessReply(reply, qualData, assets, ctx = {}) {
       ppChanges.push('generic_closer_stripped');
     }
     const settled = ctx?.hasPersistedCallback || qualData.callTimeGiven || qualData.callProposed || qualData.callbackDeclined || qualData.locationViable === false
-      || qualData.registrationDeclined === true;
+      || qualData.registrationDeclined === true || qualData.doNotCall === true;
     // Production, 2026-11-17: "תודה רבה על הניסיון" after "החלטתי לא להרשם" matched SALES_QUESTION_RE through the word
     // "ניסיון" and the offer of a representative was added to a goodbye. A thank-you or a refusal is not a sales question.
-    const isAsk = ctx?.userText && SALES_QUESTION_RE.test(ctx.userText) && !salesRefusal.isCourtesy(ctx.userText) && !salesRefusal.isRefusal(ctx.userText);
+    // Nothing is added automatically when the message is not clearly a question about a price / a trial / a membership:
+    // a refusal, a "do not call me", hesitation ("אחשוב על זה", "לא בטוחה שמתאים לי מנוי") or a courtesy.
+    const isAsk = ctx?.userText && SALES_QUESTION_RE.test(ctx.userText) && !salesRefusal.isCourtesy(ctx.userText) && !salesRefusal.isRefusal(ctx.userText)
+      && !salesRefusal.isNoCall(ctx.userText) && !salesRefusal.isHesitation(ctx.userText);
     if (!settled && isAsk && !/\?/.test(out) && !INVITE_CONTEXT_RE.test(out)) {
       out = `${out.trimEnd()}\n${CALLBACK_NEXT_STEP}`;
       ppChanges.push('next_step_offered');
@@ -330,7 +333,7 @@ function postProcessReply(reply, qualData, assets, ctx = {}) {
 
   // 4. After an explicit refusal to register no reply carries an offer of a call, a representative, a trial or
   //    registration - whoever wrote it (the model or a rule above).
-  if (qualData.registrationDeclined === true) {
+  if (qualData.registrationDeclined === true || qualData.doNotCall === true) {
     const cleaned = salesRefusal.stripOffers(out);
     if (cleaned !== out) { ppChanges.push('offer_removed_after_refusal'); out = cleaned; }
   }
@@ -374,7 +377,7 @@ function buildTurnSystemPrompt(completedTurns, qualData, name, from, msgCount) {
       ``,
       `CASE A — They gave BOTH location AND a fitness interest:`,
       `  → Sentence 1: Engage with their SPECIFIC interest — make it feel personal, not promotional`,
-      `     For Reformer: lead with the BENEFIT, not the number. "הרפורמר אצלנו זה שיעורים של 8 אנשים — מדריכ/ת שמכיר/ה אותך לפי שם ומתקדמת איתך."`,
+      `     For Reformer: lead with the BENEFIT, not the number. "הרפורמר אצלנו זה שיעורים של 8 אנשים — הדרכה אישית שמכירה אותך בשם ומתקדמת איתך."`,
       `     NOT: "סטודיו בוטיק עם 8 מקומות ברפורמר" ← the number sounds like a limitation`,
       `  → Sentence 2 (optional, only if relevant): Address their location naturally`,
       `     "מחדרה יש לנו חברות שמגיעות כל שבוע — 15 דקות נסיעה."`,
@@ -392,14 +395,14 @@ function buildTurnSystemPrompt(completedTurns, qualData, name, from, msgCount) {
       `  → 1 warm, natural sentence (NOT a cliché opener) + ONE focused question`,
       `  → Ask the single most useful unknown: what they're looking for.`,
       `  → Good: "שלום! מה מחפשים?"`,
-      `  → Good: "היי! ספר/י לי — מה מביא אותך אלינו?"`,
+      `  → Good: "היי! מה מביא אותך אלינו?"`,
       `  → Good: "שלום! מה מחפשים בסטודיו?"`,
-      `  → BAD: "מאיזה אזור את/ה ומה מחפשים?" ← two questions combined into one sentence`,
+      `  → BAD: "מאיזה אזור בארץ ומה מעניין אותך?" ← two questions combined into one sentence`,
       `  → BAD: any opener that starts with "שמחים", "ברוכים", "כיף", "איזה כיף"`,
       ``,
       `── HARD PROHIBITIONS ──`,
       `  ✗ FORBIDDEN openers — these sound like a bad chatbot, never use them:`,
-      `    "איזה כיף שקפצת לבקר" / "שמחים שפנית" / "ברוכ/ה הבא/ה" / "כיף שפנית" / "שמחים לעזור"`,
+      `    "איזה כיף שקפצת לבקר" / "שמחים שפנית" / "ברוכים הבאים" / "כיף שפנית" / "שמחים לעזור"`,
       `    Any opener that is a generic platitude, not a real response to what they said.`,
       `  ✗ Never ask about location if they already gave it`,
       `  ✗ Never ask what they're looking for if they already told you`,
@@ -437,7 +440,7 @@ const UNIVERSAL_STAGE_RULES = [
   `    (a) "דרך השדה 12, פרדס חנה-כרכור"`,
   `    (b) the exact Waze link from the Studio Assets section — copy the URL CHARACTER BY CHARACTER, unchanged.`,
   `    ⚠️ NEVER percent-encode Hebrew: do NOT output %D7... sequences. Output the URL as plain readable text.`,
-  `    Then ask: "המיקום מתאים לך? תרצה/י לתאם ביקור?"`,
+  `    Then ask: "המיקום מתאים לך? מתאים לתאם ביקור?"`,
   `    Never give the address without the Waze link. Never give a Waze link you invented or modified.`,
   `U2. ANSWER FIRST: If the lead asks ANY question or requests more details — answer it genuinely`,
   `    and fully (up to 3 sentences). Only after answering, return naturally to the stage.`,
@@ -490,7 +493,7 @@ function buildStageContext(completedTurns, qualData, msgCount) {
     return [
       `STATE: LOCATION NOT VIABLE.`,
       `Close warmly in one sentence. Leave the door open.`,
-      `Example: "מבין/ה — אם זה ישתנה בעתיד תמיד ברוכ/ה לפנות 😊"`,
+      `Example: "מובן לגמרי — אם זה ישתנה בעתיד, אפשר תמיד לפנות 😊"`,
       `FORBIDDEN: call proposal, class info, pricing, any forward steps.`,
     ].join('\n');
   }
@@ -704,7 +707,7 @@ function setQualData(phone, updates) {
 
 function computeLeadProfile(lead, qualData, history) {
   if (qualData.registrationDeclined === true) {
-    return { readiness: 'LOW', readinessEvidence: 'הודעה מפורשת על החלטה לא להירשם', qualificationReason: 'החליט/ה לא להירשם'.replace('/ה', ''),
+    return { readiness: 'LOW', readinessEvidence: 'הודעה מפורשת על החלטה לא להירשם', qualificationReason: 'סירוב מפורש להרשמה',
       nextBestAction: 'אין פעולה — בלי הצעות ובלי מעקב אוטומטי. שאלה חדשה תיענה.', appointmentState: 'declined', preferredCallTime: null,
       interests: qualData.fitnessInterest ?? qualData.goal ?? null, location: qualData.location ?? null, updatedAt: new Date().toISOString() };
   }
@@ -856,7 +859,7 @@ async function reliableHandoffAlert(phone, name, history, latestQualData) {
         qd.fitnessInterest ? `💪 ענין: ${qd.fitnessInterest}` : '',
         qd.goal            ? `🎯 מטרה: ${qd.goal}` : '',
         `📊 מוכנות: ${readiness.level} — ${readiness.evidence}`,
-        `\n⚠️ Brief מפורט לא הצליח (${briefErr?.message ?? 'unknown'}). בדוק/י ב-dashboard.`,
+        `\n⚠️ Brief מפורט לא הצליח (${briefErr?.message ?? 'unknown'}). יש לבדוק ב-dashboard.`,
       ].filter(Boolean).join('\n');
       try {
         const ar2 = await alertOwner(`📋 ליד (fallback) — ${name ?? phone}`, fallbackLines);
@@ -1136,7 +1139,7 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
   // the bot is stuck (OpenAI errors, session resets, etc.). Escalate to human.
   if (completedTurns === 0 && msgCount >= 4) {
     logger.warn('[lead_agent] Anti-loop triggered', { from, msgCount });
-    const loopMsg = `מצטער/ת — נתקלנו בתקלה טכנית 🙏 מעביר אותך לנציג מהצוות שייצור קשר ישירות.`;
+    const loopMsg = `סליחה — נתקלנו בתקלה טכנית 🙏 מעביר אותך לנציג מהצוות שייצור קשר ישירות.`;
     await sendText(from, loopMsg).catch(() => {});
     store.upsertLead(from, { status: 'escalated' });
     store.logEvent('loop_escalated', from, { msgCount, completedTurns: 0 });
@@ -1425,10 +1428,13 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
   }
 
   const turnSystemPrompt = buildTurnSystemPrompt(completedTurns, freshQualData, name, from, msgCount)
+    + (freshQualData.doNotCall === true && freshQualData.registrationDeclined !== true
+      ? '\n\n[DO NOT CALL] The lead asked NOT to be called. Never offer or mention a call or a representative calling back. Answer in writing only.'
+      : '')
     + (freshQualData.registrationDeclined === true
       ? '\n\n[REGISTRATION DECLINED] The lead said explicitly that they decided NOT to register. Answer only what was asked now, briefly and warmly. Do NOT offer a call, a representative, a trial lesson or registration, and do NOT ask qualification questions. End without a question.'
       : '')
-    + '\n\nWORDING — ABSOLUTE RULE: never write slash forms such as "את/ה", "מחפש/ת", "תחליט/י". The lead\'s gender is unknown unless their own words show it: use neutral Hebrew ("מה מעניין אותך?", "אפשר ל...", "איך אפשר לעזור?") and never guess a gender.';
+    + '\n\nWORDING — ABSOLUTE RULE: never write a gendered slash form (a Hebrew word followed by a slash and an alternative ending). The lead\'s gender is unknown unless their own words show it: use neutral Hebrew ("מה מעניין אותך?", "אפשר ל...", "איך אפשר לעזור?") and never guess a gender.';
   const messagesForApi   = [
     { role: 'system', content: turnSystemPrompt },
     ...history,
@@ -1466,7 +1472,7 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
       store.logEvent('price_guard', from, { topic: _pg.topic, reason: _pg.reason });
       reply = _pg.reply;
     }
-    if (freshQualData.registrationDeclined === true) {
+    if (freshQualData.registrationDeclined === true || freshQualData.doNotCall === true) {
       const _clean = salesRefusal.stripOffers(reply, 'אין לי כאן מידע מעודכן על זה 🙏');
       if (_clean !== reply) { store.logEvent('offer_removed_after_refusal', from, {}); reply = _clean; }
     }
@@ -1718,7 +1724,7 @@ function crisisAcknowledgement(name) {
   const opener    = firstName ? `${firstName}, ` : '';
   return (
     `${opener}אני שומע אותך וזה חשוב לנו מאוד. ` +
-    `אני רוצה לוודא שתקבל/י תמיכה ישירה עכשיו — ` +
+    `חשוב לי שתהיה לך תמיכה ישירה עכשיו — ` +
     `הצוות שלנו מקבל התראה ויצור איתך קשר אישית בהקדם. ` +
     `תודה שאמרת לנו 🙏`
   );

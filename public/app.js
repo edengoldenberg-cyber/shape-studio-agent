@@ -2343,6 +2343,17 @@ function renderBarakTable(leads) {
       call_cancelled:     'בקשת השיחה בוטלה — אין פעולה אוטומטית',
       call_no_answer:     'לא ענה לשיחה — מעקב ידני לפי שיקול הצוות',
     })[l.status] ?? qp?.nextBestAction ?? '—';
+    // An explicit refusal to register, with when and where it was said; a classification that was corrected or is
+    // waiting for a decision. Shown in the row itself, not only in a tooltip.
+    const q = l.meta?.qualData ?? {};
+    const srcHe = { whatsapp_text: 'הודעת טקסט', voice_transcript: 'הודעה קולית (תמלול)', history: 'מההיסטוריה של השיחה' };
+    const dHe = iso => { const t = iso ? new Date(iso) : null; return t && !isNaN(t) ? t.toLocaleDateString('he-IL', { timeZone: 'Asia/Jerusalem', day: '2-digit', month: '2-digit' }) : 'מועד לא ידוע'; };
+    const notes = [];
+    if (q.registrationDeclined === true) notes.push(`<div class="lead-note declined" data-note="declined">🚫 סירוב להרשמה · ${esc(dHe(q.registrationDeclinedAt))} · ${esc(srcHe[q.registrationDeclinedSource] ?? 'מקור לא ידוע')}${q.registrationDeclinedText ? ` · "${esc(q.registrationDeclinedText)}"` : ''}<br>בלי הצעות מכירה ובלי מעקב אוטומטי. שאלה חדשה תיענה.</div>`);
+    if (q.doNotCall === true) notes.push(`<div class="lead-note declined" data-note="no-call">📵 בקשה לא להתקשר · ${esc(dHe(q.doNotCallAt))}</div>`);
+    if (l.meta?.classificationReview) notes.push(`<div class="lead-note review" data-note="review">❓ סיווג לבירור: ${esc(l.meta.classificationReview.reason ?? '')}. בלי מעקב יזום עד להכרעה.</div>`);
+    if (l.meta?.classificationCorrected) notes.push(`<div class="lead-note fixed" data-note="corrected">✔️ סיווג תוקן ${esc(dHe(l.meta.classificationCorrected.at))}: סומן כמנוי, לפי Arbox — ${esc(({ lead: 'ליד', former_member: 'מנוי לשעבר', staff: 'איש צוות' })[l.meta.classificationCorrected.evidence] ?? l.meta.classificationCorrected.evidence)}. בלי מעקב יזום.</div>`);
+    const noteHtml = notes.join('');
     const qualReason = qp?.qualificationReason ?? '';
     const readyEmoji = qp?.readiness === 'HIGH' ? '🔥' : qp?.readiness === 'MEDIUM' ? '🌡️' : qp?.readiness === 'LOW' ? '❄️' : '';
     // Status badge: show qualification reason as tooltip
@@ -2356,7 +2367,7 @@ function renderBarakTable(leads) {
       <td style="text-align:center">${l.introOfferSent ? '✅' : '—'}</td>
       <td>${arbox}</td>
       <td style="color:var(--muted)">${timeSince(l.lastActivity)}</td>
-      <td class="lead-next" title="${esc(nextAction)}">${readyEmoji} ${esc(nextAction)}</td>
+      <td class="lead-next" title="${esc(nextAction)}">${readyEmoji} ${esc(nextAction)}${noteHtml}</td>
     </tr>`;
   }).join(''));
 }

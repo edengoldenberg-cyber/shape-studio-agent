@@ -1579,3 +1579,245 @@ describe('12. An explicit refusal to register', () => {
     expect(lastTo(phone)).toContain('שמעניין אותך');
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Acceptance of the owner's closing list (2026-11-18), through the full pipeline with simulated sends.
+describe('13. Refusal, "do not call", ownership and history — acceptance', () => {
+  const qd = phone => store.getLead(phone).meta.qualData ?? {};
+  const OFFER = /נציג|שיחה|ניסיון|להירשם|יחזור אליך|מתי נוח/;
+  const sayRaw = async (phone, text, extra = {}) => (await request(app).post('/api/whatsapp/simulate')
+    .send({ from: phone, text, name: 'WA Profile', type: 'text', messageId: `t-${++msgSeq}`, timestamp: new Date().toISOString(), ...extra }).set('Content-Type', 'application/json')).body;
+
+  test('the refusal is stored with its date, source and context; the score does not rise and the next action is not "continue the bot"', async () => {
+    const phone = await newLead();
+    mockAi.queue.push('איזה כיף! מה המטרה שלך באימונים?');
+    await say(phone, 'מחפשת משהו לחיזוק הגב');
+    const before = store.getLead(phone).score;
+    setNow(il(2026, 11, 16, 11, 0));
+    await say(phone, 'אני בסוף החלטתי לא להרשם');
+    expect(qd(phone)).toMatchObject({ registrationDeclined: true, registrationDeclinedAt: il(2026, 11, 16, 11, 0).toISOString(), registrationDeclinedText: 'אני בסוף החלטתי לא להרשם',
+      registrationDeclinedSource: 'whatsapp_text', registrationDeclinedContext: 'איזה כיף! מה המטרה שלך באימונים?' });
+    expect(qd(phone).registrationDeclinedMessageId).toMatch(/^t-\d+$/);
+    expect(store.getLead(phone).score).toBeLessThanOrEqual(Math.min(before, 2));
+    expect(store.getLead(phone).meta.qualProfile).toMatchObject({ appointmentState: 'declined', readiness: 'LOW' });
+    expect(store.getLead(phone).meta.qualProfile.nextBestAction).not.toMatch(/המשך את הבוט/);
+    const row = (await request(app).get('/api/leads')).body.find(l => l.meta?.qualData?.registrationDeclinedText === 'אני בסוף החלטתי לא להרשם');
+    expect(row).toBeTruthy();                                  // the panel receives the refusal with the lead
+  });
+
+  test('a refusal said in a voice message (transcript) is handled exactly the same, and its source is recorded', async () => {
+    const phone = await newLead();
+    clearOut();
+    const r = await sayRaw(phone, 'היי זאת אני, רציתי להגיד שהחלטתי בסוף שלא להמשיך. תודה', { fromVoice: true });
+    expect(r.route).toBe('registration_declined');
+    expect(qd(phone)).toMatchObject({ registrationDeclined: true, registrationDeclinedSource: 'voice_transcript' });
+    expect(lastTo(phone)).toBe('תודה על העדכון 🙏 שיהיה בהצלחה!');
+    const t = await sayRaw(phone, 'תודה רבה על הניסיון', { fromVoice: true });
+    expect(t.route).toBe('declined_courtesy');
+    for (const x of textsTo(phone)) expect(x.text).not.toMatch(OFFER);
+  });
+
+  test('other wordings, negation and several intentions in one message', async () => {
+    for (const text of ['לצערי בסוף לא יוצא לי', 'זה לא בשבילי, תודה רבה', 'מצאתי סטודיו אחר קרוב לבית', 'אנחנו מוותרים בינתיים', 'לא ממשיכה, תודה על הכל']) {
+      const phone = await newLead();
+      const r = await say(phone, text);
+      expect([text, r.route, qd(phone).registrationDeclined]).toEqual([text, 'registration_declined', true]);
+    }
+    // not a refusal: a question, hesitation, one lesson, a call declined — and nothing is offered automatically after hesitation
+    for (const text of ['אם לא ארשם עכשיו, זה בסדר?', 'אני לא בטוחה שמתאים לי מנוי', 'החלטתי לא לבוא היום', 'אחשוב על זה ואחזור אליכם']) {
+      const phone = await newLead();
+      clearOut();
+      mockAi.queue.push('ברור, בלי לחץ 🙂');
+      const r = await say(phone, text);
+      expect([text, qd(phone).registrationDeclined ?? false]).toEqual([text, false]);
+      expect([text, r.route]).not.toEqual([text, 'registration_declined']);
+      expect([text, /רוצה שנציג יחזור אליך/.test(lastTo(phone) ?? '')]).toEqual([text, false]);
+    }
+    // a refusal AND a question: the refusal is stored, the question is answered, nothing is offered
+    const phone = await newLead();
+    clearOut();
+    const r = await say(phone, 'החלטתי לא להירשם, אבל כמה עולה שיעור ניסיון?');
+    expect(qd(phone).registrationDeclined).toBe(true);
+    expect(r.route).not.toBe('registration_declined');
+    expect(lastTo(phone)).toMatch(/60/);                       // the approved trial price
+    expect(lastTo(phone)).not.toMatch(/נציג|יחזור אליך|רוצה ש/);
+  });
+
+  test('refusal → a question about a service: the correct information stays, only the offer is removed', async () => {
+    const phone = await newLead();
+    await say(phone, 'לא מעוניינת, תודה');
+    clearOut();
+    mockAi.queue.push('יש מקלחות ולוקרים בסטודיו 🙂\nמוזמנת להירשם לשיעור ניסיון ולראות בעצמך!');
+    await say(phone, 'יש אצלכם מקלחות?');
+    expect(lastTo(phone)).toBe('יש מקלחות ולוקרים בסטודיו 🙂');
+    expect(qd(phone).registrationDeclined).toBe(true);
+  });
+
+  test('"אל תתקשרו אליי": no callback request, no reminder, and a later offer of a call is removed', async () => {
+    const phone = await newLead();
+    clearOut();
+    const apts = diskApts().length;
+    const r = await say(phone, 'אל תתקשרו אליי בבקשה');
+    expect(r.route).toBe('do_not_call');
+    expect(lastTo(phone)).toBe('בסדר גמור, לא נתקשר 🙏');
+    expect(qd(phone)).toMatchObject({ doNotCall: true, callbackDeclined: true, doNotCallSource: 'whatsapp_text' });
+    expect(qd(phone).registrationDeclined).toBeUndefined();   // not a refusal to register
+    expect(diskApts().length).toBe(apts);
+    expect(openApt(phone) ?? null).toBeNull();
+    expect(store.getLead(phone).meta.awaitingCallbackTime).not.toBe(true);
+    expect(alerts()).toHaveLength(0);
+    clearOut();
+    mockAi.queue.push('השיעורים בקבוצות של עד 8 🙂 רוצה שנציג יתקשר אליך ויסביר?');
+    await say(phone, 'כמה אנשים בשיעור?');
+    expect(lastTo(phone)).toBe('השיעורים בקבוצות של עד 8 🙂');
+    setNow(il(2026, 11, 17, 9, 30));
+    await worker.runCycle(store);
+    expect(staffRemindersFor(phone).length + prospectRemindersFor(phone).length).toBe(0);
+    // an explicit request brings the call back
+    await say(phone, 'טוב, בעצם תתקשרו אליי');
+    expect(qd(phone).doNotCall).toBe(false);
+    expect(lastTo(phone)).toMatch(/מתי|שעה/);
+  });
+
+  test('an open callback request → refusal: the request is cancelled by the prospect, the manager is told once, no reminder is sent', async () => {
+    setNow(il(2026, 11, 16, 9, 0));
+    const phone = await leadWithCallback({ timeText: 'היום ב-14:00' });
+    const apt = openApt(phone);
+    clearOut();
+    const r = await say(phone, 'אני בסוף החלטתי לא להרשם');
+    expect(r.route).toBe('registration_declined');
+    const after = aptStore.get(apt.id);
+    expect(after).toMatchObject({ status: 'cancelled', cancelledBy: 'prospect', prospectAvailability: 'cancelled', cancelWhy: 'registration_declined' });
+    expect(after.cancelReason).toBe('אני בסוף החלטתי לא להרשם');
+    expect(aptStore.get(apt.id).scheduledAt.toISOString()).toBe(il(2026, 11, 16, 14, 0).toISOString());   // history kept
+    expect(openApt(phone) ?? null).toBeNull();
+    expect(alerts().filter(a => /בוטלה בידי הליד/.test(a.subject))).toHaveLength(1);
+    expect(lastTo(phone)).toBe('תודה על העדכון 🙏 שיהיה בהצלחה!');
+    await say(phone, 'לא מעוניינת');                           // said again
+    expect(alerts().filter(a => /בוטלה בידי הליד/.test(a.subject))).toHaveLength(1);
+    clearOut();
+    setNow(il(2026, 11, 16, 13, 35));
+    await worker.runCycle(store); restart(); await worker.runCycle(store);
+    expect(staffRemindersFor(phone).length + prospectRemindersFor(phone).length).toBe(0);
+    expect(textsTo(phone)).toHaveLength(0);                   // nothing to this lead after the restart either
+  });
+
+  test('refusal → an explicit request for a call opens exactly ONE new request, recorded as a new interest', async () => {
+    const phone = await newLead();
+    await say(phone, 'ויתרתי');
+    clearOut();
+    const apts = diskApts().length;
+    await say(phone, 'התחרטתי, אשמח שיחזרו אליי מחר ב-10:30');
+    await say(phone, 'דנה');
+    await say(phone, 'אשמח שיחזרו אליי מחר ב-10:30');          // the same request again
+    expect(qd(phone)).toMatchObject({ registrationDeclined: false, registrationReopenedSource: 'whatsapp_text' });
+    expect(qd(phone).registrationReopenedAt).toBeTruthy();
+    expect(qd(phone).registrationDeclinedText).toBe('ויתרתי');   // the earlier refusal stays on record
+    expect(diskApts().length).toBe(apts + 1);
+    expect(summaries()).toHaveLength(1);
+  });
+
+  test('the same message delivered twice: one reply, one change of state, one manager message', async () => {
+    setNow(il(2026, 11, 16, 9, 0));
+    const phone = await leadWithCallback({ timeText: 'היום ב-14:00' });
+    clearOut();
+    const id = `dup-${++msgSeq}`;
+    const a = await sayRaw(phone, 'החלטתי שלא להמשיך', { messageId: id });
+    const b = await sayRaw(phone, 'החלטתי שלא להמשיך', { messageId: id });
+    expect(a.route).toBe('registration_declined');
+    expect(textsTo(phone)).toHaveLength(1);
+    expect(alerts().filter(x => /בוטלה בידי הליד/.test(x.subject))).toHaveLength(1);
+    expect(store.getEvents({ type: 'registration_declined', phone })).toHaveLength(1);
+    expect(b.route ?? null).not.toBe('registration_declined');
+  });
+
+  test('an old record without the refusal field: the refusal in its history is respected, across a restart and a sync', async () => {
+    const phone = await newLead();
+    await say(phone, 'אני בסוף החלטתי לא להרשם');
+    // as it was stored before the field existed: the conversation is there, the field is not
+    const cur = store.getLead(phone);
+    const { registrationDeclined, registrationDeclinedAt, registrationDeclinedText, registrationDeclinedSource, declineCourtesyAnswered, callbackDeclined, ...oldQd } = cur.meta.qualData;
+    store.upsertLead(phone, { status: 'warm', score: 8, meta: { ...cur.meta, qualData: { ...oldQd, callProposed: true } } });
+    require('../utils/persist').saveLeads(store);
+    clearOut();
+    restart();
+    app._purgeKnownMembersFromLeadStore('test_sync');
+    const out = app._reconcileLeads('test_sync');
+    expect(out.refusals.map(x => x.phone)).toEqual([phone]);
+    expect(qd(phone)).toMatchObject({ registrationDeclined: true, registrationDeclinedSource: 'history', registrationDeclinedText: 'אני בסוף החלטתי לא להרשם' });
+    expect(store.getLead(phone)).toMatchObject({ status: 'cold', score: 2 });
+    expect(mockOut.texts).toHaveLength(0);                     // recording it sends nothing
+    expect(alerts()).toHaveLength(0);
+    const ai = mockAi.calls;
+    const r = await say(phone, 'תודה רבה על הניסיון');
+    expect(r.route).toMatch(/^declined_(courtesy|silent)$/);
+    for (const t of textsTo(phone)) expect(t.text).not.toMatch(OFFER);
+    expect(mockAi.calls).toBe(ai);
+    // another restart and sync: nothing comes back, nothing is sent
+    clearOut();
+    restart(); app._purgeKnownMembersFromLeadStore('test_sync'); const again = app._reconcileLeads('test_sync');
+    expect(again.refusals).toHaveLength(0);
+    expect(qd(phone).registrationDeclined).toBe(true);
+    await worker.runCycle(store);
+    expect(mockOut.texts).toHaveLength(0);
+    expect(store.getDormantLeads(0).map(l => l.phone)).not.toContain(phone);
+  });
+
+  test('the same old record without a restart: the history is read at the moment the lead writes', async () => {
+    const phone = await newLead();
+    await say(phone, 'לא מעוניינת, תודה');
+    const cur = store.getLead(phone);
+    const { registrationDeclined, registrationDeclinedAt, registrationDeclinedText, registrationDeclinedSource, declineCourtesyAnswered, ...oldQd } = cur.meta.qualData;
+    store.upsertLead(phone, { status: 'warm', meta: { ...cur.meta, qualData: oldQd } });
+    clearOut();
+    mockAi.queue.push('בשמחה! רוצה שנציג יחזור אליך ויעזור לבחור את האימון המתאים?');
+    await say(phone, 'תודה רבה');
+    for (const t of textsTo(phone)) expect(t.text).not.toMatch(OFFER);
+    expect(qd(phone)).toMatchObject({ registrationDeclined: true, registrationDeclinedSource: 'history' });
+  });
+
+  test('a conversation the staff were handling by hand before the system could see it stays with the staff', async () => {
+    const inboxMod = require('../utils/whatsapp_inbox');
+    const hist = (phone, direction, text, idMessage, at) => inboxMod.loadMessage({ phone, direction, text, timestamp: at, mediaType: null, idMessage, senderName: null, agentId: 'green-api' });
+    // 1. the last outgoing message was typed on the studio phone (id 2A…, 20 characters), a few days ago
+    const a = newPhone();
+    hist(a, 'in',  'אני רוצה להרשם לשיעור ניסיון', 'AC84D5AAAAAAAAAAAAAA', il(2026, 11, 11, 9, 0));
+    hist(a, 'out', 'אשמח לשוחח איתך 2-3 דקות אם זה בסדר', '2A1E99BBBBBBBBBBBBBB', il(2026, 11, 12, 9, 0));
+    clearOut();
+    const ai = mockAi.calls;
+    const r = await say(a, 'היוש אשמח בערב');
+    expect(r.route).toBe('human_owns_hold');
+    expect(mockOut.texts).toHaveLength(0);
+    expect(mockAi.calls).toBe(ai);
+    expect(store.getLead(a)).toMatchObject({ status: 'human_owns', meta: { humanOwnsReason: 'prior_manual_conversation', humanOwnsEvidence: { kind: 'last_outgoing_typed_on_phone', messageId: '2A1E99BBBBBBBBBBBBBB' } } });
+    for (const text of ['כמה עולה מנוי?', 'אני בסוף החלטתי לא להרשם', 'תודה']) expect([text, (await say(a, text)).route]).toEqual([text, 'human_owns_hold']);
+    expect(mockOut.texts).toHaveLength(0);
+
+    // 2. an outgoing message that came through the API (an automatic reminder) is NOT evidence of manual handling
+    const b = newPhone();
+    hist(b, 'out', 'היי, זו תזכורת לשיעור הניסיון שלך', '3EB0B4CCCCCCCCCCCCCCCC', il(2026, 11, 12, 9, 0));
+    const rb = await say(b, 'היי, מתעניינת בפילאטיס מכשירים');
+    expect(rb.route).toBe('barak');
+    expect(store.getLead(b).status).not.toBe('human_owns');
+
+    // 3. a hand-typed message that is too old, and one after which the staff released the conversation, change nothing
+    const c = newPhone();
+    hist(c, 'out', 'היי', '2A54A0DDDDDDDDDDDDDD', il(2026, 9, 1, 9, 0));
+    expect((await say(c, 'היי, מתעניינת בפילאטיס מכשירים')).route).toBe('barak');
+    const d = newPhone();
+    hist(d, 'out', 'נדבר מחר', '2A6F6AEEEEEEEEEEEEEE', il(2026, 11, 14, 9, 0));
+    await say(d, 'היי');
+    expect(store.getLead(d).status).toBe('human_owns');
+    await post(`/api/leads/${d}/release`, {});
+    expect((await say(d, 'היי, מתעניינת בפילאטיס מכשירים')).route).toBe('barak');
+  });
+
+  test('wording: fixed texts of the lead flow carry no slash form', () => {
+    const { hasSlashForm } = require('../utils/sales_refusal');
+    const src = f => require('fs').readFileSync(require('path').join(__dirname, '..', f), 'utf8').split('\n')
+      .filter(l => hasSlashForm(l) && !/^\s*(\/\/|\*|\/\*)/.test(l) && !/alertOwner|notifyManagersOnce|logger\.|subject|`👤|הליד |חבר\/ה|ממתאמנ\/ת|לקוח\/ה|המתאמנ\/ת|דוח\/ות|ביקש\/ה|שלח\/ה/.test(l));
+    expect(src('agents/lead_agent.js')).toEqual([]);
+    expect(src('agents/deterministic_reply.js')).toEqual([]);
+    expect(src('utils/pricing.js')).toEqual([]);
+  });
+});

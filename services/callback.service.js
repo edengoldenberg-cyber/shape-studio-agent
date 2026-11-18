@@ -555,7 +555,7 @@ function createCallbackService(deps) {
       setLeadStatus(phone, 'call_cancelled', { awaitingCallbackTime: false, callbackCancelledAt: stamp, ...closedCycleQualPatch(phone) });
       persist.saveLeads(store);
       cancelCalendarEvent(r.apt).catch(() => {});
-      const reply = `הבנתי, ביטלתי את בקשת השיחה 🙏 אם תרצה/י לתאם בעתיד — אנחנו כאן 😊`;
+      const reply = `הבנתי, ביטלתי את בקשת השיחה 🙏`;
       await send(reply);
       await notifyManagersOnce(apt, 'prospect_cancelled', `❌ הליד ביטל/ה את בקשת השיחה — ${who}`,
         [`👤 ${who}`, `📱 ${localPhone(phone)}`, `📅 המועד שבוטל: ${fmt}`, `💬 "${msg.slice(0, 200)}"`, `הבקשה נסגרה ולא יישלחו תזכורות.`].join('\n'));
@@ -591,7 +591,7 @@ function createCallbackService(deps) {
       if (apt.lateAvailabilityReplyAt) return { route: 'post_call_avail_late', reply: null, state: 'late' };
       try { aptStore.update(apt.id, { lateAvailabilityReplyAt: stamp }); }
       catch (err) { logger.error('[callback] late reply not persisted', { phone, error: err.message }); }
-      const reply = `תודה על התשובה 🙏 המועד שנרשם (${fmt}) כבר עבר. אם תרצה/י — כתבו לי יום ושעה חדשים ואעדכן את הצוות.`;
+      const reply = `תודה על התשובה 🙏 המועד שנרשם (${fmt}) כבר עבר. אפשר לכתוב לי יום ושעה חדשים ואעדכן את הצוות.`;
       patchLead(phone, {}, { awaitingCallbackTime: true, callbackTimeAttempts: 0 });
       persist.saveLeads(store);
       await send(reply);
@@ -614,6 +614,31 @@ function createCallbackService(deps) {
   }
 
   /** Opt-out while a callback is open: close it so no reminder can follow. */
+  /**
+   * The prospect withdrew: an explicit refusal to register, or "do not call me", while a callback request is open.
+   * The request is closed as cancelled by the prospect (history kept), its reminders stop (a cancelled request is
+   * never reminded), and the managers are told ONCE. Nothing is sent to the prospect from here.
+   * Returns { cancelled, apt } — cancelled=false when there is no open request or it could not be persisted.
+   */
+  async function cancelByProspect({ phone, text, sentAt, why = 'registration_declined', displayName = null }) {
+    const apt = openCallback(phone);
+    if (!apt) return { cancelled: false, apt: null };
+    const stamp = (validDate(sentAt) ? sentAt : new Date()).toISOString();
+    const fmt = validDate(apt.scheduledAt) ? fmtApt(apt) : (apt.rawTime ?? '');
+    let r;
+    try { r = aptStore.cancel(apt.id, { by: 'prospect', reason: String(text ?? '').slice(0, 200) }); aptStore.update(apt.id, { prospectAvailability: 'cancelled', prospectAvailabilityAt: stamp, cancelWhy: why }); }
+    catch (err) { logger.error('[callback] cancellation after a refusal not persisted', { phone, error: err.message }); return { cancelled: false, apt, error: 'persist_failed' }; }
+    setLeadStatus(phone, 'call_cancelled', { awaitingCallbackTime: false, callbackCancelledAt: stamp, ...closedCycleQualPatch(phone) });
+    persist.saveLeads(store);
+    cancelCalendarEvent(r.apt).catch(() => {});
+    const who = firstName(getLead(phone)?.meta?.qualData?.confirmedName) ?? firstName(apt.leadName) ?? firstName(displayName) ?? localPhone(phone);
+    await notifyManagersOnce(apt, 'prospect_cancelled', `❌ בקשת השיחה בוטלה בידי הליד — ${who}`,
+      [`👤 ${who}`, `📱 ${localPhone(phone)}`, `📅 המועד שבוטל: ${fmt}`, `💬 "${String(text ?? '').slice(0, 200)}"`,
+       why === 'do_not_call' ? `הליד ביקש שלא להתקשר.` : `הליד הודיע על החלטה לא להירשם.`, `הבקשה נסגרה ולא יישלחו תזכורות.`].join('\n'));
+    store.logEvent('prospect_availability_replied', phone, { aptId: apt.id, availState: 'cancelled', why });
+    return { cancelled: true, apt: aptStore.get(apt.id) };
+  }
+
   function cancelForOptOut(phone) {
     const apt = openCallback(phone);
     if (!apt) return null;
@@ -798,7 +823,7 @@ function createCallbackService(deps) {
   }
 
   return {
-    acceptTime, finalize, captureWhileHumanOwned, ownerSendSummary, handleAvailabilityReply, cancelForOptOut,
+    acceptTime, finalize, captureWhileHumanOwned, ownerSendSummary, handleAvailabilityReply, cancelForOptOut, cancelByProspect,
     staffConfirm, staffOutcome, staffReschedule, panelRows,
     openCallback, isFuture, setLeadStatus,
     STOP_STATUSES, CALLBACK_STATUSES,

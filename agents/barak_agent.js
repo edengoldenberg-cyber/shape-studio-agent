@@ -71,7 +71,7 @@ function buildSubscriptionContext() {
   lines.push('');
   lines.push('**מנויים חודשיים לפי מספר כניסות:**');
   for (const p of (SUB_PKG.packages ?? [])) {
-    const price = p.price_ils != null ? `${p.price_ils} ש"ח/חודש` : 'מחיר — פנה/י לסטודיו';
+    const price = p.price_ils != null ? `${p.price_ils} ש"ח/חודש` : 'מחיר — אצל הצוות';
     lines.push(`• **${p.name}** — ${price} | ${p.description} | מתאים ל: ${p.best_for}`);
   }
   return lines.join('\n');

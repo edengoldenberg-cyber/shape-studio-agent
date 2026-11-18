@@ -31,7 +31,7 @@ const logger = require('./logger');
  * @param {function}   _autoAddKnownMember
  * @returns {Promise<{ converted: number, checked: number, errors: number }>}
  */
-async function detectAndMarkConversions(store, memberCache, normalizeToE164, _autoAddKnownMember) {
+async function detectAndMarkConversions(store, memberCache, normalizeToE164, _autoAddKnownMember, identity = null) {
   let arboxSvc;
   try { arboxSvc = require('../services/arbox.service'); } catch {
     logger.warn('[conversion-detector] arbox.service unavailable — skipping');
@@ -73,6 +73,14 @@ async function detectAndMarkConversions(store, memberCache, normalizeToE164, _au
 
     const arboxUser = arboxByPhone.get(norm);
     if (!arboxUser) continue;  // not found in Arbox members — genuine lead
+
+    // The identity resolver is the ONE rule for "who is a member" (valid membership today, or an aggregator). An active
+    // Arbox row alone is not it: a lead who came to a trial lesson, a former member and a staff member are active rows too.
+    // No answer from the resolver (Arbox unreadable, old copy) = no conversion in this run.
+    if (identity?.peek) {
+      const id = identity.peek(norm);
+      if (!id || id.stale === true || !['member', 'aggregator'].includes(id.category)) continue;
+    }
 
     // This lead has become an active Arbox member — convert them
     const name = `${arboxUser.first_name ?? ''} ${arboxUser.last_name ?? ''}`.trim()

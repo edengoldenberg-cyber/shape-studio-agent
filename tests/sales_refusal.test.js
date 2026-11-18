@@ -102,7 +102,9 @@ describe('the module only decides: no I/O, no Arbox', () => {
     const server = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
     const a = server.indexOf('async function handleSalesRefusal('), b = server.indexOf('async function handleLeadCallbackFlow(');
     expect(a).toBeGreaterThan(0); expect(b).toBeGreaterThan(a);
-    expect(server.slice(a, b)).not.toMatch(/arbox|executeWrite|classActions|memberHandoff/i);
+    // the function itself, without comment lines
+    const body = server.slice(a, server.indexOf('\n}\n', a)).split('\n').filter(l => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    expect(body).not.toMatch(/arbox|executeWrite|classActions|memberHandoff/i);
   });
 });
 
