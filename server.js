@@ -697,7 +697,7 @@ const CODE_FEATURES = [
   'staff_confirm_lifecycle', // confirm / outcome endpoints enforce transitions
   'current_callback_latest', // a lead's current callback = its most recent request only
   'quiet_hours_restored',    // utils/time.isQuietHours active again (22:00–08:00 Israel)
-  'dana_rating_v1', 'system_status_v1', 'sales_refusal_v1', 'sales_refusal_v2', 'lead_reconcile_v1', 'studio_knowledge_v1', 'members_board_v1', 'owner_tasks_v1', 'contact_kind_v1',          // Dana studio: rating of a stored file, review history, score with evidence, apply-improvements guard
+  'dana_rating_v1', 'system_status_v1', 'sales_refusal_v1', 'sales_refusal_v2', 'lead_reconcile_v1', 'studio_knowledge_v1', 'members_board_v1', 'owner_tasks_v1', 'tomer_work_board_v1', 'contact_kind_v1',          // Dana studio: rating of a stored file, review history, score with evidence, apply-improvements guard
 ];
 app.get('/api/version', (_req, res) => {
   res.json({
@@ -3391,6 +3391,10 @@ app.get('/api/tomer/members-board/:userId', async (req, res) => {
 // ── The owner's open tasks and the reminders to him (services/owner_tasks.js). Never a message to a customer. ─────
 const ownerTasks = app.locals.ownerTasks = require('./services/owner_tasks').createOwnerTasks({
   cases: serviceCases, tomerStore, aptStore, logger,
+  // retention messages that exist as records (a program that is switched on found someone): they are on the board too
+  care: { openEpisodes: () => require('./utils/member_care_store').listEpisodes({ status: ['pending', 'deferred', 'sending', 'sent', 'uncertain', 'blocked', 'failed'], limit: 500 })
+            .filter(e => e.status !== 'sent' || e.conversation?.awaiting), label: id => memberCare.PROGRAMS[id]?.label ?? id },
+  classWritesFor: phone => { try { return arboxGateway.writesEnabled('class_book') && (process.env.ARBOX_WRITE_AUDIENCE === 'all' || String(process.env.ARBOX_WRITE_TEST_PHONES ?? '').split(',').map(s => s.replace(/\D/g, '')).includes(String(phone))); } catch { return false; } },
   caseLabel: c => require('./services/tomer_service').CATEGORY[c.category]?.label ?? c.category,
   managerPhone: () => _tomerManagerPhone(),
   sendManager: (phone, text) => sendText(phone, text, { linkPreview: false }),
@@ -3418,10 +3422,21 @@ app.post('/api/owner-tasks/settings', jsonBody, (req, res) => {
 });
 app.post('/api/owner-tasks/act', jsonBody, async (req, res) => {
   try {
-    const out = await ownerTasks.act(String(req.body?.key ?? ''), String(req.body?.action ?? ''), { by: String(req.body?.by ?? '').trim().slice(0, 40) || 'עדן', note: req.body?.note ?? null, until: req.body?.until ?? null });
+    const out = await ownerTasks.act(String(req.body?.key ?? ''), String(req.body?.action ?? ''), { by: String(req.body?.by ?? '').trim().slice(0, 40) || 'עדן', note: req.body?.note ?? null, until: req.body?.until ?? null, to: req.body?.to ?? null });
     res.status(out.ok ? 200 : out.error === 'not_found' ? 404 : 400).json(out);
   } catch (err) { logger.error('[owner-tasks] act failed', { error: err.message }); res.status(500).json({ ok: false, error: err.message }); }
 });
+// ── Tomer's one work board: every open case, task, class request, callback and retention message, with what it waits
+// for, who is on it, when, what was done and what closes it (services/owner_tasks.js → board()). Read-only GETs.
+const tomerRoles = app.locals.tomerRoles = require('./services/tomer_roles').createTomerRoles({ gateway: arboxGateway, memberCare, ownerTasks, identity, logger });
+app.get('/api/tomer/board', (_req, res) => {
+  try { res.json(ownerTasks.board()); }
+  catch (err) { logger.error('[board] failed', { error: err.message }); res.status(500).json({ ok: false, state: 'sync_error', error: err.message }); }
+});
+app.get('/api/tomer/board/roles', (_req, res) => { try { res.json(tomerRoles.roles()); } catch (err) { res.status(500).json({ ok: false, error: err.message }); } });
+app.get('/api/tomer/board/proposals', async (_req, res) => { try { res.json(await tomerRoles.proposals()); } catch (err) { logger.error('[board] proposals failed', { error: err.message }); res.status(500).json({ ok: false, state: 'sync_error', error: err.message }); } });
+app.get('/api/tomer/members-external', (_req, res) => { try { const out = tomerRoles.external(); res.status(out.ok ? 200 : 503).json(out); } catch (err) { res.status(500).json({ ok: false, error: err.message }); } });
+
 // Every 15 minutes: run the programs that are due today. Does nothing while the switch is off.
 if (process.env.TEST_NO_BIND !== 'true') {
   cron.schedule('*/15 * * * *', () => { memberCare.tick().catch(err => logger.error('[member-care] scheduled run failed', { error: err.message })); }, { timezone: 'Asia/Jerusalem' });

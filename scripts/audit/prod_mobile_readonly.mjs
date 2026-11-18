@@ -147,6 +147,38 @@ try {
       await audit(`${W} owner tasks`, W);
       await shot(`prod-tomer-${W}-5-owner-tasks`, true);
     }
+    // The work board (GET only: tiles and filters are client-side; no action button is tapped)
+    {
+      const tiles = await evalJs(`[...document.querySelectorAll('#tw-bd-today .tw-bd-tile')].map(t => ({ k: t.dataset.bucket, n: parseInt(t.querySelector('.tw-bd-n').textContent, 10) }))`);
+      let agree = tiles.length === 6; const det = [];
+      for (const t of tiles) {
+        await tap(`#tw-bd-today .tw-bd-tile[data-bucket="${t.k}"]`); await sleep(300);
+        const n = await evalJs(`document.querySelectorAll('#tw-ot-list > .tw-ot-card').length`);
+        det.push(`${t.k}=${t.n}/${n}`); if (n !== t.n) agree = false;
+        await tap(`#tw-bd-today .tw-bd-tile[data-bucket="${t.k}"]`); await sleep(200);
+      }
+      if (W === WIDTHS[0]) console.log('  board tiles (number / cards listed): ' + det.join(' '));
+      check(`${W} board: the six tiles are shown and each opens a list of exactly its number`, agree, det.join(' '));
+      const cards = await evalJs(`[...document.querySelectorAll('#tw-ot-list > .tw-ot-card')].map(c => ({ board: c.dataset.board, line: c.innerText.replace(/\s+/g, ' ').replace(/05\d[- ]?\d{7}|9725\d{8}/g, '<phone>').slice(0, 170) }))`);
+      if (W === WIDTHS[0]) for (const c of cards.slice(0, 6)) console.log('    card [' + c.board + '] ' + c.line);
+      if (cards.length) {
+        if (await evalJs(`document.querySelector('#tw-ot-list > .tw-ot-card .tw-ot-more').hidden`)) { await tap('#tw-ot-list > .tw-ot-card [data-toggle]'); await sleep(250); }
+        const heads = await evalJs(`[...document.querySelectorAll('#tw-ot-list > .tw-ot-card .tw-ot-more h4')].map(h => h.innerText.trim())`);
+        check(`${W} board: a card shows why it was opened, what was done, what closes it and its history`, ['למה נפתחה', 'מה בוצע עד עכשיו', 'מה סוגר את המשימה', 'היסטוריית שינויים'].every(h => heads.includes(h)), heads.join(' | '));
+      }
+      for (const [id, box, sel, min, what] of [['tw-bd-props', 'tw-bd-props-box', '.tw-bd-prop', 9, 'retention proposals'], ['tw-bd-roles', 'tw-bd-roles-box', '.tw-bd-role', 11, 'role map']]) {
+        await evalJs(`document.getElementById('${id}').scrollIntoView({ block: 'center' })`);
+        await tap(`#${id} > summary`);
+        const loaded = await until(`document.querySelectorAll('#${box} ${sel}').length >= ${min} || !!document.querySelector('#${box} [data-state="error"]')`, 90000);
+        const rows = await evalJs(`[...document.querySelectorAll('#${box} ${sel}')].map(r => (r.dataset.prop ?? r.dataset.role) + ':' + r.dataset.state + ' — ' + r.innerText.replace(/\s+/g, ' ').replace(/•••\d{3}/g, '').slice(0, 150))`);
+        if (W === WIDTHS[0]) for (const r of rows) console.log('    ' + what + ': ' + r);
+        check(`${W} board: the ${what} load with a state on every row`, loaded && rows.length >= min && !(await evalJs(`!!document.querySelector('#${box} [data-state="error"]')`)), `rows ${rows.length}`);
+        await audit(`${W} board ${what}`, W);
+        await tap(`#${id} > summary`);
+      }
+      await audit(`${W} work board`, W);
+      await shot(`prod-tomer-${W}-5b-board`);
+    }
     // Members board (GET only: the board, one member card)
     if (await tap('.tw-tab[data-pane="members"]')) {
       const loaded = await until(`document.querySelectorAll('#tw-mb-groups .tw-mb-group').length >= 8 || !!document.querySelector('#tw-mb-state [data-state="error"]')`, 60000);
@@ -164,6 +196,14 @@ try {
         const r = await evalJs(`({ n: document.querySelector('#tw-mb-groups .tw-mb-group[data-g="${g}"] .tw-mb-n').textContent.trim(), cards: document.querySelectorAll('#tw-mb-list .tw-mb-card').length, empty: !!document.querySelector('#tw-mb-list [data-state="empty"]'), active: document.querySelector('#tw-mb-groups .tw-mb-group.active')?.dataset.g })`);
         check(`${W} members "${g}": the list holds exactly the number on the group (${r.n})`, r.active === g && (r.n === '—' || (Number(r.n) === r.cards && (r.cards > 0 || r.empty))), JSON.stringify(r));
       }
+      await evalJs(`document.getElementById('tw-mb-external').scrollIntoView({ block: 'center' })`);
+      await tap('#tw-mb-external > summary');
+      const extLoaded = await until(`/ממתין להחלטה שלך/.test(document.getElementById('tw-mb-external-box').innerText) || !!document.querySelector('#tw-mb-external-box [data-state="error"]')`, 30000);
+      const extLine = await evalJs(`(document.querySelector('#tw-mb-external-box .tw-mb-line')?.innerText ?? '').replace(/\s+/g, ' ').slice(0, 200)`);
+      if (W === WIDTHS[0]) console.log('  outside-club members: ' + extLine);
+      check(`${W} members: outside-club members are listed separately, with a number, a source and a time`, extLoaded && /^\d+ חברי מועדון חיצוני/.test(extLine) && /מקור:/.test(extLine) && /עודכן:/.test(extLine), extLine);
+      await audit(`${W} outside-club members`, W);
+      await tap('#tw-mb-external > summary');
       await tap('#tw-mb-groups .tw-mb-group[data-g="active"]'); await sleep(400);
       if (await tap('#tw-mb-list .tw-mb-card .tw-mb-open')) {
         const opened = await until(`(document.querySelector('#tw-mb-list .tw-mb-card.open .tw-mb-detail')?.innerText ?? '').includes('היסטוריית טיפול')`, 30000);

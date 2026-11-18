@@ -493,7 +493,11 @@ describe('A registration request in two messages (live failure 2026-11-18)', () 
     expect(open[0].memberMessage).toMatch(/היום בשעה 18.*אימון כוח בשעה 18/s);
     expect(casesOf(P)).toHaveLength(0);
     expect(mockOut.alerts).toHaveLength(0);                                       // still being clarified: no alert
-    expect((await request(app).get('/api/owner-tasks')).body.open.map(x => x.key)).not.toContain(`task:${open[0].id}`);   // and not in the owner's task list yet
+    // on the board it waits for the MEMBER: it is not among what needs the owner, and not in his reminders
+    const bd = (await request(app).get('/api/tomer/board')).body;
+    expect(bd.items.find(x => x.key === `task:${open[0].id}`)).toMatchObject({ board: 'waiting_member', assignee: 'תומר' });
+    expect(bd.today.needsOwner).not.toContain(`task:${open[0].id}`);
+    expect(bd.today.tomerCan).toContain(`task:${open[0].id}`);
 
     // the member picks an existing class: the request is complete, handed to the staff, and said exactly so
     await say(P, 'ב-19');
@@ -508,7 +512,10 @@ describe('A registration request in two messages (live failure 2026-11-18)', () 
     expect(fin[0]).toMatchObject({ kind: 'book', missing: null, alert: { state: 'sent' } });
     expect(fin[0].detail).toMatch(/שיעור מבוקש \(Arbox\): אימון כח 19:00 .* 5\/10 רשומים, 5 פנויים/);
     expect(fin[0].detail).toMatch(/מנוי בתוקף \(Arbox\): מנוי חודשי/);
-    expect((await request(app).get('/api/owner-tasks')).body.open.map(x => x.key)).toContain(`task:${fin[0].id}`);       // now it is the owner's
+    const bd2 = (await request(app).get('/api/tomer/board')).body;                // now it is the owner's
+    expect(bd2.items.find(x => x.key === `task:${fin[0].id}`)).toMatchObject({ board: 'waiting_owner', assignee: 'עדן', userId: expect.anything() });
+    expect(bd2.today.needsOwner).toContain(`task:${fin[0].id}`);
+    expect(bd2.counts.needsOwner).toBe(bd2.today.needsOwner.length);
     const alert = mockOut.alerts.at(-1);
     expect(mockOut.alerts).toHaveLength(1);                                       // ONE alert, when the request is ready for the owner
     expect(alert.subject).toMatch(/^📌 תומר: רישום לשיעור/);

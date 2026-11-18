@@ -116,34 +116,56 @@
   $('tw-mb-refresh')?.addEventListener('click', () => refreshBoard(true));
   document.querySelector('.tw-tab[data-pane="members"]')?.addEventListener('click', () => { if (!MB.data) loadBoard(); });
 
-  /* ═══ The owner's tasks ═══════════════════════════════════════════════════ */
-  const OT = { data: null, drafts: new Map(), openKey: null };
+  /* ═══ The work board: every open case, task, class request, callback and retention message — once ═══════════════
+   * Status, the person on it and the due time are separate. A sent alert is not a delivery and a sent message is not a
+   * finished task: each card says what was done, what it waits for and what closes it. The counters of "היום והבא בתור"
+   * are the lengths of the very lists they open. A source that was not read is named — its tasks are unknown, not zero. */
+  const OT = { data: null, drafts: new Map(), openKey: null, bucket: null, f: { q: '', status: '', type: '', who: '', due: '' }, extra: { roles: null, props: null, ext: null } };
   const ST_HE = { open: 'פתוח', in_progress: 'בטיפול', snoozed: 'נדחה', done: 'בוצע', cancelled: 'בוטל' };
-  const ACT_HE = { done: 'בוצע', in_progress: 'בטיפול', snooze: 'נדחה למועד', cancel: 'בוטל', reopen: 'נפתח מחדש', source_closed: 'נסגר במערכת המקור' };
+  const ACT_HE = { done: 'בוצע', in_progress: 'בטיפול', snooze: 'נדחה למועד', cancel: 'בוטל', reopen: 'נפתח מחדש', source_closed: 'נסגר במערכת המקור', assign: 'שויך' };
+  const BUCKETS = [['needsOwner', 'דורש ממך פעולה'], ['tomerCan', 'אצל תומר / ממתין ללקוח'], ['overdue', 'באיחור'], ['stuck', 'תקוע'], ['planned', 'מתוכנן'], ['recentDone', 'הושלם לאחרונה']];
+  const SRC_HE = { cases: 'פניות תומר', tasks: 'משימות ובקשות שיעור', callbacks: 'שיחות חוזרות של ברק', care: 'הודעות שימור' };
   const byName = () => ($('tw-staff-name')?.value ?? '').trim() || 'עדן';
 
   async function loadOwnerTasks() {
     const box = $('tw-ot-list'); if (!box) return;
-    if (!OT.data) box.innerHTML = '<div class="tw-empty" data-state="loading">טוען משימות…</div>';
+    if (!OT.data) box.innerHTML = '<div class="tw-empty" data-state="loading">טוען את לוח המשימות…</div>';
     const y = window.scrollY;
-    try { const { status, body } = await getJson('/api/owner-tasks?closed=1'); OT.data = status === 200 && body?.ok ? body : { ok: false, error: body?.error ?? `שגיאה ${status}` }; }
-    catch (e) { OT.data = { ok: false, error: e.message }; }
+    try { const { status, body } = await getJson('/api/tomer/board'); OT.data = status === 200 && body?.ok ? body : { ok: false, state: body?.state ?? 'sync_error', error: body?.error ?? `שגיאה ${status}` }; }
+    catch (e) { OT.data = { ok: false, state: 'not_loaded', error: e.message }; }
     renderOwnerTasks();
     window.scrollTo(0, y);
   }
 
+  function matches(t) {
+    const f = OT.f, d = OT.data;
+    if (OT.bucket && !(d.today[OT.bucket] ?? []).includes(t.key)) return false;
+    if (f.q && !`${t.who ?? ''} ${t.title ?? ''} ${t.reason ?? ''}`.includes(f.q.trim())) return false;
+    if (f.status && t.board !== f.status) return false;
+    if (f.type && t.kind !== f.type) return false;
+    if (f.who && (t.assignee ?? '') !== f.who) return false;
+    if (f.due === 'overdue' && !t.overdue) return false;
+    if (f.due === 'today' && !(t.dueSetAt && new Date(t.dueSetAt).toDateString() === new Date().toDateString())) return false;
+    if (f.due === 'later' && !(t.dueSetAt && new Date(t.dueSetAt) > new Date())) return false;
+    return true;
+  }
+
   function renderOwnerTasks() {
-    const d = OT.data, box = $('tw-ot-list'), head = $('tw-ot-status');
+    const d = OT.data, box = $('tw-ot-list'), head = $('tw-ot-status'), tiles = $('tw-bd-today');
     if (!box || !d) return;
-    if (!d.ok) { box.innerHTML = `<div class="tw-state-error" data-state="error" role="alert">לא ניתן לטעון את המשימות (${esc(d.error ?? '')}). זה אינו "אין משימות".</div>`; head.innerHTML = ''; return; }
+    if (!d.ok) {
+      box.innerHTML = `<div class="tw-state-error" data-state="error" role="alert"><strong>${d.state === 'not_loaded' ? 'לא נטען' : 'תקלה בסנכרון'}</strong> — לוח המשימות לא נקרא (${esc(d.error ?? '')}). זה אינו "אין משימות".</div>`;
+      head.innerHTML = ''; if (tiles) tiles.innerHTML = ''; return;
+    }
     const r = d.reminders, s = d.settings;
-    head.innerHTML = `<div class="tw-ot-rem ${esc(r.state)}" data-reminders="${esc(r.state)}"><strong>תזכורות אליך:</strong> ${esc(r.text)}${d.lastDigest ? ` · אחרונה: ${esc(hm(d.lastDigest.at))} (${d.lastDigest.state === 'sent' ? `נשלחה, ${d.lastDigest.keys.length} משימות` : d.lastDigest.state === 'nothing_due' ? 'לא היה על מה להזכיר' : 'לא נשלחה'})` : ''}</div>
-      ${d.sourceError ? `<div class="tw-state-error" role="alert">חלק מהמקורות לא נקראו: ${esc(d.sourceError)}</div>` : ''}
+    const bad = Object.entries(d.sources ?? {}).filter(([k, v]) => v && v.ok === false && !(k === 'care' && v.error === 'לא מחובר'));
+    head.innerHTML = `${bad.length ? `<div class="tw-state-error" data-state="partial" role="alert"><strong>לא נטען:</strong> ${bad.map(([k, v]) => `${esc(SRC_HE[k] ?? k)} (${esc(v.error ?? '')})`).join(' · ')}. המספרים למטה חלקיים — הם אינם "אפס".</div>` : ''}
+      <div class="tw-ot-rem ${esc(r.state)}" data-reminders="${esc(r.state)}"><strong>תזכורות אליך:</strong> ${esc(r.text)} · אחרונה: ${r.lastAt ? `${esc(hm(r.lastAt))} (${r.lastState === 'sent' ? 'התקבלה אצל ספק השליחה' : r.lastState === 'nothing_due' ? 'לא היה מה להזכיר' : 'לא נשלחה'})` : 'לא נשלחה מעולם'} · הבאה: ${r.nextAt ? esc(r.nextAt) : 'אין — השליחה כבויה'}</div>
       <details class="tw-ot-settings"${r.state === 'needs_settings' ? ' open' : ''}><summary>הגדרת תזכורות</summary>
         <label>שעות שליחה (למשל 09:00, 17:00) <input type="text" id="tw-ot-times" class="field-input" inputmode="numeric" value="${esc((OT.drafts.get('times') ?? s.times.join(', ')))}" placeholder="09:00, 17:00"></label>
         <label>לא להזכיר על אותה משימה יותר מפעם ב- <input type="number" id="tw-ot-gap" class="field-input" min="1" max="168" value="${esc(String(OT.drafts.get('gap') ?? s.minGapHours))}"> שעות</label>
         <label class="tw-ot-check"><input type="checkbox" id="tw-ot-enabled"${(OT.drafts.get('enabled') ?? s.enabled) ? ' checked' : ''}> להפעיל תזכורות</label>
-        <div class="tw-mb-small">תזכורת אחת מרוכזת בכל שעה שהוגדרה, רק על משימות שמועדן הגיע, לא בשעות השקט ולא בשבת. נשלחת אליך בלבד.</div>
+        <div class="tw-mb-small">תזכורת אחת מרוכזת בכל שעה שהוגדרה, רק על משימות שמחכות לך ושמועדן הגיע, לא בשעות השקט ולא בשבת. נשלחת אליך בלבד — לא ללקוחות.</div>
         <button type="button" class="btn btn-secondary" id="tw-ot-save">שמירת ההגדרה</button> <button type="button" class="btn btn-secondary" id="tw-ot-preview">מה תכיל התזכורת הראשונה?</button>
         <pre id="tw-ot-preview-box" class="tw-ot-preview" hidden></pre></details>`;
     for (const [id, k] of [['tw-ot-times', 'times'], ['tw-ot-gap', 'gap']]) $(id)?.addEventListener('input', e => OT.drafts.set(k, e.target.value));
@@ -151,39 +173,84 @@
     $('tw-ot-save')?.addEventListener('click', saveSettings);
     $('tw-ot-preview')?.addEventListener('click', async () => { const { body } = await getJson('/api/owner-tasks/preview'); const p = $('tw-ot-preview-box'); p.hidden = false; p.textContent = body?.text ?? 'אין כרגע משימה שמועדה הגיע — לא תישלח תזכורת.'; });
 
+    // "היום והבא בתור": each number is the length of the list the tile opens
+    if (tiles) {
+      tiles.innerHTML = BUCKETS.map(([k, label]) => `<button type="button" class="tw-bd-tile${OT.bucket === k ? ' active' : ''}" data-bucket="${k}" aria-pressed="${OT.bucket === k}"><span class="tw-bd-n">${d.today[k].length}${bad.length ? '<small>+?</small>' : ''}</span><span class="tw-bd-l">${label}</span></button>`).join('');
+      tiles.querySelectorAll('[data-bucket]').forEach(b => b.addEventListener('click', () => { OT.bucket = OT.bucket === b.dataset.bucket ? null : b.dataset.bucket; renderOwnerTasks(); }));
+    }
+    // filters keep what was chosen; their options follow the data
+    const all = [...d.items, ...d.recentDone];
+    const fill = (id, vals, cur, first) => { const el = $(id); if (!el) return; const opts = [`<option value="">${first}</option>`, ...vals.map(([v, l]) => `<option value="${esc(v)}"${v === cur ? ' selected' : ''}>${esc(l)}</option>`)].join(''); if (el.dataset.sig !== opts) { el.innerHTML = opts; el.dataset.sig = opts; } el.value = cur; };
+    fill('tw-bd-f-status', Object.entries(d.statuses), OT.f.status, 'כל הסטטוסים');
+    fill('tw-bd-f-type', [...new Set(all.map(x => x.kind).filter(Boolean))].map(v => [v, v]), OT.f.type, 'כל סוגי הטיפול');
+    fill('tw-bd-f-who', [...new Set(all.map(x => x.assignee).filter(Boolean))].map(v => [v, v]), OT.f.who, 'כל האחראים');
+    if ($('tw-bd-f-q') && $('tw-bd-f-q').value !== OT.f.q) $('tw-bd-f-q').value = OT.f.q;
+    if ($('tw-bd-f-due')) $('tw-bd-f-due').value = OT.f.due;
+
     const card = t => {
       const open = OT.openKey === t.key, closed = ['done', 'cancelled'].includes(t.state);
-      const hist = t.history.slice(-6).reverse().map(h => `<div class="tw-mb-li">${esc(hm(h.at))} · ${esc(h.by ?? '')} · ${esc(ACT_HE[h.action] ?? h.action)}${h.until ? ` עד ${esc(hm(h.until))}` : ''}${h.note ? ` — ${esc(h.note)}` : ''}${h.source ? ` (${esc(h.source)})` : ''}</div>`).join('');
-      return `<div class="tw-ot-card ${esc(t.state)}" data-task="${esc(t.key)}" data-state="${esc(t.state)}">
-        <div class="tw-mb-card-top"><span class="tw-mb-name">${esc(t.agent === 'barak' ? 'ברק' : 'תומר')} · ${esc(t.kind ?? '')}: ${esc(t.title ?? '')}</span><span class="tw-mb-tag ot-${esc(t.state)}">${ST_HE[t.state] ?? t.state}</span></div>
-        <div class="tw-mb-line">${esc(t.who ?? '')} · ממתין ${esc(t.waiting)}${t.notYetDue ? ` · מועד הטיפול: ${esc(hm(t.dueAt))}` : ''}${t.state === 'snoozed' ? ` · נדחה עד ${esc(hm(t.snoozeUntil))}` : ''} · תזכורת אחרונה: ${t.lastReminderAt ? esc(hm(t.lastReminderAt)) + ` (${t.reminderCount})` : 'לא נשלחה'}</div>
-        <div class="tw-ot-actions">${closed ? `<button type="button" data-act="reopen">פתיחה מחדש</button>` : `<button type="button" data-act="done" class="primary">בוצע</button><button type="button" data-act="in_progress">בטיפול</button><button type="button" data-act="snooze">דחה למועד</button><button type="button" data-act="cancel">בוטל</button>`}
-          <button type="button" data-toggle="1" aria-expanded="${open}">${open ? 'סגירה' : 'פרטים'}</button>${t.link ? `<a class="tw-ot-link" href="${esc(t.link)}">למקור</a>` : ''}</div>
+      const hist = t.history.slice(-8).reverse().map(h => `<div class="tw-mb-li">${esc(hm(h.at))} · ${esc(h.by ?? '')} · ${esc(ACT_HE[h.action] ?? h.action)}${h.until ? ` עד ${esc(hm(h.until))}` : ''}${h.note ? ` — ${esc(h.note)}` : ''}${h.source ? ` (${esc(h.source)})` : ''}</div>`).join('');
+      const trail = (t.trail ?? []).map(x => `<div class="tw-mb-li">${x.at ? esc(hm(x.at)) + ' · ' : ''}${esc(x.text)}</div>`).join('');
+      return `<div class="tw-ot-card ${esc(t.state)}${t.overdue ? ' overdue' : ''}" data-task="${esc(t.key)}" data-state="${esc(t.state)}" data-board="${esc(t.board)}">
+        <div class="tw-mb-card-top"><span class="tw-mb-name">${esc(t.who ?? '')}</span><span class="tw-mb-tag bd-${esc(t.board)}">${esc(t.boardLabel ?? ST_HE[t.state] ?? t.state)}</span>${t.overdue ? '<span class="tw-mb-tag bd-overdue">באיחור</span>' : ''}</div>
+        <div class="tw-mb-line"><b>${esc(t.agent === 'barak' ? 'ברק' : 'תומר')} · ${esc(t.kind ?? '')}:</b> ${esc(t.title ?? '')}</div>
+        ${t.blocked ? `<div class="tw-bd-blocked" role="alert">חסום: ${esc(t.blocked)}</div>` : ''}
+        <div class="tw-mb-line">אחראי/ת: <b>${esc(t.assignee ?? '—')}</b> · ${t.dueSetAt ? `מועד: ${esc(hm(t.dueSetAt))}` : 'לא נקבע מועד'} · ממתין ${esc(t.waiting)}${t.snoozeReason ? ` · סיבת הדחייה: ${esc(t.snoozeReason)}` : ''}</div>
+        ${closed ? '' : `<div class="tw-mb-line tw-bd-next">הבא: ${esc(t.next ?? '—')}</div>`}
+        <div class="tw-ot-actions">${closed ? `<button type="button" data-act="reopen">פתיחה מחדש</button>` : `<button type="button" data-act="done" class="primary">בוצע</button><button type="button" data-act="in_progress">בטיפול</button><button type="button" data-act="snooze">דחה למועד</button><button type="button" data-act="cancel">בטל</button>`}
+          <button type="button" data-toggle="1" aria-expanded="${open}">${open ? 'סגירה' : 'פרטים'}</button>${t.userId ? `<button type="button" data-member="${esc(String(t.userId))}">כרטיס לקוח</button>` : ''}${t.link ? `<a class="tw-ot-link" href="${esc(t.link)}">למקור</a>` : ''}</div>
         <div class="tw-ot-more"${open ? '' : ' hidden'}>
-          <label>הערה (לא חובה) <input type="text" class="field-input" data-note maxlength="300" value="${esc(OT.drafts.get('note:' + t.key) ?? '')}"></label>
+          <div class="tw-mb-sec"><h4>למה נפתחה</h4><div class="tw-mb-li">${esc(t.reason ?? '—')}</div><div class="tw-mb-li">מקור: ${esc(t.source ?? '—')} · נפתחה: ${esc(hm(t.createdAt))}</div></div>
+          <div class="tw-mb-sec"><h4>מה בוצע עד עכשיו</h4>${trail || '<div class="tw-mb-small">עדיין לא בוצע דבר.</div>'}</div>
+          <div class="tw-mb-sec"><h4>מה סוגר את המשימה</h4><div class="tw-mb-li">${esc(t.closeRule ?? '—')}</div></div>
+          ${closed ? '' : `<label>הערה / סיבה <input type="text" class="field-input" data-note maxlength="300" value="${esc(OT.drafts.get('note:' + t.key) ?? '')}"></label>
           <label>דחייה עד <input type="datetime-local" class="field-input" data-until value="${esc(OT.drafts.get('until:' + t.key) ?? '')}"></label>
-          <div class="tw-mb-sec"><h4>היסטוריה</h4>${hist || '<div class="tw-mb-small">אין עדיין פעולות.</div>'}</div></div></div>`;
+          <label>אחראי/ת <span class="tw-bd-assign"><input type="text" class="field-input" data-assignee maxlength="40" value="${esc(OT.drafts.get('to:' + t.key) ?? t.assignee ?? '')}"><button type="button" data-act="assign">שיוך</button></span></label>`}
+          <div class="tw-mb-sec"><h4>היסטוריית שינויים</h4>${hist || '<div class="tw-mb-small">אין עדיין פעולות.</div>'}</div></div></div>`;
     };
-    box.innerHTML = (d.open.length ? d.open.map(card).join('') : '<div class="tw-empty" data-state="empty">אין משימה שמחכה לאישור ביצוע.</div>')
-      + (d.closed.length ? `<details class="tw-ot-closed"><summary>נסגרו לאחרונה (${d.closed.length})</summary>${d.closed.map(card).join('')}</details>` : '');
+    const pool = OT.bucket === 'recentDone' ? d.recentDone : d.items;
+    const shown = pool.filter(matches);
+    const filtered = OT.bucket || Object.values(OT.f).some(Boolean);
+    box.innerHTML = `<div class="tw-mb-small" id="tw-bd-count">מוצגות ${shown.length} מתוך ${pool.length}${OT.bucket ? ` · ${BUCKETS.find(b => b[0] === OT.bucket)[1]}` : ''}${filtered ? ' · <button type="button" class="tw-bd-clear" id="tw-bd-clear">ניקוי הסינון</button>' : ''} · עודכן ${esc(hm(d.generatedAt))}</div>`
+      + (shown.length ? shown.map(card).join('') : `<div class="tw-empty" data-state="empty">${pool.length ? 'אין משימה שמתאימה לסינון.' : (OT.bucket === 'recentDone' ? 'לא נסגרה משימה ב-7 הימים האחרונים.' : 'אין משימה פתוחה.')}</div>`)
+      + (!OT.bucket && d.recentDone.length ? `<details class="tw-ot-closed"><summary>הושלמו לאחרונה (${d.recentDone.length})</summary>${d.recentDone.filter(matches).map(card).join('')}</details>` : '');
+    $('tw-bd-clear')?.addEventListener('click', () => { OT.bucket = null; OT.f = { q: '', status: '', type: '', who: '', due: '' }; renderOwnerTasks(); });
     box.querySelectorAll('.tw-ot-card').forEach(el => {
       const key = el.dataset.task;
       el.querySelector('[data-note]')?.addEventListener('input', e => OT.drafts.set('note:' + key, e.target.value));
       el.querySelector('[data-until]')?.addEventListener('input', e => OT.drafts.set('until:' + key, e.target.value));
+      el.querySelector('[data-assignee]')?.addEventListener('input', e => OT.drafts.set('to:' + key, e.target.value));
       el.querySelector('[data-toggle]')?.addEventListener('click', () => { OT.openKey = OT.openKey === key ? null : key; renderOwnerTasks(); });
+      el.querySelector('[data-member]')?.addEventListener('click', e => openMember(e.currentTarget.dataset.member));
       el.querySelectorAll('[data-act]').forEach(b => b.addEventListener('click', () => act(key, b.dataset.act, el)));
     });
-    const badge = document.getElementById('tw-badge-tasks'); if (badge) badge.textContent = d.counts.open ? String(d.counts.open) : '';
+    const badge = document.getElementById('tw-badge-tasks'); if (badge) badge.textContent = d.today.needsOwner.length ? String(d.today.needsOwner.length) : '';
+  }
+
+  /** From a task to the member's card in the members board. */
+  async function openMember(userId) {
+    document.querySelector('.tw-tab[data-pane="members"]')?.click();
+    if (!MB.data?.ok) await loadBoard();
+    if (!MB.data?.ok) return;
+    const m = MB.data.members.find(x => String(x.userId) === String(userId));
+    if (!m) { toast('ללקוח/ה הזה/ו אין כרטיס בלוח החברים (אינו/ה מנוי פעיל, או חבר/ת מועדון חיצוני).', false); return; }
+    MB.group = m.groups[0] ?? 'active'; MB.q = ''; if ($('tw-mb-search')) $('tw-mb-search').value = '';
+    renderBoard();
+    if (MB.openId !== String(userId)) await toggleCard(String(userId));
+    document.querySelector(`#tw-mb-list .tw-mb-card[data-member="${CSS.escape(String(userId))}"]`)?.scrollIntoView({ block: 'start' });
   }
 
   async function act(key, action, el) {
-    const note = OT.drafts.get('note:' + key) ?? '', untilRaw = OT.drafts.get('until:' + key) ?? '';
-    if (action === 'snooze' && !untilRaw) { OT.openKey = key; renderOwnerTasks(); toast('לבחור תאריך ושעה לדחייה (בשדה "דחייה עד")', false); document.querySelector(`.tw-ot-card[data-task="${CSS.escape(key)}"] [data-until]`)?.focus(); return; }
+    const note = OT.drafts.get('note:' + key) ?? '', untilRaw = OT.drafts.get('until:' + key) ?? '', to = (OT.drafts.get('to:' + key) ?? el.querySelector('[data-assignee]')?.value ?? '').trim();
+    const focus = sel => { OT.openKey = key; renderOwnerTasks(); document.querySelector(`.tw-ot-card[data-task="${CSS.escape(key)}"] ${sel}`)?.focus(); };
+    if (action === 'snooze' && !untilRaw) { toast('לבחור תאריך ושעה לדחייה (בשדה "דחייה עד")', false); focus('[data-until]'); return; }
+    if (action === 'snooze' && !note.trim()) { toast('לכתוב את סיבת הדחייה (בשדה "הערה / סיבה")', false); focus('[data-note]'); return; }
+    if (action === 'assign' && !to) { toast('לכתוב את שם האחראי/ת', false); focus('[data-assignee]'); return; }
     el.querySelectorAll('button').forEach(b => { b.disabled = true; });
     try {
-      const d = await post('/api/owner-tasks/act', { key, action, by: byName(), note: note || null, until: action === 'snooze' ? new Date(untilRaw).toISOString() : null });
+      const d = await post('/api/owner-tasks/act', { key, action, by: byName(), note: note || null, until: action === 'snooze' ? new Date(untilRaw).toISOString() : null, to: action === 'assign' ? to : null });
       if (!d.ok) throw new Error(d.error === 'snooze_needs_future_time' ? 'מועד הדחייה צריך להיות בעתיד' : (d.error ?? 'הפעולה נכשלה'));
-      OT.drafts.delete('note:' + key); OT.drafts.delete('until:' + key);
+      for (const k of ['note:', 'until:', 'to:']) OT.drafts.delete(k + key);
       toast(`נרשם: ${ACT_HE[action] ?? action}`);
       await loadOwnerTasks();
     } catch (e) { toast(`❌ ${e.message}`, false); el.querySelectorAll('button').forEach(b => { b.disabled = false; }); }
@@ -201,11 +268,46 @@
     } catch (e) { toast(`❌ ${e.message}`, false); }
   }
 
+  /* ── what was only proposed, what Tomer does role by role, and the outside-club members (loaded when opened) ── */
+  const errBox = (b, what) => `<div class="tw-state-error" data-state="error" role="alert"><strong>לא נטען</strong> — ${what} (${esc(b?.error ?? '')}). זה אינו "אין נתונים".</div>`;
+  async function loadExtra(kind, url, boxId, render) {
+    const box = $(boxId); if (!box) return;
+    if (!OT.extra[kind]) box.innerHTML = '<div class="tw-empty" data-state="loading">טוען…</div>';
+    try { const { status, body } = await getJson(url); OT.extra[kind] = status === 200 && body?.ok ? body : { ok: false, error: body?.error ?? `שגיאה ${status}` }; }
+    catch (e) { OT.extra[kind] = { ok: false, error: e.message }; }
+    box.innerHTML = OT.extra[kind].ok ? render(OT.extra[kind]) : errBox(OT.extra[kind], 'הנתונים לא נקראו');
+  }
+  const renderProps = p => `<div class="tw-mb-small">${esc(p.note)}</div>` + p.programs.map(x => `<div class="tw-bd-prop" data-prop="${esc(x.id)}" data-state="${esc(x.state)}">
+      <div class="tw-mb-card-top"><span class="tw-mb-name">${esc(x.label)}</span><span class="tw-mb-tag bd-${x.state === 'approved_active' ? 'in_progress' : x.state === 'proposal' ? 'planned' : 'blocked'}">${esc(x.stateLabel ?? 'לא נטען')}</span></div>
+      ${x.state === 'not_loaded' ? `<div class="tw-bd-blocked">לא נטען: ${esc(x.error ?? (x.blocks ?? []).join(' · '))}</div>` : `<div class="tw-mb-line">מועמדים היום: <b>${x.candidates}</b> מתוך ${x.totalActive} מנויים פעילים · מקור: ${esc(x.source)} · נכון ל-${esc(dmy(x.today))}</div>
+      <div class="tw-mb-line">כלל: ${esc(x.rule)}</div>
+      ${x.blocks.length ? `<div class="tw-bd-blocked">למה לא נשלח: ${x.blocks.map(esc).join(' · ')}</div>` : ''}
+      ${x.sample.length ? `<details><summary>מי המועמדים (${x.sample.length}${x.candidates > x.sample.length ? ' ראשונים' : ''})</summary>${x.sample.map(m => `<div class="tw-mb-li">${esc(m.name ?? '—')} ${esc(m.phone ?? '')}${m.why ? ` — ${esc(m.why)}` : ''}</div>`).join('')}</details>` : ''}
+      ${x.excluded.length ? `<div class="tw-mb-small">לא נכללו: ${x.excluded.map(e => `${esc(e.text)} (${e.count})`).join(' · ')}</div>` : ''}`}</div>`).join('');
+  const renderRoles = r => r.rows.map(x => `<div class="tw-bd-role" data-role="${esc(x.id)}" data-state="${esc(x.state)}">
+      <div class="tw-mb-card-top"><span class="tw-mb-name">${esc(x.label)}</span><span class="tw-mb-tag bd-${x.state === 'active' ? 'in_progress' : x.state === 'partial' ? 'waiting_member' : x.state === 'ready_off' ? 'planned' : 'blocked'}">${esc(x.stateLabel)}</span></div>
+      <div class="tw-mb-li"><b>ממומש:</b> ${esc(x.implemented)}</div><div class="tw-mb-li"><b>פעיל למי:</b> ${esc(x.activeFor)}</div><div class="tw-mb-li"><b>אומת חי:</b> ${esc(x.live)}</div>
+      ${x.blocked ? `<div class="tw-mb-li"><b>חסום:</b> ${esc(x.blocked)}</div>` : ''}${x.missing ? `<div class="tw-mb-li"><b>חסר:</b> ${esc(x.missing)}</div>` : ''}</div>`).join('');
+  const renderExt = x => `<div class="tw-mb-line"><b>${x.count}</b> חברי מועדון חיצוני · כלל: ${esc(x.rule)} · מקור: ${esc(x.source)} · עודכן: ${esc(hm(x.fetchedAt))}</div>
+      <div class="tw-mb-sec"><h4>מה זמין להם</h4>${x.available.map(a => `<div class="tw-mb-li">${esc(a)}</div>`).join('')}</div>
+      <div class="tw-mb-sec"><h4>מה לא כלול</h4>${x.notAvailable.map(a => `<div class="tw-mb-li">${esc(a)}</div>`).join('')}</div>
+      <div class="tw-mb-sec"><h4>ממתין להחלטה שלך</h4>${x.decisions.map(a => `<div class="tw-mb-li">${esc(a)}</div>`).join('')}</div>
+      <details><summary>הרשימה (${x.count})</summary>${x.members.length ? x.members.map(m => `<div class="tw-mb-li">${esc(m.name)} ${esc(m.phone)}</div>`).join('') : '<div class="tw-mb-small">אין חברי מועדון חיצוני ב-Arbox.</div>'}</details>`;
+  const extraDefs = [['props', '/api/tomer/board/proposals', 'tw-bd-props-box', renderProps, 'tw-bd-props'], ['roles', '/api/tomer/board/roles', 'tw-bd-roles-box', renderRoles, 'tw-bd-roles'], ['ext', '/api/tomer/members-external', 'tw-mb-external-box', renderExt, 'tw-mb-external']];
+  for (const [kind, url, boxId, render, detailsId] of extraDefs) $(detailsId)?.addEventListener('toggle', e => { if (e.target.open) loadExtra(kind, url, boxId, render); });
+  const reloadOpenExtras = () => { for (const [kind, url, boxId, render, detailsId] of extraDefs) if ($(detailsId)?.open) loadExtra(kind, url, boxId, render); };
+
+  for (const [id, k] of [['tw-bd-f-q', 'q'], ['tw-bd-f-status', 'status'], ['tw-bd-f-type', 'type'], ['tw-bd-f-who', 'who'], ['tw-bd-f-due', 'due']])
+    $(id)?.addEventListener(id === 'tw-bd-f-q' ? 'input' : 'change', e => { OT.f[k] = e.target.value; if (OT.data?.ok) renderOwnerTasks(); });
+  // a link like #tomer/board or #tomer/members opens that pane directly
+  const openFromHash = () => { const m = /^#tomer\/(board|tasks|members)$/.exec(location.hash); if (!m) return; document.querySelector('.tab-btn[data-tab="tomer"]')?.click(); setTimeout(() => document.querySelector(`.tw-tab[data-pane="${m[1] === 'members' ? 'members' : 'tasks'}"]`)?.click(), 60); };
+  window.addEventListener('hashchange', openFromHash); setTimeout(openFromHash, 400);
+
   document.querySelector('.tw-tab[data-pane="tasks"]')?.addEventListener('click', loadOwnerTasks);
   document.getElementById('tw-refresh')?.addEventListener('click', () => {
     const active = document.querySelector('.tw-tab.active')?.dataset.pane;
-    if (active === 'tasks') loadOwnerTasks();
-    if (active === 'members') refreshBoard(false);
+    if (active === 'tasks') { loadOwnerTasks(); reloadOpenExtras(); }
+    if (active === 'members') { refreshBoard(false); reloadOpenExtras(); }
   });
   window.__tomerManage = { loadBoard, loadOwnerTasks };
 })();

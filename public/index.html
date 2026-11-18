@@ -527,6 +527,7 @@
           <div id="tw-mb-rule"></div>
           <div id="tw-mb-list" class="tw-list"></div>
           <div id="tw-mb-decisions"></div>
+          <details id="tw-mb-external" class="tw-bd-extra"><summary>חברי מועדון חיצוני (אינם בקבוצות שלמעלה)</summary><div id="tw-mb-external-box"></div></details>
         </div>
 
         <!-- ── Service cases pane ─────────────────────────────── -->
@@ -584,10 +585,20 @@
         <!-- ── Eden Tasks pane ────────────────────────────────── -->
         <div class="tw-pane" id="twp-tasks" dir="rtl">
           <div class="tw-ot" id="tw-ot">
-            <h3 class="tw-ot-title">משימות שמחכות לאישור ביצוע שלך</h3>
+            <h3 class="tw-ot-title">לוח העבודה של תומר — היום והבא בתור</h3>
             <p class="tw-desc">משימות של ברק ושל תומר. משימה נסגרת רק כשאתה מסמן "בוצע", או כשהיא נסגרה במערכת שבה היא רשומה. קריאת ההודעה או פתיחת הפנייה אינן סגירה.</p>
+            <div id="tw-bd-today" class="tw-bd-today" role="group" aria-label="היום והבא בתור"></div>
             <div id="tw-ot-status"></div>
-            <div id="tw-ot-list" class="tw-list"><div class="tw-empty" data-state="loading">טוען משימות…</div></div>
+            <div class="tw-bd-filters" role="group" aria-label="סינון וחיפוש">
+              <input type="search" id="tw-bd-f-q" class="field-input" placeholder="חיפוש לפי לקוח או נושא" autocomplete="off"/>
+              <select id="tw-bd-f-status" class="field-input" aria-label="סטטוס"><option value="">כל הסטטוסים</option></select>
+              <select id="tw-bd-f-type" class="field-input" aria-label="סוג טיפול"><option value="">כל סוגי הטיפול</option></select>
+              <select id="tw-bd-f-who" class="field-input" aria-label="אחראי"><option value="">כל האחראים</option></select>
+              <select id="tw-bd-f-due" class="field-input" aria-label="מועד"><option value="">כל המועדים</option><option value="overdue">באיחור</option><option value="today">מועד היום</option><option value="later">מועד עתידי</option></select>
+            </div>
+            <div id="tw-ot-list" class="tw-list"><div class="tw-empty" data-state="loading">טוען את לוח המשימות…</div></div>
+            <details id="tw-bd-props" class="tw-bd-extra"><summary>תוכניות שימור — מועמדים והצעות (לא נשלח דבר)</summary><div id="tw-bd-props-box"></div></details>
+            <details id="tw-bd-roles" class="tw-bd-extra"><summary>מה תומר עושה היום — לפי תפקיד</summary><div id="tw-bd-roles-box"></div></details>
           </div>
           <h3 class="tw-ot-title">משימות הצוות של תומר (רשימה מלאה)</h3>
           <div class="tw-filter-row">

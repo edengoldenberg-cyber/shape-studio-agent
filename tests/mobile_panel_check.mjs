@@ -475,6 +475,61 @@ try {
     check(`${W} owner tasks: a refresh keeps the typed times, the typed note and the open details`, otAfter.times === '09:00, 17:00' && (ot.cards < 1 || (otAfter.note === 'טיוטת הערה' && otAfter.more)), JSON.stringify(otAfter));
     await audit(`${W} owner tasks`);
     await shot(`owner-tasks-${W}`, true);
+
+    // ── the work board: tiles agree with their lists, filters, card details, proposals, roles ──
+    const bdTiles = await evalJs(`[...document.querySelectorAll('#tw-bd-today .tw-bd-tile')].map(t => ({ k: t.dataset.bucket, n: parseInt(t.querySelector('.tw-bd-n').textContent, 10) }))`);
+    check(`${W} board: the six "היום והבא בתור" tiles are shown with numbers`, bdTiles.length === 6 && bdTiles.every(t => Number.isInteger(t.n)), JSON.stringify(bdTiles));
+    let tilesAgree = true; const tileDetail = [];
+    for (const t of bdTiles) {
+      await tap(`#tw-bd-today .tw-bd-tile[data-bucket="${t.k}"]`); await sleep(250);
+      const shown = await evalJs(`({ cards: document.querySelectorAll('#tw-ot-list > .tw-ot-card').length, empty: !!document.querySelector('#tw-ot-list [data-state="empty"]'), active: document.querySelector('#tw-bd-today .tw-bd-tile.active')?.dataset.bucket })`);
+      tileDetail.push(`${t.k}:${t.n}/${shown.cards}`);
+      if (shown.active !== t.k || shown.cards !== t.n || (t.n === 0 && !shown.empty)) tilesAgree = false;
+      await tap(`#tw-bd-today .tw-bd-tile[data-bucket="${t.k}"]`); await sleep(150);
+    }
+    check(`${W} board: every tile opens a list of exactly its number (an empty one says so)`, tilesAgree, tileDetail.join(' '));
+    const bdAll = await evalJs(`document.querySelectorAll('#tw-ot-list > .tw-ot-card').length`);
+    if (bdAll >= 1) {
+      const nm = await evalJs(`document.querySelector('#tw-ot-list > .tw-ot-card .tw-mb-name').textContent.trim().slice(0, 3)`);
+      await evalJs(`(() => { const i = document.getElementById('tw-bd-f-q'); i.value = ${JSON.stringify('__N__')}.replace('__N__', document.querySelector('#tw-ot-list > .tw-ot-card .tw-mb-name').textContent.trim().slice(0, 3)); i.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+      await sleep(250);
+      const fq = await evalJs(`({ shown: document.querySelectorAll('#tw-ot-list > .tw-ot-card').length, ok: [...document.querySelectorAll('#tw-ot-list > .tw-ot-card')].every(c => c.innerText.includes(document.getElementById('tw-bd-f-q').value)), count: document.getElementById('tw-bd-count')?.innerText ?? '' })`);
+      check(`${W} board: searching "${nm}" narrows the list to matching tasks and says how many are shown`, fq.shown >= 1 && fq.shown <= bdAll && fq.ok && /מוצגות \d+ מתוך \d+/.test(fq.count), JSON.stringify(fq));
+      const stVal = await evalJs(`document.querySelector('#tw-ot-list > .tw-ot-card').dataset.board`);
+      await evalJs(`(() => { const s = document.getElementById('tw-bd-f-status'); s.value = ${JSON.stringify('__S__')}.replace('__S__', document.querySelector('#tw-ot-list > .tw-ot-card').dataset.board); s.dispatchEvent(new Event('change', { bubbles: true })); })()`);
+      await sleep(250);
+      check(`${W} board: the status filter keeps only that status (${stVal})`, await evalJs(`[...document.querySelectorAll('#tw-ot-list > .tw-ot-card')].length >= 1 && [...document.querySelectorAll('#tw-ot-list > .tw-ot-card')].every(c => c.dataset.board === document.getElementById('tw-bd-f-status').value)`));
+      if (await evalJs(`document.querySelector('#tw-ot-list > .tw-ot-card .tw-ot-more').hidden`)) { await tap('#tw-ot-list > .tw-ot-card [data-toggle]'); await sleep(200); }   // an earlier step may have left it open
+      const det = await evalJs(`(() => { const m = document.querySelector('#tw-ot-list > .tw-ot-card .tw-ot-more'); const b = m.getBoundingClientRect(); return { open: !m.hidden, heads: [...m.querySelectorAll('h4')].map(h => h.innerText.trim()), inside: b.left >= -1 && b.right <= innerWidth + 1, assign: !!m.querySelector('[data-assignee]') }; })()`);
+      check(`${W} board: a card's details show why it was opened, what was done, what closes it and its history — inside the screen`, det.open && ['למה נפתחה', 'מה בוצע עד עכשיו', 'מה סוגר את המשימה', 'היסטוריית שינויים'].every(h => det.heads.includes(h)) && det.inside && det.assign, JSON.stringify(det));
+      await evalJs(`(() => { const i = document.querySelector('#tw-ot-list > .tw-ot-card [data-note]'); i.value = 'טיוטה בלוח'; i.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+      await tap('#tw-refresh'); await sleep(1800);
+      const kept = await evalJs(`({ q: document.getElementById('tw-bd-f-q').value, st: document.getElementById('tw-bd-f-status').value, note: document.querySelector('#tw-ot-list > .tw-ot-card [data-note]')?.value ?? null, more: document.querySelector('#tw-ot-list > .tw-ot-card .tw-ot-more')?.hidden === false })`);
+      check(`${W} board: a refresh keeps the search, the status filter, the open card and the typed note`, kept.q === nm && kept.st === stVal && kept.note === 'טיוטה בלוח' && kept.more, JSON.stringify(kept));
+      await audit(`${W} board card`);
+      await tap('#tw-bd-clear'); await sleep(200);
+      check(`${W} board: clearing the filter shows everything again`, await evalJs(`document.querySelectorAll('#tw-ot-list > .tw-ot-card').length`) === bdAll);
+    }
+    for (const [id, box, sel, min, what] of [['tw-bd-props', 'tw-bd-props-box', '.tw-bd-prop', 9, 'retention proposals'], ['tw-bd-roles', 'tw-bd-roles-box', '.tw-bd-role', 11, 'role map']]) {
+      await evalJs(`document.getElementById('${id}').scrollIntoView({ block: 'center' })`);
+      await tap(`#${id} > summary`);
+      const okLoad = await until(`document.querySelectorAll('#${box} ${sel}').length >= ${min} || !!document.querySelector('#${box} [data-state="error"]')`, 30000);
+      const info = await evalJs(`({ rows: document.querySelectorAll('#${box} ${sel}').length, states: [...document.querySelectorAll('#${box} ${sel}')].map(r => r.dataset.state), err: document.querySelector('#${box} [data-state="error"]')?.innerText ?? null, text: document.getElementById('${box}').innerText.slice(0, 200) })`);
+      check(`${W} board: the ${what} load (${min} rows), each with a state`, okLoad === true && info.rows >= min && info.states.every(Boolean) && !info.err, JSON.stringify(info).slice(0, 300));
+      if (id === 'tw-bd-props') check(`${W} board: proposals say nothing is sent while the programs are off`, /מועמדים בלבד/.test(info.text) && info.states.every(s => s !== 'approved_active'), JSON.stringify(info.states));
+      await audit(`${W} board ${what}`);
+      await tap(`#${id} > summary`);
+    }
+    await shot(`board-${W}`, true);
+    await tap('.tw-tab[data-pane="members"]');
+    await until(`document.querySelectorAll('#tw-mb-groups .tw-mb-group').length >= 8`, 20000);
+    await evalJs(`document.getElementById('tw-mb-external').scrollIntoView({ block: 'center' })`);
+    await tap('#tw-mb-external > summary');
+    const extOk = await until(`/חברי מועדון חיצוני/.test(document.getElementById('tw-mb-external-box').innerText) && /ממתין להחלטה שלך/.test(document.getElementById('tw-mb-external-box').innerText) || !!document.querySelector('#tw-mb-external-box [data-state="error"]')`, 20000);
+    check(`${W} members: outside-club members are shown separately with what is available and what waits for a decision`, extOk === true && await evalJs(`!document.querySelector('#tw-mb-external-box [data-state="error"]')`));
+    await audit(`${W} outside-club members`);
+    await tap('#tw-mb-external > summary');
+    await tap('.tw-tab[data-pane="tasks"]');
     await evalJs(`(() => { const i = document.getElementById('tw-ot-times'); i.value = ''; i.dispatchEvent(new Event('input', { bubbles: true })); })()`);
 
     // ── Knowledge: the status says what is saved, given to the agents and verified — not a blanket "success" ──
