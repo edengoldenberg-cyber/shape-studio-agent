@@ -170,6 +170,23 @@ describe('system status — once the owner has supplied what was missing', () =>
   });
 });
 
+describe('system status — lead records', () => {
+  test('refusals, corrected classifications and records waiting for a decision are counted; a full phone is never shown', async () => {
+    const leads = [{ phone: '972500000011', status: 'cold', meta: { qualData: { registrationDeclined: true } } }, { phone: '972500000012', status: 'cold', meta: { classificationCorrected: { evidence: 'lead' } } },
+      { phone: '972500008704', status: 'converted_member', meta: { classificationReview: { reason: 'כמה שורות Arbox על אותו טלפון: member + lead' } } }, { phone: '972500000014', status: 'new', meta: { qualData: { doNotCall: true } } }];
+    const out = await build(providers({ store: { getEvents: () => [], getAllLeads: () => leads } }));
+    const r = row(out, 'barak_records');
+    expect(r.state).toBe('blocked');
+    expect(r.detail).toContain('1 סירובים מפורשים');
+    expect(r.detail).toContain('1 בקשות לא להתקשר');
+    expect(r.detail).toContain('1 רשומות שסיווגן תוקן');
+    expect(r.detail).toContain('…8704 (כמה שורות Arbox');
+    expect(JSON.stringify(out)).not.toMatch(/9725\d{8}/);
+    const clean = await build(providers({ store: { getEvents: () => [], getAllLeads: () => leads.slice(0, 2) } }));
+    expect(row(clean, 'barak_records').state).toBe('live');
+  });
+});
+
 test('countItems reads the knowledge shapes the panel saves', () => {
   expect(countItems({ instructors: [1, 2] })).toBe(2);
   expect(countItems({ classes: [1], _universal_access: '' })).toBe(1);

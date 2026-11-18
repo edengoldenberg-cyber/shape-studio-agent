@@ -120,6 +120,20 @@ async function build(d = {}) {
     const human = leads.filter(l => l.status === 'human_owns').length;
     return { state: 'live', detail: `ברק עונה ללידים חדשים. ${human} שיחות בטיפול ידני (ברק שותק בהן עד שחרור בפאנל).` };
   });
+  add('barak', 'barak_records', 'רשומות לידים: סירובים, סיווג ובירור', () => {
+    const leads = d.store?.getAllLeads ? d.store.getAllLeads() : null;
+    if (!leads) return { state: 'unknown', detail: 'רשומות הלידים לא נקראו' };
+    const declined = leads.filter(l => l.meta?.qualData?.registrationDeclined === true);
+    const noCall = leads.filter(l => l.meta?.qualData?.doNotCall === true);
+    const corrected = leads.filter(l => l.meta?.classificationCorrected);
+    const review = leads.filter(l => l.meta?.classificationReview || l.meta?.refusalReview);
+    const base = `${declined.length} סירובים מפורשים להרשמה (בלי הצעות ובלי מעקב אוטומטי) · ${noCall.length} בקשות לא להתקשר · ${corrected.length} רשומות שסיווגן תוקן לפי Arbox.`;
+    if (review.length) {
+      return { state: 'blocked', detail: `${base} ${review.length} רשומות ממתינות לבירור ואינן מקבלות מעקב יזום: ${review.map(l => `${tail(l.phone)} (${l.meta.classificationReview?.reason ?? l.meta.refusalReview?.reason})`).join('; ').slice(0, 400)}`,
+               action: 'לבדוק ב-Arbox את הרשומות האלה: כשנשארת שורה אחת עם מנוי בתוקף (או שהשורה הכפולה מוסרת) הסימון יורד לבד.' };
+    }
+    return { state: 'live', detail: base };
+  });
   add('barak', 'barak_prices', 'מחירים', () => {
     const pkg = d.pricing.load();
     const priced = d.pricing.pricedPackages(pkg).length, total = pkg.packages.length, trial = d.pricing.trialOf(pkg);
