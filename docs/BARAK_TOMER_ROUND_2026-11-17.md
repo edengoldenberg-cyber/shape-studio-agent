@@ -429,3 +429,13 @@ node scripts/arbox/verify_class_flow.cjs --kind cancel --user-id N --date YYYY-M
 - **כיבוי מהיר:** כתיבת Arbox — `railway variable delete ARBOX_WRITES_ENABLED` + `railway up --detach`; הודעות יזומות — כיבוי תוכנית בפאנל (מיידי) או `railway variable delete TOMER_PROACTIVE_ENABLED` + פריסה; תזכורות לבעלים — ביטול הסימון בפאנל; תזכורות שיחה — `CALLBACK_PENDING_REMINDER_ENABLED=false` + פריסה; מענה אוטומטי — `WHATSAPP_AUTO_REPLY=false` + פריסה.
 
 - **`railway ssh`:** נכשל לסירוגין ב-"Host key verification failed" (כמה שרתי קצה); כשנדחה, הפקודה לא רצה — מנסים שוב, לא עוקפים את האימות; אחרי פלט ריק תמיד קוראים מצב לפני שליחה חוזרת.
+
+**אחרי ההפעלה (18.11, 20:04) — קריאה בלבד.**
+
+- **מקור שני להקפאות — לא נמצא ב-API.** `activeMembersReport` / `activeMembershipsReport` עם `hideHold=0` ועם `hideHold=1` מחזירים אותה רשימה בדיוק (147 / 158 שורות), כולל שלושת המוקפאים, בסטטוס `active`. `searchUser.suspended` = 0 לכל 145 הפעילים, כולל שלושת המוקפאים. כלומר המקורות האחרים לא מסמנים הקפאה כלל — לא מאשרים ולא סותרים. `freezeSourceConfirmed` נשאר false; נדרשת בדיקת הבעלים במסך המוקפאים של Arbox.
+
+- **מעבר מאוחר של לקוח הבדיקה (18:44):** `lateCancellationReport` 17–20.11 = 14 שורות של לקוחות אחרים (ביטולים 0.1–5.9 ש׳ לפני), **אף שורה** ללקוח הבדיקה, אף שביטולו היה 1:15 ש׳ לפני; `bookingCancellationReport` מציג את הביטול (`cancelled_by: user`, `hours_before 01:15:46`); `restrictedMembersReport` — לא מופיע; `searchUser.restricted` = 0; מנוי פעיל, חוב 0. גריעת כניסה לא ניתנת למדידה: המנוי חופשי־חודשי בלי יתרת כניסות. משמעות: ביטול דרך ה-API בתוך החלון **לא** נרשם כביטול מאוחר.
+
+- **הבהרה:** `month1` = "חודש ראשון + אימוני אורח" (הודעה ביום 30 שמנפיקה 2 אימוני אורח) — תוכנית נפרדת מליווי החודש הראשון (`welcome`, `onboarding7`, `onboarding14`) שאושר ומופעל.
+
+- **ניטור 18:54–20:04:** 0 שגיאות; 0 כתיבות Arbox; פנייה אחת של מנויה (19:00) → נפתחה פנייה, נמסרה ונקראה, הצוות ענה ידנית ב-19:02 והבוט השתתק; סיכום יומי לבעלים 20:00 נמסר. 5 אזהרות 429 בסנכרון היסטוריית צ׳אטים בעלייה.
