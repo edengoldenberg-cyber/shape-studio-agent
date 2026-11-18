@@ -315,3 +315,126 @@ describe('Routing follows the one identity resolver', () => {
     expect(arbox.writes()).toHaveLength(0);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Owner acceptance list, 2026-11-18 — information and customer management, through the real pipeline against the local
+// Arbox stand-in. Nothing is sent to a customer outside the captured stand-in sends.
+describe('Members, leads, live availability and the management screens', () => {
+  const scheduleReads = () => arbox.log.filter(l => l.path === '/v3/schedule').length;
+  const seed = () => arbox.state.schedule.push(
+    { schedule_id: 11, date: day(1), start_time: '09:00', end_time: '10:00', session_name: 'פילאטיס מכשירים', staff_member: { name: 'מלאני לוי' }, max_participants: 10, registration_count: 7 },
+    { schedule_id: 12, date: day(1), start_time: '19:00', end_time: '20:00', session_name: 'פילאטיס מכשירים', staff_member: { name: 'עדן גל' }, max_participants: 10, registration_count: 10, standby_members: 2 });
+  const json = (method, url, body) => request(app)[method](url).send(body ?? {}).set('Content-Type', 'application/json');
+
+  test("a member's message goes to Tomer and creates no sales lead: not in the leads list, no score, no sales action", async () => {
+    world();
+    plan(person({ phone: '0507110001' }));
+    const r = await say('972507110001', 'מה הכתובת של הסטודיו?');
+    expect(r.route).toMatch(/^tomer_/);
+    const leads = (await request(app).get('/api/leads')).body;
+    expect(leads.filter(l => l.kind === 'member')).toEqual([]);
+    const rec = require('../utils/lead_store').getLead('972507110001');
+    if (rec) { expect(rec.score ?? 0).toBeLessThanOrEqual(4); expect(rec.meta?.qualProfile ?? null).toBeNull(); }
+    const kinds = (await request(app).get('/api/leads/kinds')).body;
+    expect(kinds.ok).toBe(true);
+    expect(kinds.inSalesList).toBe(leads.length);
+  });
+
+  test('a lead and a member with lead records: only the leads are in the sales list, each record carries its kind', async () => {
+    world();
+    plan(person({ phone: '0507110002' }));
+    person({ role: 'lead', active: 1, phone: '0507110003' });
+    const store = require('../utils/lead_store');
+    store.upsertLead('972507110002', { status: 'human_owns', score: 4, meta: { humanOwnsReason: 'staff_manual_reply' } });   // the staff answered a member by hand
+    await say('972507110003', 'היי, מתעניינת בפילאטיס מכשירים');
+    await say('972507110004', 'היי, מתעניינת בפילאטיס מכשירים');                                                           // not in Arbox at all
+    const list = (await request(app).get('/api/leads')).body, all = (await request(app).get('/api/leads?all=1')).body;
+    expect(list.map(l => l.kind).sort()).toEqual(['lead', 'trial']);
+    expect(all.map(l => l.kind).sort()).toEqual(['lead', 'member', 'trial']);
+    expect(all.find(l => l.kind === 'member').kindLabel).toBe('מנוי');
+    // the reconcile pass takes the sales score off the member record and keeps its ownership
+    app._reconcileLeads('test');
+    expect(store.getLead('972507110002')).toMatchObject({ status: 'human_owns', score: 0, meta: { notSalesLead: { kind: 'member' }, humanOwnsReason: 'staff_manual_reply' } });
+    expect(store.getActiveLeads().map(l => l.phone)).not.toContain('972507110002');
+    expect(store.getSendableLeads().map(l => l.phone)).not.toContain('972507110002');
+  });
+
+  test('an ordinary conversation reads no schedule; a question about room in a class reads that class now and answers with the live number', async () => {
+    world(); seed();
+    await say('972507110005', 'היי, מתעניינת בפילאטיס מכשירים');
+    await say('972507110005', 'אני מחפשת משהו לחיזוק הגב');
+    expect(scheduleReads()).toBe(0);
+    const r = await say('972507110005', 'יש מקום מחר ב-9:00 בפילאטיס מכשירים?');
+    expect(scheduleReads()).toBe(1);
+    expect(r.barakReply).toMatch(/נכון לרגע זה לפי Arbox/);
+    expect(r.barakReply).toMatch(/09:00 \| פילאטיס מכשירים.*יש מקום \(3 מתוך 10 פנויים\)/);
+    expect(r.barakReply).not.toMatch(/19:00/);
+    const full = await say('972507110005', 'ויש מקום מחר ב-19:00 בפילאטיס מכשירים?');
+    expect(full.barakReply).toMatch(/מלא כרגע, 2 ברשימת המתנה/);
+  });
+
+  test('a missing detail is the only thing asked; Arbox without occupancy or unreachable → "cannot verify", never full / free / zero', async () => {
+    world(); seed();
+    await say('972507110006', 'היי, מתעניינת בפילאטיס מכשירים');
+    const ask = await say('972507110006', 'יש מקום בשיעור פילאטיס מכשירים?');
+    expect(ask.barakReply).toMatch(/חסר לי רק: יום/);
+    const hour = await say('972507110006', 'יש מקום מחר בפילאטיס מכשירים?');
+    expect(hour.barakReply).toMatch(/חסר לי רק: שעה/);
+    expect(hour.barakReply).toMatch(/09:00 \| פילאטיס מכשירים/);
+    expect(hour.barakReply).not.toMatch(/פנויים|מלא/);
+    arbox.mode.occupancyDown = true; gateway.clearCache();
+    const noOcc = await say('972507110006', 'יש מקום מחר ב-9:00 בפילאטיס מכשירים?');
+    expect(noOcc.barakReply).toMatch(/לא הצלחתי לאמת כרגע את התפוסה/);
+    arbox.mode.occupancyDown = false;
+  });
+
+  test('knowledge through the panel endpoints: restore → waiting for the owner → confirm; the sync answer is operational, not "success"', async () => {
+    for (const f of ['staff_directory.json', 'classes_knowledge.json']) { try { fs.unlinkSync(path.join(DATA_DIR, f)); } catch { /* absent */ } }   // as in production before the restore
+    world(); seed();
+    const st0 = (await request(app).get('/api/admin/knowledge/status')).body;
+    expect(st0.summary.rows.find(r => r.id === 'staff').state).toBe('empty');
+    const res = await json('post', '/api/admin/knowledge/restore', { type: 'staff' });
+    expect(res.body).toMatchObject({ ok: true, restored: 14 });
+    const st1 = res.body.summary.rows.find(r => r.id === 'staff');
+    expect(st1.state).toBe('partial');
+    expect(st1.text).toMatch(/טרם אושרו/);
+    const sync = (await json('post', '/api/admin/sync-agent-knowledge')).body;
+    expect(sync.summary.state).toBe('partial');                                   // not a blanket success
+    expect(sync.summary.rows.find(r => r.id === 'classes').state).toBe('empty');
+    const conf = (await json('post', '/api/admin/knowledge/confirm', { type: 'staff' })).body;
+    expect(conf.summary.rows.find(r => r.id === 'staff').state).toBe('ok');
+    // the owner edits and saves; a restore over it is refused — newer information is never overwritten
+    const cur = require('../agents/barak_agent').getRawKnowledge().staff;
+    await json('post', '/api/admin/knowledge/staff', { ...cur, instructors: cur.instructors.slice(0, 3) });
+    const again = await json('post', '/api/admin/knowledge/restore', { type: 'staff' });
+    expect(again.status).toBe(409);
+    expect(again.body).toMatchObject({ ok: false, error: 'newer_information_exists' });
+    expect(require('../agents/barak_agent').getRawKnowledge().staff.instructors).toHaveLength(3);
+  });
+
+  test("the members board and the owner's tasks answer from the real stores", async () => {
+    world();
+    plan(person({ phone: '0507110007', first: 'נועה' }), { start: day(-10), end: day(5) });
+    plan(person({ phone: '0507110008', first: 'מיכל' }));
+    const b = (await request(app).get('/api/tomer/members-board')).body;
+    expect(b.ok).toBe(true);
+    expect(b.groups.find(g => g.id === 'active').count).toBe(2);
+    expect(b.groups.find(g => g.id === 'expiring').count).toBe(1);
+    expect(b.groups.find(g => g.id === 'first_month').count).toBe(1);
+    expect(b.groups.every(g => g.rule && g.source)).toBe(true);
+    const id = b.members.find(m => m.groups.includes('expiring')).userId;
+    const card = (await request(app).get(`/api/tomer/members-board/${id}`)).body;
+    expect(card).toMatchObject({ ok: true, member: { userId: String(id) } });
+    await say('972507110007', 'אני רוצה להקפיא את המנוי מ-1.12 עד 15.12');           // opens a case for the staff
+    const ot = (await request(app).get('/api/owner-tasks')).body;
+    expect(ot.ok).toBe(true);
+    expect(ot.open.some(t => t.key.startsWith('case:') && t.agent === 'tomer')).toBe(true);
+    expect(ot.reminders.state).toBe('needs_settings');                              // nothing is sent until the owner sets the times
+    const key = ot.open.find(t => t.key.startsWith('case:')).key;
+    const done = (await json('post', '/api/owner-tasks/act', { key, action: 'done', by: 'עדן' })).body;
+    expect(done).toMatchObject({ ok: true, task: { state: 'done' } });
+    expect((await request(app).get('/api/owner-tasks')).body.open.map(t => t.key)).not.toContain(key);
+    const cases = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'service_cases.json'), 'utf8')).cases;
+    expect(cases.find(c => `case:${c.id}` === key).status).toBe('resolved');        // the owner's word is recorded on the case too
+  });
+});

@@ -336,23 +336,49 @@ describe('B. Verified Arbox reads', () => {
     expect(openCases(a.phone)).toHaveLength(1);
   });
 
-  test('schedule answer shows real occupancy, hides cancelled classes, never invents spots', async () => {
+  // Owner policy, 2026-11-18: occupancy is not volunteered in an ordinary conversation. A schedule answer lists the
+  // classes; free places are checked for a specific class when the member asks — from Arbox, at that moment.
+  // (Before: every line of "מה יש מחר?" carried "רשומים 7 מתוך 10".)
+  test('schedule answer lists the classes without occupancy, hides cancelled classes, and says how to check a class', async () => {
     const m = member();
     await say(m.phone, 'מה יש מחר?');
     const t = lastTo(m.phone);
-    expect(t).toMatch(/09:00 פילאטיס מכשירים — מלאני לוי \(רשומים 7 מתוך 10\)/);
-    expect(t).toMatch(/19:00 פילאטיס מכשירים — עדן גל \(מלא \(10\/10\), 2 ברשימת המתנה\)/);
+    expect(t).toMatch(/09:00 פילאטיס מכשירים — מלאני לוי/);
+    expect(t).toMatch(/19:00 פילאטיס מכשירים — עדן גל/);
+    expect(t).not.toMatch(/רשומים \d|(?<![א-ת])מלא(?![א-ת])|\d+\/\d+|ברשימת המתנה|מקומות/);
+    expect(t).toMatch(/כדי לבדוק אם יש מקום בשיעור מסוים/);
     expect(t).not.toMatch(/יוגה/);
     expect(t).not.toMatch(/\*\*|רוצה מקום/);
   });
 
-  test('occupancy report down → schedule without any occupancy claim', async () => {
+  test('a question about room in a specific class is answered with the real occupancy of that class, read now', async () => {
+    const m = member();
+    await say(m.phone, 'יש מקום מחר ב-9:00 בפילאטיס מכשירים?');
+    expect(lastTo(m.phone)).toMatch(/נכון לרגע זה לפי Arbox/);
+    expect(lastTo(m.phone)).toMatch(/09:00.*רשומים 7 מתוך 10/s);
+    expect(lastTo(m.phone)).not.toMatch(/19:00/);                     // only the class that was asked about
+    await say(m.phone, 'ויש מקום מחר ב-19:00 בפילאטיס מכשירים?');
+    expect(lastTo(m.phone)).toMatch(/מלא \(10\/10\), 2 ברשימת המתנה/);
+  });
+
+  test('a question about room with no day or hour asks only for what is missing', async () => {
+    const m = member();
+    await say(m.phone, 'יש מקום בשיעור פילאטיס מכשירים?');
+    expect(lastTo(m.phone)).toMatch(/חסר לי רק/);
+    expect(lastTo(m.phone)).not.toMatch(/רשומים \d|מלא \(/);
+  });
+
+  test('occupancy report down → the schedule says it is the planned timetable; a question about room says it cannot be verified', async () => {
     const m = member();
     arbox.mode.occupancyDown = true;
     await say(m.phone, 'מה יש מחר?');
-    expect(lastTo(m.phone)).toMatch(/אין לי כרגע נתוני תפוסה/);
+    expect(lastTo(m.phone)).toMatch(/אין לי כרגע נתוני ביטולי שיעורים/);
     expect(lastTo(m.phone)).toMatch(/המערכת המתוכננת בלבד/);
     expect(lastTo(m.phone)).not.toMatch(/רשומים \d|מלא \(|\(מלא/);
+    gateway.clearCache();
+    await say(m.phone, 'יש מקום מחר ב-9:00 בפילאטיס מכשירים?');
+    expect(lastTo(m.phone)).toMatch(/לא הצלחתי לאמת את התפוסה כרגע/);
+    expect(lastTo(m.phone)).not.toMatch(/רשומים \d|(?<![א-ת])מלא(?![א-ת])|\d+\/\d+|יש מקום \(|נכון לרגע זה/);
   });
 
   test('Arbox unavailable → says so; a request still becomes a case', async () => {

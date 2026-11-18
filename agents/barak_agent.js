@@ -42,10 +42,20 @@ let STAFF_DIR   = loadJSON(STAFF_PATH,   { instructors: [] });
 let SUB_PKG     = require('../utils/pricing').load();
 let CLASSES_DATA = loadJSON(CLASSES_PATH, { classes: [], _universal_access: '' });
 
+// What may be given to the agents. services/studio_knowledge.js sets this: a list restored from history and not yet
+// confirmed by the owner contributes only what the live Arbox schedule supports. Default: everything that is saved.
+let KNOWLEDGE_FILTER = { instructor: () => true, classType: () => true, capacityOf: c => c.capacity ?? null };
+const usableInstructors = () => (STAFF_DIR.instructors ?? []).filter(s => { try { return KNOWLEDGE_FILTER.instructor(s); } catch { return false; } });
+const usableClasses     = () => (CLASSES_DATA.classes ?? []).filter(c => { try { return KNOWLEDGE_FILTER.classType(c); } catch { return false; } });
+function setKnowledgeFilter(f) {
+  KNOWLEDGE_FILTER = { ...KNOWLEDGE_FILTER, ...f };
+  STAFF_CONTEXT = buildStaffContext(); CLASSES_CONTEXT = buildClassesContext();
+}
+
 // Build a compact staff context string injected into every Barak AI call
 function buildStaffContext() {
   const lines = ['## Staff Directory'];
-  for (const s of STAFF_DIR.instructors) {
+  for (const s of usableInstructors()) {
     const specs  = s.specialties?.length ? s.specialties.join(', ') : 'ללא מידע';
     const flags  = [
       s.rehab          ? '🏥 שיקומי'       : null,
@@ -83,8 +93,9 @@ function buildClassesContext() {
   if (CLASSES_DATA._universal_access) {
     lines.push(`\n**כלול בכל מנוי:** ${CLASSES_DATA._universal_access}\n`);
   }
-  for (const c of (CLASSES_DATA.classes ?? [])) {
-    const cap    = c.capacity ? `${c.capacity} משתתפים מקסימום` : '';
+  for (const c of usableClasses()) {
+    const capN   = (() => { try { return KNOWLEDGE_FILTER.capacityOf(c); } catch { return null; } })();
+    const cap    = capN ? `${capN} משתתפים מקסימום` : '';
     const intens = c.intensity ? ` | עצימות: ${c.intensity}` : '';
     const best   = c.best_for  ? ` | מתאים ל: ${c.best_for}` : '';
     const note   = c.notes     ? `\n  💡 ${c.notes}` : '';
@@ -140,6 +151,8 @@ function reloadKnowledge({ staffData, pkgData, classesData } = {}) {
   const result = {
     reloaded_at:      new Date().toISOString(),
     staff_count:      STAFF_DIR.instructors?.length ?? 0,
+    staff_given_to_agents:   usableInstructors().length,
+    classes_given_to_agents: usableClasses().length,
     packages_count:   (SUB_PKG.packages?.length ?? 0) + (SUB_PKG.trial ? 1 : 0),
     classes_count:    CLASSES_DATA.classes?.length ?? 0,
     contexts_rebuilt: true,
@@ -534,7 +547,7 @@ async function chat(userMessage) {
  */
 function findInstructorsBySpecialty(query) {
   const q = (query ?? '').toLowerCase();
-  const matched = STAFF_DIR.instructors.filter(s => {
+  const matched = usableInstructors().filter(s => {
     // Check rehab / שיקומי flag
     if (/שיקומ|rehab|rehabilit/.test(q) && s.rehab) return true;
     // Check pre/post-natal flag
@@ -543,7 +556,7 @@ function findInstructorsBySpecialty(query) {
     return (s.specialties ?? []).some(sp => sp.toLowerCase().includes(q) || q.includes(sp.toLowerCase()))
       || (s.certifications ?? []).some(c => c.toLowerCase().includes(q));
   });
-  return { matched, all: STAFF_DIR.instructors };
+  return { matched, all: usableInstructors() };
 }
 
 /** Return subscription package context string (for lead_agent and server.js). */
@@ -806,4 +819,5 @@ module.exports = {
   getClassesContext,
   reloadKnowledge,
   getRawKnowledge,
+  setKnowledgeFilter,
 };

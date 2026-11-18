@@ -67,6 +67,7 @@ class WhatsAppInbox {
       // Inbound message
       thread.messages.push({
         id,
+        waId:        msg.messageId ?? null,          // the provider's own message id: evidence that a real message arrived
         direction:   'in',
         text:        msg.text ?? '',
         timestamp:   msg.receivedAt ? new Date(msg.receivedAt) : new Date(),

@@ -81,6 +81,7 @@ function createTomerService(deps) {
     managerPhone = () => null,                  // () => the ONE phone that receives case alerts
     sendManager = async () => { throw new Error('manager channel not configured'); },   // async (phone, text) => provider result
     ai = null,                                  // async ({ system, user }) => string
+    knowledgeFacts = () => [],                  // () => string[] — instructors / class types an agent may state (verified or confirmed)
     sendTimetable = async () => false,          // async (phone) => true when the timetable image was sent
     applyTakeover = () => {},                   // (phone, text) — staff took the conversation
     allowed = () => true,                       // (phone) => may the new flow handle / message this phone (test-only restriction)
@@ -300,11 +301,11 @@ function createTomerService(deps) {
   const upcomingOnly = cls => { const p = ilParts(now()); const t = `${String(p.hour).padStart(2, '0')}:${String(p.minute).padStart(2, '0')}`; const d = today(); return cls.filter(c => c.date > d || (c.date === d && c.start > t)); };
   const sameClass = (b, c) => b.date === c.date && b.time === c.start && (b.className ?? '').trim() === (c.name ?? '').trim();
 
-  async function resolveClass(ctx, { range = 7 } = {}) {
+  async function resolveClass(ctx, { range = 7, fresh = false } = {}) {
     const dt = extractDayAndTime(ctx.text, ctx.sentAt);
     if (dt.invalid) return { error: 'invalid_date' };
     const from = today(), to = plus(range);
-    const data = await gateway.getClasses({ from, to });
+    const data = await gateway.getClasses({ from, to, fresh });
     const pool = upcomingOnly(data.classes);
     const hasFilter = !!(dt.day || dt.hour || NAME_HINTS.some(([q]) => q.test(ctx.text)));
     const matches = hasFilter ? filterClasses(pool, ctx.text, dt) : [];
@@ -339,8 +340,11 @@ function createTomerService(deps) {
     }
     const byDate = new Map();
     for (const c of pool.slice(0, 24)) byDate.set(c.date, [...(byDate.get(c.date) ?? []), c]);
-    const blocks = [...byDate].map(([d, list]) => `${fmtDate(d)}:\n` + list.map(c => `• ${c.start} ${c.name}${c.instructor ? ` — ${c.instructor}` : ''}${occText(c) ? ` (${occText(c)})` : ''}`).join('\n'));
-    const note = data.occupancyAvailable ? 'מספר הרשומים נכון לרגע זה לפי Arbox.' : 'אין לי כרגע נתוני תפוסה וביטולי שיעורים מ-Arbox — זו המערכת המתוכננת בלבד, בלי מידע על מקומות פנויים או על שיעור שבוטל.';
+    // An ordinary schedule answer lists the classes only. How many are registered is not volunteered: it is checked
+    // for a specific class when the member asks whether there is room (hAvailability), from Arbox, at that moment.
+    const blocks = [...byDate].map(([d, list]) => `${fmtDate(d)}:\n` + list.map(c => `• ${c.start} ${c.name}${c.instructor ? ` — ${c.instructor}` : ''}`).join('\n'));
+    const note = (data.occupancyAvailable ? '' : 'אין לי כרגע נתוני ביטולי שיעורים מ-Arbox — זו המערכת המתוכננת בלבד.\n')
+      + 'כדי לבדוק אם יש מקום בשיעור מסוים — אפשר לכתוב לי את היום והשעה.';
     await say(ctx.phone, `${blocks.join('\n\n')}\n\n${note}`, { handler: 'schedule', trigger: ctx.category, dataSource: data.source + (data.stale ? ' (stale)' : ''), name: ctx.name });
     return R('answered');
   }
@@ -469,10 +473,28 @@ function createTomerService(deps) {
   }
 
   async function hAvailability(ctx) {
-    let rc; try { rc = await resolveClass(ctx); } catch { await arboxDown(ctx); return R('arbox_unavailable'); }
-    if (rc.error || !rc.matches.length) return hSchedule(ctx);
+    // Free places are read from Arbox NOW, for the class that was asked about. A missing day / hour / class type is
+    // asked for — only what is missing. When Arbox or its occupancy report cannot be read the answer says so:
+    // never "full", "free" or a number from an old copy.
+    let rc;
+    try { rc = await resolveClass(ctx, { fresh: true }); } catch { await arboxDown(ctx); return R('arbox_unavailable'); }
+    if (rc.error) { await say(ctx.phone, `התאריך שכתבת לא קיים בלוח השנה 🙂 לאיזה יום הכוונה?`, { handler: 'availability', trigger: ctx.category, name: ctx.name }); return R('clarification'); }
+    if (rc.data.stale) { await arboxDown(ctx); return R('arbox_unavailable'); }
+    const missing = [!rc.dt.day ? 'יום' : null, !rc.dt.hour && rc.matches.length !== 1 ? 'שעה' : null].filter(Boolean);
+    if (!rc.hasFilter || (rc.matches.length > 1 && missing.length)) {
+      await say(ctx.phone, `כדי לבדוק מקום בשיעור מסוים חסר לי רק: ${(missing.length ? missing : ['יום', 'שעה']).join(' ו')}. לאיזה שיעור הכוונה?`, { handler: 'availability', trigger: ctx.category, name: ctx.name });
+      return R('clarification');
+    }
+    if (!rc.matches.length) {
+      await say(ctx.phone, `לא מצאתי ב-Arbox שיעור שמתאים למה שכתבת${rc.dt.day ? ` ב${fmtDate(ilDateString(rc.dt.day))}` : ''}. לאיזה שיעור הכוונה — יום, שעה וסוג?`, { handler: 'availability', trigger: ctx.category, dataSource: rc.data.source, name: ctx.name });
+      return R('clarification');
+    }
     const lines = [];
-    for (const c of rc.matches.slice(0, 4)) lines.push(`• ${fmtClass(c)} — ${occText(c) ?? 'אין נתוני תפוסה כרגע'}`);
+    if (rc.matches.slice(0, 4).every(c => !occText(c))) {
+      await say(ctx.phone, `לא הצלחתי לאמת את התפוסה כרגע מול Arbox, אז לא אנחש 🙏 השיעור מופיע בלוח: ${fmtClass(rc.matches[0])}. אפשר לנסות שוב בעוד כמה דקות.`, { handler: 'availability', trigger: ctx.category, dataSource: rc.data.source, name: ctx.name });
+      return R('answered');
+    }
+    for (const c of rc.matches.slice(0, 4)) lines.push(`• ${fmtClass(c)} — ${occText(c) ?? 'לא הצלחתי לאמת את התפוסה כרגע'}`);
     await say(ctx.phone, `נכון לרגע זה לפי Arbox:\n${lines.join('\n')}`, { handler: 'availability', trigger: ctx.category, dataSource: rc.data.source, name: ctx.name });
     return R('answered');
   }
@@ -639,6 +661,8 @@ function createTomerService(deps) {
         return on ? '- רישום, ביטול ומעבר שיעור: החבר/ה כותב/ת לתומר את היום והשעה, ותומר מבצע רק אחרי אישור בכתב; אפשר גם לבצע לבד באפליקציית Arbox.'
                   : '- רישום, ביטול ומעבר שיעור: אפשר לבצע לבד באפליקציית Arbox; בקשה שנכתבת לתומר (יום ושעה) מועברת לצוות, ותומר אינו מבצע אותה בעצמו.'; })(),
       '- הקפאה, ביטול וחידוש מנוי, זיכויים ושינויי חיוב דורשים את אישור הצוות.',
+      ...(() => { try { return knowledgeFacts(); } catch { return []; } })(),
+      '- מי מלמד/ת בשיעור מסוים, באיזו שעה, והאם יש בו מקום — אינם בעובדות האלה: הם נבדקים מול Arbox. על שאלה כזו החזר NEED_STAFF.',
     ].filter(Boolean).join('\n');
     let out = null;
     try { out = (await ai({ system, user: ctx.text }))?.trim() ?? null; } catch (err) { logger.warn('[tomer] model unavailable', { error: err.message }); }

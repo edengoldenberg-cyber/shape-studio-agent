@@ -427,6 +427,63 @@ try {
       check(`${W} whatsapp: "back" returns to the list of chats`, (await until(`getComputedStyle(document.querySelector('.wa-threads-sidebar')).display !== 'none' && document.querySelector('.wa-thread-item').getBoundingClientRect().height > 0`, 3000)) === true);
     }
 
+    // ── Tomer: the members board (real data from the Arbox stand-in), on a phone ──
+    await goTab('tomer');
+    await tap('.tw-tab[data-pane="members"]');
+    const mbLoaded = await until(`document.querySelectorAll('#tw-mb-groups .tw-mb-group').length >= 8 || !!document.querySelector('#tw-mb-state [data-state="error"]')`, 20000);
+    const mb = await evalJs(`({ groups: document.querySelectorAll('#tw-mb-groups .tw-mb-group').length, numbered: [...document.querySelectorAll('#tw-mb-groups .tw-mb-n')].every(n => /^(\\d+|—)$/.test(n.textContent.trim())),
+      rule: document.getElementById('tw-mb-rule')?.innerText ?? '', cards: document.querySelectorAll('#tw-mb-list .tw-mb-card').length, state: document.querySelector('#tw-mb-state [data-state]')?.dataset.state ?? null })`);
+    check(`${W} members: the board loads with its groups, each with a number or "—"`, mbLoaded && mb.state === 'ok' && mb.groups >= 8 && mb.numbered, JSON.stringify(mb));
+    check(`${W} members: the chosen group shows its rule, its source and when it was read`, /כלל החישוב:/.test(mb.rule) && /מקור:/.test(mb.rule) && /עודכן:/.test(mb.rule), mb.rule.slice(0, 160));
+    check(`${W} members: the active members are listed`, mb.cards >= 1, JSON.stringify(mb));
+    await audit(`${W} members board`);
+    if (mb.cards >= 1) {
+      const firstName = await evalJs(`document.querySelector('#tw-mb-list .tw-mb-card .tw-mb-name').textContent.trim()`);
+      await type('#tw-mb-search', firstName.slice(0, 3));
+      await sleep(300);
+      await tap('#tw-mb-list .tw-mb-card .tw-mb-open');
+      check(`${W} members: the member card opens with memberships, attendance, bookings, history and next action`, (await until(`(document.querySelector('#tw-mb-list .tw-mb-card.open .tw-mb-detail')?.innerText ?? '').includes('היסטוריית טיפול')`, 15000)) === true);
+      const openId = await evalJs(`document.querySelector('#tw-mb-list .tw-mb-card.open')?.dataset.member ?? null`);
+      await evalJs(`scrollTo(0, 240)`);
+      await tap('#tw-refresh');
+      await sleep(2500);
+      const after = await evalJs(`({ q: document.getElementById('tw-mb-search').value, open: document.querySelector('#tw-mb-list .tw-mb-card.open')?.dataset.member ?? null, detail: (document.querySelector('#tw-mb-list .tw-mb-card.open .tw-mb-detail')?.innerText ?? '').length, group: document.querySelector('#tw-mb-groups .tw-mb-group.active')?.dataset.g })`);
+      check(`${W} members: a refresh keeps the search text, the chosen group and the open card`, after.q === firstName.slice(0, 3) && after.open === openId && after.detail > 40 && after.group === 'active', JSON.stringify(after));
+      await audit(`${W} member card`);
+      await shot(`members-${W}`, true);
+      await evalJs(`(() => { const i = document.getElementById('tw-mb-search'); i.value = ''; i.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+    }
+    // a group whose source was not read is "לא נטען", and a group with nobody is an honest empty list
+    await tap('#tw-mb-groups .tw-mb-group[data-g="expired"]');
+    const exp = await evalJs(`({ n: document.querySelector('#tw-mb-groups .tw-mb-group[data-g="expired"] .tw-mb-n').textContent.trim(), empty: document.querySelector('#tw-mb-list [data-state="empty"]')?.innerText ?? null, cards: document.querySelectorAll('#tw-mb-list .tw-mb-card').length })`);
+    check(`${W} members: an empty group says "אין מנויים מתאימים", it is not shown as an error or left blank`, exp.n === '—' ? true : (Number(exp.n) === exp.cards && (exp.cards > 0 || /אין מנויים מתאימים/.test(exp.empty ?? ''))), JSON.stringify(exp));
+
+    // ── Tomer: tasks waiting for the owner's confirmation, and the reminder settings ──
+    await tap('.tw-tab[data-pane="tasks"]');
+    check(`${W} owner tasks: the list and the reminder status load`, (await until(`!!document.querySelector('#tw-ot-status [data-reminders]') && !document.querySelector('#tw-ot-list [data-state="loading"]')`, 15000)) === true);
+    const ot = await evalJs(`({ rem: document.querySelector('#tw-ot-status [data-reminders]')?.dataset.reminders, cards: document.querySelectorAll('#tw-ot-list > .tw-ot-card').length, text: document.querySelector('#tw-ot-status [data-reminders]')?.innerText ?? '' })`);
+    check(`${W} owner tasks: no reminder is sent before the owner sets the times, and the screen says so`, ot.rem === 'needs_settings' && /לא הוגדרו שעות/.test(ot.text), JSON.stringify(ot));
+    check(`${W} owner tasks: the open cases and tasks of the stand-in data are listed`, ot.cards >= 1, JSON.stringify(ot));
+    await evalJs(`(() => { const d = document.querySelector('.tw-ot-settings'); d.open = true; const i = document.getElementById('tw-ot-times'); i.value = '09:00, 17:00'; i.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+    if (ot.cards >= 1) {
+      await tap('#tw-ot-list > .tw-ot-card [data-toggle]');
+      await evalJs(`(() => { const i = document.querySelector('#tw-ot-list > .tw-ot-card [data-note]'); i.value = 'טיוטת הערה'; i.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+    }
+    await tap('#tw-refresh');
+    await sleep(1800);
+    const otAfter = await evalJs(`({ times: document.getElementById('tw-ot-times')?.value, note: document.querySelector('#tw-ot-list > .tw-ot-card [data-note]')?.value ?? null, more: document.querySelector('#tw-ot-list > .tw-ot-card .tw-ot-more')?.hidden === false })`);
+    check(`${W} owner tasks: a refresh keeps the typed times, the typed note and the open details`, otAfter.times === '09:00, 17:00' && (ot.cards < 1 || (otAfter.note === 'טיוטת הערה' && otAfter.more)), JSON.stringify(otAfter));
+    await audit(`${W} owner tasks`);
+    await shot(`owner-tasks-${W}`, true);
+    await evalJs(`(() => { const i = document.getElementById('tw-ot-times'); i.value = ''; i.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+
+    // ── Knowledge: the status says what is saved, given to the agents and verified — not a blanket "success" ──
+    await goTab('knowledge');
+    check(`${W} knowledge: the status rows load`, (await until(`document.querySelectorAll('#kn-sync-result .kn-row').length >= 4`, 15000)) === true);
+    const kn = await evalJs(`({ head: document.querySelector('#kn-sync-result strong')?.innerText ?? '', states: [...document.querySelectorAll('#kn-sync-result .kn-row')].map(r => r.dataset.knId + ':' + r.dataset.knState), raw: /staff_context_has_instructors|classes_context_loaded/.test(document.getElementById('kn-sync-result').innerText) })`);
+    check(`${W} knowledge: no raw check names, and "success" only when every row is fine`, !kn.raw && (kn.states.every(s => s.endsWith(':ok')) ? /אומת/.test(kn.head) : /חלקית/.test(kn.head)), JSON.stringify(kn));
+    await audit(`${W} knowledge status`);
+
     // ── the other shared screens fit ──────────────────────────────────────────
     for (const t of ['maya', 'automations', 'knowledge', 'health', 'sandbox']) {
       await goTab(t); await sleep(500);

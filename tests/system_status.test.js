@@ -38,6 +38,7 @@ function providers(over = {}) {
     danaReferences: { count: () => 0 },
     danaNotify: { status: () => ({ mode: 'mock', pending: 1 }) },
     identity: { severalRows: () => [] },
+    ownerTasks: { list: () => ({ counts: { open: 0, snoozed: 0, inProgress: 0 }, sourceError: null, reminders: { state: 'on', text: 'תזכורת מרוכזת אחת בשעות 09:00.' } }) },
   };
   return { ...base, ...over, env: { ...base.env, ...(over.env ?? {}) } };
 }

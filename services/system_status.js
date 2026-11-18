@@ -103,6 +103,16 @@ async function build(d = {}) {
   });
   add('system', 'quiet_hours', 'שעות שקט', () => ({ state: 'live',
     detail: `הודעות יזומות אינן נשלחות בין ${env.QUIET_HOUR_START ?? '22'}:00 ל-${String(env.QUIET_HOUR_END ?? '8').padStart(2, '0')}:00; שחרור בבוקר ב-${env.QUIET_HOUR_MORNING_RELEASE ?? '08:30'}.` }));
+  add('system', 'owner_tasks', 'משימות שמחכות לאישור ביצוע שלך, ותזכורות אליך', () => {
+    if (!d.ownerTasks?.list) return { state: 'unknown', detail: 'לא נקרא' };
+    const l = d.ownerTasks.list(), r = l.reminders;
+    const base = `${l.counts.open} משימות פתוחות (${l.counts.snoozed} נדחו, ${l.counts.inProgress} בטיפול). משימה נסגרת רק ב"בוצע" שלך או בסגירה מאומתת במערכת המקור.`;
+    if (l.sourceError) return { state: 'fail', detail: `${base} חלק מהמקורות לא נקראו: ${l.sourceError}.`, action: 'לרענן; אם זה חוזר — לבדוק את הלוגים.' };
+    if (r.state === 'needs_settings') return { state: 'blocked', detail: `${base} ${r.text}`, action: 'לקבוע שעות שליחה ותדירות בפאנל תומר → "תורים לעדן".' };
+    if (r.state === 'failed') return { state: 'fail', detail: `${base} ${r.text}`, action: 'לבדוק את חיבור ה-WhatsApp.' };
+    if (r.state === 'off') return { state: 'off', detail: `${base} ${r.text}`, action: 'להפעיל בפאנל תומר → "תורים לעדן".' };
+    return { state: 'live', detail: `${base} ${r.text}` };
+  });
   add('system', 'recent_failures', 'תקלות ב-24 השעות האחרונות', () => {
     const evs = d.store?.getEvents ? d.store.getEvents({ since: new Date(now - 24 * HOUR), limit: 500 }) : null;
     if (!evs) return { state: 'unknown', detail: 'יומן האירועים לא נקרא' };
@@ -145,7 +155,13 @@ async function build(d = {}) {
              detail: `לא נשמרו מחירי מנויים${trial ? ` (ידועה רק הצעת ההיכרות: ${trial.price_ils} ₪)` : ''}. על שאלת מחיר מנוי ברק עונה "אין לי מחיר מעודכן" ומציע שיחה עם נציג — הוא אינו ממציא מחיר.`,
              action: 'להזין מחירי מנויים בלשונית "ידע סוכן" ולשמור.' };
   });
-  add('barak', 'barak_knowledge', 'ידע על מדריכים ושיעורים', () => {
+  add('barak', 'barak_knowledge', 'ידע על מדריכים וסוגי שיעורים (ברק ותומר)', () => {
+    if (d.studioKnowledge?.summary) {
+      const sm = d.studioKnowledge.summary();
+      const rows = sm.rows.filter(r => r.id === 'staff' || r.id === 'classes' || r.id === 'staff_missing' || r.id === 'arbox');
+      const worst = rows.some(r => r.state === 'empty') ? 'blocked' : rows.some(r => r.state === 'partial' || r.state === 'unknown') ? 'limited' : 'live';
+      return { state: worst, detail: rows.map(r => `${r.label}: ${r.text}`).join(' '), action: rows.map(r => r.action).filter(Boolean)[0] ?? null };
+    }
     const k = d.barakAgent.getRawKnowledge();
     const staff = countItems(k.staff), classes = countItems(k.classes);
     if (staff && classes) return { state: 'live', detail: `${staff} אנשי צוות · ${classes} שיעורים שמורים.` };

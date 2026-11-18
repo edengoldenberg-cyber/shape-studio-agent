@@ -212,7 +212,7 @@ function _autoAddKnownMember(phone, name) {
 function _reconcileLeads(source = 'unknown') {
   try {
     const out = require('./utils/lead_reconcile').reconcile({ store, identity, inbox, aptStore, logger, computeProfile: leadAgent.computeLeadProfile });
-    if (out.corrected.length || out.refusals.length) {
+    if (out.corrected.length || out.refusals.length || out.kindChanges) {
       persist.saveLeads(store);
       broadcastSse('leads_updated', { source: `reconcile_${source}`, corrected: out.corrected.length, refusals: out.refusals.length });
     }
@@ -643,33 +643,29 @@ app.post('/api/leads/:phone/set-qual', requireTestMode, jsonBody, (req, res) => 
 // Runtime member filter: confirmed members are stripped from every response.
 // Also reactively purges any members found — so the first dashboard open after
 // a failed startup purge permanently cleans the store without a manual step.
-app.get('/api/leads', (_req, res) => {
-  const allLeads = store.getAllLeads();
-
-  // Identify any leads that are now confirmed members in PhoneRegistry.
-  // isMember() is synchronous O(1) — safe to call in a request handler.
-  const memberLeads = allLeads.filter(l =>
-    l.phone && l.status !== 'converted_member' && phoneRegistry.isMember(l.phone)
-  );
-
-  // Reactively reclassify members found during dashboard load.
-  // Uses reclassifyAsConvertedMember so history is preserved.
-  if (memberLeads.length > 0) {
-    for (const l of memberLeads) {
-      store.reclassifyAsConvertedMember(l.phone, { name: l.name ?? null, source: 'reactive_api_read' });
-      store.logEvent('member_reclassified_on_api_read', l.phone, { name: l.name ?? null });
-      logger.info('[api/leads] Reactive reclassify — confirmed member removed from lead view', {
-        phone: l.phone, name: l.name, historyTurns: (l.history ?? []).length,
-      });
-    }
-    persist.saveLeads(store);
-  }
-
-  const leads = allLeads
-    .filter(l => l.status !== 'converted_member' && (!l.phone || !phoneRegistry.isMember(l.phone)))
-    .map(({ history, ...l }) => ({ ...l, phone: maskPhone(l.phone) }));
-
-  res.json(leads);
+/** Kind of every stored record (utils/contact_kind.js): member, staff, former member, Arbox lead, lead, contact, test, unclear. */
+function _contactKinds() {
+  return require('./utils/contact_kind').classifyAll(store.getAllLeads(), {
+    peek: p => identity.peek(p), getThread: p => inbox.getThread(p),
+    hasAppointment: p => aptStore.getByPhone(p).length > 0,
+  });
+}
+// GET /api/leads — the SALES leads only. A member, a staff number, a number the staff merely wrote to and a test record
+// are conversations, not leads: they are not listed here (GET /api/leads?all=1 lists everything, each with its kind).
+// Reading the list changes nothing — it used to re-stamp member records on every load of the panel.
+app.get('/api/leads', (req, res) => {
+  const kinds = _contactKinds();
+  const all = store.getAllLeads().map(l => ({ l, k: kinds.get(l.phone) }));
+  const shown = req.query.all === '1' ? all : all.filter(x => x.k?.salesList);
+  res.json(shown.map(({ l: { history, ...l }, k }) => ({ ...l, phone: maskPhone(l.phone), kind: k?.kind ?? 'unclear', kindLabel: k?.label ?? 'לבירור', kindReason: k?.reason ?? null })));
+});
+// GET /api/leads/kinds — how many stored records are of each kind, and how many are in the sales list
+app.get('/api/leads/kinds', (_req, res) => {
+  const kinds = _contactKinds(), counts = {};
+  for (const k of kinds.values()) counts[k.kind] = (counts[k.kind] ?? 0) + 1;
+  const { LABEL } = require('./utils/contact_kind');
+  res.json({ ok: true, total: kinds.size, inSalesList: [...kinds.values()].filter(k => k.salesList).length, counts, labels: LABEL,
+    identityAt: (() => { try { return identity.summary().at ? new Date(identity.summary().at).toISOString() : null; } catch { return null; } })() });
 });
 
 // GET /api/version — running code identity, for deployment verification
@@ -701,7 +697,7 @@ const CODE_FEATURES = [
   'staff_confirm_lifecycle', // confirm / outcome endpoints enforce transitions
   'current_callback_latest', // a lead's current callback = its most recent request only
   'quiet_hours_restored',    // utils/time.isQuietHours active again (22:00–08:00 Israel)
-  'dana_rating_v1', 'system_status_v1', 'sales_refusal_v1', 'sales_refusal_v2', 'lead_reconcile_v1',          // Dana studio: rating of a stored file, review history, score with evidence, apply-improvements guard
+  'dana_rating_v1', 'system_status_v1', 'sales_refusal_v1', 'sales_refusal_v2', 'lead_reconcile_v1', 'studio_knowledge_v1', 'members_board_v1', 'owner_tasks_v1', 'contact_kind_v1',          // Dana studio: rating of a stored file, review history, score with evidence, apply-improvements guard
 ];
 app.get('/api/version', (_req, res) => {
   res.json({
@@ -760,7 +756,7 @@ app.get('/api/system/status', async (_req, res) => {
   try {
     const danaStudio = require('./services/dana_studio');
     const out = await require('./services/system_status').build({
-      store, aptStore, appointmentWorker, arboxGateway, tomerTest, tomerStore, serviceCases, barakAgent, identity,
+      store, aptStore, appointmentWorker, arboxGateway, tomerTest, tomerStore, serviceCases, barakAgent, identity, studioKnowledge, ownerTasks: app.locals.ownerTasks,
       pricing: require('./utils/pricing'),
       voiceIntake: app.locals.voiceIntake, memberCare: app.locals.memberCare,
       danaStudio: { workerStatus: danaStudio.workerStatus,
@@ -2367,11 +2363,14 @@ const INTENT_PATTERNS = {
 const CALL_DECLINED_RE =
   /(?:(?:לא|אין)\s+רוצ[הה]|אל\s+ת)\s*ש(?:יתקשרו|יחזרו|יצרו\s+קשר)|רק\s+(?:וואטסאפ|מסרונים?|הודעות?)(?:\s|[,!.?]|$)/i;
 
+const LEAD_AVAIL_RE = /יש\s+(?:עוד\s+)?מקום|נשאר\s+מקום|נותר\s+מקום|יש\s+מקומות|מקום\s+פנוי|מקומות\s+פנויים|השיעור\s+מלא|התמלא|(?:^|\s)מלא\s*\??$/;
 function detectSchedulingIntent(text) {
   if (!text) return 'general';
   // call_declined: explicit negation of a callback — route to AI, not representative path
   if (CALL_DECLINED_RE.test(text))                   return 'general';
   if (INTENT_PATTERNS.representative.test(text))     return 'representative';
+  // "יש מקום מחר ב-18:00?" — a question about free places in a class: answered from Arbox at that moment, never by the model
+  if (LEAD_AVAIL_RE.test(text) && (/שיעור|אימון|פילאטיס|יוגה|כו?ח|all\s*in|קנגו|kango|חיטוב|היום|מחר|מחרתיים|ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת|ב-?\s*\d/i.test(text))) return 'availability';
   if (INTENT_PATTERNS.reschedule.test(text))         return 'reschedule';
   if (INTENT_PATTERNS.fixed_booking.test(text))      return 'fixed_booking';
   if (INTENT_PATTERNS.cancellation.test(text))       return 'cancellation';
@@ -2437,12 +2436,12 @@ function extractClassFilter(text) {
   // Map of Hebrew/English keywords → partial class name pattern
   const CLASS_KEYWORDS = [
     [/פילאטיס מכשירים|reformer|מכשירים/,              /reformer|מכשירים/i],
-    [/פילאטיס בר|barre|pilates barre/,                 /barre/i],
+    [/פילאטיס בר(?![א-ת])|barre|pilates barre/,        /barre|פילאטיס בר(?![א-ת])/i],
     [/אימון כח|strength|כוח/,                          /strength|כח|כוח/i],
     [/all in|אול אין|אול-אין/,                         /all\s*in/i],
     [/עיצוב|חיטוב|toning|sculpt|concept/,              /toning|sculpt|עיצוב|חיטוב/i],
     [/יוגה|yoga|ashtanga/,                             /yoga|יוגה|ashtanga/i],
-    [/קנגו|kangoo/,                                    /kangoo|קנגו/i],
+    [/קנגו|kangoo|kango/,                              /kango|קנגו/i],
   ];
 
   for (const [detect, matchRe] of CLASS_KEYWORDS) {
@@ -2558,12 +2557,46 @@ async function buildSchedulingReply(intent, msg, clientMatch, { noMatchPassthrou
   // For booking / schedule_query — pull live Arbox schedule for the right day.
   // Pass msg.timestamp (Unix seconds) so "חמישי" resolves relative to the send
   // time rather than the server's processing clock.
+  // A question about free places in a class: read from Arbox now, for that class. Only the missing detail is asked for.
+  // When Arbox or its occupancy cannot be read the answer says so — never "full", "free" or a number that was not read.
+  if (intent === 'availability') {
+    const sentAt = _saneDate(msg?.timestamp);
+    const dt = callbackTime.extractDayAndTime(msgText, sentAt);
+    const classFilter = extractClassFilter(msgText);
+    const ymd = d => `${d.year}-${String(d.month + 1).padStart(2, '0')}-${String(d.day).padStart(2, '0')}`;
+    const nowIL = new Date(sentAt.getTime()).toLocaleString('sv-SE', { timeZone: 'Asia/Jerusalem' });   // "YYYY-MM-DD HH:MM:SS"
+    const av = await studioKnowledge.availability({ pick: classes => {
+      if (!dt.day) return { missing: ['יום'] };
+      let pool = classes.filter(c => c.date === ymd(dt.day) && `${c.date} ${c.start}` > nowIL.slice(0, 16));
+      if (classFilter) pool = pool.filter(c => classFilter.test(c.name));
+      if (dt.hour) {
+        const want = [dt.hour.h, ...(dt.hour.ambiguous && dt.hour.h < 12 ? [dt.hour.h + 12] : [])].map(h => `${String(h).padStart(2, '0')}:${String(dt.hour.min ?? 0).padStart(2, '0')}`);
+        pool = pool.filter(c => want.includes(c.start));
+      }
+      if (pool.length > 1 && !dt.hour) return { missing: ['שעה'], options: pool };
+      if (pool.length > 1 && !classFilter) return { missing: ['סוג השיעור'], options: pool };
+      return { classes: pool.slice(0, 2) };
+    } });
+    const dayLabel = dt.day ? formatDateHe(ymd(dt.day)) : '';
+    store.logEvent('availability_check', normalizeToE164(msg?.from) ?? null, { status: av.status, reason: av.reason ?? null, classes: (av.classes ?? []).length });
+    if (av.status === 'unavailable') return `לא הצלחתי לאמת כרגע את התפוסה מול Arbox, אז לא אנחש 🙏 אפשר לנסות שוב בעוד כמה דקות.`;
+    if (av.status === 'ask') {
+      const opts = (av.options ?? []).slice(0, 6).map(c => `• ${c.start} | ${c.name}`).join('\n');
+      return `כדי לבדוק מקום בשיעור מסוים חסר לי רק: ${av.missing.join(' ו')}.${opts ? `\nב${dayLabel} יש:\n${opts}` : ''}`;
+    }
+    if (av.status === 'none') return `לא מצאתי ב-Arbox שיעור כזה${dayLabel ? ` ב${dayLabel}` : ''}. לאיזה שיעור הכוונה — יום, שעה וסוג?`;
+    const lines = av.classes.map(c => `• ${c.start} | ${c.name}${c.instructor ? ` | ${c.instructor}` : ''} — ${c.occupancy.spotsLeft > 0 ? `יש מקום (${c.occupancy.spotsLeft} מתוך ${c.occupancy.capacity} פנויים)` : `מלא כרגע${c.occupancy.standby ? `, ${c.occupancy.standby} ברשימת המתנה` : ''}`}`);
+    return `נכון לרגע זה לפי Arbox, ב${dayLabel}:\n${lines.join('\n')}`;
+  }
+
   let scheduleData = { classes: [], total: 0, date: null };
   try {
     scheduleData = await barakAgent.checkSchedule(msgText, msg?.timestamp ?? null);
-  } catch { /* non-fatal */ }
+  } catch (err) { scheduleData = { classes: [], total: 0, date: null, error: err.message }; }
 
   if (intent === 'booking' || intent === 'schedule_query') {
+    // Arbox could not be read: that is not "no classes".
+    if (scheduleData.error) return `לא הצלחתי לבדוק כרגע את לוח השיעורים ב-Arbox, אז לא אנחש 🙏 אפשר לנסות שוב בעוד כמה דקות.`;
     if (!scheduleData.classes?.length) {
       const dayLabel = scheduleData.date ? formatDateHe(scheduleData.date) : 'היום';
       return `אין שיעורים ב${dayLabel}. רוצה שאבדוק יום אחר? 🗓️`;
@@ -2605,17 +2638,16 @@ async function buildSchedulingReply(intent, msg, clientMatch, { noMatchPassthrou
     }
 
     // General schedule listing
-    const lines = displayClasses.map(c => {
-      const cap = capacityFor(c.name);
-      return `• ${c.start}–${c.end} | ${c.name}\n  בהדרכת ${c.staff} | ${cap} מקומות`;
-    }).join('\n');
+    // A listing names the classes only. A fixed "N places" is not availability and is not shown; whether there is room
+    // in a specific class is checked against Arbox when it is asked (intent 'availability').
+    const lines = displayClasses.map(c => `• ${c.start}–${c.end} | ${c.name}\n  בהדרכת ${c.staff}`).join('\n');
 
     // Only add a name greeting if this is a filtered (personal) query, not a full listing
     const preamble = classFilter
       ? `ב${dayLabel} 🏋️\n\n`
       : `שיעורי ה${dayLabel} ב-Shape Studio 🏋️\n\n`;
 
-    return `${preamble}${lines}\n\nרוצה מקום? אפשר לענות עם שם השיעור 💪`;
+    return `${preamble}${lines}\n\nכדי לבדוק אם יש מקום בשיעור מסוים — אפשר לכתוב לי את השעה.`;
   }
 
   return null;
@@ -3232,7 +3264,16 @@ async function _memberVoiceOrConfirm(msg, fromNorm, name) {
 }
 let memberCare = null;                                   // created right after the service (it sends through it)
 const tomerGateway = tomerTest.wrapGateway(arboxGateway);
+// Fixed studio knowledge (instructors, class types) with its provenance and verification, and the live check of free
+// places. The Arbox schedule is read 20 s after start and every 30 minutes; a failed read is shown, never hidden.
+const studioKnowledge = app.locals.studioKnowledge = require('./services/studio_knowledge').createStudioKnowledge({ gateway: arboxGateway, barakAgent, pricing, logger });
+if (process.env.NODE_ENV !== 'test') {
+  setTimeout(() => studioKnowledge.refreshLive({ force: true }).catch(() => {}), 20_000).unref();
+  setInterval(() => studioKnowledge.refreshLive({ force: true }).catch(() => {}), 30 * 60 * 1000).unref();
+}
+
 const tomerService = app.locals.tomerService = createTomerService({
+  knowledgeFacts: () => studioKnowledge.facts(),
   leadStore: tomerLeadStore, persist: { saveLeads: () => persist.saveLeads(store) }, logger,
   gateway: tomerGateway, cases: serviceCases, tomerStore, inbox,
   allowed: phone => _tomerOn(phone),
@@ -3334,6 +3375,53 @@ memberCare = createMemberCare({
     ? (() => { const base = new Date(process.env.MEMBER_CARE_TEST_NOW).getTime(), t0 = Date.now(); return { now: () => new Date(base + (Date.now() - t0)) }; })() : {}),
 });
 app.locals.memberCare = memberCare;
+
+// ── Tomer's member-management board (read-only; services/members_board.js) ─────────────────────────────────────────
+const membersBoard = app.locals.membersBoard = require('./services/members_board').createMembersBoard({ care: memberCare, cases: serviceCases, tomerStore, logger,
+  getMemberBookings: (userId, range) => arboxGateway.getBookings(userId, range) });
+app.get('/api/tomer/members-board', async (req, res) => {
+  try { res.json(await membersBoard.board({ fresh: req.query.fresh === '1' })); }
+  catch (err) { logger.error('[members-board] failed', { error: err.message }); res.status(500).json({ ok: false, state: 'sync_error', error: String(err.message).slice(0, 200) }); }
+});
+app.get('/api/tomer/members-board/:userId', async (req, res) => {
+  try { const out = await membersBoard.card(String(req.params.userId).replace(/[^\w-]/g, '')); res.status(out.ok ? 200 : out.state === 'not_found' ? 404 : 503).json(out); }
+  catch (err) { logger.error('[members-board] card failed', { error: err.message }); res.status(500).json({ ok: false, state: 'sync_error', error: String(err.message).slice(0, 200) }); }
+});
+
+// ── The owner's open tasks and the reminders to him (services/owner_tasks.js). Never a message to a customer. ─────
+const ownerTasks = app.locals.ownerTasks = require('./services/owner_tasks').createOwnerTasks({
+  cases: serviceCases, tomerStore, aptStore, logger,
+  caseLabel: c => require('./services/tomer_service').CATEGORY[c.category]?.label ?? c.category,
+  managerPhone: () => _tomerManagerPhone(),
+  sendManager: (phone, text) => sendText(phone, text, { linkPreview: false }),
+  isQuietHours: () => require('./utils/time').isQuietHours(),
+  baseUrl: () => getBackendBase(),
+  // "בוצע" / "בוטל" are recorded where the task lives too, so the panels agree with the owner's word
+  closeSource: async (key, action, { by, note }) => {
+    const [kind, id] = [key.slice(0, key.indexOf(':')), key.slice(key.indexOf(':') + 1)];
+    const text = note || (action === 'done' ? `אושר ביצוע בפאנל (${by})` : `בוטל בפאנל (${by})`);
+    if (kind === 'case') return tomerService.staff.resolve(id, { note: text, outcome: 'other', by });
+    if (kind === 'task') { const t = tomerStore.resolveTask(id, { resolutionNote: text, resolvedBy: by }); broadcastSse('tomer_task', { id }); return { ok: !!t }; }
+    if (kind === 'apt') { const r = callbackSvc.staffOutcome(id, action === 'done' ? 'completed' : 'cancelled', action === 'done' ? { notes: text } : { reason: text }); broadcastSse('appointment_updated', { aptId: id }); return r; }
+    return { ok: false, error: 'unknown_source' };
+  },
+});
+if (process.env.NODE_ENV !== 'test') setInterval(() => ownerTasks.tick().catch(err => logger.error('[owner-tasks] tick failed', { error: err.message })), 5 * 60 * 1000).unref();
+app.get('/api/owner-tasks', (req, res) => {
+  try { res.json(ownerTasks.list({ includeClosed: req.query.closed === '1' })); }
+  catch (err) { logger.error('[owner-tasks] list failed', { error: err.message }); res.status(500).json({ ok: false, error: 'list_failed' }); }
+});
+app.get('/api/owner-tasks/preview', (_req, res) => { try { res.json({ ok: true, ...ownerTasks.preview() }); } catch (err) { res.status(500).json({ ok: false, error: err.message }); } });
+app.post('/api/owner-tasks/settings', jsonBody, (req, res) => {
+  try { const out = ownerTasks.setSettings(req.body ?? {}, { by: String(req.body?.by ?? '').trim().slice(0, 40) || 'עדן' }); res.status(out.ok ? 200 : 400).json(out); }
+  catch (err) { logger.error('[owner-tasks] settings failed', { error: err.message }); res.status(500).json({ ok: false, error: err.message }); }
+});
+app.post('/api/owner-tasks/act', jsonBody, async (req, res) => {
+  try {
+    const out = await ownerTasks.act(String(req.body?.key ?? ''), String(req.body?.action ?? ''), { by: String(req.body?.by ?? '').trim().slice(0, 40) || 'עדן', note: req.body?.note ?? null, until: req.body?.until ?? null });
+    res.status(out.ok ? 200 : out.error === 'not_found' ? 404 : 400).json(out);
+  } catch (err) { logger.error('[owner-tasks] act failed', { error: err.message }); res.status(500).json({ ok: false, error: err.message }); }
+});
 // Every 15 minutes: run the programs that are due today. Does nothing while the switch is off.
 if (process.env.TEST_NO_BIND !== 'true') {
   cron.schedule('*/15 * * * *', () => { memberCare.tick().catch(err => logger.error('[member-care] scheduled run failed', { error: err.message })); }, { timezone: 'Asia/Jerusalem' });
@@ -6590,6 +6678,37 @@ app.get('/api/admin/knowledge', (_req, res) => {
   res.json({ ok: true, ...barakAgent.getRawKnowledge() });
 });
 
+// GET /api/admin/knowledge/status — saved / given to the agents / verified against Arbox / waiting for the owner
+app.get('/api/admin/knowledge/status', async (req, res) => {
+  try {
+    await studioKnowledge.refreshLive({ force: req.query.refresh === '1' });
+    res.json({ ok: true, summary: studioKnowledge.summary(), status: studioKnowledge.status() });
+  } catch (err) { logger.error('[admin] knowledge status failed', { error: err.message }); res.status(500).json({ ok: false, error: 'status_failed' }); }
+});
+// POST /api/admin/knowledge/restore { type: 'staff' | 'classes' } — from the historic copy shipped with the code; never
+// over newer information; the result waits for the owner's confirmation.
+app.post('/api/admin/knowledge/restore', jsonBody, async (req, res) => {
+  try {
+    const out = studioKnowledge.restoreHistoric(req.body?.type, { by: String(req.body?.by ?? '').trim().slice(0, 40) || 'בעלים' });
+    if (!out.ok) return res.status(out.error === 'newer_information_exists' ? 409 : 400).json(out);
+    store.logEvent('knowledge_restored', null, { type: req.body?.type, restored: out.restored ?? 0, unchanged: !!out.unchanged });
+    await studioKnowledge.refreshLive();
+    res.json({ ...out, summary: studioKnowledge.summary() });
+  } catch (err) { logger.error('[admin] knowledge restore failed', { error: err.message }); res.status(500).json({ ok: false, error: err.message }); }
+});
+// POST /api/admin/knowledge/confirm { type } — the owner confirms a restored list as it now stands
+app.post('/api/admin/knowledge/confirm', jsonBody, (req, res) => {
+  try {
+    const out = studioKnowledge.confirm(req.body?.type, { by: String(req.body?.by ?? '').trim().slice(0, 40) || 'בעלים' });
+    if (!out.ok) return res.status(400).json(out);
+    store.logEvent('knowledge_confirmed', null, { type: req.body?.type });
+    res.json({ ...out, summary: studioKnowledge.summary() });
+  } catch (err) { logger.error('[admin] knowledge confirm failed', { error: err.message }); res.status(500).json({ ok: false, error: err.message }); }
+});
+// A save from the panel is the owner's own word: a restored list that the owner saves is thereby confirmed.
+const _ownerSaved = data => (data?._restored && data._restored.confirmed !== true
+  ? { ...data, _restored: { ...data._restored, confirmed: true, confirmedAt: new Date().toISOString(), confirmedBy: 'owner_save' } } : data);
+
 // POST /api/admin/knowledge/staff — save staff_directory.json and hot-reload
 app.post('/api/admin/knowledge/staff', jsonBody, (req, res) => {
   const data = req.body;
@@ -6597,7 +6716,7 @@ app.post('/api/admin/knowledge/staff', jsonBody, (req, res) => {
     return res.status(400).json({ ok: false, error: 'body must have { instructors: [...] }' });
   }
   try {
-    const result = barakAgent.reloadKnowledge({ staffData: data });
+    const result = barakAgent.reloadKnowledge({ staffData: _ownerSaved(data) });
     store.logEvent('knowledge_sync', null, { type: 'staff', ...result });
     res.json({ ok: true, ...result });
   } catch (err) {
@@ -6627,7 +6746,7 @@ app.post('/api/admin/knowledge/classes', jsonBody, (req, res) => {
   const data = req.body;
   if (!data?.classes) return res.status(400).json({ error: 'classes array required' });
   try {
-    const result = barakAgent.reloadKnowledge({ classesData: data });
+    const result = barakAgent.reloadKnowledge({ classesData: _ownerSaved(data) });
     store.logEvent('knowledge_sync', null, { type: 'classes', classes_count: result.classes_count });
     res.json({ ok: true, ...result });
   } catch (err) {
@@ -6685,7 +6804,8 @@ app.post('/api/admin/sync-agent-knowledge', async (_req, res) => {
     });
 
     logger.info('[admin] sync-agent-knowledge complete', reload);
-    res.json({ ok: true, ...reload, verification: checks });
+    await studioKnowledge.refreshLive({ force: true }).catch(() => {});
+    res.json({ ok: true, ...reload, verification: checks, summary: studioKnowledge.summary() });
   } catch (err) {
     logger.error('[admin] sync-agent-knowledge failed', { error: err.message });
     res.status(500).json({ ok: false, error: err.message });

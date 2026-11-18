@@ -134,6 +134,36 @@ function reconcile(d) {
     }
     if (!changed) out.unchanged++;
   }
+
+  // ── C. kind: a conversation record is not necessarily a sales lead ────────────
+  // A member, a staff number, a number the staff merely wrote to and a test record keep their history and their
+  // status (human ownership included), but carry no sales score, no "next sales action", and are out of every sales
+  // list and every automated outreach. The mark follows the evidence: it is lifted when the evidence changes.
+  {
+    const kinds = require('./contact_kind').classifyAll(store.getAllLeads(), {
+      peek: p => (identity?.peek ? identity.peek(p) : null), getThread: p => (inbox?.getThread ? inbox.getThread(p) : null),
+      hasAppointment: p => (aptStore?.getByPhone ? aptStore.getByPhone(p).length > 0 : false) });
+    out.kinds = {}; out.kindChanges = 0;
+    for (const [phone, k] of kinds) {
+      out.kinds[k.kind] = (out.kinds[k.kind] ?? 0) + 1;
+      if (k.kind === 'unclear') continue;                               // no evidence: nothing is marked or lifted
+      const lead = store.getLead(phone), meta = lead.meta ?? {};
+      const notSales = !k.salesList;
+      if (notSales && (meta.notSalesLead?.kind !== k.kind || (lead.score ?? 0) !== 0 || meta.qualProfile)) {
+        const { qualProfile, ...rest } = meta;
+        store.upsertLead(phone, { score: 0, meta: { ...rest, notSalesLead: { kind: k.kind, reason: k.reason, at: meta.notSalesLead?.kind === k.kind ? meta.notSalesLead.at : nowIso },
+          ...(qualProfile ? { salesProfileArchived: { ...qualProfile, archivedAt: nowIso } } : {}) } });
+        store.logEvent('record_kind_set', phone, { kind: k.kind });
+        out.kindChanges++;
+      } else if (!notSales && meta.notSalesLead) {
+        const { notSalesLead, ...rest } = meta;
+        store.upsertLead(phone, { meta: { ...rest, kindChangedAt: nowIso } });
+        store.logEvent('record_kind_lifted', phone, { was: notSalesLead.kind, now: k.kind });
+        out.kindChanges++;
+      }
+    }
+    if (out.kindChanges) logger.info('[lead-reconcile] record kinds brought in line with the evidence', { changes: out.kindChanges, kinds: out.kinds });
+  }
   return out;
 }
 

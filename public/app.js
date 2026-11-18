@@ -1064,7 +1064,7 @@ function renderTomerQueue(leads) {
     const color = days > 7 ? 'var(--hot)' : 'var(--warm)';
     const introIcon = l.introOfferSent ? (l.introOfferRedeemed ? '✅ נוצלה' : '⏳ ממתינה') : '—';
     return `<tr>
-      <td><span class="lead-name">${esc(l.name ?? '—')}</span></td>
+      <td><span class="lead-name">${esc(l.name ?? '—')}</span>${l.kind && l.kind !== 'lead' ? `<span class="lead-kind ${esc(l.kind)}" title="${esc(l.kindReason ?? '')}">${esc(l.kindLabel ?? l.kind)}</span>` : ''}</td>
       <td><div class="score-cell"><span class="score-num">${l.score}</span><div class="score-track"><div class="score-fill ${tier}" style="width:${l.score*10}%"></div></div></div></td>
       <td><span class="badge ${l.status||'new'}">${statusLabel(l.status)}</span></td>
       <td style="text-align:center;font-weight:700;color:${color}">${days}ד</td>
@@ -1987,6 +1987,15 @@ async function loadBarakPanel() {
     renderBarakStats(daily);
     renderBarakTable(allLeads);
     renderCallbackPanel(cbData.callbacks ?? []);
+    // what is NOT in this list, and why: a conversation is not necessarily a sales lead
+    fetch('/api/leads/kinds').then(r => r.json()).then(k => {
+      const tb = document.getElementById('barak-leads-tbody'); const wrap = tb?.closest('.table-wrapper') ?? tb?.closest('table'); if (!wrap || !k?.ok) return;
+      let note = document.getElementById('barak-leads-note');
+      if (!note) { note = document.createElement('div'); note.id = 'barak-leads-note'; note.className = 'leads-hidden-note'; wrap.parentNode.insertBefore(note, wrap); }
+      const c = k.counts ?? {}, part = (n, t) => (n ? `${n} ${t}` : null);
+      const hidden = [part((c.member ?? 0) + (c.aggregator ?? 0), 'מנויים (מטופלים בתומר)'), part(c.staff, 'מספרי צוות'), part(c.contact, 'שיחות שאינן ליד'), part(c.test, 'רשומות בדיקה')].filter(Boolean);
+      note.textContent = `מוצגים ${k.inSalesList} לידים מתוך ${k.total} שיחות שמורות.` + (hidden.length ? ` לא מוצגים כאן: ${hidden.join(' · ')}. הסיווג לפי נתוני המנויים ב-Arbox${k.identityAt ? ` (עודכן ${new Date(k.identityAt).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' })})` : ''}.` : '');
+    }).catch(() => {});
     const upEl = document.getElementById('barak-updated');
     if (upEl) upEl.textContent = 'עודכן: ' + now();
   } catch (e) { console.error('loadBarakPanel', e); }
@@ -2359,7 +2368,7 @@ function renderBarakTable(leads) {
     // Status badge: show qualification reason as tooltip
     const statusTitle = qualReason ? ` title="${esc(qualReason)}"` : '';
     return `<tr>
-      <td><span class="lead-name">${esc(l.name ?? '—')}</span></td>
+      <td><span class="lead-name">${esc(l.name ?? '—')}</span>${l.kind && l.kind !== 'lead' ? `<span class="lead-kind ${esc(l.kind)}" title="${esc(l.kindReason ?? '')}">${esc(l.kindLabel ?? l.kind)}</span>` : ''}</td>
       <td style="direction:ltr;text-align:right;font-variant-numeric:tabular-nums">${esc(l.phone)}</td>
       <td><div class="score-cell"><span class="score-num">${l.score}</span><div class="score-track"><div class="score-fill ${tier}" style="width:${l.score*10}%"></div></div></div></td>
       <td><span class="badge ${l.status||'new'}"${statusTitle}>${statusLabel(l.status)}</span></td>
@@ -3465,6 +3474,40 @@ function showKnView(view) {
 }
 
 // ── Load knowledge from server ────────────────────────────────────────────────
+/* Knowledge status: for each list — saved? given to the agents? verified against Arbox? what is needed. */
+const KN_STATE = { ok: ['kn-ok', 'תקין'], partial: ['kn-partial', 'חלקי'], empty: ['kn-empty', 'חסר'], unknown: ['kn-unknown', 'לא ניתן לאמת'] };
+function renderKnowledgeStatus(summary) {
+  const box = document.getElementById('kn-sync-result');
+  if (!box) return;
+  if (!summary) { box.className = 'knowledge-sync-result error'; box.textContent = 'לא ניתן לקרוא את מצב המידע מהשרת. לרענן את הדף.'; box.style.display = ''; return; }
+  const head = summary.state === 'ok' ? '✅ המידע שמור, נטען לסוכנים ואומת' : '⚠️ המידע נטען חלקית — ראו מה חסר';
+  box.className = 'knowledge-sync-result' + (summary.state === 'ok' ? '' : ' partial');
+  box.innerHTML = `<strong>${head}</strong><div class="kn-rows">${summary.rows.map(r => {
+    const [cls, label] = KN_STATE[r.state] ?? KN_STATE.unknown;
+    const btns = [r.state === 'empty' && (r.id === 'staff' || r.id === 'classes') && /לשחזר/.test(r.action ?? '') ? `<button type="button" class="btn-xs btn-xs-sec" data-kn-restore="${r.id}">שחזר מהעותק ההיסטורי</button>` : '',
+                  r.state !== 'empty' && /אישור הרשימה/.test(r.action ?? '') ? `<button type="button" class="btn-xs btn-xs-sec" data-kn-confirm="${r.id}">אישור הרשימה</button>` : ''].join('');
+    return `<div class="kn-row ${cls}" data-kn-id="${esc(r.id)}" data-kn-state="${esc(r.state)}"><div class="kn-row-top"><b>${esc(r.label)}</b><span class="kn-state ${cls}">${label}</span></div>
+      <div class="kn-row-text">${esc(r.text)}</div>${r.action ? `<div class="kn-row-action"><strong>מה נדרש:</strong> ${esc(r.action)}</div>` : ''}${btns ? `<div class="kn-row-btns">${btns}</div>` : ''}</div>`; }).join('')}</div>`;
+  box.style.display = '';
+  box.querySelectorAll('[data-kn-restore]').forEach(b => b.addEventListener('click', () => knowledgeAction('restore', b.dataset.knRestore, b)));
+  box.querySelectorAll('[data-kn-confirm]').forEach(b => b.addEventListener('click', () => knowledgeAction('confirm', b.dataset.knConfirm, b)));
+}
+async function knowledgeAction(kind, type, btn) {
+  if (kind === 'confirm' && !confirm('לאשר את הרשימה כפי שהיא מוצגת עכשיו? אחרי האישור כל הרשומות בה יימסרו לסוכנים.')) return;
+  btn.disabled = true;
+  try {
+    const d = await post(`/api/admin/knowledge/${kind}`, { type });
+    if (!d.ok) throw new Error(d.error === 'newer_information_exists' ? 'קיים מידע חדש יותר — לא שוחזר מעליו' : (d.error ?? 'הפעולה נכשלה'));
+    knowledgeData = null; await loadKnowledge(true);
+    renderKnowledgeStatus(d.summary ?? null);
+    toast(kind === 'restore' ? '✅ שוחזר — ממתין לאישור שלך' : '✅ הרשימה אושרה');
+  } catch (err) { toast(`❌ ${err.message}`); btn.disabled = false; }
+}
+async function loadKnowledgeStatus() {
+  try { const d = await fetch('/api/admin/knowledge/status').then(r => r.json()); renderKnowledgeStatus(d.ok ? d.summary : null); }
+  catch { renderKnowledgeStatus(null); }
+}
+
 async function loadKnowledge(force = false) {
   if (knowledgeData && !force) { renderKnowledge(knowledgeData); return; }
   try {
@@ -3475,6 +3518,7 @@ async function loadKnowledge(force = false) {
     ]);
     knowledgeData = d;
     renderKnowledge(d);
+    loadKnowledgeStatus();
   } catch (err) {
     toast(`❌ שגיאה בטעינת ידע: ${err.message}`);
   }
@@ -3863,15 +3907,10 @@ async function triggerSync(showDetails = true) {
     const sub = document.getElementById('kn-last-synced');
     if (sub) sub.textContent = `סונכרן ב-${ts} | ${d.staff_count} מדריכים · ${d.packages_count} חבילות`;
 
-    if (showDetails && result) {
-      const checks = (d.verification ?? []).map(c =>
-        `${c.passed ? '✅' : '❌'} ${c.test}${c.sample ? ` — ${c.sample.slice(0,80)}` : ''}${c.rehab_instructors?.length ? ` | שיקומי: ${c.rehab_instructors.join(', ')}` : ''}`
-      ).join('\n');
-      result.className = 'knowledge-sync-result';
-      result.innerHTML = `<strong>✅ הסוכן עודכן בהצלחה</strong> — ${ts}<br><pre style="margin:8px 0 0;font-size:12px;white-space:pre-wrap">${esc(checks)}</pre>`;
-      result.style.display = '';
-    }
-    toast('✅ זיכרון סוכן רוענן');
+    renderKnowledgeStatus(d.summary ?? null);
+    const st = d.summary?.state;
+    toast(st === 'ok' ? '✅ המידע נטען לסוכנים ואומת' : '⚠️ הרענון בוצע — חלק מהמידע חסר או ממתין לאישור (פרטים למעלה)');
+
   } catch (err) {
     if (result) {
       result.className = 'knowledge-sync-result error';

@@ -1,0 +1,76 @@
+{
+  "_note": "Class information injected into Barak's AI context. Edit via the dashboard → ידע סוכן → אימונים.",
+  "_universal_access": "כל מנוי — בכל רמה — כולל גישה מלאה לכל סוגי השיעורים ללא הגבלה.",
+  "classes": [
+    {
+      "id": "reformer",
+      "name_he": "פילאטיס מכשירים",
+      "name_en": "Reformer Pilates",
+      "capacity": 8,
+      "intensity": "בינונית",
+      "pitch": "פילאטיס על מכשיר Reformer — מחזק ליבה, משפר יציבה, מאריך שרירים. קבוצות מיני של 8 מקומות בלבד.",
+      "best_for": "חיזוק ליבה, שיפור יציבה, שיקום, גמישות, כל הרמות",
+      "notes": "הכי מבוקש בסטודיו. 8 מקומות — בוטיק אמיתי, לא חדר כושר."
+    },
+    {
+      "id": "strength",
+      "name_he": "אימון כוח",
+      "name_en": "Strength Training",
+      "capacity": 10,
+      "intensity": "בינונית-גבוהה",
+      "pitch": "אימון כוח פונקציונלי — בונה כוח, עיצוב גוף, תוצאות מדידות.",
+      "best_for": "בניית כוח, עיצוב גוף, שריפת קלוריות, חיזוק כללי",
+      "notes": ""
+    },
+    {
+      "id": "barre",
+      "name_he": "Pilates Barre",
+      "name_en": "Pilates Barre",
+      "capacity": 10,
+      "intensity": "בינונית",
+      "pitch": "בלט פילאטיס — רגליים, ישבן, ליבה בתנועות קטנות ומדויקות.",
+      "best_for": "עיצוב רגליים וישבן, שיפור גמישות ויציבה",
+      "notes": ""
+    },
+    {
+      "id": "all_in",
+      "name_he": "ALL IN",
+      "name_en": "ALL IN",
+      "capacity": 10,
+      "intensity": "גבוהה",
+      "pitch": "אימון פונקציונלי עצים בסגנון CrossFit — לאנשים שרוצים אתגר.",
+      "best_for": "שריפת קלוריות, כוח, סיבולת, אנרגיה גבוהה",
+      "notes": ""
+    },
+    {
+      "id": "toning",
+      "name_he": "Concept Toning",
+      "name_en": "Concept Toning",
+      "capacity": 10,
+      "intensity": "נמוכה-בינונית",
+      "pitch": "עיצוב לצלילי מוזיקה — משקולות קלות, חזרות גבוהות, כיף ומשחרר.",
+      "best_for": "עיצוב כללי, שמירה על כושר, מתחילים, נשים לאחר לידה",
+      "notes": ""
+    },
+    {
+      "id": "yoga",
+      "name_he": "Ashtanga Yoga",
+      "name_en": "Ashtanga Yoga",
+      "capacity": 10,
+      "intensity": "בינונית",
+      "pitch": "יוגה דינמית עם נשימה — גמישות, כוח, ריכוז ורוגע.",
+      "best_for": "גמישות, הרפיה, חיזוק מנטלי, שיפור נשימה",
+      "notes": ""
+    },
+    {
+      "id": "kangoo",
+      "name_he": "Kangoo Jumps",
+      "name_en": "Kangoo Jumps",
+      "capacity": 10,
+      "intensity": "בינונית-גבוהה",
+      "pitch": "קרדיו על קפיצנים ייחודיים — ידידותי למפרקים, מרענן ומלא שמחה.",
+      "best_for": "קרדיו, שריפת קלוריות, בעיות מפרקים, כיף",
+      "notes": ""
+    }
+  ]
+}
