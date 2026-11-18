@@ -37,6 +37,7 @@ function providers(over = {}) {
     danaStudio: { workerStatus: () => ({ online: true, state: 'idle', lastSeen: iso(5000), pipelineVersion: '1.5.0', queued: 0, running: 0 }), summary: () => ({ awaitingReview: 1 }) },
     danaReferences: { count: () => 0 },
     danaNotify: { status: () => ({ mode: 'mock', pending: 1 }) },
+    identity: { severalRows: () => [] },
   };
   return { ...base, ...over, env: { ...base.env, ...(over.env ?? {}) } };
 }
@@ -184,6 +185,21 @@ describe('system status — lead records', () => {
     expect(JSON.stringify(out)).not.toMatch(/9725\d{8}/);
     const clean = await build(providers({ store: { getEvents: () => [], getAllLeads: () => leads.slice(0, 2) } }));
     expect(row(clean, 'barak_records').state).toBe('live');
+  });
+});
+
+describe('system status — phones with several Arbox rows', () => {
+  test('names and Arbox ids of every row are listed for the owner; the phone only by its last four digits', async () => {
+    const identity = { severalRows: () => [{ phone: '972500001540', rows: [{ userId: 11274768, role: 'client', name: 'אילנה לוי', category: 'member' }, { userId: 12197234, role: 'lead', name: 'אילנה לוי', category: 'lead' }] }] };
+    const out = await build(providers({ identity }));
+    const r = row(out, 'tomer_duplicates');
+    expect(r.state).toBe('blocked');
+    expect(r.detail).toMatch(/איש אינו נבחר אוטומטית/);
+    expect(r.action).toMatch(/אינה מוחקת ואינה מאחדת/);
+    expect(r.items).toEqual([{ phoneTail: '…1540', rows: [{ name: 'אילנה לוי', userId: '11274768', role: 'לקוח', status: 'מנוי בתוקף' }, { name: 'אילנה לוי', userId: '12197234', role: 'ליד', status: 'בלי מנוי' }] }]);
+    expect(JSON.stringify(out)).not.toMatch(/9725\d{8}/);
+    expect(row(await build(providers({ identity: { severalRows: () => [] } })), 'tomer_duplicates').state).toBe('live');
+    expect(row(await build(providers({ identity: undefined })), 'tomer_duplicates').state).toBe('unknown');
   });
 });
 

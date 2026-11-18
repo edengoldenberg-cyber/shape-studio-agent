@@ -205,7 +205,24 @@ function createIdentityResolver({ gateway, logger = console, now = () => new Dat
     return { at: _dir?.at ?? null, membershipsFresh: !!_dir?.membershipsFresh, phones: _dir?.byPhone.size ?? 0, counts, sharedPhones: shared, sharedWithDifferentCategories: conflicts, ambiguousMembers: ambiguous, lastError: _lastError };
   }
 
-  return { resolve, peek, refresh, load, phonesIn, summary, _reset() { _dir = null; _inflight = null; _lastError = null; },
+  /**
+   * Phones that carry a member-type row AND another active row with a different Arbox user id (a lead row next to the
+   * client row, a second person). The member service picks nobody on such a phone; the owner settles the rows in Arbox.
+   * Returns [{ phone, rows: [{ userId, role, name, category }] }] — for the owner's panel only.
+   */
+  function severalRows() {
+    const out = [];
+    if (!_dir) return out;
+    const day = today();
+    for (const [phone, recs] of _dir.byPhone) {
+      const act = recs.filter(r => r.active);
+      if (new Set(act.map(r => String(r.userId))).size < 2 || !act.some(r => r.role === 'client' || r.role === 'aggregatorMember')) continue;
+      out.push({ phone, rows: act.map(r => ({ userId: r.userId, role: r.role, name: r.name ?? null, category: categoryOf(r, day) })) });
+    }
+    return out;
+  }
+
+  return { resolve, peek, refresh, load, phonesIn, summary, severalRows, _reset() { _dir = null; _inflight = null; _lastError = null; },
     get ready() { return !!_dir; }, FRESH_MS, MAX_STALE_MS };
 }
 

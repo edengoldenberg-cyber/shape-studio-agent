@@ -52,7 +52,7 @@ async function build(d = {}) {
   const add = (group, id, label, fn) => {
     try {
       const r = fn();
-      if (r) rows.push({ group, id, label, state: r.state, detail: r.detail ?? '', action: r.action ?? null });
+      if (r) rows.push({ group, id, label, state: r.state, detail: r.detail ?? '', action: r.action ?? null, ...(r.items ? { items: r.items } : {}) });
     } catch (err) {
       rows.push({ group, id, label, state: 'unknown', detail: `לא ניתן לקרוא את המצב (${String(err.message).slice(0, 80)})`, action: null });
     }
@@ -186,6 +186,17 @@ async function build(d = {}) {
     }
     return { state: 'limited', detail: `מצב בדיקה: רק ${t.allowlist?.length ?? 0} מספרי בדיקה מקבלים את השירות החדש; מתאמנים אמיתיים מקבלים את המסלול הישן.`,
              action: 'החלטה שלך: TOMER_MODE=all.' };
+  });
+  add('tomer', 'tomer_duplicates', 'טלפונים עם יותר משורה אחת ב-Arbox (זהות לבירור)', () => {
+    const list = d.identity?.severalRows ? d.identity.severalRows() : null;
+    if (!list) return { state: 'unknown', detail: 'ספריית הזהויות לא נקראה' };
+    if (!list.length) return { state: 'live', detail: 'אין טלפון עם יותר משורה פעילה אחת ב-Arbox.' };
+    const ROLE = { client: 'לקוח', lead: 'ליד', aggregatorMember: 'חבר מועדון', staffMember: 'צוות' };
+    const CAT = { member: 'מנוי בתוקף', aggregator: 'חבר מועדון', former_member: 'מנוי לשעבר', lead: 'בלי מנוי', staff: 'צוות', unverified: 'מנוי לא אומת' };
+    return { state: 'blocked',
+      detail: `${list.length} טלפונים רשומים ב-Arbox על יותר משורה פעילה אחת. מי שכותב ממספר כזה מקבל מידע כללי בלבד: פרטי מנוי אינם מוצגים, ובקשה לרישום, ביטול, מעבר או הקפאה עוברת לצוות לבירור — איש אינו נבחר אוטומטית.`,
+      action: 'להכריע ב-Arbox לכל טלפון: אם זו אותה לקוחה שנרשמה פעמיים — לאחד או להפוך את השורה המיותרת ללא פעילה; אם אלה שני אנשים — לעדכן לאחד מהם טלפון אחר. המערכת אינה מוחקת ואינה מאחדת.',
+      items: list.map(x => ({ phoneTail: tail(x.phone), rows: x.rows.map(r => ({ name: r.name ?? '(ללא שם)', userId: String(r.userId), role: ROLE[r.role] ?? r.role, status: CAT[r.category] ?? r.category ?? '' })) })) };
   });
   add('tomer', 'tomer_manager', 'התראות שירות למנהל', () => {
     const p = env.TOMER_MANAGER_PHONE;

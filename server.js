@@ -760,7 +760,7 @@ app.get('/api/system/status', async (_req, res) => {
   try {
     const danaStudio = require('./services/dana_studio');
     const out = await require('./services/system_status').build({
-      store, aptStore, appointmentWorker, arboxGateway, tomerTest, tomerStore, serviceCases, barakAgent,
+      store, aptStore, appointmentWorker, arboxGateway, tomerTest, tomerStore, serviceCases, barakAgent, identity,
       pricing: require('./utils/pricing'),
       voiceIntake: app.locals.voiceIntake, memberCare: app.locals.memberCare,
       danaStudio: { workerStatus: danaStudio.workerStatus,

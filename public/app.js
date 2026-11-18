@@ -2439,6 +2439,7 @@ function renderSystemStatus(data) {
         <div class="sys-row-top"><span class="sys-row-name">${esc(r.label)}</span><span class="sys-state ${st.cls}">${st.text}</span></div>
         <div class="sys-row-detail">${esc(r.detail)}</div>
         ${r.action ? `<div class="sys-row-action"><strong>מה נדרש:</strong> ${esc(r.action)}</div>` : ''}
+        ${Array.isArray(r.items) && r.items.length ? `<ul class="sys-items">${r.items.map(it => `<li class="sys-item"><span class="sys-item-phone" dir="ltr">${esc(it.phoneTail)}</span>${it.rows.map(x => `<span class="sys-item-row"><b>${esc(x.name)}</b> · מזהה Arbox <span dir="ltr">${esc(x.userId)}</span> · ${esc(x.role)}${x.status ? ' · ' + esc(x.status) : ''}</span>`).join('')}</li>`).join('')}</ul>` : ''}
       </div>`; }).join('')}</div>`;
   }).join('');
   return summary + groups;

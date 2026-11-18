@@ -144,6 +144,12 @@ try {
         for (const r of rows) console.log('    ' + r);
         console.log('  header: ' + (await evalJs(`document.getElementById('status-label')?.innerText ?? ''`)));
       }
+      const dup = await evalJs(`(() => { const r = document.querySelector('#health-grid .sys-row[data-status-id="tomer_duplicates"]'); if (!r) return null; const items = [...r.querySelectorAll('.sys-item')];
+        return { state: r.dataset.state, items: items.length, rows: r.querySelectorAll('.sys-item-row').length, withId: [...r.querySelectorAll('.sys-item-row')].filter(x => /מזהה Arbox\s*\d+/.test(x.innerText)).length,
+                 named: [...r.querySelectorAll('.sys-item-row b')].filter(b => b.innerText.trim().length > 1).length, tails: items.map(i => i.querySelector('.sys-item-phone')?.innerText.trim()),
+                 inside: items.every(i => { const b = i.getBoundingClientRect(); return b.left >= -1 && b.right <= innerWidth + 1; }) }; })()`);
+      if (W === WIDTHS[0]) console.log('  duplicate-rows list: ' + JSON.stringify(dup));
+      check(`${W} status: the phones with several Arbox rows are listed with a name and an Arbox id on every row, inside the screen`, !!dup && (dup.items === 0 || (dup.rows >= 2 * dup.items && dup.withId === dup.rows && dup.named === dup.rows && dup.inside)), JSON.stringify(dup));
       await audit(`${W} status`, W);
       await shot(`prod-status-${W}`, true);
     }

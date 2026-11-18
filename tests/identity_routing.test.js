@@ -233,6 +233,51 @@ describe('Routing follows the one identity resolver', () => {
     expect(r.route).toMatch(/^tomer_/);
   });
 
+  // Owner rule, 2026-11-18 (three such phones in production — the same name on a client row and on a lead row): the
+  // phone is served by the member service, but nobody is picked automatically. General information is given; nothing
+  // about "the" membership is shown and no action is taken until the owner settles the rows in Arbox.
+  test('two Arbox rows on one phone: general information yes — membership details, class actions and Arbox requests no', async () => {
+    world();
+    person({ role: 'lead', active: 1, phone: '0507900002', first: 'אילנה', last: 'לוי' });
+    plan(person({ phone: '050-7900002', first: 'אילנה', last: 'לוי' }), { end: day(25) });
+    const gw = require('../services/arbox_gateway');
+    expect(await gw.resolveMember('972507900002')).toMatchObject({ status: 'ambiguous', reason: 'several_rows_on_phone', count: 2 });
+    expect((await gw.resolveMember('972507900002')).member).toBeUndefined();
+
+    const a = await say('972507900002', 'מה הכתובת של הסטודיו?');
+    expect(a.route).toMatch(/^tomer_/);
+    expect(textsTo('972507900002').join('\n')).toMatch(/דרך השדה|waze/i);                      // general information is given
+
+    mockOut.texts.length = 0; mockOut.mgr.length = 0;
+    await say('972507900002', 'עד מתי המנוי שלי בתוקף?');
+    const about = textsTo('972507900002').join('\n');
+    expect(about).not.toMatch(/\d{1,2}\.\d{1,2}\.\d{4}|מנוי חודשי|בתוקף עד|כניסות/);          // no detail of a membership
+    expect(about).not.toMatch(/אילנה/);                                                         // nobody is addressed as the member
+
+    mockOut.texts.length = 0;
+    const calls0 = arbox.state.writes?.length ?? 0;
+    await say('972507900002', 'אפשר להעביר אותי מהשיעור של מחר ב-18:00 לשיעור של 19:00?');
+    await say('972507900002', 'כן');
+    expect(arbox.state.writes?.length ?? 0).toBe(calls0);                                       // nothing was requested from Arbox
+    const reply = textsTo('972507900002').join('\n');
+    expect(reply).not.toMatch(/נרשמת|רשמתי אותך|הועברת|בוטל|ביטלתי/);                          // no claim that anything was done
+    expect(reply).toMatch(/העברתי את הבקשה לצוות/);
+    const cases = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'service_cases.json'), 'utf8')).cases.filter(c => c.phone === '972507900002');
+    const tasks = require('../utils/tomer_store').getTasks({ phone: '972507900002' });
+    expect(cases.length + tasks.length).toBeGreaterThanOrEqual(1);                              // the request went to the staff
+    expect(mockOut.mgr.length + mockOut.alerts.length).toBeGreaterThanOrEqual(1);
+  });
+
+  test('one Arbox row on the phone is still identified and served as before', async () => {
+    world();
+    plan(person({ phone: '050-7900003', first: 'נועה', last: 'כהן' }), { end: day(25) });
+    expect(await require('../services/arbox_gateway').resolveMember('972507900003')).toMatchObject({ status: 'found', member: { firstName: 'נועה' } });
+    // an INACTIVE second row does not make the phone unclear
+    person({ role: 'lead', active: 0, phone: '0507900003', first: 'נועה', last: 'כהן' });
+    require('../services/arbox_gateway').clearCache();
+    expect(await require('../services/arbox_gateway').resolveMember('972507900003')).toMatchObject({ status: 'found' });
+  });
+
   test('Arbox unreadable: an unknown contact is HELD (not sent to Barak); a known member is still served; a lead confirmed minutes ago passes', async () => {
     world();
     plan(person({ phone: '0508000001' }));

@@ -190,6 +190,15 @@ async function resolveMember(phone) {
   const active = all.filter(u => u.active);
   const pick = active.length === 1 ? active[0] : (active.length === 0 && all.length === 1 ? all[0] : null);
   if (!pick) return { status: 'ambiguous', count: (active.length || all.length), fetchedAt: idx.fetchedAt, stale: idx.stale };
+  // Another ACTIVE Arbox row with a different user id on the same phone — a lead row next to the client row, a staff
+  // row, a second person. The phone alone does not say who is writing, and whether the rows are one person entered
+  // twice is the owner's decision in Arbox, not a guess made here (production, 2026-11-18: three such phones). Nobody
+  // is picked: no membership detail is shown and no action is taken for "the member" until the rows are settled.
+  const rows = (idx.value.byPhone.get(norm) ?? []).filter(u => u.active && String(u.userId) !== String(pick.userId));
+  if (rows.length) {
+    return { status: 'ambiguous', reason: 'several_rows_on_phone', count: 1 + rows.length, fetchedAt: idx.fetchedAt, stale: idx.stale,
+             rows: [pick, ...rows].map(u => ({ userId: u.userId, name: u.name, role: u.role })) };
+  }
   return { status: 'found', member: pick, fetchedAt: idx.fetchedAt, stale: idx.stale, source: '/v3/users' };
 }
 
