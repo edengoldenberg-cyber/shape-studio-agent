@@ -409,3 +409,23 @@ node scripts/arbox/verify_class_flow.cjs --kind cancel --user-id N --date YYYY-M
 **Green API — הגדרות דיווח (18.11, 17:08).** באישור הבעלים נשלח `setSettings {stateWebhook:yes, statusInstanceWebhook:yes, deviceWebhook:yes}` → `saveSettings:true`; `getSettings` מאשר שנשמרו; המופע נשאר `authorized`. עד 17:14 לא הגיע אף אירוע חיבור (אין שינוי מצב → אין אירוע), כך שהקליטה בשרת אומתה בבדיקה מבודדת בלבד. לפי התיעוד הרשמי: `statusInstanceChanged` ו-`deviceInfo` מסומנים "deprecated / temporarily not working"; `stateInstanceChanged` פעיל. **למה לא מגיעים דיווחי מסירה:** לפי התיעוד, דיווחי סטטוס ההודעות (`outgoingMessageStatus`: sent / delivered / read / failed) נשלטים על ידי ההגדרה `outgoingWebhook` — שהיא **"no"** בחשבון. `outgoingMessageWebhook: yes` היא הגדרה אחרת (הודעות שנשלחו מהטלפון → `outgoingMessageReceived`, שאכן מתקבלות). זה תואם את כל מה שנצפה ואינו מעיד על תקלה בחיבור המקושר. גם `statusMessage` ביומן הספק תלוי באותה הגדרה. הפעלת `outgoingWebhook` לא בוצעה — ממתינה לאישור הבעלים (אתחול נוסף של המופע אצל הספק; בלי ניתוק מכשירים).
 
 **Green API — דיווחי סטטוס מסירה הופעלו (18.11, 17:47).** באישור הבעלים, אחרי בדיקה שאין שליחה פעילה (תור הספק: 0): `setSettings {outgoingWebhook:yes}` → `saveSettings:true`; `getSettings` מאשר `outgoingWebhook: yes`; המופע `authorized`. לא נותק ולא קושר שום מכשיר. ממתין: בדיקה מתואמת מ-972526324276 (אילו סטטוסים נקלטים לאיזה מזהה; שעדכון סטטוס לא מפעיל תשובה), ואחריה מספר חדש שהבעלים ימסור.
+
+## 21. הפעלה מלאה (2026-11-18, 18:55)
+
+
+
+פריסה חיה: `ab598a93-f0e4-4495-bfda-155acf1d706d`, commit `1847fc1`. גיבוי: `prod-data_2026-11-18_pre-full-activation.tgz`. באישור הבעלים.
+
+
+
+- **מעבר בתוך חלון הביטול — אומת מול Arbox (18:42–18:45, לקוח הבדיקה 12622086):** רישום 18.11 20:00 (חלון 8 ש׳, 76 דק׳ לפני) → 200; מעבר: `bookSession` 19.11 17:00 → 200 + קריאה חוזרת, ואז `cancelUserBooking` של 20:00 בתוך החלון → 200 + קריאה חוזרת; ניקוי: ביטול 19.11 17:00 → 200. בסוף: רק רישום הבסיס 18.11 09:15; מנוי ללא שינוי, חוב 0, אין עסקאות. לא נראה דרך ה-API (ולכן לא אומת): האם Arbox מסמן ביטול כזה כ"מאוחר" בכרטיס הלקוח. `class_move_late.verified=true`.
+
+- **מתגים:** `ARBOX_WRITE_AUDIENCE=all`, `ARBOX_WRITE_OPS=class_book,class_cancel,class_move_late`, `CALLBACK_PENDING_REMINDER_PHONES` נמחק (תזכורות שיחה לכל הלידים, רק לבקשות מאז `CALLBACK_REMINDER_SINCE=2026-11-18T04:50Z`). אומת בשרת: executable = class_book, class_cancel, class_move_late; membership_hold / membership_cancel = false.
+
+- **חברי מועדון חיצוני:** `class_actions.plan` מסרב `external_member` לכל שורה שאינה `client` → משימה לצוות.
+
+- **תוכניות שימור:** כל 8 המאושרות `enabled`. `absence7`, `onboarding7`, `onboarding14` חסומות לכל לקוח בנפרד (`freeze_unknown`) כי `freezeSourceConfirmed=false` — לא שונה. לקוח הבדיקה מוחרג.
+
+- **כיבוי מהיר:** כתיבת Arbox — `railway variable delete ARBOX_WRITES_ENABLED` + `railway up --detach`; הודעות יזומות — כיבוי תוכנית בפאנל (מיידי) או `railway variable delete TOMER_PROACTIVE_ENABLED` + פריסה; תזכורות לבעלים — ביטול הסימון בפאנל; תזכורות שיחה — `CALLBACK_PENDING_REMINDER_ENABLED=false` + פריסה; מענה אוטומטי — `WHATSAPP_AUTO_REPLY=false` + פריסה.
+
+- **`railway ssh`:** נכשל לסירוגין ב-"Host key verification failed" (כמה שרתי קצה); כשנדחה, הפקודה לא רצה — מנסים שוב, לא עוקפים את האימות; אחרי פלט ריק תמיד קוראים מצב לפני שליחה חוזרת.
