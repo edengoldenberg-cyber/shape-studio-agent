@@ -128,11 +128,11 @@ try {
   await cdp('Page.navigate', { url: `${BASE}/#tomer` });
   await until(`document.readyState === 'complete' && document.querySelector('.tab-btn.active')?.dataset.tab === 'tomer'`, 15000);
   await click('.tw-tab[data-pane="care"]');
-  check('the "ליווי חברים" tab lists the nine programs', (await until(`document.querySelectorAll('#tc-programs tr[data-program]').length === 9`)) === true, JSON.stringify(pageErrors));
+  check('the "ליווי חברים" tab lists the eleven programs (nine + the 7-day check-in and the ended-membership task, 2026-11-18)', (await until(`document.querySelectorAll('#tc-programs tr[data-program]').length === 11`)) === true, JSON.stringify(pageErrors));
   check('the old "אוטומציה" / "הודעות מתוזמנות" tabs are gone', !(await exists('.tw-tab[data-pane="automation"]')) && !(await exists('.tw-tab[data-pane="upcoming"]')));
   // ── as shipped: the contact policy is not owner-approved → nothing can be activated ──
   check('as shipped, ALL nine programs are blocked: the contact policy is not owner-approved yet',
-    (await evalJs(`[...document.querySelectorAll('#tc-programs tr[data-program]')].map(r => r.dataset.state).join(',')`)) === Array(9).fill('blocked').join(',')
+    (await evalJs(`[...document.querySelectorAll('#tc-programs tr[data-program]')].map(r => r.dataset.state).join(',')`)) === Array(11).fill('blocked').join(',')
     && /מדיניות הקשר.*עוד לא אושרה על ידי בעלת הסטודיו/.test(await txt(prog('birthday'))) && (await evalJs(`document.querySelector(${q(act('birthday', 'enable'))}).disabled`)) === true);
   check('the API refuses to enable an unapproved program too', (await api('POST', '/api/tomer/care/programs/birthday', { enabled: true, by: 'בדיקה' })).error === 'program_blocked');
   // ── owner approval of the contact policy — through the panel controls ───────
@@ -142,7 +142,7 @@ try {
   check('approval card shows the policy that is being approved (hours, Friday, Saturday, birthday rule, cooldowns, program hours, priority) and that it is NOT approved',
     (await attr('#tc-approval', 'data-approval')) === 'none' && /לא אושרה — אי אפשר להפעיל אף תוכנית/.test(await txt('#tc-approval'))
     && /שעות שליחה: 09:00–20:00/.test(approvalText) && /יום שישי: עד 13:00/.test(approvalText) && /שבת: לא נשלח/.test(approvalText) && /יום הולדת שחל בשבת: ברכה ביום שישי/.test(approvalText)
-    && /מרווח בין הודעות יזומות: 72 שעות/.test(approvalText) && /מרווח בין הודעות נוכחות: 6 ימים/.test(approvalText) && /יום הולדת 09:00/.test(approvalText) && /ברוכים הבאים › חיוב חודשי שנכשל › יום הולדת/.test(approvalText), approvalText);
+    && /מרווח בין הודעות יזומות: 72 שעות/.test(approvalText) && /מרווח בין הודעות נוכחות: 6 ימים/.test(approvalText) && /יום הולדת 09:00/.test(approvalText) && /ברוכים הבאים › יום הולדת › מנוי לא-מתחדש/.test(approvalText), approvalText);   // the order proposed to the owner on 2026-11-18
   await click('#tc-approval [data-care="policy-approve"]');
   check('approval without ticking the confirmation is refused', !!(await flashed('error', /יש לסמן את תיבת האישור/)) && (await overview()).policyApproval.approved === false);
   await click('#tc-approve-ok');
@@ -205,10 +205,11 @@ try {
   check('the confirmed source is shown with who confirmed it; members without a hold row are now "not frozen"',
     !!(await flashed('ok', /דוח ההקפאות אושר/)) && (await until(`document.querySelector('#tc-freeze')?.dataset.freezeConfirmed === '1'`)) === true
     && /אושר כמקור אמין על ידי צוות \(בדיקה\)/.test(await txt('#tc-freeze')) && (await attr(`${R1} [data-freeze]`, 'data-freeze')) === 'not_frozen' && (await overview()).freeze.sourceConfirmed.by === 'צוות (בדיקה)');
-  check('every program starts disabled; welcome and failed-payment are BLOCKED with the missing setting named',
-    (await evalJs(`[...document.querySelectorAll('#tc-programs tr[data-program]')].map(r => r.dataset.state).join(',')`)) === 'blocked,blocked,off,off,off,off,off,off,off'
-    && /קישור מאושר לקבוצת הוואטסאפ/.test(await txt(prog('welcome'))) && /דרך מאושרת ובטוחה/.test(await txt(prog('payment_failed'))) && /עוד לא אושרה/.test(await txt(prog('payment_failed'))));
-  check('a blocked program cannot be enabled (button disabled)', (await evalJs(`document.querySelector(${q(act('welcome', 'enable'))}).disabled`)) === true);
+  // the owner-approved welcome carries no group link (2026-11-18), so only the failed-payment program is blocked by a missing setting
+  check('every program starts disabled; failed-payment is BLOCKED with the missing setting named',
+    (await evalJs(`[...document.querySelectorAll('#tc-programs tr[data-program]')].map(r => r.dataset.state).join(',')`)) === 'off,off,off,off,off,off,off,off,blocked,off,off'
+    && /דרך מאושרת ובטוחה/.test(await txt(prog('payment_failed'))) && /עוד לא אושרה/.test(await txt(prog('payment_failed'))));
+  check('a blocked program cannot be enabled (button disabled)', (await evalJs(`document.querySelector(${q(act('payment_failed', 'enable'))}).disabled`)) === true);
   check('missing guest-session policy decisions are listed', /תוקף אימוני האורח/.test(await txt('#tc-settings .tc-missing')) && /איך רושמים אורח ב-Arbox/.test(await txt('#tc-settings .tc-missing')));
   check('proposed contact-policy defaults are shown (09–20, Friday 13, 72h, 6 days, 24h)', (await evalJs(`['windowStart','windowEnd','fridayEnd','cooldownHours','attendanceCooldownDays','recentConversationHours'].map(k => document.getElementById('tc-p-' + k).value).join(',')`)) === '9,20,13,72,6,24');
 
@@ -224,7 +225,7 @@ try {
   await click(act('absence7', 'preview'));
   check('preview (7 days): Arbox sources with read time; says the program is not yet activated', (await until(`!!document.querySelector('#tc-preview [data-inc]')`)) === true && (await evalJs(`[...document.querySelectorAll('#tc-preview [data-src]')].every(e => e.dataset.srcOk === '1')`)) === true && /התוכנית טרם הופעלה/.test(await txt('#tc-preview')));
   check('preview: אביגיל and גליה (7 days today) are included with the exact source date and the message text', (await evalJs(`[...document.querySelectorAll('#tc-preview [data-inc]')].map(e => e.dataset.inc + ':' + e.dataset.decision).sort().join(',')`)) === '1:send,3:send'
-    && (await txt('#tc-preview [data-inc="1"]')).includes(`lastAttendance: ${day(-7)}`) && /לא ראינו אותך בסטודיו בשבוע האחרון/.test(await evalJs(`document.querySelector('#tc-preview [data-inc="1"] .tw-cd-text').textContent`)));
+    && (await txt('#tc-preview [data-inc="1"]')).includes(`lastAttendance: ${day(-7)}`) && /עבר קצת זמן מאז האימון האחרון שלך/.test(await evalJs(`document.querySelector('#tc-preview [data-inc="1"] .tw-cd-text').textContent`)));
   check('preview: exclusions are counted by reason (upcoming booking, new member who never attended, not in the window)', (await exists('#tc-preview [data-excl="has_upcoming_booking"]')) && (await exists('#tc-preview [data-excl="new_never_attended"]')) && (await exists('#tc-preview [data-excl="not_in_window"]')));
   check('preview sent nothing', sent.length === 0);
 
@@ -242,7 +243,7 @@ try {
   check('preview after the pause: גליה is now "blocked — השהיה פעילה"', (await until(`document.querySelector('#tc-preview [data-inc="3"]')?.dataset.decision === 'block'`)) === true && /השהיה פעילה/.test(await txt('#tc-preview [data-inc="3"]')));
   await click(act('absence7', 'run'));
   check('run now: one message sent, one blocked — reported as such', !!(await flashed('ok', /נשלחו 1, נדחו 0, חסומות 1/)));
-  check('only אביגיל received the 7-day message (with Tomer\'s introduction); the paused and the booked members received nothing', toMember(P.A).length === 1 && /^אני תומר, העוזר הדיגיטלי של Shape Studio\.\nהיי אביגיל 💛 לא ראינו אותך/.test(toMember(P.A)[0].message) && sent.length === 1, JSON.stringify(sent.map(s => s.chatId)));
+  check('only אביגיל received the 7-day message (the approved wording, which says who writes — no second introduction); the paused and the booked members received nothing', toMember(P.A).length === 1 && /^היי אביגיל, כאן תומר משייפ 🙂 עבר קצת זמן מאז האימון האחרון שלך/.test(toMember(P.A)[0].message) && sent.length === 1, JSON.stringify(sent.map(s => s.chatId)));
   await tab('sent');
   check('"נשלחו": the message is listed as sent, waiting for a reply, with its wording', (await until(`document.querySelectorAll('#tc-episodes tr[data-episode]').length === 1`)) === true && /נשלח/.test(await txt('#tc-episodes tr[data-episode]')) && /ממתין לתגובה/.test(await txt('#tc-episodes tr[data-episode]')));
   await tab('upcoming');
@@ -292,7 +293,7 @@ try {
   await click('#tc-episodes [data-care="ep-retry"]');
   await flashed('ok', /יישלח בריצה הבאה/);
   await click(act('welcome', 'run'));
-  check('after staff say it did not arrive, the next run sends it — once, with the group link', !!(await flashed('ok', /נשלחו 1/)) && toMember(P.W).length === 1 && toMember(P.W)[0].message.includes(GROUP) && /היי ורד, ברוכים הבאים ל־Shape Studio! 💛/.test(toMember(P.W)[0].message));
+  check('after staff say it did not arrive, the next run sends it — once, in the approved wording and without a group link', !!(await flashed('ok', /נשלחו 1/)) && toMember(P.W).length === 1 && !/chat\.whatsapp\.com/.test(toMember(P.W)[0].message) && /^היי ורד, כאן תומר, העוזר הדיגיטלי של שייפ 🙂 ברוכים הבאים!/.test(toMember(P.W)[0].message));
 
   // ── reports ────────────────────────────────────────────────────────────────
   await click('#tc-absence-load');
@@ -318,7 +319,7 @@ try {
   check('disable: the program is off again', !!(await flashed('ok', /התוכנית כובתה/)) && (await state('month1')) === 'off');
   await fill('#tc-group-link', '');
   await click('#tc-save');
-  check('removing the group link blocks AND disables the welcome program', !!(await flashed('ok', /ההגדרות נשמרו/)) && (await until(`document.querySelector(${q(prog('welcome'))})?.dataset.state === 'blocked'`)) === true && (await overview()).programs.find(p => p.id === 'welcome').enabled === false);
+  check('removing the group link does not block the welcome program (its approved wording carries no link)', !!(await flashed('ok', /ההגדרות נשמרו/)) && (await overview()).programs.find(p => p.id === 'welcome').blocks.every(x => x.code !== 'group_link_missing'));
 
   // ── restart: everything persisted, nothing sent ────────────────────────────
   const before = sent.length, ovBefore = await overview();

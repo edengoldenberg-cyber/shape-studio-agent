@@ -116,7 +116,7 @@ function createTomerService(deps) {
     // message to this member, or the first after a week without one.
     const ms = cases.getMember(phone);
     const introduce = !ms?.introAt || !ms?.lastTomerAt || now().getTime() - new Date(ms.lastTomerAt).getTime() > INTRO_GAP_MS;
-    const text = introduce ? `${INTRO}\n${body}` : body;
+    const text = introduce && !/כאן תומר/.test(String(body).slice(0, 60)) ? `${INTRO}\n${body}` : body;
     let idMessage = null, state = 'sent', error = null;
     if (!allowed(phone)) {
       // Defence in depth: the send wrapper refuses too. Nothing is sent, nothing recorded as sent.

@@ -55,10 +55,15 @@ const PROGRAMS = {
   absence14:      { label: '14 ימים בלי אימון',            needs: ['users', 'memberships', 'attendance', 'futureBookings'] },
   absence7:       { label: '7 ימים בלי אימון',             needs: ['users', 'memberships', 'attendance', 'futureBookings'] },
   tuesday:        { label: 'יום שלישי — אין אימון השבוע',   needs: ['users', 'memberships', 'attendance', 'futureBookings'] },
-  onboarding14:   { label: 'שבועיים מההצטרפות',            needs: ['users', 'memberships', 'types', 'attendance'] },
+  onboarding7:    { label: 'שבוע מההצטרפות — בדיקת השתלבות', needs: ['users', 'memberships', 'types', 'attendance'] },
+  onboarding14:   { label: 'שבועיים מההצטרפות — שביעות רצון', needs: ['users', 'memberships', 'types', 'attendance'] },
+  expired:        { label: 'מנוי שהסתיים בלי חידוש — משימה לעדן', needs: ['users', 'memberships', 'types'] },
   month1:         { label: 'חודש ראשון + אימוני אורח',      needs: ['users', 'memberships', 'types', 'attendance'] },
 };
-const PRIORITY = ['welcome', 'payment_failed', 'birthday', 'expiry5', 'absence14', 'absence7', 'tuesday', 'onboarding14', 'month1'];
+const PRIORITY = ['welcome', 'birthday', 'expiry5', 'absence7', 'onboarding7', 'onboarding14', 'absence14', 'expired', 'payment_failed', 'tuesday', 'month1'];
+// Programs that open a task for the owner instead of writing to the member (owner policy 2026-11-18): a membership that
+// ended without a renewal - always; 14 days without training - when policy.absence14Task is set.
+const taskOnly = (id, settings) => id === 'expired' || (id === 'absence14' && settings?.policy?.absence14Task === true);
 const DONE = new Set(['sending', 'sent', 'uncertain', 'closed', 'expired', 'cancelled']);   // never (re)sent by a run
 const FREEZE_REVIEW_DAYS = 14;   // a staff review of one member's freeze status is valid this long, then it is unknown again
 
@@ -77,7 +82,7 @@ const EXCL_HE = {
   not_active: 'אין מנוי פעיל', joined_this_week: 'הצטרף/ה השבוע', attended_this_week: 'כבר התאמן/ה השבוע (כניסה מאומתת)',
   has_booking_this_week: 'יש רישום פעיל להמשך השבוע', absence_track: 'בטיפול תוכנית ההיעדרות (7+ ימים)',
   attendance_unknown: 'אין כניסה מאומתת ב-30 הימים האחרונים — משך ההיעדרות לא ידוע', new_never_attended: 'חבר/ה חדש/ה שעוד לא הגיע/ה לאימון ראשון',
-  not_in_window: 'לא בחלון הימים של התוכנית', before_baseline: 'האירוע קדם להפעלת התוכנית (אין שליחה רטרואקטיבית)', has_upcoming_booking: 'יש רישום לאימון קרוב',
+  not_in_window: 'לא בחלון הימים של התוכנית', before_baseline: 'האירוע קדם להפעלת התוכנית (אין שליחה רטרואקטיבית)', has_upcoming_booking: 'יש רישום לאימון קרוב', not_sending_day: 'יום ההולדת חל ביום שאין בו שליחה — דולג, בלי ברכה מאוחרת', still_active: 'יש מנוי פעיל',
   no_birthday: 'אין תאריך לידה ב-Arbox', birthday_invalid: 'תאריך הלידה ב-Arbox אינו סביר', not_today: 'לא היום',
   recurring: 'מנוי מתחדש אוטומטית', type_unknown: 'סוג המנוי נמחק ב-Arbox — לא ידוע אם מתחדש', no_end_date: 'אין תאריך סיום', renewed: 'כבר קיים מנוי חדש / ממשיך',
   not_first: 'אינו המנוי הראשון (חידוש)', earlier_unknown: 'קיים מנוי קודם מסוג לא ידוע — לא ניתן לאשר שזה חבר/ה חדש/ה', member_since_earlier: 'לפי Arbox החברות התחילה לפני המנוי הזה (ייבוא / חבר/ה ותיק/ה)',
@@ -91,6 +96,7 @@ function createMemberCare(deps) {
     state: st,                                   // { proactiveOn(), allowed(phone), owner(phone), lastConversationAt(phone), testPhones() }
     audit = () => {},
     now = () => new Date(),
+    openOwnerTask = null,                        // ({ program, phone, name, userId, summary, detail }) → { id }: a task for the owner instead of a message
   } = deps;
   const OWNER = 'care-' + Math.random().toString(36).slice(2, 10);
 
@@ -105,7 +111,7 @@ function createMemberCare(deps) {
     if (!ap.approved) out.push({ code: 'policy_unapproved', text: ap.stale
       ? 'מדיניות הקשר שונתה אחרי האישור — נדרש אישור מחודש של בעלת הסטודיו'
       : 'מדיניות הקשר (שעות שליחה, יום הולדת, מרווחים, סדר עדיפויות) עוד לא אושרה על ידי בעלת הסטודיו' });
-    if (id === 'welcome' && !/^https:\/\/chat\.whatsapp\.com\/\S{10,}$/.test(String(settings.groupLink ?? ''))) out.push({ code: 'group_link_missing', text: 'לא הוגדר קישור מאושר לקבוצת הוואטסאפ של הסטודיו' });
+    if (id === 'welcome' && settings.policy?.welcomeGroupLink === true && !/^https:\/\/chat\.whatsapp\.com\/\S{10,}$/.test(String(settings.groupLink ?? ''))) out.push({ code: 'group_link_missing', text: 'לא הוגדר קישור מאושר לקבוצת הוואטסאפ של הסטודיו' });
     if (id === 'payment_failed') {
       if (!String(settings.paymentResolution ?? '').trim()) out.push({ code: 'payment_resolution_missing', text: 'לא הוגדרה דרך מאושרת ובטוחה להסדרת התשלום (קישור / הנחיה)' });
       if (!settings.billingDataConfirmed) out.push({ code: 'billing_data_unconfirmed', text: 'משמעות נתוני החיוב ב-Arbox (FAIL בדוח העסקאות) עוד לא אושרה על ידי בעלת הסטודיו' });
@@ -244,13 +250,15 @@ function createMemberCare(deps) {
       const day = bm === 2 && bd === 29 && !isLeap(year) ? 28 : bd;
       const date = `${year}-${String(bm).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
       let sendOn = date, variant = 'default';
-      if (wday(date) === 6 && !settings.policy.saturday) { if (settings.policy.birthdaySaturday === 'sunday') { sendOn = addD(date, 1); variant = 'belated'; } else { sendOn = addD(date, -1); variant = 'eve'; } }
+      if (settings.policy.birthdaySaturday === 'skip') { if ((wday(date) === 6 && !settings.policy.saturday) || (wday(date) === 5 && settings.policy.friday === false)) return { excl: [date === snap.today ? 'not_sending_day' : 'not_today'] }; }
+      else if (wday(date) === 6 && !settings.policy.saturday) { if (settings.policy.birthdaySaturday === 'sunday') { sendOn = addD(date, 1); variant = 'belated'; } else { sendOn = addD(date, -1); variant = 'eve'; } }
       if (sendOn !== snap.today) return { excl: ['not_today'] };
       return { cand: { key: `bday:${year}`, variant, sourceDates: { birthdayThisYear: date }, validUntil: sendOn, vars: {} } };   // the birth YEAR is never stored or shown
     },
-    expiry5(m, snap) {
+    expiry5(m, snap, _base, settings) {
       if (!m.isActive) return { excl: ['not_active'] };
-      const ending = m.activeMs.filter(x => x.endDate && diffD(x.endDate, snap.today) >= 1 && diffD(x.endDate, snap.today) <= 5);
+      const days = Number(settings?.policy?.expiryDays ?? 5);
+      const ending = m.activeMs.filter(x => x.endDate && diffD(x.endDate, snap.today) >= 1 && diffD(x.endDate, snap.today) <= days);
       if (!ending.length) return { excl: [m.activeMs.some(x => x.endDate) ? 'not_in_window' : 'no_end_date'] };
       const x = ending.sort((a, b) => a.endDate.localeCompare(b.endDate))[0];
       if (x.kind === 'unknown' || x.recurring === null) return { excl: ['type_unknown'] };
@@ -270,7 +278,19 @@ function createMemberCare(deps) {
       const attended = m.checkins.filter(d => d >= m.firstStart).length;
       return { cand: { key: `${prefix}:${m.first.membershipUserId}`, variant: attended ? 'attended' : 'not_attended', sourceDates: { firstMembershipStart: m.firstStart, membershipUserId: m.first.membershipUserId, verifiedSessionsSinceStart: attended }, validUntil: addD(m.firstStart, days + 6), vars: {} } };
     },
+    onboarding7(m, snap, base)  { return E._first(m, snap, base, 7, 'ob7'); },
     onboarding14(m, snap, base) { return E._first(m, snap, base, 14, 'ob14'); },
+    /** A membership that ended in the last 7 days with nothing after it: a task for the owner, never a message. */
+    expired(m, snap, base) {
+      if (m.isActive) return { excl: ['still_active'] };
+      const ended = m.memberships.filter(x => (x.kind === 'plan' || x.kind === 'session') && x.endDate && x.endDate < snap.today).sort((a, b) => b.endDate.localeCompare(a.endDate))[0];
+      if (!ended) return { excl: ['no_end_date'] };
+      const since = diffD(snap.today, ended.endDate);
+      if (since < 1 || since > 7) return { excl: ['not_in_window'] };
+      if (ended.endDate < base) return { excl: ['before_baseline'] };
+      if (m.memberships.some(o => o.membershipUserId !== ended.membershipUserId && !o.cancelled && o.startDate && o.startDate > ended.endDate)) return { excl: ['renewed'] };
+      return { cand: { key: `expd:${ended.membershipUserId}`, variant: 'default', sourceDates: { membershipUserId: ended.membershipUserId, endDate: ended.endDate, membershipName: ended.name }, validUntil: addD(ended.endDate, 7), vars: { membershipName: ended.name, endDate: ended.endDate } } };
+    },
     month1(m, snap, base)       { return E._first(m, snap, base, 30, 'm1'); },
   };
 
@@ -302,26 +322,29 @@ function createMemberCare(deps) {
   // ── wording ─────────────────────────────────────────────────────────────────
   function render(program, variant, m, vars, settings) {
     const name = m.firstName || 'שלום';
+    const hi = m.firstName ? `היי ${m.firstName}, ` : 'היי, ';
     const f = m.gender === 'female', male = m.gender === 'male';
     const g = (fe, ma, neutral) => (f ? fe : male ? ma : neutral);
     switch (program) {
-      case 'welcome': return `היי ${name}, ברוכים הבאים ל־Shape Studio! 💛\nשמחים שבחרת בנו ומתרגשים להתחיל יחד.\nכאן מצטרפים לקבוצת הוואטסאפ של הסטודיו:\n${settings.groupLink}\nאם צריך עזרה עם ההתחלה, אני כאן 😊`;
+      case 'welcome': return `${hi}כאן תומר, העוזר הדיגיטלי של שייפ 🙂 ברוכים הבאים! אני כאן לשאלות ולעזרה עם האימונים והשיעורים.`;
       case 'tuesday': return `היי ${name} 😊 לפי מה שרשום אצלי עוד לא נקבע לך אימון השבוע.\nרוצה שאעזור למצוא שיעור שמתאים? אפשר לכתוב לי יום ושעה שנוחים לך.`;
-      case 'absence7': return `היי ${name} 💛 לא ראינו אותך בסטודיו בשבוע האחרון, ורציתי לבדוק שהכול בסדר.\nמה שלומך?`;
+      case 'absence7': return `${hi}כאן תומר משייפ 🙂 עבר קצת זמן מאז האימון האחרון שלך. איך הולך? יש משהו שנוכל לעזור בו כדי לחזור לשגרה?`;
+      case 'onboarding7': return `${hi}איך עבר השבוע הראשון בשייפ? הסתדרת עם ההרשמה והשיעורים? יש משהו שנוכל לעזור בו?`;
       case 'absence14':
         if (variant === 'standalone') return `היי ${name} 💛 עברו כשבועיים מאז האימון האחרון שלך אצלנו, ורציתי לבדוק שהכול בסדר.\nיש משהו שאפשר לעזור בו כדי לחזור?`;
         if (variant === 'after_schedule') return `היי ${name}, חוזר אלייך אחרי השיחה שלנו על השעות. אם משהו השתנה בלו"ז — אשמח לבדוק שוב אילו שיעורים יכולים להתאים. מתי נוח לך?`;
         if (variant.startsWith('after_')) return `היי ${name}, חוזר אלייך אחרי השיחה שלנו בשבוע שעבר 💛 איך הולך? אם יעזור — אחפש יחד איתך שיעור לשבוע הקרוב.`;
         return `היי ${name}, עברו כבר שבועיים מאז האימון האחרון שלך. אנחנו כאן כשיתאים לך לחזור — ואם משהו מקשה (שעות, עומס או כל דבר אחר), אשמח לשמוע ולנסות לעזור.`;
       case 'birthday':
+        if (settings.policy?.birthdaySaturday === 'skip') return `מזל טוב${m.firstName ? ` ${m.firstName}` : ''} 🎉 מאחלים לך בריאות, שמחה והרבה רגעים טובים. מצוות שייפ!`;
         if (variant === 'eve') return `${name}, מזל טוב לקראת יום ההולדת שלך מחר! 🎉\nכל הצוות של Shape Studio מאחל לך שנה של בריאות, כוח ושמחה 💛`;
         if (variant === 'belated') return `${name}, מזל טוב ליום ההולדת (באיחור קל)! 🎉\nכל הצוות של Shape Studio מאחל לך שנה של בריאות, כוח ושמחה 💛`;
         return `${name}, מזל טוב ליום ההולדת! 🎉\nכל הצוות של Shape Studio מאחל לך שנה של בריאות, כוח ושמחה 💛`;
       case 'payment_failed': return `היי ${name}, הודעה קצרה ודיסקרטית: החיוב החודשי האחרון על המנוי לא עבר.\n${String(settings.paymentResolution).trim()}\nמטעמי אבטחה, לא שולחים פרטי כרטיס או קוד אבטחה בוואטסאפ. אם זה כבר הוסדר — אפשר להתעלם 🙏`;
-      case 'expiry5': return `היי ${name}, המנוי שלך${vars.membershipName ? ` (${vars.membershipName})` : ''} בתוקף עד ${dmy(vars.endDate)}.\nרוצה לחדש אותו? אם כן — כתבו לי ואפתח בקשה לצוות. אני לא מחדש ולא מחייב בעצמי.`;
+      case 'expiry5': return `${hi}לפי המערכת המנוי שלך מסתיים ב־${dmy(vars.endDate)}. רוצה שנציג מהצוות יחזור אליך לגבי המשך?`;
       case 'onboarding14':
         return variant === 'attended'
-          ? `היי ${name}, עברו שבועיים מאז שהצטרפת 💛 איך ההרגשה עד עכשיו?\nאם אפשר לעזור במשהו — בחירת שיעורים, שעות, כל דבר — אני כאן.`
+          ? `${hi}רציתי לשמוע איך הולך לך בשייפ עד עכשיו — מה עובד טוב ומה נוכל לשפר?`   // owner-approved wording (2026-11-18), for a member with verified attendance
           : `היי ${name}, עברו שבועיים מאז ההצטרפות, ולפי מה שרשום אצלי עוד לא יצא לך להגיע לאימון.\nרוצה שאעזור למצוא שיעור ראשון שמתאים לך?`;
       case 'month1':
         return (variant === 'attended'
@@ -356,14 +379,15 @@ function createMemberCare(deps) {
     const missing = PROGRAMS[id].needs.filter(n => !snap.src[n]?.ok);
     if (missing.length) return { dataBlocked: missing.map(n => ({ source: n, error: snap.src[n]?.error ?? 'unavailable' })), included: [], excluded: [] };
     const included = [], excluded = [];
-    const rows = id === 'payment_failed' ? failedCharges(snap, base, settings) : snap.members.filter(m => m.isActive || id === 'welcome').map(m => ({ m, ...E[id](m, snap, base, settings) }));
+    const rows = id === 'payment_failed' ? failedCharges(snap, base, settings) : snap.members.filter(m => m.isActive || id === 'welcome' || id === 'expired').map(m => ({ m, ...E[id](m, snap, base, settings) }));
     for (const r of rows) {
       if (r.excl) { excluded.push({ userId: r.m.userId, name: r.m.name, reasons: r.excl }); continue; }
       const key = store.episodeKey(id, r.m.userId, r.cand.key);
       const ep = store.getEpisode(key);
       if (ep && DONE.has(ep.status)) { excluded.push({ userId: r.m.userId, name: r.m.name, reasons: ['already_handled'], episodeStatus: ep.status }); continue; }
-      const pol = r.defer ? { decision: 'defer', reasons: [r.defer] } : policyFor(id, r.m, settings);
-      included.push({ m: r.m, key, cand: r.cand, policy: pol, text: render(id, r.cand.variant, r.m, r.cand.vars, settings) });
+      // a task for the owner is not a message to the member: the sending hours, the weekly cap and the freeze check do not apply
+      const pol = taskOnly(id, settings) ? { decision: 'send', reasons: [] } : r.defer ? { decision: 'defer', reasons: [r.defer] } : policyFor(id, r.m, settings);
+      included.push({ m: r.m, key, cand: r.cand, policy: pol, task: taskOnly(id, settings), text: taskOnly(id, settings) ? null : render(id, r.cand.variant, r.m, r.cand.vars, settings) });
     }
     return { dataBlocked: null, included, excluded, baseline: base };
   }
@@ -459,7 +483,7 @@ function createMemberCare(deps) {
           summary.considered++;
           const base = { program: x.id, userId: x.m.userId, phone: x.m.phone, name: x.m.name, episodeKey: x.cand.key, variant: x.cand.variant, sourceDates: x.cand.sourceDates, validUntil: x.cand.validUntil };
           let pol = x.policy;
-          if (pol.decision === 'send' && sentOne) pol = { decision: 'defer', reasons: ['one_message_per_run'] };
+          if (pol.decision === 'send' && sentOne && !x.task) pol = { decision: 'defer', reasons: ['one_message_per_run'] };
           if (pol.decision !== 'send') {
             try { store.upsertEpisode(x.key, { ...base, status: pol.decision === 'block' ? 'blocked' : 'deferred', reasons: pol.reasons }, { type: pol.decision === 'block' ? 'blocked' : 'deferred', detail: pol.reasons.join(',') }); }
             catch (err) { summary.errors++; logger.error('[member-care] deferral not recorded', { key: x.key, error: err.message }); continue; }
@@ -482,8 +506,24 @@ function createMemberCare(deps) {
     }
   }
 
+  /** A program that opens ONE task for the owner (no message to the member). Re-read first; recorded so it never repeats. */
+  async function openTaskEpisode(x, base, snap) {
+    const rv = await revalidate(x.id, x, snap);
+    if (rv && rv.unavailable) { store.upsertEpisode(x.key, { ...base, status: 'deferred', reasons: ['revalidation_unavailable'] }, { type: 'deferred', detail: `Arbox could not be re-read: ${rv.unavailable}` }); return 'deferred'; }
+    if (rv) { store.upsertEpisode(x.key, { ...base, status: 'cancelled', reasons: [rv] }, { type: 'cancelled', detail: `changed before the task was opened: ${rv}` }); return 'cancelled'; }
+    const prev = store.getEpisode(x.key);
+    if (prev && DONE.has(prev.status)) return 'deferred';
+    if (typeof openOwnerTask !== 'function') { store.upsertEpisode(x.key, { ...base, status: 'blocked', reasons: ['no_task_channel'] }, { type: 'blocked', detail: 'no way to open an owner task' }); return 'blocked'; }
+    const summary = x.id === 'expired' ? `המנוי${x.cand.vars.membershipName ? ` (${x.cand.vars.membershipName})` : ''} הסתיים ב-${dmy(x.cand.vars.endDate)} ולא חודש` : `${x.cand.sourceDates.daysAbsent} ימים בלי אימון (אימון אחרון ${dmy(x.cand.sourceDates.lastAttendance)})`;
+    const t = openOwnerTask({ program: x.id, phone: x.m.phone, name: x.m.name, userId: x.m.userId, summary, detail: `נפתח על ידי תוכנית "${PROGRAMS[x.id].label}" לפי נתוני Arbox. לא נשלחה הודעה ללקוח/ה.` });
+    store.upsertEpisode(x.key, { ...base, status: 'closed', reasons: [], caseId: t?.id ?? null, conversation: { outcome: 'owner_task' } }, { type: 'owner_task', detail: t?.id ?? null });
+    audit({ phone: x.m.phone, memberName: x.m.name, event: 'care_owner_task', tomerAction: `${x.id}: ${summary}`, taskId: t?.id ?? null });
+    return 'tasks';
+  }
+
   /** Revalidate, record 'sending' durably, send once, record the outcome. Returns the summary bucket. */
   async function sendEpisode(x, base, snap, settings) {
+    if (x.task) return openTaskEpisode(x, base, snap);
     const rv = await revalidate(x.id, x, snap);
     if (rv && rv.unavailable) { store.upsertEpisode(x.key, { ...base, status: 'deferred', reasons: ['revalidation_unavailable'] }, { type: 'deferred', detail: `Arbox could not be re-read before sending: ${rv.unavailable}` }); return 'deferred'; }
     if (rv) { store.upsertEpisode(x.key, { ...base, status: 'cancelled', reasons: [rv] }, { type: 'cancelled', detail: `changed before sending: ${rv}` }); return 'cancelled'; }
@@ -650,8 +690,9 @@ function createMemberCare(deps) {
     const m = { userId: `test-${phone}`, phone, phoneShared: false, name: 'חבר/ת בדיקה (זהות מדומה)', firstName: 'בדיקה', gender: null, isActive: true, onHold: false, freeze: 'not_frozen', freezeSource: 'synthetic', lastAttendance: addD(today, -8) };
     const pol = policyFor(id, m, settings);
     if (pol.decision !== 'send') return { ok: false, error: 'policy', reasons: pol.reasons.map(c => ({ code: c, text: policyLib.REASON_HE[c] ?? c })) };
-    const variant = id === 'absence14' ? 'standalone' : ['onboarding14', 'month1'].includes(id) ? 'attended' : 'default';
-    const vars = id === 'expiry5' ? { membershipName: 'מנוי בדיקה (נתון מדומה)', endDate: addD(today, 5) } : {};
+    if (taskOnly(id, settings)) return { ok: false, error: 'task_only_program', text: 'התוכנית הזו פותחת משימה לעדן ואינה שולחת הודעה ללקוח/ה.' };
+    const variant = id === 'absence14' ? 'standalone' : ['onboarding7', 'onboarding14', 'month1'].includes(id) ? 'attended' : 'default';
+    const vars = id === 'expiry5' ? { membershipName: 'מנוי בדיקה (נתון מדומה)', endDate: addD(today, Number(settings.policy?.expiryDays ?? 5)) } : {};
     const key = store.episodeKey(id, m.userId, `test:${now().getTime()}`);
     const x = { id, key, m, cand: { key: `test:${now().getTime()}`, variant, vars, sourceDates: { synthetic: true } }, text: render(id, variant, m, vars, settings) };
     const base = { program: id, userId: m.userId, phone, name: m.name, episodeKey: x.cand.key, variant, sourceDates: { synthetic: true }, validUntil: today, synthetic: true };

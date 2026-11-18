@@ -1635,9 +1635,10 @@ function renderCareApproval(o) {
   const chip = state === 'approved' ? '<span class="tw-chip tw-chip-info">אושרה</span>' : state === 'stale' ? '<span class="tw-chip tw-chip-bad">האישור בוטל — ערך שונה אחרי האישור</span>' : '<span class="tw-chip tw-chip-warn">לא אושרה — אי אפשר להפעיל אף תוכנית</span>';
   const li = (k, label, value) => '<li data-approve-item="' + k + '">' + label + ': <strong>' + esc(value) + '</strong></li>';
   const hh = n => String(n).padStart(2, '0') + ':00';
-  const items = li('window', 'שעות שליחה', hh(p.windowStart) + '–' + hh(p.windowEnd)) + li('friday', 'יום שישי', 'עד ' + hh(p.fridayEnd)) + li('saturday', 'שבת', p.saturday ? 'נשלח' : 'לא נשלח')
-    + li('birthdaySaturday', 'יום הולדת שחל בשבת', p.birthdaySaturday === 'sunday' ? 'ברכה ביום ראשון' : 'ברכה ביום שישי')
-    + li('cooldown', 'מרווח בין הודעות יזומות', p.cooldownHours + ' שעות') + li('attendanceCooldown', 'מרווח בין הודעות נוכחות', p.attendanceCooldownDays + ' ימים')
+  const items = li('window', 'שעות שליחה', hh(p.windowStart) + '–' + hh(p.windowEnd)) + li('friday', 'יום שישי', p.friday === false ? 'לא נשלח' : 'עד ' + hh(p.fridayEnd)) + li('saturday', 'שבת', p.saturday ? 'נשלח' : 'לא נשלח')
+    + li('birthdaySaturday', p.birthdaySaturday === 'skip' ? 'יום הולדת שחל ביום בלי שליחה' : 'יום הולדת שחל בשבת', p.birthdaySaturday === 'skip' ? 'מדלגים ומתעדים — בלי ברכה מוקדמת או מאוחרת' : p.birthdaySaturday === 'sunday' ? 'ברכה ביום ראשון' : 'ברכה ביום שישי')
+    + li('cooldown', 'מרווח בין הודעות יזומות', p.cooldownHours + ' שעות' + (p.cooldownAll ? ' — הודעה יזומה אחת ללקוח/ה, במשותף לכל התוכניות' : ''))
+    + (p.expiryDays ? li('expiryDays', 'פנייה לפני סיום מנוי', p.expiryDays + ' ימים לפני הסיום') : '') + (p.absence14Task ? li('absence14Task', '14 ימים בלי אימון', 'משימה לעדן, בלי הודעה ללקוח/ה') : '') + li('attendanceCooldown', 'מרווח בין הודעות נוכחות', p.attendanceCooldownDays + ' ימים')
     + li('recentConversation', 'לא כותבים אחרי שיחה', p.recentConversationHours + ' שעות') + li('replyWindow', 'תגובה משויכת אוטומטית להודעה עד', p.replyWindowDays + ' ימים')
     + li('defaultPause', 'השהיה כשאין תאריך חזרה', p.defaultPauseDays + ' ימים') + li('paymentGrace', 'המתנה אחרי חיוב שנכשל', p.paymentGraceHours + ' שעות')
     + li('hours', 'שעת הריצה של כל תוכנית', o.programs.map(x => x.label + ' ' + hh(x.hour)).join(' · '))

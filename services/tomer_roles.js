@@ -89,9 +89,9 @@ function createTomerRoles(d) {
         activeFor: 'הלוח והתראות על בקשה בשלה / בירור שנתקע / כשל: פעילים. תזכורות חוזרות אליך: ' + (f.rem?.state === 'on' ? 'פעילות.' : 'כבויות.'),
         live: 'התראות אליך התקבלו אצל ספק השליחה (18.11.2026). תזכורת מרוכזת — לא נשלחה מעולם.', blocked: f.rem?.state === 'on' ? null : f.rem?.text ?? 'לא הוגדרו שעות ותדירות.', missing: 'שעות ותדירות לתזכורות — החלטה שלך.' },
       { id: 'external', label: 'חברי מועדון חיצוני', state: 'partial',
-        implemented: 'מזוהים ב-Arbox כחברי מועדון ומנותבים לתומר; מקבלים אותן תשובות שירות. מוצגים בפאנל ברשימה נפרדת.',
-        activeFor: 'שירות בשיחה: פעיל. קבוצות המעקב (נעדרים, חודש ראשון, סיום מנוי) ותוכניות השימור: אינם כלולים.', live: 'לא אומת חי.',
-        blocked: null, missing: 'האם לכלול אותם במעקב ההגעה ובתוכניות השימור, ואילו פעולות (רישום / ביטול) מותרות להם — החלטה שלך.' },
+        implemented: 'מזוהים ב-Arbox כחברי מועדון ומנותבים לתומר; מקבלים אותן תשובות שירות. מוצגים בפאנל ברשימה נפרדת עם מעקב נוכחות.',
+        activeFor: 'שירות בשיחה ומעקב נוכחות ברשימה נפרדת: פעילים. פניות יזומות וכתיבת Arbox עבורם: כבויות (החלטתך מ-18.11.2026).', live: 'הרשימה והנוכחות נקראות מ-Arbox; שיחה עם חבר/ת מועדון — לא אומתה חי.',
+        blocked: null, missing: null },
     ];
     return { ok: true, generatedAt: now().toISOString(), states: STATE_HE, rows: rows.map(r => ({ ...r, stateLabel: STATE_HE[r.state] })),
       switches: { proactive: f.proactive, policyApproved: f.policyOk, classWrites: ex('class_book') && ex('class_cancel'), writeAudience: audience, lateMove: ex('class_move_late'), freeze: ex('membership_hold'), membershipCancel: ex('membership_cancel'), ownerReminders: f.rem?.state ?? null } };
@@ -119,17 +119,34 @@ function createTomerRoles(d) {
       note: 'אלה מועמדים בלבד. שום הודעה אינה מתוזמנת ואינה נשלחת עד שתאשר את מדיניות הקשר, את התוכנית ואת הנוסח. הפעלת תוכנית אינה שולחת צבר היסטורי: היא פועלת רק על אירועים מרגע ההפעלה.' };
   }
 
-  /** Members who come through an outside club / provider (Arbox role "aggregatorMember"). */
-  function external() {
+  /**
+   * Members who come through an outside club / provider (Arbox role "aggregatorMember"). Owner decision 2026-11-18:
+   * their attendance IS followed and shown here, in their own list; proactive messages and Arbox writes for them stay off.
+   * Attendance comes from the same 30-day report the members board uses; when it was not read it is "not loaded".
+   */
+  async function external() {
     try {
-      const list = identity.phonesIn(['aggregator']);
-      const at = (() => { try { const s = identity.summary(); return s?.at ? new Date(s.at).toISOString() : null; } catch { return null; } })();
-      return { ok: true, count: list.length, fetchedAt: at, source: 'Arbox — רשימת הלקוחות (שורות מסוג חבר מועדון) ורשימת המנויים',
+      const today = gateway.todayIL(), addD = (d, n) => new Date(Date.parse(`${d}T00:00:00Z`) + n * 86400000).toISOString().slice(0, 10);
+      const [users, ms] = await Promise.all([gateway.getAllUsers(), gateway.getAllMemberships()]);
+      const valid = new Set(ms.memberships.filter(m => m.active && !m.cancelled && (!m.startDate || m.startDate <= today) && (!m.endDate || m.endDate >= today)).map(m => String(m.userId)));
+      const agg = users.users.filter(u => u.role === 'aggregatorMember' && valid.has(String(u.userId)));
+      let att = null, attErr = null;
+      try { att = await gateway.getAllBookings({ from: addD(today, -30), to: today }); } catch (err) { attErr = String(err.message).slice(0, 140); }
+      const last = new Map();
+      if (att) for (const x of att.bookings) if (x.checkedIn && x.date <= today) { const k = String(x.userId); if (!last.has(k) || last.get(k) < x.date) last.set(k, x.date); }
+      const days = d => Math.round((Date.parse(today) - Date.parse(d)) / 86400000);
+      const members = agg.map(u => { const l = last.get(String(u.userId)) ?? null; return { name: u.name ?? '—', phone: mask(u.phone), lastAttendance: att ? l : null, daysAbsent: att && l ? days(l) : null }; })
+        .sort((a, b) => (b.daysAbsent ?? 999) - (a.daysAbsent ?? 999) || a.name.localeCompare(b.name, 'he'));
+      return { ok: true, count: agg.length, fetchedAt: new Date(users.fetchedAt ?? now()).toISOString(), source: 'Arbox — רשימת הלקוחות (שורות מסוג חבר מועדון), רשימת המנויים ודוח הנוכחות',
         rule: 'שורת לקוח ב-Arbox מסוג "חבר מועדון" (דרך גורם חיצוני) עם מנוי בתוקף.',
-        members: list.map(x => ({ name: x.name ?? '—', phone: mask(x.phone) })).sort((a, b) => a.name.localeCompare(b.name, 'he')),
-        available: ['מזוהים כשכותבים לסטודיו ומנותבים לתומר', 'מקבלים תשובות שירות (כתובת, לוח שיעורים, מקום פנוי, מי מעביר/ה)', 'בקשות רישום / ביטול שיעור מועברות לצוות'],
-        notAvailable: ['אינם נכללים בקבוצות המעקב (נעדרים, חודש ראשון, סיום מנוי)', 'אינם מועמדים לתוכניות השימור', 'אין להם כרטיס לקוח בלוח החברים'],
-        decisions: ['האם לעקוב אחרי ההגעה שלהם ולכלול אותם בקבוצות המעקב?', 'האם מותר לפנות אליהם ביוזמה (שימור), ובאילו תוכניות?', 'האם תומר רשאי לרשום / לבטל להם שיעורים, או שזה נעשה רק דרך הגורם החיצוני?'] };
+        attendance: att ? { known: true, fetchedAt: new Date(att.fetchedAt ?? now()).toISOString(), trainedLast7: members.filter(m => m.daysAbsent !== null && m.daysAbsent < 7).length,
+            absent7plus: members.filter(m => m.daysAbsent !== null && m.daysAbsent >= 7).length, noCheckin30: members.filter(m => m.daysAbsent === null).length,
+            rule: 'כניסה מאומתת (צ\'ק-אין) ב-30 הימים האחרונים. בלי כניסה ב-30 יום = משך ההיעדרות אינו ידוע, לא "נעדר/ת".' }
+          : { known: false, error: attErr },
+        members,
+        available: ['מזוהים כשכותבים לסטודיו ומנותבים לתומר', 'מקבלים תשובות שירות (כתובת, לוח שיעורים, מקום פנוי, מי מעביר/ה)', 'מעקב נוכחות: אימון אחרון וימים בלי אימון, ברשימה הזו', 'בקשות רישום / ביטול שיעור מועברות לצוות'],
+        notAvailable: ['פניות יזומות (תוכניות השימור) — כבויות עבורם', 'רישום / ביטול שיעור ב-Arbox על ידי תומר — כבוי עבורם'],
+        decisions: [] };
     } catch (err) { return { ok: false, state: 'not_loaded', error: String(err.message).slice(0, 160) }; }
   }
 

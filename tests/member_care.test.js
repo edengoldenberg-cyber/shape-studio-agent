@@ -231,11 +231,11 @@ describe('1. Gates: everything is off until three things are true', () => {
   test('default: every program disabled; the deployment switch off → nothing runs; blocked programs cannot be enabled', async () => {
     world(MON);
     const ov = (await get('/api/tomer/care/overview')).body;
-    expect(ov.programs.map(p => p.enabled)).toEqual(Array(9).fill(false));
+    expect(ov.programs.map(p => p.enabled)).toEqual(Array(11).fill(false));          // 9 + the 7-day check-in and the ended-membership task (2026-11-18)
     expect(ov.settings.policy.managerDigest).toBe(false);
-    expect(ov.programs.find(p => p.id === 'welcome').blocks.map(b => b.code)).toEqual(['group_link_missing']);
+    // the owner-approved welcome carries no group link (2026-11-18): the link is required only when he asks for it
+    expect(ov.programs.find(p => p.id === 'welcome').blocks.map(b => b.code)).toEqual([]);
     expect(ov.programs.find(p => p.id === 'payment_failed').blocks.map(b => b.code)).toEqual(['payment_resolution_missing', 'billing_data_unconfirmed']);
-    expect((await post('/api/tomer/care/programs/welcome', { enabled: true })).body).toMatchObject({ ok: false, error: 'program_blocked' });
     expect((await post('/api/tomer/care/programs/payment_failed', { enabled: true })).status).toBe(409);
     const a = cm(); attend(a, addIso(MON, -7));
     await enable('absence7');
@@ -262,7 +262,8 @@ describe('1. Gates: everything is off until three things are true', () => {
     const t = await post('/api/tomer/care/test-send/absence7', { by: 'עדן' });
     expect(t.body.ok).toBe(true);
     expect(mockOut.texts.map(x => x.to)).toEqual(['972587700001']);
-    expect(mockOut.texts[0].text).toMatch(/לא ראינו אותך בסטודיו בשבוע האחרון/);
+    expect(mockOut.texts[0].text).toMatch(/כאן תומר משייפ 🙂 עבר קצת זמן מאז האימון האחרון שלך/);   // the owner's approved wording (2026-11-18)
+    expect(mockOut.texts[0].text).not.toMatch(/אני תומר, העוזר הדיגיטלי/);                      // it already says who writes: no double introduction
     const reply = await say('972587700001', 'אני בחופשה עד 20.12');
     expect(reply.route).toBe('tomer_care_reply');
     expect(careStore.getPause('972587700001', new Date())).toMatchObject({ reason: 'vacation', until: '2026-12-20', endKnown: true });
@@ -293,16 +294,18 @@ describe('2. Welcome — genuinely new members only', () => {
     const r = await runAll();
     expect(r.sent).toBe(2);
     expect(got(fresh)).toHaveLength(1);
-    expect(got(fresh)[0]).toContain('היי נועה, ברוכים הבאים ל־Shape Studio! 💛');
-    expect(got(fresh)[0]).toContain(GROUP);
+    expect(got(fresh)[0]).toBe('היי נועה, כאן תומר, העוזר הדיגיטלי של שייפ 🙂 ברוכים הבאים! אני כאן לשאלות ולעזרה עם האימונים והשיעורים.');   // approved wording, no group link
+    expect(got(fresh)[0]).not.toMatch(/chat\.whatsapp\.com/);                // no group link until the owner supplies an approved one
     expect(got(trial)).toHaveLength(1);
     for (const m of [existing, renewal, unknown, imported]) expect(got(m)).toHaveLength(0);
     await runAll(); at(addIso(MON, 1)); await runAll();
     expect(got(fresh)).toHaveLength(1);                                       // one welcome, ever
     expect(ep1('welcome', fresh)).toMatchObject({ status: 'sent', sourceDates: { membershipStart: MON }, send: { idMessage: expect.stringMatching(/^MSG_/) } });
     // removing the link blocks and disables the program
-    const off = await post('/api/tomer/care/settings', { groupLink: '' });
-    expect(off.body.overview.programs.find(p => p.id === 'welcome')).toMatchObject({ enabled: false, blocks: [{ code: 'group_link_missing' }] });
+    const off = await post('/api/tomer/care/settings', { groupLink: '', policy: { welcomeGroupLink: true } });   // when the welcome is set to carry the link
+    const wl = off.body.overview.programs.find(p => p.id === 'welcome');
+    expect(wl.enabled).toBe(false);
+    expect(wl.blocks.map(x => x.code)).toContain('group_link_missing');
   });
 });
 
@@ -380,7 +383,7 @@ describe('4. Seven / fourteen days absent — boundaries, no backlog, no overlap
     expect((await reasons('absence7', upcoming)).reasons).toEqual(['has_upcoming_booking']);
     const r1 = await runAll();
     expect(r1.sent).toBe(2);
-    expect(got(d7)[0]).toMatch(/לא ראינו אותך בסטודיו בשבוע האחרון/);
+    expect(got(d7)[0]).toMatch(/עבר קצת זמן מאז האימון האחרון שלך\. איך הולך\?/);
     expect(got(d14)[0]).toMatch(/עברו כשבועיים מאז האימון האחרון/);            // no 7-day message was ever sent → stand-alone wording
     expect(ep1('absence14', d14).variant).toBe('standalone');
     // Tuesday next day: d6 reaches 7 days and d13 reaches 14 (both crossed AFTER activation) → each gets its
@@ -388,7 +391,7 @@ describe('4. Seven / fourteen days absent — boundaries, no backlog, no overlap
     at(TUE);
     const r2 = await runAll();
     expect(r2.sent).toBe(2);
-    expect(got(d6)).toHaveLength(1); expect(got(d6)[0]).toMatch(/בשבוע האחרון/);
+    expect(got(d6)).toHaveLength(1); expect(got(d6)[0]).toMatch(/עבר קצת זמן מאז האימון האחרון שלך/);
     expect(got(d13)).toHaveLength(1); expect(ep1('absence14', d13).variant).toBe('standalone');
     expect((await reasons('tuesday', d7)).reasons).toEqual(['absence_track']);
     expect(got(d7)).toHaveLength(1);
@@ -474,7 +477,7 @@ describe('5. Contact policy — one shared layer', () => {
     at(addIso(MON, 3), '10:30');                                               // 72h later, day 10 of the absence
     await runAll();
     expect(got(m)).toHaveLength(2);
-    expect(got(m)[1]).toMatch(/לא ראינו אותך/);
+    expect(got(m)[1]).toMatch(/עבר קצת זמן מאז האימון האחרון שלך/);
   });
 });
 
@@ -598,8 +601,8 @@ describe('8. Non-recurring membership — five days to expiry', () => {
     expect((await reasons('expiry5', unknown)).reasons).toEqual(['type_unknown']);
     expect((await reasons('expiry5', later)).reasons).toEqual(['not_in_window']);
     expect((await runAll()).sent).toBe(2);
-    expect(got(fixed)[0]).toContain(`המנוי שלך (מנוי 3 חודשים) בתוקף עד ${end.split('-').reverse().join('.')}`);
-    expect(got(fixed)[0]).toMatch(/אני לא מחדש ולא מחייב בעצמי/);
+    expect(got(fixed)[0]).toContain(`לפי המערכת המנוי שלך מסתיים ב־${end.split('-').reverse().join('.')}. רוצה שנציג מהצוות יחזור אליך לגבי המשך?`);
+    expect(got(fixed)[0]).not.toMatch(/₪|הנחה|מחיר/);                          // approved wording: no price, discount or renewal terms
     at(TUE); await runAll();
     expect(got(fixed)).toHaveLength(1);
     const yes = await say(fixed.phone, 'כן, רוצה לחדש');
@@ -629,7 +632,7 @@ describe('9. Onboarding (14 days), first month, guest-session entitlement', () =
     at(MON, '11:05');
     expect((await reasons('onboarding14', renewal)).included).toBe(false);
     expect((await runAll()).sent).toBe(3);
-    expect(got(trained)[0]).toMatch(/עברו שבועיים מאז שהצטרפת 💛 איך ההרגשה עד עכשיו/);
+    expect(got(trained)[0]).toMatch(/רציתי לשמוע איך הולך לך בשייפ עד עכשיו — מה עובד טוב ומה נוכל לשפר\?/);
     expect(got(never)[0]).toMatch(/עוד לא יצא לך להגיע לאימון/);                // does not assume they trained
     expect(got(month)[0]).toMatch(/חודש ראשון ב־Shape Studio מאחוריך/);
     expect(got(month)[0]).toMatch(/שני אימוני אורח במתנה, לחברים או למשפחה/);

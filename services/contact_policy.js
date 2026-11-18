@@ -47,6 +47,7 @@ const REASON_HE = {
 function inSendWindow(now, p) {
   const t = ilParts(now);
   if (t.weekday === 6 && !p.saturday) return false;
+  if (t.weekday === 5 && p.friday === false) return false;         // Sunday–Thursday only
   if (t.hour < p.windowStart) return false;
   if (t.hour >= (t.weekday === 5 ? Math.min(p.fridayEnd, p.windowEnd) : p.windowEnd)) return false;
   return true;
@@ -79,7 +80,8 @@ function evaluate({ program, now, policy, member, state }) {
   if (state.openCase) defer.push('open_case');
   if (!inSendWindow(now, policy)) defer.push('outside_window');
   if (!RECENT_CONV_EXEMPT.has(program) && state.lastConversationAt && t - state.lastConversationAt < policy.recentConversationHours * 3600000) defer.push('recent_conversation');
-  if (!COOLDOWN_EXEMPT.has(program) && state.lastProactiveAt && t - state.lastProactiveAt < policy.cooldownHours * 3600000) defer.push('cooldown');
+  // p.cooldownAll: ONE proactive message per member in the cooldown, shared by every program (no exemptions)
+  if ((policy.cooldownAll || !COOLDOWN_EXEMPT.has(program)) && state.lastProactiveAt && t - state.lastProactiveAt < policy.cooldownHours * 3600000) defer.push('cooldown');
   if (ATTENDANCE_FAMILY.has(program) && state.lastAttendanceMsgAt && t - state.lastAttendanceMsgAt < policy.attendanceCooldownDays * 86400000) defer.push('attendance_cooldown');
 
   if (block.length) return { decision: 'block', reasons: [...block, ...defer] };

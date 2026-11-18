@@ -251,13 +251,23 @@ describe('what Tomer does today, role by role — from the running switches', ()
     expect(on.programs.find(x => x.id === 'absence7')).toMatchObject({ state: 'approved_active', blocks: [] });
   });
 
-  test('outside-club members are listed separately with what is available and what waits for a decision', () => {
-    const x = mk({ aggregators: [{ phone: '972587000011', name: 'חברת מועדון ב', category: 'aggregator' }, { phone: '972587000012', name: 'חבר מועדון א', category: 'aggregator' }] }).external();
-    expect(x).toMatchObject({ ok: true, count: 2, fetchedAt: '2026-11-18T08:00:00.000Z' });
-    expect(x.members).toEqual([{ name: 'חבר מועדון א', phone: '•••012' }, { name: 'חברת מועדון ב', phone: '•••011' }]);
-    expect(x.decisions).toHaveLength(3);
-    expect(x.notAvailable.join(' ')).toMatch(/אינם נכללים בקבוצות המעקב/);
-    const broken = require('../services/tomer_roles').createTomerRoles({ gateway: {}, memberCare: {}, ownerTasks: {}, identity: { phonesIn: () => { throw new Error('directory not loaded'); } } }).external();
+  test('outside-club members: their own list with attendance followed; proactive messages and Arbox writes stay off; unread attendance is "not loaded"', async () => {
+    const { createTomerRoles } = require('../services/tomer_roles');
+    const gw = ({ att = 'ok' } = {}) => ({ todayIL: () => '2026-11-18',
+      getAllUsers: async () => ({ fetchedAt: Date.parse('2026-11-18T08:00:00Z'), users: [{ userId: 1, role: 'aggregatorMember', name: 'חברת מועדון ב', phone: '972587000011' }, { userId: 2, role: 'aggregatorMember', name: 'חבר מועדון א', phone: '972587000012' },
+        { userId: 3, role: 'aggregatorMember', name: 'בלי מנוי', phone: '972587000013' }, { userId: 4, role: 'client', name: 'מנויה רגילה', phone: '972587000014' }] }),
+      getAllMemberships: async () => ({ memberships: [{ userId: 1, active: true, cancelled: false, startDate: '2026-01-01', endDate: null }, { userId: 2, active: true, cancelled: false, startDate: '2026-01-01', endDate: null }, { userId: 4, active: true, cancelled: false, startDate: '2026-01-01', endDate: null }] }),
+      getAllBookings: async () => { if (att !== 'ok') throw new Error('bookingsReport 500'); return { fetchedAt: Date.parse('2026-11-18T08:05:00Z'), bookings: [{ userId: 1, date: '2026-11-16', checkedIn: true }, { userId: 1, date: '2026-11-17', checkedIn: false }, { userId: 4, date: '2026-11-17', checkedIn: true }] }; } });
+    const mkr = g => createTomerRoles({ gateway: g, memberCare: {}, ownerTasks: {}, identity: {}, now: () => new Date('2026-11-18T08:10:00Z') });
+    const x = await mkr(gw()).external();
+    expect(x).toMatchObject({ ok: true, count: 2, fetchedAt: '2026-11-18T08:00:00.000Z', decisions: [] });
+    expect(x.members).toEqual([{ name: 'חבר מועדון א', phone: '•••012', lastAttendance: null, daysAbsent: null }, { name: 'חברת מועדון ב', phone: '•••011', lastAttendance: '2026-11-16', daysAbsent: 2 }]);
+    expect(x.attendance).toMatchObject({ known: true, trainedLast7: 1, absent7plus: 0, noCheckin30: 1 });       // no check-in in 30 days is "unknown", not "absent"
+    expect(x.notAvailable.join(' ')).toMatch(/פניות יזומות .* כבויות/);
+    const noAtt = await mkr(gw({ att: 'down' })).external();
+    expect(noAtt).toMatchObject({ ok: true, count: 2, attendance: { known: false, error: 'bookingsReport 500' } });
+    expect(noAtt.members.every(m => m.lastAttendance === null && m.daysAbsent === null)).toBe(true);
+    const broken = await mkr({ todayIL: () => '2026-11-18', getAllUsers: async () => { throw new Error('directory not loaded'); }, getAllMemberships: async () => ({ memberships: [] }) }).external();
     expect(broken).toMatchObject({ ok: false, state: 'not_loaded', error: 'directory not loaded' });
   });
 });

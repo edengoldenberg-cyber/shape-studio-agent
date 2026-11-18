@@ -40,7 +40,7 @@ const { randomUUID } = require('crypto');
 const dataDir = () => (process.env.DATA_DIR ?? path.join(__dirname, '../data')).replace(/[/\\]$/, '');
 const file    = () => path.join(dataDir(), 'member_care.json');
 
-const PROGRAM_IDS = ['welcome', 'payment_failed', 'birthday', 'expiry5', 'absence14', 'absence7', 'tuesday', 'onboarding14', 'month1'];   // priority order
+const PROGRAM_IDS = ['welcome', 'birthday', 'expiry5', 'absence7', 'onboarding7', 'onboarding14', 'absence14', 'expired', 'payment_failed', 'tuesday', 'month1'];   // priority order
 
 /** Proposed defaults — every value is shown in the panel and can be changed there. */
 const DEFAULT_POLICY = {
@@ -57,7 +57,7 @@ const DEFAULT_POLICY = {
   paymentGraceHours: 24,       // wait a day after a failed charge before writing
   managerDigest: false,        // scheduled manager digest — off until approved
 };
-const DEFAULT_HOURS = { welcome: 10, payment_failed: 11, birthday: 9, expiry5: 10, absence14: 10, absence7: 10, tuesday: 10, onboarding14: 11, month1: 11 };
+const DEFAULT_HOURS = { welcome: 10, payment_failed: 11, birthday: 9, expiry5: 10, absence14: 10, absence7: 10, tuesday: 10, onboarding7: 11, onboarding14: 11, month1: 11, expired: 10 };
 
 function defaults() {
   return {

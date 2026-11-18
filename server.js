@@ -3351,6 +3351,9 @@ const tomerService = app.locals.tomerService = createTomerService({
 memberCare = createMemberCare({
   gateway: tomerGateway, store: careStore, cases: serviceCases, logger,
   sendMember: (phone, text, meta) => tomerService.say(phone, text, meta),
+  // a retention rule that ends with a task for the owner (14 days without training, a membership that ended) - no message
+  openOwnerTask: ({ program, phone, name, userId, summary, detail }) => { const t = tomerStore.createTask({ type: 'staff_followup', phone, memberName: name, arboxId: userId ?? null, summary, detail, priority: 'normal' });
+    tomerStore.updateTask(t.id, { careProgram: program, title: program === 'expired' ? 'מנוי הסתיים בלי חידוש' : 'נעדר/ת 14 ימים' }); broadcastSse('tomer_task', { id: t.id }); return t; },
   state: {
     proactiveOn: () => _tomerSwitch() && tomerTest.proactiveEnabled(),
     allowed: phone => _tomerOn(phone),
@@ -3435,7 +3438,7 @@ app.get('/api/tomer/board', (_req, res) => {
 });
 app.get('/api/tomer/board/roles', (_req, res) => { try { res.json(tomerRoles.roles()); } catch (err) { res.status(500).json({ ok: false, error: err.message }); } });
 app.get('/api/tomer/board/proposals', async (_req, res) => { try { res.json(await tomerRoles.proposals()); } catch (err) { logger.error('[board] proposals failed', { error: err.message }); res.status(500).json({ ok: false, state: 'sync_error', error: err.message }); } });
-app.get('/api/tomer/members-external', (_req, res) => { try { const out = tomerRoles.external(); res.status(out.ok ? 200 : 503).json(out); } catch (err) { res.status(500).json({ ok: false, error: err.message }); } });
+app.get('/api/tomer/members-external', async (_req, res) => { try { const out = await tomerRoles.external(); res.status(out.ok ? 200 : 503).json(out); } catch (err) { res.status(500).json({ ok: false, error: err.message }); } });
 
 // Every 15 minutes: run the programs that are due today. Does nothing while the switch is off.
 if (process.env.TEST_NO_BIND !== 'true') {
@@ -3475,7 +3478,11 @@ if (process.env.TEST_NO_BIND !== 'true') {
       try { int('windowStart', 6, 12); int('windowEnd', 13, 22); int('fridayEnd', 9, 16); int('cooldownHours', 0, 720); int('attendanceCooldownDays', 0, 30); int('recentConversationHours', 0, 168); int('replyWindowDays', 1, 14); int('defaultPauseDays', 1, 90); int('paymentGraceHours', 0, 168); }
       catch (err) { return { ok: false, error: 'bad_policy', detail: err.message }; }
       if ('saturday' in b.policy) p.saturday = b.policy.saturday === true;
-      if (['friday', 'sunday'].includes(b.policy.birthdaySaturday)) p.birthdaySaturday = b.policy.birthdaySaturday;
+      if (['friday', 'sunday', 'skip'].includes(b.policy.birthdaySaturday)) p.birthdaySaturday = b.policy.birthdaySaturday;
+      // owner policy 2026-11-18: Sunday–Thursday only, one proactive message per member per cooldown for ALL programs,
+      // renewal N days before the end, 14 days of absence → a task for the owner
+      for (const k of ['friday', 'cooldownAll', 'absence14Task', 'welcomeGroupLink']) if (k in b.policy) p[k] = b.policy[k] === true;
+      if ('expiryDays' in b.policy) { const n = Number(b.policy.expiryDays); if (!Number.isInteger(n) || n < 1 || n > 30) return { ok: false, error: 'bad_policy', detail: 'expiryDays' }; p.expiryDays = n; }
       if ((p.windowStart ?? cur.windowStart) >= (p.windowEnd ?? cur.windowEnd)) return { ok: false, error: 'bad_policy' };
       patch.policy = p;                                    // managerDigest is not settable: no digest exists until approved
     }
