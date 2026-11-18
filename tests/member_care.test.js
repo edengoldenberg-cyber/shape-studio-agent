@@ -633,7 +633,8 @@ describe('9. Onboarding (14 days), first month, guest-session entitlement', () =
     expect((await reasons('onboarding14', renewal)).included).toBe(false);
     expect((await runAll()).sent).toBe(3);
     expect(got(trained)[0]).toMatch(/רציתי לשמוע איך הולך לך בשייפ עד עכשיו — מה עובד טוב ומה נוכל לשפר\?/);
-    expect(got(never)[0]).toMatch(/עוד לא יצא לך להגיע לאימון/);                // does not assume they trained
+    expect(got(never)[0]).toMatch(/רציתי לבדוק אם הסתדרת עם תחילת האימונים\. רוצה עזרה במציאת שיעור ראשון שמתאים לך\?/);   // owner's wording 2026-11-18
+    expect(got(never)[0]).not.toMatch(/איך הולך לך|מה עובד טוב/);                // does not assume they trained
     expect(got(month)[0]).toMatch(/חודש ראשון ב־Shape Studio מאחוריך/);
     expect(got(month)[0]).toMatch(/שני אימוני אורח במתנה, לחברים או למשפחה/);
     expect(got(month)[0]).not.toMatch(/בתוקף עד|עד סוף|ב-Arbox|נקבע/);         // no invented expiry / booking claims

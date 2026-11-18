@@ -482,11 +482,32 @@ async function getAllCancellations({ from, to }) {
  * live (no member was on hold when probed) — matching is by user_id only, and `rowFields`
  * is returned so the first real row can be inspected.
  */
+/**
+ * Members whose membership is on hold TODAY.
+ * Measured against the real Arbox on 2026-11-18 (read-only probes): the report returns the holds whose END date
+ * (end_suspend_time) falls inside [fromDate, toDate] - not the holds that are active in that range - and refuses a
+ * range longer than 31 days. Reading only the next 30 days therefore misses a hold that is active now and ends later.
+ * So the coming 13 months are read window by window (all pages), and a member counts as on hold when a hold covers
+ * today (start_suspend_time ≤ today ≤ end_suspend_time). If any window fails the whole read fails: a partial list is
+ * never used. NOT covered, and never assumed: a hold with no end date, or one ending more than 13 months ahead.
+ */
+const HOLD_WINDOWS = 13;
 async function getHolds({ from, to }) {
-  const r = await cached(`holds:${from}:${to}`, 10 * 60 * 1000, async () => {
-    const body = await _get('/v3/reports/membersOnHoldReport', { fromDate: from, toDate: to, limit: 200 });
-    const rows = Array.isArray(body?.data) ? body.data : [];
-    return { userIds: [...new Set(rows.map(x => x.user_id).filter(v => v !== undefined && v !== null).map(String))], totalRows: rows.length, rowFields: rows[0] ? Object.keys(rows[0]) : [] };
+  const r = await cached(`holds:${from}:${to}`, 30 * 60 * 1000, async () => {
+    const today = todayIL(), plus = (d, n) => new Date(Date.parse(`${d}T00:00:00Z`) + n * 86400000).toISOString().slice(0, 10);
+    const byId = new Map();
+    let start = from;
+    for (let i = 0; i < HOLD_WINDOWS; i++) {
+      const end = plus(start, 30);
+      for (const x of await _getAllPages('/v3/reports/membersOnHoldReport', { fromDate: start, toDate: end }, { maxPages: 10 })) byId.set(String(x.membership_hold_id ?? `${x.user_id}:${x.start_suspend_time ?? x.start_date}:${x.end_suspend_time ?? x.end_date}`), x);
+      start = plus(end, 1);
+    }
+    const rows = [...byId.values()];
+    // a row without the suspend dates (never seen from Arbox) is kept as "on hold": unknown is not read as "not frozen"
+    const covers = x => (!x.start_suspend_time || x.start_suspend_time <= today) && (!x.end_suspend_time || x.end_suspend_time >= today);
+    const active = rows.filter(covers);
+    return { userIds: [...new Set(active.map(x => x.user_id).filter(v => v !== undefined && v !== null).map(String))], totalRows: active.length, rowsRead: rows.length, windows: HOLD_WINDOWS, readUntil: plus(start, -1),
+      holds: active.map(x => ({ userId: String(x.user_id), from: x.start_suspend_time ?? null, to: x.end_suspend_time ?? null })), rowFields: rows[0] ? Object.keys(rows[0]) : [] };
   }, { maxStaleMs: 0 });
   return { ...r.value, fetchedAt: r.fetchedAt, stale: r.stale, source: '/v3/reports/membersOnHoldReport' };
 }

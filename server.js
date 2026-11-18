@@ -3398,7 +3398,8 @@ const ownerTasks = app.locals.ownerTasks = require('./services/owner_tasks').cre
   cases: serviceCases, tomerStore, aptStore, logger,
   // retention messages that exist as records (a program that is switched on found someone): they are on the board too
   care: { openEpisodes: () => require('./utils/member_care_store').listEpisodes({ status: ['pending', 'deferred', 'sending', 'sent', 'uncertain', 'blocked', 'failed'], limit: 500 })
-            .filter(e => e.status !== 'sent' || e.conversation?.awaiting), label: id => memberCare.PROGRAMS[id]?.label ?? id },
+            .filter(e => e.status !== 'sent' || e.conversation?.awaiting), label: id => memberCare.PROGRAMS[id]?.label ?? id,
+          reason: c => require('./services/contact_policy').REASON_HE[c] ?? memberCare.EXCL_HE[c] ?? c },
   classWritesFor: phone => { try { return arboxGateway.writesEnabled('class_book') && (process.env.ARBOX_WRITE_AUDIENCE === 'all' || String(process.env.ARBOX_WRITE_TEST_PHONES ?? '').split(',').map(s => s.replace(/\D/g, '')).includes(String(phone))); } catch { return false; } },
   caseLabel: c => require('./services/tomer_service').CATEGORY[c.category]?.label ?? c.category,
   managerPhone: () => _tomerManagerPhone(),

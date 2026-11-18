@@ -17,12 +17,12 @@ const { ilParts } = require('../utils/callback_time');
 
 const ATTENDANCE_FAMILY = new Set(['tuesday', 'absence7', 'absence14']);
 const COOLDOWN_EXEMPT   = new Set(['welcome', 'payment_failed', 'birthday', 'expiry5']);   // date-bound or transactional
-const PAUSE_APPLIES     = new Set(['tuesday', 'absence7', 'absence14', 'onboarding14', 'month1']);
+const PAUSE_APPLIES     = new Set(['tuesday', 'absence7', 'absence14', 'onboarding7', 'onboarding14', 'month1']);
 const RECENT_CONV_EXEMPT = new Set(['welcome', 'birthday']);
 const FREEZE_ALLOWS     = new Set(['birthday']);
 // Absence-related outreach ("we have not seen you") is wrong for a frozen member, so it needs a
 // KNOWN "not frozen". An unknown freeze status blocks these programs — it is never read as "not frozen".
-const FREEZE_MUST_BE_KNOWN = new Set(['tuesday', 'absence7', 'absence14', 'onboarding14', 'month1']);
+const FREEZE_MUST_BE_KNOWN = new Set(['tuesday', 'absence7', 'absence14', 'onboarding7', 'onboarding14', 'month1']);
 
 const REASON_HE = {
   proactive_locked:      'תוכניות יזומות נעולות (TOMER_PROACTIVE_ENABLED)',

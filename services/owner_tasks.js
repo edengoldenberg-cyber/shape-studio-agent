@@ -107,7 +107,7 @@ function createOwnerTasks(d) {
           const bad = ['blocked', 'failed', 'uncertain'].includes(e.status);
           out.push({ key: `care:${e.key}`, agent: 'tomer', kind: 'הודעת שימור', type: `care_${e.program}`, title: care.label(e.program), who: e.name ?? e.memberName ?? tail(e.phone), userId: e.userId ?? null, createdAt: e.createdAt, dueAt: e.sendAt ?? e.createdAt, hasDue: !!e.sendAt,
             link: '#tomer', reason: `תוכנית "${care.label(e.program)}" מצאה שהלקוח/ה עומד/ת בתנאים`, source: 'נתוני Arbox (מנויים ונוכחות)', assignee: 'תומר', wait: e.status === 'sent' ? 'member' : null,
-            blocked: bad ? (e.status === 'uncertain' ? 'לא ידוע אם ההודעה נשלחה — לא תישלח שוב אוטומטית' : `ההודעה לא נשלחה (${(e.reasons ?? []).join(', ') || e.status})`) : null,
+            blocked: bad ? (e.status === 'uncertain' ? 'לא ידוע אם ההודעה נשלחה — לא תישלח שוב אוטומטית' : `ההודעה לא נשלחה: ${(e.reasons ?? []).map(c => (care.reason ? care.reason(c) : c)).join(' · ') || e.status}`) : null,
             trail: (e.history ?? []).slice(-6).map(h => ({ at: h.at, text: `${h.type}${h.detail ? ` — ${cut(h.detail, 60)}` : ''}` })), next: e.status === 'sent' ? 'ההודעה נשלחה; ממתין לתשובת הלקוח/ה' : 'שליחת ההודעה במועד שנקבע, אחרי בדיקה חוזרת מול Arbox',
             closeRule: 'נסגרת כשההודעה נשלחה והשיחה הסתיימה, או כשהלקוח/ה כבר אינו/ה עומד/ת בתנאים (חזר/ה להתאמן, חידש/ה).' });
         }

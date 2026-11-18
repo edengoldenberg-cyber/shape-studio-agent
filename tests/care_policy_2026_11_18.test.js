@@ -146,3 +146,34 @@ describe('the programs, on a snapshot', () => {
     expect(w.care.programBlocks('welcome').map(b => b.code)).not.toContain('group_link_missing');
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// The hold report, as measured on the real Arbox on 2026-11-18: it returns holds by their END date inside the range and
+// refuses more than 31 days. Reading only the next 30 days missed a hold that is active today and ends later.
+describe('who is on hold today — the read covers every hold that is active now', () => {
+  const { createArboxMock } = require('./helpers/arbox_mock.cjs');
+  const arbox = createArboxMock();
+  let gw;
+  const day = n => new Date(Date.now() + n * 86400000).toLocaleDateString('en-CA', { timeZone: 'Asia/Jerusalem' });
+  const hold = (id, user, from, to) => ({ membership_hold_id: id, user_id: user, membership_user_id: 9000 + id, start_suspend_time: from, end_suspend_time: to, total_days: 1, suspend_reason: 'x' });
+  beforeAll(async () => { process.env.ARBOX_BASE_URL = await arbox.listen(); process.env.ARBOX_CLIENT_ID = 'test'; process.env.ARBOX_MIN_GAP_MS = '0'; process.env.ARBOX_LOCATION_ID = '1'; jest.resetModules(); gw = require('../services/arbox_gateway'); });
+  afterAll(async () => { await arbox.close(); });
+
+  test('a long hold that ends in three months is found; an ended one and one that has not started are not "on hold today"', async () => {
+    arbox.reset();
+    arbox.state.holds.push(hold(1, 11, day(-10), day(12)), hold(2, 22, day(-20), day(95)), hold(3, 33, day(-40), day(-3)), hold(4, 44, day(20), day(50)));
+    gw.clearCache();
+    const r = await gw.getHolds({ from: day(-1), to: day(29) });
+    expect(r.userIds.sort()).toEqual(['11', '22']);                                // 22 ends in 95 days: the 30-day read used to miss it
+    expect(r.holds.find(h => h.userId === '22')).toEqual({ userId: '22', from: day(-20), to: day(95) });
+    expect(r.windows).toBe(13);
+    expect(r.rowsRead).toBe(3);                                                    // the ended hold is outside what is read; the future one is read and not counted
+    expect(arbox.log.filter(l => /membersOnHoldReport/.test(l.path)).every(l => (new Date(l.query.toDate) - new Date(l.query.fromDate)) / 86400000 <= 31)).toBe(true);
+  });
+
+  test('a failed window fails the whole read — a partial list is never used as "not on hold"', async () => {
+    arbox.reset(); arbox.mode.holdsDown = true; gw.clearCache();
+    await expect(gw.getHolds({ from: day(-1), to: day(29) })).rejects.toThrow();
+    arbox.mode.holdsDown = false;
+  });
+});

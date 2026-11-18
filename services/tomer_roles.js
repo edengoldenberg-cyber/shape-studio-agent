@@ -13,6 +13,7 @@
  * was seen working in production, with its date; everything else says "לא אומת חי".
  */
 
+const FREEZE_DEPENDENT = new Set(['absence7', 'onboarding7', 'onboarding14', 'tuesday', 'month1']);   // every message of these needs a KNOWN "not frozen"
 const STATE_HE = { active: 'פעיל', partial: 'פעיל חלקית', ready_off: 'מוכן אך כבוי', blocked: 'חסום', missing: 'חסר' };
 
 function createTomerRoles(d) {
@@ -105,7 +106,9 @@ function createTomerRoles(d) {
         const p = await memberCare.preview(id);
         if (!p.ok) { out.push({ id, label: memberCare.PROGRAMS[id].label, state: 'not_loaded', error: p.error ?? 'לא נטען' }); continue; }
         const dataBlocked = p.dataBlocked ? (Array.isArray(p.dataBlocked) ? p.dataBlocked.join(', ') : String(p.dataBlocked)) : null;
-        const blocks = [...(f.proactive ? [] : ['מתג ההודעות היזומות של תומר כבוי']), ...(p.blocks ?? []).map(b => b.text ?? String(b)), ...(dataBlocked ? [`נתון חסר מ-Arbox: ${dataBlocked}`] : [])];
+        const needsFreeze = FREEZE_DEPENDENT.has(id) && !(id === 'absence14' && p.included.every(x => x.decision === 'send')) && p.freeze && !p.freeze.sourceConfirmed;
+        const blocks = [...(f.proactive ? [] : ['מתג ההודעות היזומות של תומר כבוי']), ...(p.blocks ?? []).map(b => b.text ?? String(b)), ...(dataBlocked ? [`נתון חסר מ-Arbox: ${dataBlocked}`] : []),
+          ...(needsFreeze ? [`מקור ההקפאות לא אושר: ${p.freeze.unknown} מנויים במצב "הקפאה לא אומתה" — לא נשלחת אליהם הודעת נוכחות או ליווי עד השוואה מול Arbox`] : [])];
         const willSend = p.enabled && f.proactive && !blocks.length;
         out.push({ id, label: p.label, state: dataBlocked ? 'not_loaded' : willSend ? 'approved_active' : p.enabled ? 'approved_blocked' : 'proposal',
           stateLabel: dataBlocked ? 'לא נטען' : willSend ? 'מאושרת ופעילה' : p.enabled ? 'מאושרת אך חסומה' : 'הצעה לבדיקה — כבויה, שום הודעה לא תישלח',

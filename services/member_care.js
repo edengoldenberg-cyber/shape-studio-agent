@@ -82,7 +82,7 @@ const EXCL_HE = {
   not_active: 'אין מנוי פעיל', joined_this_week: 'הצטרף/ה השבוע', attended_this_week: 'כבר התאמן/ה השבוע (כניסה מאומתת)',
   has_booking_this_week: 'יש רישום פעיל להמשך השבוע', absence_track: 'בטיפול תוכנית ההיעדרות (7+ ימים)',
   attendance_unknown: 'אין כניסה מאומתת ב-30 הימים האחרונים — משך ההיעדרות לא ידוע', new_never_attended: 'חבר/ה חדש/ה שעוד לא הגיע/ה לאימון ראשון',
-  not_in_window: 'לא בחלון הימים של התוכנית', before_baseline: 'האירוע קדם להפעלת התוכנית (אין שליחה רטרואקטיבית)', has_upcoming_booking: 'יש רישום לאימון קרוב', not_sending_day: 'יום ההולדת חל ביום שאין בו שליחה — דולג, בלי ברכה מאוחרת', still_active: 'יש מנוי פעיל',
+  not_in_window: 'לא בחלון הימים של התוכנית', before_baseline: 'האירוע קדם להפעלת התוכנית (אין שליחה רטרואקטיבית)', has_upcoming_booking: 'יש רישום לאימון קרוב', on_hold: 'המנוי בהקפאה', not_sending_day: 'יום ההולדת חל ביום שאין בו שליחה — דולג, בלי ברכה מאוחרת', still_active: 'יש מנוי פעיל',
   no_birthday: 'אין תאריך לידה ב-Arbox', birthday_invalid: 'תאריך הלידה ב-Arbox אינו סביר', not_today: 'לא היום',
   recurring: 'מנוי מתחדש אוטומטית', type_unknown: 'סוג המנוי נמחק ב-Arbox — לא ידוע אם מתחדש', no_end_date: 'אין תאריך סיום', renewed: 'כבר קיים מנוי חדש / ממשיך',
   not_first: 'אינו המנוי הראשון (חידוש)', earlier_unknown: 'קיים מנוי קודם מסוג לא ידוע — לא ניתן לאשר שזה חבר/ה חדש/ה', member_since_earlier: 'לפי Arbox החברות התחילה לפני המנוי הזה (ייבוא / חבר/ה ותיק/ה)',
@@ -231,6 +231,7 @@ function createMemberCare(deps) {
       if (m.daysAbsent < days || m.daysAbsent > days + 6) return { excl: ['not_in_window'] };
       if (addD(m.lastAttendance, days) < base) return { excl: ['before_baseline'] };
       if (m.future.length) return { excl: ['has_upcoming_booking'] };
+      if (id === 'absence14' && m.freeze === 'frozen') return { excl: ['on_hold'] };
       let variant = 'default';
       if (id === 'absence14') {
         const prev = store.getEpisode(store.episodeKey('absence7', m.userId, `abs:${m.lastAttendance}`));
@@ -345,7 +346,7 @@ function createMemberCare(deps) {
       case 'onboarding14':
         return variant === 'attended'
           ? `${hi}רציתי לשמוע איך הולך לך בשייפ עד עכשיו — מה עובד טוב ומה נוכל לשפר?`   // owner-approved wording (2026-11-18), for a member with verified attendance
-          : `היי ${name}, עברו שבועיים מאז ההצטרפות, ולפי מה שרשום אצלי עוד לא יצא לך להגיע לאימון.\nרוצה שאעזור למצוא שיעור ראשון שמתאים לך?`;
+          : `${hi}כאן תומר משייפ 🙂 רציתי לבדוק אם הסתדרת עם תחילת האימונים. רוצה עזרה במציאת שיעור ראשון שמתאים לך?`;
       case 'month1':
         return (variant === 'attended'
           ? `היי ${name}, חודש ראשון ב־Shape Studio מאחוריך 🎉 איך היה? נשמח לשמוע.`
