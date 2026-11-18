@@ -3369,7 +3369,9 @@ memberCare = createMemberCare({
       }
       return null;
     },
-    testPhones: () => tomerTest.status().routeOverridePhones,
+    // the phone a labelled TEST message may go to: the route-overridden test phone, or - when Tomer serves everyone and
+    // there is no override - the phones named in TOMER_TEST_ONLY_PHONES (the owner's Arbox test member)
+    testPhones: () => { const s = tomerTest.status(); return s.routeOverridePhones.length ? s.routeOverridePhones : s.allowlist; },
   },
   audit: e => { try { tomerStore.appendAudit({ ...e, owner: 'tomer' }); } catch { /* audit is a view */ } },
   // Automated browser checks only (NODE_ENV=test): a clock that starts at a given instant, so
