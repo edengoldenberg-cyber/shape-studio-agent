@@ -36,6 +36,8 @@ const clean = t => String(t ?? '').replace(/[‎‏‪-‮]/g, '').replace(/\s+/
 const isInfoRequest = text => { const t = clean(text); return !!t && !NOT_A_LEAD.test(t) && (ASKS_DETAILS.test(t) || ASKS_ABOUT.test(t)); };
 const isSpecific = text => SPECIFIC.test(clean(text));
 
+// Hebrew family of a class name as the studio writes it ("Pilates Barre" → פילאטיס, "Ashtanga Yoga" → יוגה)
+const FAMILIES = [[/פילאטיס|pilates|רפורמר|reformer|barre/i, 'פילאטיס'], [/(?<![א-ת])כו?ח(?![א-ת])|strength/i, 'אימוני כוח'], [/יוגה|yoga/i, 'יוגה']];
 const heList = a => (a.length <= 1 ? a.join('') : `${a.slice(0, -1).join(', ')} ו${/^[\dA-Za-z]/.test(a[a.length - 1]) ? '-' : ''}${a[a.length - 1]}`);
 
 /**
@@ -47,9 +49,12 @@ function build({ classNames = [] } = {}) {
   if (!names.length) {
     return { partial: true, used: [], text: 'היי 😊 כאן ברק מ-Shape Studio, שמח שפנית.\nכדי שאכוון אותך נכון — איזה סוג אימון מעניין אותך?' };
   }
-  const pick = names.slice(0, 2);
+  // Short and in Hebrew: the families the verified names belong to, never a name that is not on the list.
+  const fam = FAMILIES.filter(([re]) => names.some(n => re.test(n))).map(([, he]) => he);
+  const more = names.some(n => !FAMILIES.some(([re]) => re.test(n)));
+  if (!fam.length) return { partial: false, used: names, text: `היי 😊 כאן ברק מ-Shape Studio.\nיש אצלנו כמה סוגי אימונים בקבוצות.\nאיזה סוג אימון מעניין אותך?` };
   return { partial: false, used: names,
-    text: `היי 😊 כאן ברק מ-Shape Studio.\nיש אצלנו ${heList(names)}.\nמה הכי מעניין אותך — ${pick.join(', ')} או משהו אחר?` };
+    text: `היי 😊 כאן ברק מ-Shape Studio.\nיש אצלנו ${heList(fam)}${more ? ' ועוד' : ''}.\nמה הכי מעניין אותך?` };
 }
 
 module.exports = { isInfoRequest, isSpecific, build };

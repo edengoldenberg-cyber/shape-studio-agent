@@ -993,9 +993,8 @@ describe('A lead asks for details about the studio (production 2026-11-18 16:23)
     const r = await say(P, text);
     expect(r.route).not.toBe('unclassified');
     const t = last(P);
-    expect(t).toMatch(/^היי 😊 כאן ברק מ-Shape Studio\.\nיש אצלנו /);
-    for (const name of NAMES) expect(t).toContain(name);                           // what the studio really has, nothing else
-    expect(t).toMatch(/מה הכי מעניין אותך — פילאטיס מכשירים, אימון כוח או משהו אחר\?$/);
+    expect(t).toBe('היי 😊 כאן ברק מ-Shape Studio.\nיש אצלנו פילאטיס, אימוני כוח ויוגה ועוד.\nמה הכי מעניין אותך?');   // short, Hebrew, only families the verified list holds
+    expect(NAMES.length).toBe(7);
     expect((t.match(/\?/g) ?? []).length).toBe(1);                                 // one question
     expect(t).not.toMatch(/במה אפשר לעזור|קיבלנו את הודעתך|₪|ש"ח|מחיר/);
     expect(mockAi.calls).toBe(calls);                                              // it does not depend on the model
@@ -1021,7 +1020,7 @@ describe('A lead asks for details about the studio (production 2026-11-18 16:23)
     mockAi.fallback = null;                                                        // a model answer of null would break a model-made reply
     await say(P, 'אשמח לשמוע על המקום');
     mockAi.fallback = 'היי! אשמח לעזור 😊 מה מחפשים?';
-    expect(last(P)).toMatch(/כאן ברק מ-Shape Studio\.\nיש אצלנו /);
+    expect(last(P)).toMatch(/כאן ברק מ-Shape Studio\.\nיש אצלנו פילאטיס, אימוני כוח ויוגה ועוד\./);
     expect(last(P)).not.toMatch(/תקלה/);
     expect(mockAi.calls).toBe(before);
     expect(typeof OpenAI).toBe('function');
@@ -1044,6 +1043,20 @@ describe('A lead asks for details about the studio (production 2026-11-18 16:23)
     await say(Q, 'אפשר עוד פרטים?');
     expect(mockAi.calls).toBe(c2 + 1);                                             // the second time the conversation goes on - the introduction is not repeated
     expect(textsTo(Q).filter(x => /כאן ברק מ-Shape Studio\.\nיש אצלנו/.test(x))).toHaveLength(1);
+    // a follow-up that holds NO sales word ("מה ההבדל ביניהם?") stays with Barak: the same conversation, with the
+    // introduction in its history and the verified lists in its context - it does not fall back to the fixed greeting
+    const F = phone();
+    await say(F, 'היי אשמח לקבל פרטים נוספים על הסטודיו');
+    const c3 = mockAi.calls;
+    const rf = await say(F, 'מה ההבדל ביניהם?');
+    expect(rf.route).not.toBe('unclassified');
+    expect(mockAi.calls).toBe(c3 + 1);
+    expect(last(F)).not.toMatch(/קיבלנו את הודעתך|במה אפשר לעזור/);
+    const OpenAI = require('openai');
+    const sent = OpenAI.mock.results.map(r => r.value?.chat?.completions?.create?.mock?.calls ?? []).flat().map(c => c[0]?.messages ?? []).filter(ms => ms.some(m => m.role === 'user' && m.content === 'מה ההבדל ביניהם?')).at(-1);
+    expect(sent.find(m => m.role === 'system').content).toMatch(/VERIFIED STUDIO FACTS[\s\S]*Class types at the studio: פילאטיס מכשירים, אימון כוח/);
+    expect(sent.some(m => m.role === 'assistant' && /כאן ברק מ-Shape Studio/.test(m.content))).toBe(true);   // the introduction is part of the context
+    expect(sent.some(m => m.role === 'user' && /פרטים נוספים על הסטודיו/.test(m.content))).toBe(true);
   });
 
   test('with no verified lists Barak\'s context says so and forbids naming classes', () => {
@@ -1059,3 +1072,40 @@ describe('A lead asks for details about the studio (production 2026-11-18 16:23)
     expect(last(B)).not.toMatch(/כאן ברק מ-Shape Studio/);
   });
 });
+
+// "The provider accepted the message" is not "the customer received a readable message" (production 2026-11-18 16:23:
+// the lead saw "ממתין להודעה"; every message of the day was "sent" at the provider and no delivery status ever arrived).
+describe('What is known about the delivery of a sent message', () => {
+  const ledger = () => require('../utils/delivery_ledger');
+  const hook = body => request(app).post('/api/green-api/webhook').send(body).set('Content-Type', 'application/json');
+  const row = async () => (await request(app).get('/api/system/status')).body.rows.find(r => r.id === 'wa_delivery');
+
+  test('accepted by the provider is recorded as accepted only; with no delivery confirmation at all the panel says it cannot tell', async () => {
+    world(); ledger()._reset(); try { fs.unlinkSync(path.join(DATA_DIR, 'delivery_ledger.json')); } catch { /* absent */ }
+    ledger().recordAccepted('3EB0AAA1', '972507170001'); ledger().recordAccepted('3EB0AAA2', '972507170002');
+    expect(ledger().get('3EB0AAA1')).toMatchObject({ status: 'accepted', tail: '0001', history: [] });
+    expect(ledger().summary()).toMatchObject({ accepted: 2, confirmed: 0, failed: 0, anyStatusReported: false });
+    const r = await row();
+    expect(r.state).toBe('blocked');
+    expect(r.detail).toMatch(/לאף אחת מהן לא התקבל אישור מסירה או קריאה — אי אפשר לדעת אם הלקוחות קיבלו הודעה קריאה/);
+    expect(r.action).toMatch(/מכשירים מקושרים/);
+  });
+
+  test('a delivery status from the provider is recorded on the message and never goes backwards; a failure is always shown', async () => {
+    world(); ledger()._reset(); try { fs.unlinkSync(path.join(DATA_DIR, 'delivery_ledger.json')); } catch { /* absent */ }
+    ledger().recordAccepted('3EB0BBB1', '972507170003'); ledger().recordAccepted('3EB0BBB2', '972507170004');
+    await hook({ typeWebhook: 'outgoingMessageStatus', idMessage: '3EB0BBB1', status: 'delivered' });
+    await hook({ typeWebhook: 'outgoingMessageStatus', idMessage: '3EB0BBB1', status: 'read' });
+    await hook({ typeWebhook: 'outgoingMessageStatus', idMessage: '3EB0BBB1', status: 'sent' });          // a late, lower status
+    await waitFor(() => ledger().get('3EB0BBB1')?.history?.length === 3);
+    expect(ledger().get('3EB0BBB1')).toMatchObject({ status: 'read' });
+    expect((await row()).state).toBe('partial');
+    await hook({ typeWebhook: 'outgoingMessageStatus', idMessage: '3EB0BBB2', status: 'failed', description: 'not delivered' });
+    await waitFor(() => ledger().get('3EB0BBB2')?.status === 'failed');
+    const r = await row();
+    expect(r.state).toBe('fail');
+    expect(r.detail).toMatch(/ל-1 מהן דווח כשל מסירה/);
+    expect(textsTo('972507170003')).toHaveLength(0);                                // a status webhook never produces a reply
+  });
+});
+

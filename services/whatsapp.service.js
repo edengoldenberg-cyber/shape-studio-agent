@@ -350,6 +350,8 @@ async function _dispatch(to, text, { linkPreview = true } = {}) {
     // debug() is filtered out at the default log level and would hide deliveries.
     if (data?.idMessage) {
       logger.info('[Green API] Message sent ✓', { to, chatId, idMessage: data.idMessage });
+      // accepted by the provider - which is not a delivery: what is later reported about this id is kept in the ledger
+      try { require('../utils/delivery_ledger').recordAccepted(data.idMessage, to); } catch { /* evidence only */ }
     } else {
       // Green API returned HTTP 200 but no idMessage — message was NOT queued.
       // This typically means the WhatsApp session is not authorized (needs QR scan).

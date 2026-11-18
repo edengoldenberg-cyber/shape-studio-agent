@@ -103,6 +103,17 @@ async function build(d = {}) {
   });
   add('system', 'quiet_hours', 'שעות שקט', () => ({ state: 'live',
     detail: `הודעות יזומות אינן נשלחות בין ${env.QUIET_HOUR_START ?? '22'}:00 ל-${String(env.QUIET_HOUR_END ?? '8').padStart(2, '0')}:00; שחרור בבוקר ב-${env.QUIET_HOUR_MORNING_RELEASE ?? '08:30'}.` }));
+  // "The provider accepted the message" is not "the customer received a readable message": this row says what is known.
+  add('system', 'wa_delivery', 'מסירת הודעות WhatsApp ללקוחות', () => {
+    if (!d.delivery?.summary) return null;                    // the ledger is given by the caller, like every other source
+    const s = d.delivery.summary({ hours: 24 });
+    if (!s.accepted) return { state: 'unknown', detail: 'לא נשלחה הודעה ב-24 השעות האחרונות (או שהמערכת עלתה מחדש לפני פחות מיממה).' };
+    const base = `ב-24 השעות האחרונות ספק השליחה קיבל ${s.accepted} הודעות.`;
+    if (s.failed) return { state: 'fail', detail: `${base} ל-${s.failed} מהן דווח כשל מסירה.`, action: 'לבדוק את ההודעות שנכשלו ואת חיבור ה-WhatsApp.' };
+    if (!s.confirmed) return { state: 'blocked', detail: `${base} לאף אחת מהן לא התקבל אישור מסירה או קריאה — אי אפשר לדעת אם הלקוחות קיבלו הודעה קריאה. "התקבל אצל הספק" אינו מסירה.`,
+      action: 'לבדוק בטלפון של הסטודיו: WhatsApp → מכשירים מקושרים, ושאין הודעת "הסנכרון הושהה". לבדוק בחשבון Green API שדיווחי סטטוס ההודעות פעילים.' };
+    return { state: s.confirmed === s.accepted ? 'live' : 'partial', detail: `${base} ל-${s.confirmed} התקבל אישור מסירה או קריאה; ל-${s.accepted - s.confirmed} עדיין לא.` };
+  });
   add('system', 'owner_tasks', 'משימות שמחכות לאישור ביצוע שלך, ותזכורות אליך', () => {
     if (!d.ownerTasks?.list) return { state: 'unknown', detail: 'לא נקרא' };
     const l = d.ownerTasks.list(), r = l.reminders;

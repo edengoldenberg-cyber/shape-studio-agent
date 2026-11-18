@@ -756,7 +756,7 @@ app.get('/api/system/status', async (_req, res) => {
   try {
     const danaStudio = require('./services/dana_studio');
     const out = await require('./services/system_status').build({
-      store, aptStore, appointmentWorker, arboxGateway, tomerTest, tomerStore, serviceCases, barakAgent, identity, studioKnowledge, ownerTasks: app.locals.ownerTasks,
+      store, aptStore, appointmentWorker, arboxGateway, tomerTest, tomerStore, serviceCases, barakAgent, identity, studioKnowledge, ownerTasks: app.locals.ownerTasks, delivery: require('./utils/delivery_ledger'),
       pricing: require('./utils/pricing'),
       voiceIntake: app.locals.voiceIntake, memberCare: app.locals.memberCare,
       danaStudio: { workerStatus: danaStudio.workerStatus,
@@ -5285,6 +5285,20 @@ app.post('/api/green-api/webhook', (req, res) => {
       // Green API is actually reaching the server.  Previously this was
       // logger.debug — invisible at the default log level.
       logger.info('[green-api/webhook] Received', { typeWebhook: rawType });
+
+      // Delivery statuses and the connection's own reports: recorded as evidence (utils/delivery_ledger.js). Until
+      // 2026-11-18 they were ignored, so nothing could tell whether a customer had received a readable message.
+      if (rawType === 'outgoingMessageStatus') {
+        const m = require('./utils/delivery_ledger').recordStatus(body?.idMessage ?? null, body?.status ?? null, { description: body?.description ?? null });
+        logger.info('[green-api/webhook] delivery status', { idMessage: body?.idMessage ?? null, status: body?.status ?? null, description: body?.description ?? null, known: !!m && !m.unknownOrigin });
+        return;
+      }
+      if (rawType === 'stateInstanceChanged' || rawType === 'statusInstanceChanged' || rawType === 'deviceInfo') {
+        const v = body?.stateInstance ?? body?.statusInstance ?? body?.deviceData?.deviceModel ?? '';
+        require('./utils/delivery_ledger').recordConnection(rawType, v);
+        logger.info('[green-api/webhook] connection report', { typeWebhook: rawType, value: v });
+        return;
+      }
 
       // ── 4. Route by typeWebhook ───────────────────────────────────────────────
       //
