@@ -128,6 +128,17 @@ try {
       await audit(`${W} tomer tasks`, W);
       await shot(`prod-tomer-${W}-4-tasks`);
     }
+    // System status (GET only)
+    if (await tap('.tab-btn[data-tab="health"]')) {
+      check(`${W} status: the capability table loads`, await until(`document.querySelectorAll('#health-grid .sys-row').length >= 15`));
+      if (W === WIDTHS[0]) {
+        const rows = await evalJs(`[...document.querySelectorAll('#health-grid .sys-row')].map(r => r.dataset.state.padEnd(8) + r.dataset.statusId.padEnd(20) + (r.querySelector('.sys-row-detail')?.innerText ?? '').replace(/\\s+/g, ' ').slice(0, 170))`);
+        for (const r of rows) console.log('    ' + r);
+        console.log('  header: ' + (await evalJs(`document.getElementById('status-label')?.innerText ?? ''`)));
+      }
+      await audit(`${W} status`, W);
+      await shot(`prod-status-${W}`, true);
+    }
   }
   console.log('');
   check('no request other than GET left the browser', blocked.filter(b => !b.startsWith('GET')).length === 0 || true, '');
