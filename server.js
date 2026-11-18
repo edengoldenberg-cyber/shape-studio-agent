@@ -678,7 +678,7 @@ const CODE_FEATURES = [
   'staff_confirm_lifecycle', // confirm / outcome endpoints enforce transitions
   'current_callback_latest', // a lead's current callback = its most recent request only
   'quiet_hours_restored',    // utils/time.isQuietHours active again (22:00–08:00 Israel)
-  'dana_rating_v1',          // Dana studio: rating of a stored file, review history, score with evidence, apply-improvements guard
+  'dana_rating_v1', 'system_status_v1',          // Dana studio: rating of a stored file, review history, score with evidence, apply-improvements guard
 ];
 app.get('/api/version', (_req, res) => {
   res.json({
@@ -721,6 +721,36 @@ app.get('/api/system', (_req, res) => {
     store:  store.getSystemHealth(),
     events: store.getEvents({ limit: 20 }).reverse(),
   });
+});
+
+// GET /api/system/status — the truthful capability table (what is live, limited, off, blocked or failing).
+// Read-only: computed from the running configuration and the stored data at the moment of the request.
+let _greenStateCache = { at: 0, state: null };
+async function _greenStateCached() {
+  if (Date.now() - _greenStateCache.at < 2 * 60 * 1000) return _greenStateCache;
+  let state = null;
+  try { state = await greenApiSvc.getInstanceState(); } catch { state = null; }
+  _greenStateCache = { at: Date.now(), state };
+  return _greenStateCache;
+}
+app.get('/api/system/status', async (_req, res) => {
+  try {
+    const danaStudio = require('./services/dana_studio');
+    const out = await require('./services/system_status').build({
+      store, aptStore, appointmentWorker, arboxGateway, tomerTest, tomerStore, serviceCases, barakAgent,
+      pricing: require('./utils/pricing'),
+      voiceIntake: app.locals.voiceIntake, memberCare: app.locals.memberCare,
+      danaStudio: { workerStatus: danaStudio.workerStatus,
+        summary: () => ({ awaitingReview: danaStudio.list().filter(p => p.status === 'ready_for_review').length }) },
+      danaReferences: { count: () => require('./services/dana_references').list().length },
+      danaNotify: require('./services/dana_notify'),
+      greenState: _greenStateCached,
+    });
+    res.json({ ok: true, ...out });
+  } catch (err) {
+    logger.error('[system-status] failed', { error: err.message });
+    res.status(500).json({ ok: false, error: 'status_failed' });
+  }
 });
 
 // GET /api/maya/summary — executive summary: conversion funnel + campaign KPIs

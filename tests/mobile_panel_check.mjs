@@ -433,6 +433,19 @@ try {
       check(`${W} ${t}: fits the screen (no sideways scroll, nothing outside or cut)`, a.docW <= a.vw + 1 && a.layoutW <= a.vw + 1 && a.off.length === 0 && a.cut.length === 0, `doc ${a.docW}/${a.layoutW}; ` + [...a.off, ...a.cut].slice(0, 4).join(' | '));
       check(`${W} ${t}: controls are at least 44×44`, a.small.length === 0, `${a.small.length}: ` + a.small.slice(0, 6).join(' | '));
       if (t === 'maya') await shot(`maya-${W}`, true);
+      if (t === 'health') {
+        // the status table is computed, not a constant "active": every row has a state, and a capability that is
+        // off in this isolated server (Arbox class writes, Dana publishing) is not shown as live
+        await until(`document.querySelectorAll('#health-grid .sys-row').length >= 15`, 8000);
+        const st = await evalJs(`(() => { const r = [...document.querySelectorAll('#health-grid .sys-row')]; const by = id => r.find(x => x.dataset.statusId === id);
+          return { n: r.length, unlabelled: r.filter(x => !x.querySelector('.sys-state')?.textContent.trim() || !x.querySelector('.sys-row-detail')?.textContent.trim()).length,
+            writes: by('tomer_class_writes')?.dataset.state, publish: by('dana_publish')?.dataset.state, groups: document.querySelectorAll('#health-grid .sys-group').length,
+            blockedNoAction: r.filter(x => x.dataset.state === 'blocked' && !x.querySelector('.sys-row-action')).length, old: document.querySelectorAll('#health-grid .hstatus.active').length }; })()`);
+        check(`${W} health: the status table shows every component with a state and an explanation`, st.n >= 15 && st.unlabelled === 0 && st.groups === 4, JSON.stringify(st));
+        check(`${W} health: switched-off capabilities are not shown as active`, st.writes === 'blocked' && st.publish === 'off' && st.old === 0, JSON.stringify(st));
+        check(`${W} health: every "waiting for you" row says what is needed`, st.blockedNoAction === 0, JSON.stringify(st));
+        await shot(`health-${W}`, true);
+      }
     }
     check(`${W}: the tab row shows every tab without sideways scrolling`, await evalJs(`(() => { const n = document.querySelector('.tab-nav'); return n.scrollWidth <= n.clientWidth + 1 && [...n.querySelectorAll('.tab-btn')].every(b => { const r = b.getBoundingClientRect(); return r.left >= 0 && r.right <= innerWidth; }); })()`));
   }

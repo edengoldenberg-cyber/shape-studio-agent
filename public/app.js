@@ -43,8 +43,10 @@ let refreshTimer = null;
 async function pingServer() {
   try {
     await fetch('/health');
-    document.querySelector('.status-dot').classList.add('live');
-    document.getElementById('status-label').textContent = 'מערכת פעילה';
+    // "connected" only says the server answers; failing components are counted from /api/system/status
+    const n = window._sysAttention || 0;
+    document.querySelector('.status-dot').classList.toggle('live', !n);
+    document.getElementById('status-label').textContent = n ? `${n} תקלות — מצב מערכת` : 'השרת מחובר';
   } catch {
     document.querySelector('.status-dot').classList.remove('live');
     document.getElementById('status-label').textContent = 'לא מחובר';
@@ -2395,43 +2397,69 @@ document.getElementById('btn-sync-status').addEventListener('click', async () =>
    HEALTH TAB
    ══════════════════════════════════════════════════════════════════════════════ */
 
-async function loadHealth() {
+const SYS_STATE = {
+  live:    { cls: 'live',    text: 'פעיל' },
+  limited: { cls: 'limited', text: 'פעיל חלקית' },
+  off:     { cls: 'off',     text: 'כבוי' },
+  blocked: { cls: 'blocked', text: 'מחכה לך' },
+  fail:    { cls: 'fail',    text: 'תקלה' },
+  unknown: { cls: 'fail',    text: 'לא ידוע' },
+};
+const SYS_GROUPS = [['system', 'מערכת'], ['barak', 'ברק — לידים'], ['tomer', 'תומר — מתאמנים'], ['dana', 'דנה — תוכן']];
+const SYS_UNREADABLE = msg => `<div class="sys-row fail" data-status-id="unreadable"><div class="sys-row-top"><span class="sys-row-name">מצב המערכת</span><span class="sys-state fail">לא ידוע</span></div><div class="sys-row-detail">${msg}</div></div>`;
+
+function renderSystemStatus(data) {
+  const c = data.counts ?? {};
+  const summary = `
+    <div class="sys-summary">
+      <span class="sys-pill live">${c.live ?? 0} פעילים</span>
+      <span class="sys-pill limited">${c.limited ?? 0} חלקית</span>
+      <span class="sys-pill off">${c.off ?? 0} כבויים</span>
+      <span class="sys-pill blocked">${c.blocked ?? 0} מחכים לך</span>
+      <span class="sys-pill fail">${(c.fail ?? 0) + (c.unknown ?? 0)} תקלות</span>
+    </div>`;
+  const groups = SYS_GROUPS.map(([id, title]) => {
+    const rows = (data.rows ?? []).filter(r => r.group === id);
+    if (!rows.length) return '';
+    return `<div class="sys-group"><h3 class="sys-group-title">${esc(title)}</h3>${rows.map(r => {
+      const st = SYS_STATE[r.state] ?? SYS_STATE.unknown;
+      return `<div class="sys-row ${st.cls}" data-status-id="${esc(r.id)}" data-state="${esc(r.state)}">
+        <div class="sys-row-top"><span class="sys-row-name">${esc(r.label)}</span><span class="sys-state ${st.cls}">${st.text}</span></div>
+        <div class="sys-row-detail">${esc(r.detail)}</div>
+        ${r.action ? `<div class="sys-row-action"><strong>מה נדרש:</strong> ${esc(r.action)}</div>` : ''}
+      </div>`; }).join('')}</div>`;
+  }).join('');
+  return summary + groups;
+}
+
+function setHealthBadge(n) {
+  window._sysAttention = n || 0;
+  pingServer();
+  const btn = document.querySelector('.tab-btn[data-tab="health"]');
+  if (!btn) return;
+  let b = btn.querySelector('.tab-alert');
+  if (!n) { if (b) b.remove(); return; }
+  if (!b) { b = document.createElement('span'); b.className = 'tab-alert'; btn.appendChild(b); }
+  b.textContent = String(n);
+  b.title = 'רכיבים בתקלה — פרטים בלשונית מצב מערכת';
+}
+
+async function refreshHealthBadge() {
   try {
-    const res  = await fetch('/api/system');
+    const res = await fetch('/api/system/status');
+    if (!res.ok) return null;
     const data = await res.json();
+    setHealthBadge(data.attention ?? 0);
+    return data;
+  } catch { return null; }
+}
 
-    const agentCards = Object.values(data.agents).map(a => `
-      <div class="health-card">
-        <div class="health-card-top">
-          <span class="health-card-name">${esc(a.name)}</span>
-          <span class="hstatus active">● פעיל</span>
-        </div>
-        <div class="health-card-detail">${esc(a.role)}</div>
-      </div>`).join('');
-
-    const storeCard = `
-      <div class="health-card">
-        <div class="health-card-top">
-          <span class="health-card-name">Lead Store</span>
-          <span class="hstatus active">● פעיל</span>
-        </div>
-        <div class="health-card-detail">
-          ${data.store.totalLeads} לידים בזיכרון | ממוצע ציון: ${data.store.avgScore}/10
-          ${data.store.crisisActive > 0 ? `<br><strong style="color:var(--crisis)">⚠ ${data.store.crisisActive} משבר</strong>` : ''}
-        </div>
-      </div>`;
-
-    const svcLabels = { whatsapp: 'WhatsApp Business', arbox: 'Arbox CRM', openai: 'OpenAI' };
-    const svcCards  = Object.entries(data.services).map(([k, v]) => `
-      <div class="health-card">
-        <div class="health-card-top">
-          <span class="health-card-name">${svcLabels[k] ?? k}</span>
-          <span class="hstatus ${v.configured ? 'configured' : 'pending'}">${v.configured ? '● מוגדר' : '⚠ לא מוגדר'}</span>
-        </div>
-        <div class="health-card-detail">שירות חיצוני</div>
-      </div>`).join('');
-
-    document.getElementById('health-grid').innerHTML = agentCards + storeCard + svcCards;
+async function loadHealth() {
+  const grid = document.getElementById('health-grid');
+  try {
+    const [status, sysRes] = await Promise.all([refreshHealthBadge(), fetch('/api/system')]);
+    const data = await sysRes.json();
+    grid.innerHTML = status ? renderSystemStatus(status) : SYS_UNREADABLE('לא ניתן לקרוא את מצב המערכת מהשרת. לרענן; אם זה חוזר — השרת אינו עונה.');
 
     const evEl = document.getElementById('events-list');
     if (!data.events?.length) {
@@ -2448,8 +2476,14 @@ async function loadHealth() {
 
     const upEl = document.getElementById('health-updated');
     if (upEl) upEl.textContent = 'עודכן: ' + new Date().toLocaleTimeString('he-IL', { hour:'2-digit', minute:'2-digit' });
-  } catch (e) { console.error('loadHealth', e); }
+  } catch (e) {
+    console.error('loadHealth', e);
+    if (grid) grid.innerHTML = SYS_UNREADABLE('טעינת מצב המערכת נכשלה. לרענן את הדף.');
+  }
 }
+
+// The health tab shows a red count while something is failing, on every tab, refreshed once a minute.
+window.addEventListener('load', () => { refreshHealthBadge(); setInterval(refreshHealthBadge, 60000); });
 
 function translateEvent(type) {
   return ({
