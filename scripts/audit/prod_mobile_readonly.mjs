@@ -72,7 +72,7 @@ try {
     await sleep(700);
     return true;
   }
-  const shot = async (name, full = false) => { await sleep(500); const s = await cdp('Page.captureScreenshot', { format: 'png', captureBeyondViewport: full }); writeFileSync(path.join(shotDir, name + '.png'), Buffer.from(s.data, 'base64')); };
+  const shot = async (name, full = false) => { await sleep(500); const tall = full && (await evalJs('document.documentElement.scrollHeight')) > 6000; const s = await Promise.race([cdp('Page.captureScreenshot', { format: 'png', captureBeyondViewport: full && !tall }), sleep(30000).then(() => null)]); if (!s) { console.log('  (screenshot ' + name + ' timed out and was skipped)'); return; } writeFileSync(path.join(shotDir, name + '.png'), Buffer.from(s.data, 'base64')); };
   const audit = async (label, W) => {
     const a = await evalJs(`(() => { const vw = ${W}; const vis = e => { if (!e.getClientRects().length) return false; const cs = getComputedStyle(e); if (cs.visibility === 'hidden' || cs.display === 'none' || Number(cs.opacity) === 0) return false; const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
       const inScroller = e => { for (let p = e.parentElement; p && p !== document.body; p = p.parentElement) { const cs = getComputedStyle(p); if (/(auto|scroll)/.test(cs.overflowX) && p.scrollWidth > p.clientWidth + 1) return true; } return false; };
@@ -135,6 +135,56 @@ try {
       console.log('  status: ' + (await evalJs(`document.getElementById('tw-automation-status')?.innerText.replace(/\\s+/g, ' ') ?? ''`)));
       await audit(`${W} tomer tasks`, W);
       await shot(`prod-tomer-${W}-4-tasks`);
+    }
+    // Owner tasks (inside the tasks pane; GET only — no action button is tapped, nothing is typed into the settings)
+    {
+      check(`${W} owner tasks: the list and the reminder status load`, await until(`!!document.querySelector('#tw-ot-status [data-reminders]') && !document.querySelector('#tw-ot-list [data-state="loading"]')`));
+      const ot = await evalJs(`({ rem: document.querySelector('#tw-ot-status [data-reminders]')?.dataset.reminders ?? null, cards: document.querySelectorAll('#tw-ot-list > .tw-ot-card').length,
+        status: (document.getElementById('tw-ot-status')?.innerText ?? '').replace(/\\s+/g, ' ').slice(0, 200), titles: [...document.querySelectorAll('#tw-ot-list > .tw-ot-card')].map(c => c.innerText.replace(/\\s+/g, ' ').replace(/05\\d[- ]?\\d{7}|9725\\d{8}/g, '<phone>').slice(0, 90)) })`);
+      if (W === WIDTHS[0]) console.log('  owner tasks: ' + JSON.stringify(ot));
+      check(`${W} owner tasks: the reminder state is stated (on / off / waiting for the owner's times)`, !!ot.rem && ot.status.length > 10, JSON.stringify(ot).slice(0, 200));
+      if (ot.cards) { await tap('#tw-ot-list > .tw-ot-card [data-toggle]'); await sleep(300); }
+      await audit(`${W} owner tasks`, W);
+      await shot(`prod-tomer-${W}-5-owner-tasks`, true);
+    }
+    // Members board (GET only: the board, one member card)
+    if (await tap('.tw-tab[data-pane="members"]')) {
+      const loaded = await until(`document.querySelectorAll('#tw-mb-groups .tw-mb-group').length >= 8 || !!document.querySelector('#tw-mb-state [data-state="error"]')`, 60000);
+      const mb = await evalJs(`({ state: document.querySelector('#tw-mb-state [data-state]')?.dataset.state ?? null, head: (document.getElementById('tw-mb-state')?.innerText ?? '').replace(/\\s+/g, ' ').slice(0, 160),
+        groups: [...document.querySelectorAll('#tw-mb-groups .tw-mb-group')].map(g => g.dataset.g + '=' + g.querySelector('.tw-mb-n').textContent.trim()),
+        rule: (document.getElementById('tw-mb-rule')?.innerText ?? '').replace(/\\s+/g, ' ').slice(0, 260), cards: document.querySelectorAll('#tw-mb-list .tw-mb-card').length })`);
+      if (W === WIDTHS[0]) console.log('  members board: ' + JSON.stringify(mb));
+      check(`${W} members: the board loads from Arbox with a number (or "—") on every group`, loaded && mb.state === 'ok' && mb.groups.length >= 8 && mb.groups.every(g => /=(\d+|—)$/.test(g)), JSON.stringify(mb).slice(0, 300));
+      check(`${W} members: the active group is not zero and its members are listed`, Number((mb.groups.find(g => g.startsWith('active=')) ?? '=0').split('=')[1]) > 0 && mb.cards > 0, JSON.stringify(mb.groups));
+      check(`${W} members: the chosen group states its rule, its source and when it was read`, /כלל החישוב:/.test(mb.rule) && /מקור:/.test(mb.rule) && /עודכן:/.test(mb.rule), mb.rule);
+      await audit(`${W} members board`, W);
+      await shot(`prod-tomer-${W}-6-members`);
+      for (const g of ['expiring', 'absent', 'frozen']) {
+        await tap(`#tw-mb-groups .tw-mb-group[data-g="${g}"]`); await sleep(400);
+        const r = await evalJs(`({ n: document.querySelector('#tw-mb-groups .tw-mb-group[data-g="${g}"] .tw-mb-n').textContent.trim(), cards: document.querySelectorAll('#tw-mb-list .tw-mb-card').length, empty: !!document.querySelector('#tw-mb-list [data-state="empty"]'), active: document.querySelector('#tw-mb-groups .tw-mb-group.active')?.dataset.g })`);
+        check(`${W} members "${g}": the list holds exactly the number on the group (${r.n})`, r.active === g && (r.n === '—' || (Number(r.n) === r.cards && (r.cards > 0 || r.empty))), JSON.stringify(r));
+      }
+      await tap('#tw-mb-groups .tw-mb-group[data-g="active"]'); await sleep(400);
+      if (await tap('#tw-mb-list .tw-mb-card .tw-mb-open')) {
+        const opened = await until(`(document.querySelector('#tw-mb-list .tw-mb-card.open .tw-mb-detail')?.innerText ?? '').includes('היסטוריית טיפול')`, 30000);
+        const card = await evalJs(`(() => { const d = document.querySelector('#tw-mb-list .tw-mb-card.open .tw-mb-detail'); if (!d) return null; const b = d.getBoundingClientRect();
+          return { sections: [...d.querySelectorAll('h4')].map(h => h.innerText.trim()), entries: d.querySelector('[data-entries]')?.dataset.entries ?? null, inside: b.left >= -1 && b.right <= innerWidth + 1 }; })()`);
+        if (W === WIDTHS[0]) console.log('  member card: ' + JSON.stringify(card));
+        check(`${W} members: a member card opens with its sections and stays inside the screen`, opened && !!card && card.sections.length >= 5 && card.inside && !!card.entries, JSON.stringify(card));
+        await audit(`${W} member card`, W);
+        await evalJs(`document.querySelector('#tw-mb-list .tw-mb-card.open').scrollIntoView({ block: 'start' })`);
+        await shot(`prod-tomer-${W}-7-member-card`);
+      }
+    }
+    // Agent knowledge (GET only: the status rows; no save, restore, confirm or sync is tapped)
+    if (await tap('.tab-btn[data-tab="knowledge"]')) {
+      check(`${W} knowledge: the status rows load`, await until(`document.querySelectorAll('#kn-sync-result .kn-row').length >= 4`, 30000));
+      const kn = await evalJs(`({ head: (document.querySelector('#kn-sync-result strong')?.innerText ?? '').slice(0, 120), rows: [...document.querySelectorAll('#kn-sync-result .kn-row')].map(r => r.dataset.knId + ':' + r.dataset.knState + ' — ' + r.innerText.replace(/\\s+/g, ' ').slice(0, 150)),
+        raw: /staff_context_has_instructors|classes_context_loaded/.test(document.getElementById('kn-sync-result').innerText) })`);
+      if (W === WIDTHS[0]) { console.log('  knowledge: ' + kn.head); for (const r of kn.rows) console.log('    ' + r); }
+      check(`${W} knowledge: Hebrew status per subject, no raw check names, "verified" only when every row is fine`, !kn.raw && (kn.rows.every(r => /^\w+:ok/.test(r)) ? true : !/הסוכן עודכן בהצלחה/.test(kn.head)), kn.head);
+      await audit(`${W} knowledge`, W);
+      await shot(`prod-knowledge-${W}`, true);
     }
     // System status (GET only)
     if (await tap('.tab-btn[data-tab="health"]')) {

@@ -26,6 +26,10 @@ const STATES = ['open', 'in_progress', 'snoozed', 'done', 'cancelled'];
 const ACTION_HE = { done: 'בוצע', in_progress: 'בטיפול', snooze: 'נדחה למועד', cancel: 'בוטל', reopen: 'נפתח מחדש', source_closed: 'נסגר במערכת המקור', seen: 'נרשם' };
 const MAX_DIGEST_ITEMS = 12, MAX_ATTEMPTS = 3, SLOT_WINDOW_MIN = 20;
 
+// the owner reads these: never the internal type code
+const TASK_HE = { freeze_request: 'בקשת הקפאת מנוי', cancel_request: 'בקשת ביטול מנוי', cancellation_request: 'בקשת ביטול מנוי', fixed_booking_request: 'בקשת שיבוץ קבוע', staff_followup: 'לחזור ללקוח/ה',
+  complaint: 'תלונה', unsupported_action: 'בקשה שהסוכן אינו מבצע', billing_question: 'שאלת חיוב', class_change: 'שינוי רישום לשיעור', voice_message: 'הודעה קולית', other: 'משימה כללית' };
+
 function createOwnerTasks(d) {
   const { cases, tomerStore, aptStore, logger = console, caseLabel = c => c.category, sendManager, managerPhone = () => null,
           isQuietHours = () => false, closeSource = null, baseUrl = () => null } = d;
@@ -50,7 +54,7 @@ function createOwnerTasks(d) {
     const out = [];
     try { for (const c of cases.list({ open: true, limit: 500 })) out.push({ key: `case:${c.id}`, agent: 'tomer', kind: 'פנייה', title: caseLabel(c), who: c.memberName ?? tail(c.phone), createdAt: c.createdAt, dueAt: c.createdAt, link: `#tomer/case/${c.id}` }); }
     catch (err) { out.error = `cases: ${err.message}`; }
-    try { for (const t of tomerStore.getOpenTasks()) out.push({ key: `task:${t.id}`, agent: 'tomer', kind: 'משימה', title: t.title ?? t.type, who: t.memberName ?? tail(t.phone), createdAt: t.createdAt, dueAt: t.createdAt, link: '#tomer' }); }
+    try { for (const t of tomerStore.getOpenTasks()) out.push({ key: `task:${t.id}`, agent: 'tomer', kind: 'משימה', title: t.title ?? TASK_HE[t.type] ?? 'משימה לצוות', who: t.memberName ?? tail(t.phone), createdAt: t.createdAt, dueAt: t.createdAt, link: '#tomer' }); }
     catch (err) { out.error = `${out.error ? out.error + '; ' : ''}tasks: ${err.message}`; }
     try {
       for (const a of aptStore.getAll()) {

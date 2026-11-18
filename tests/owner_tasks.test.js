@@ -194,3 +194,11 @@ describe('reminders to the owner', () => {
     expect(w.sent).toHaveLength(1);
   });
 });
+
+test('a task is titled in Hebrew, never by its internal type code', () => {
+  const w = world();
+  w.tasks = [{ id: 't1', type: 'freeze_request', phone: '972587000004', status: 'open', createdAt: il(17, 8).toISOString() }, { id: 't2', type: 'something_new', phone: '972587000005', status: 'open', createdAt: il(17, 8).toISOString() }];
+  const titles = open(w).map(t => t.title);
+  expect(titles).toEqual(expect.arrayContaining(['בקשת הקפאת מנוי', 'משימה לצוות']));
+  expect(titles.join(' ')).not.toMatch(/[a-z]_[a-z]/);
+});
