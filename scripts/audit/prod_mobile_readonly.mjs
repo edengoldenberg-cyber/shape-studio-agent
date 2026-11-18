@@ -6,7 +6,10 @@
  *
  * • The session value comes from the environment only and is never printed or written anywhere.
  * • Every request that is not GET is BLOCKED in the browser (Fetch interception) and counted; so is every request to
- *   /api/dana/ (one Dana GET route runs recovery and flushes notifications) — the Dana tab is not opened.
+ *   /api/dana/, unless --dana is given. GET /api/dana/studio/projects returns expired job leases to the queue and
+ *   sends pending owner notifications when real notifications are on: pass --dana only after checking that no job is
+ *   leased and that real notifications are off (then the GET changes nothing). With --dana the Dana studio page is
+ *   opened too: the list, the home panes and the first project, without tapping any action.
  * • Nothing is typed and no action button is tapped: only tabs, panes and "open details".
  * It is an emulated phone screen in headless Chrome, not a real device. Screenshots contain real customer data: they
  * are written to the given folder only.
@@ -22,6 +25,7 @@ const BASE = (argOf('base') ?? '').replace(/\/$/, '');
 const TOKEN = process.env.PROD_SESSION ?? '';
 const shotDir = argOf('shots') ?? path.join(process.cwd(), '.claude', 'prod-shots');
 const WIDTHS = (argOf('widths') ?? '360,390,430').split(',').map(Number).filter(Boolean);
+const DANA = process.argv.includes('--dana');
 if (!/^https:\/\//.test(BASE) || TOKEN.length < 20) { console.error('usage: PROD_SESSION=… node prod_mobile_readonly.mjs --base https://host'); process.exit(2); }
 mkdirSync(shotDir, { recursive: true });
 const bin = ['C:/Program Files/Google/Chrome/Application/chrome.exe', 'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe', 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'].find(p => existsSync(p));
@@ -48,7 +52,7 @@ try {
     if (m.method === 'Page.javascriptDialogOpening') cdp('Page.handleJavaScriptDialog', { accept: false }).catch(() => {});
     if (m.method === 'Fetch.requestPaused') {                                   // READ-ONLY: only GET, and never the Dana API
       const rq = m.params.request, u = new URL(rq.url);
-      const ok = rq.method === 'GET' && u.origin === BASE && !u.pathname.startsWith('/api/dana/');
+      const ok = rq.method === 'GET' && u.origin === BASE && (DANA || !u.pathname.startsWith('/api/dana/'));
       const okStatic = rq.method === 'GET' && u.origin !== BASE;                // fonts etc.
       if (ok || okStatic) cdp('Fetch.continueRequest', { requestId: m.params.requestId }).catch(() => {});
       else { blocked.push(`${rq.method} ${u.pathname}`); cdp('Fetch.failRequest', { requestId: m.params.requestId, errorReason: 'BlockedByClient' }).catch(() => {}); }
@@ -138,6 +142,33 @@ try {
       }
       await audit(`${W} status`, W);
       await shot(`prod-status-${W}`, true);
+    }
+
+    // Dana studio (only with --dana; GET only, no action is tapped)
+    if (DANA) {
+      await cdp('Page.navigate', { url: BASE + '/dana-studio.html' });
+      check(`${W} dana: the studio opens with the session and the project list loads`, await until(`!/login/.test(location.pathname) && document.querySelectorAll('#projects li').length > 0 && !/בודק/.test(document.getElementById('worker').textContent) && !!document.getElementById('worker').textContent.trim()`, 30000));
+      const home = await evalJs(`({ worker: document.getElementById('worker').textContent.trim(), projects: [...document.querySelectorAll('#projects .proj')].map(b => b.innerText.replace(/\\s+/g, ' ').slice(0, 160)), banner: (document.getElementById('banner')?.innerText ?? '').replace(/\\s+/g, ' ').slice(0, 200), tabs: [...document.querySelectorAll('#hometabs button')].map(b => b.dataset.home + ':' + b.textContent.trim()) })`);
+      if (W === WIDTHS[0]) { console.log('  worker: ' + home.worker); console.log('  banner: ' + (home.banner || '(none)')); for (const pr of home.projects) console.log('  project: ' + pr); console.log('  panes: ' + home.tabs.join(' | ')); }
+      await audit(`${W} dana home`, W);
+      await shot(`prod-dana-${W}-1-home`, true);
+      for (const t of home.tabs.map(x => x.split(':')[0]).filter(k => k && k !== 'projects')) {
+        if (!(await tap(`#hometabs button[data-home="${t}"]`))) continue;
+        check(`${W} dana pane "${t}": opens`, await until(`document.querySelector('#hometabs button[data-home="${t}"]').classList.contains('on') && !document.querySelector('[data-pane="${t}"]').classList.contains('hidden')`));
+        await sleep(1200);
+        await audit(`${W} dana pane ${t}`, W);
+        if (W === WIDTHS[0]) await shot(`prod-dana-${W}-pane-${t}`, true);
+      }
+      await tap('#hometabs button[data-home="projects"]');
+      if (home.projects.length && await tap('#projects .proj')) {
+        check(`${W} dana: the project opens (steps, panel and actions are drawn)`, await until(`!document.getElementById('detail').classList.contains('hidden') && document.getElementById('panel').innerText.trim().length > 40`, 30000));
+        await sleep(2500);
+        const d = await evalJs(`({ title: document.getElementById('title')?.innerText ?? '', steps: [...document.querySelectorAll('#steps button, #steps li')].map(e => e.innerText.replace(/\\s+/g, ' ').trim()).filter(Boolean).slice(0, 12), video: document.querySelectorAll('#panel video').length, videoErr: [...document.querySelectorAll('#panel video')].filter(v => v.error).length, rating: /הדירוג הסופי של דנה/.test(document.getElementById('detail').innerText), actions: [...document.querySelectorAll('#actions button')].map(b => b.innerText.trim() + (b.disabled ? ' (מושבת)' : '')), errors: [...document.querySelectorAll('#detail .bad, #notice.bad')].map(e => e.innerText.replace(/\\s+/g, ' ').slice(0, 120)).filter(Boolean).slice(0, 6) })`);
+        if (W === WIDTHS[0]) { console.log('  steps: ' + d.steps.join(' | ')); console.log('  actions: ' + d.actions.join(' | ')); console.log(`  video elements: ${d.video} (with a load error: ${d.videoErr}); rating card: ${d.rating}`); if (d.errors.length) console.log('  marked as bad: ' + d.errors.join(' || ')); }
+        check(`${W} dana project: the video player is present and did not fail to load`, d.video === 0 || d.videoErr === 0, `players ${d.video}, failed ${d.videoErr}`);
+        await audit(`${W} dana project`, W);
+        await shot(`prod-dana-${W}-2-project`, true);
+      }
     }
   }
   console.log('');

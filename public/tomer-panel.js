@@ -169,20 +169,29 @@ $id('tw-refresh')?.addEventListener('click', () => {
 // loadOverview is kept as an alias so existing code doesn't break
 async function loadOverview() { return loadToday(); }
 
+// Each load has a number. Two loads can overlap (a tab click during the one-minute refresh, a slow Arbox answer):
+// only the LATEST one may write to the screen, otherwise an older answer could replace newer counters. While a load is
+// running the counters are marked as loading, so numbers from the previous load are not read as current.
+let _todaySeq = 0;
+const TODAY_KPIS = ['twk-high', 'twk-await', 'twk-open', 'twk-member', 'twk-failed'];
 async function loadToday() {
+  const seq = ++_todaySeq;
   const listEl = $id('tw-action-list');
   if (listEl) listEl.innerHTML = '<div class="tw-empty">טוען...</div>';
+  TODAY_KPIS.forEach(id => { const el = $id(id); if (el) el.dataset.loading = '1'; });
 
   try {
-    const [todayData, overviewData] = await Promise.all([
-      api('/api/tomer/today'),
-      api('/api/tomer/overview').catch(() => ({ ok: false })),
-    ]);
+    // the Arbox indicator is filled when it arrives; the case counters do not wait for Arbox
+    api('/api/tomer/overview').catch(() => ({ ok: false })).then(o => {
+      if (seq === _todaySeq) setTxt('twk-arbox', o && o.ok === true ? (o.arboxHealth ? '✅ זמין' : '⚠️ לא זמין') : '—');
+    });
+    const todayData = await api('/api/tomer/today');
+    if (seq !== _todaySeq) return;                       // a newer load is on its way: this answer is already old
+    TODAY_KPIS.forEach(id => { const el = $id(id); if (el) { delete el.dataset.loading; el.dataset.loadSeq = String(seq); } });
 
     // ── KPIs — service cases. A number that could not be read is shown as "—", never 0.
     if (!todayData || todayData.ok !== true || !todayData.cases) {
-      ['twk-high', 'twk-await', 'twk-open', 'twk-member', 'twk-failed'].forEach(id => setTxt(id, '—'));
-      setTxt('twk-arbox', '—');
+      TODAY_KPIS.forEach(id => setTxt(id, '—'));
       if (listEl) listEl.innerHTML = '<div class="tw-state-error" data-state="error" role="alert">לא ניתן לטעון את נתוני היום' + (todayData?.error ? ' (' + esc(todayData.error) + ')' : '') + '. לחצו 🔄 לניסיון נוסף.</div>';
       return;
     }
@@ -193,7 +202,6 @@ async function loadToday() {
     setTxt('twk-open',   cc.in_progress);
     setTxt('twk-member', cc.awaiting_member);
     setTxt('twk-failed', cc.notifFailed + cc.notifUncertain + cc.notifPending);
-    setTxt('twk-arbox',  overviewData && overviewData.ok === true ? (overviewData.arboxHealth ? '✅ זמין' : '⚠️ לא זמין') : '—');
 
     // Badges: Today = cases that need staff now; Cases = all open; Tasks = legacy task queue
     const badgeToday = $id('tw-badge-today');
@@ -339,7 +347,10 @@ async function loadToday() {
 
   } catch (e) {
     console.error('loadToday', e);
-    if (listEl) listEl.innerHTML = `<div class="tw-empty">שגיאה: ${esc(e.message)}</div>`;
+    if (seq !== _todaySeq) return;
+    // the counters could not be refreshed: they are shown as unknown, never left as the previous numbers
+    TODAY_KPIS.forEach(id => { const el = $id(id); if (el) { delete el.dataset.loading; el.dataset.loadSeq = String(seq); } setTxt(id, '—'); });
+    if (listEl) listEl.innerHTML = `<div class="tw-state-error" data-state="error" role="alert">לא ניתן לטעון את נתוני היום (${esc(e.message)}). לחצו 🔄 לניסיון חוזר.</div>`;
   }
 }
 

@@ -3929,10 +3929,16 @@ initMiniChat('barak-chat-input', 'barak-send', 'barak-chat-msgs', '/api/barak/ch
 
 // Deep link: https://…/#barak opens the Barak tab (used in the manager's callback summary).
 window.addEventListener('load', () => {
+  // Every script has registered its handlers by now. A tab tapped before that (index.html keeps it) wins over the
+  // address: it is what the person asked for last.
+  window.__appReady = true;
+  const tabBtn = name => document.querySelector('.tab-btn[data-tab="' + String(name).replace(/[^a-z0-9_-]/gi, '') + '"]');
+  const pending = window.__pendingTab; window.__pendingTab = null;
+  if (pending && tabBtn(pending)) { tabBtn(pending).click(); return; }
   // "#tomer/case/<id>" → the Tomer tab (public/tomer-panel.js then opens the case).
   const h = (location.hash || '').replace('#', '').split('/')[0];
   if (!h) return;
-  const b = document.querySelector('.tab-btn[data-tab="' + h.replace(/[^a-z0-9_-]/gi, '') + '"]');
+  const b = tabBtn(h);
   if (b) b.click();
 });
 

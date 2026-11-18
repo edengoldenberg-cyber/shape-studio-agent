@@ -39,6 +39,19 @@
     <button class="tab-btn"        data-tab="knowledge">🧠 ידע סוכן</button>
     <button class="tab-btn"        data-tab="health">🟢 מצב מערכת</button>
   </nav>
+  <script>
+    // The tab row is drawn before app.js (at the end of the page) has loaded. On a slow connection a tab tapped in
+    // that gap used to be lost. It is now marked at once and opened as soon as the page scripts are ready.
+    (function () {
+      var nav = document.querySelector('.tab-nav'); if (!nav) return;
+      nav.addEventListener('click', function (e) {
+        if (window.__appReady) return;
+        var b = e.target.closest ? e.target.closest('.tab-btn') : null; if (!b) return;
+        window.__pendingTab = b.dataset.tab;
+        nav.querySelectorAll('.tab-btn').forEach(function (x) { x.classList.toggle('active', x === b); });
+      });
+    })();
+  </script>
 
   <main class="app-main">
 

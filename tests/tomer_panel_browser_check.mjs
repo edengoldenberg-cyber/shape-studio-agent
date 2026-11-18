@@ -357,8 +357,12 @@ try {
   await click('#tw-case-close');
 
   // ── Today view uses the same numbers ────────────────────────────────────────
+  // The counters of the previous load stay on screen until this load answers. Before 2026-11-18 they were read as
+  // current (this check failed now and then, and an older answer could replace a newer one): they are now marked as
+  // loading and only the latest load writes. Wait for THIS load.
+  const todaySeqBefore = Number(await evalJs(`document.getElementById('twk-await').dataset.loadSeq ?? 0`)) || 0;
   await click('.tw-tab[data-pane="today"]');
-  check('"היום": case counters match the cases pane (1 urgent, 1 awaiting staff, 1 in progress… as stored)', (await until(`/^\\d+$/.test(document.getElementById('twk-await').textContent)`)) === true
+  check('"היום": case counters match the cases pane (1 urgent, 1 awaiting staff, 1 in progress… as stored)', (await until(`document.getElementById('twk-await').dataset.loading !== '1' && Number(document.getElementById('twk-await').dataset.loadSeq) > ${todaySeqBefore} && /^\\d+$/.test(document.getElementById('twk-await').textContent)`)) === true
     && await (async () => { const k = (await api()).counts; return (await txt('#twk-high')) === String(k.high) && (await txt('#twk-await')) === String(k.awaiting_staff) && (await txt('#twk-open')) === String(k.in_progress) && (await txt('#twk-member')) === String(k.awaiting_member) && (await txt('#twk-failed')) === '0'; })());
 
   // ── Restart: persisted state, same counters, nothing replayed ──────────────

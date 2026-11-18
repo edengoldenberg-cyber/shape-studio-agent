@@ -931,6 +931,64 @@ describe('6. Reminders (real worker cycle)', () => {
     expect(prospectReminders(b)).toHaveLength(0);
   });
 
+  // Owner decision, 2026-11-18: reminders are opened to real leads and to the manager for NEW requests only. Opening
+  // them must not produce a message about a request made before that moment, nor about a time that has passed.
+  test('opening reminders to every lead: only requests made or moved after the baseline are reminded, once', async () => {
+    setNow(il(2026, 11, 16, 9, 0));
+    const oldOpen    = await leadWithCallback({ timeText: 'היום ב-14:00' });     // made before the baseline, still ahead
+    const oldExpired = await leadWithCallback({ timeText: 'היום ב-10:00' });     // made before, its time passes with no outcome
+    const oldMovedByLead  = await leadWithCallback({ timeText: 'היום ב-16:00' });
+    const oldMovedByStaff = await leadWithCallback({ timeText: 'היום ב-17:00' });
+    const baseline = il(2026, 11, 16, 12, 0);
+    process.env.CALLBACK_REMINDER_SINCE = baseline.toISOString();
+    try {
+      setNow(il(2026, 11, 16, 12, 30));
+      const fresh = await leadWithCallback({ timeText: 'היום ב-14:00' });        // made after the baseline
+      await say(oldMovedByLead, 'אפשר שיחזרו אליי היום ב-14:00 במקום?');         // the lead moves an old request
+      expect(callbackTime.formatCallbackTime(openApt(oldMovedByLead).scheduledAt)).toContain('בשעה 14:00');
+      const moved = await post(`/api/admin/appointments/${openApt(oldMovedByStaff).id}/reschedule`, { rawTime: 'היום ב-14:00' });
+      expect(moved.status).toBe(200);
+      expect((await request(app).get('/api/admin/appointments/worker-status')).body.worker.newRequestsSince).toBe(baseline.toISOString());
+
+      clearOut();
+      setNow(il(2026, 11, 16, 13, 35));
+      await worker.runCycle(store);
+      for (const p of [fresh, oldMovedByLead, oldMovedByStaff]) {
+        expect([p, staffRemindersFor(p).length, prospectReminders(p).length]).toEqual([p, 1, 1]);
+        expect(prospectReminders(p)[0].text).toContain('בשעה 14:00');
+      }
+      for (const p of [oldOpen, oldExpired]) expect([p, staffRemindersFor(p).length, prospectReminders(p).length]).toEqual([p, 0, 0]);
+      expect(openApt(oldOpen).reminderSent).toBe(false);                         // history is not rewritten to hide it
+
+      // no duplicates: more cycles, a restart, and the old times of the moved requests
+      setNow(il(2026, 11, 16, 13, 50));
+      await worker.runCycle(store); restart(); await worker.runCycle(store);
+      setNow(il(2026, 11, 16, 15, 35)); await worker.runCycle(store);            // 16:00 was the lead's old time
+      setNow(il(2026, 11, 16, 16, 35)); await worker.runCycle(store);            // 17:00 was the staff-moved old time
+      for (const p of [fresh, oldMovedByLead, oldMovedByStaff]) expect([p, staffRemindersFor(p).length, prospectReminders(p).length]).toEqual([p, 1, 1]);
+      for (const p of [oldOpen, oldExpired]) expect([p, staffRemindersFor(p).length, prospectReminders(p).length]).toEqual([p, 0, 0]);
+    } finally { delete process.env.CALLBACK_REMINDER_SINCE; }
+  });
+
+  test('the baseline and the test allow-list combine; a baseline that cannot be read closes reminders', async () => {
+    setNow(il(2026, 11, 16, 12, 30));
+    const a = await leadWithCallback({ timeText: 'היום ב-14:00' });
+    const b = await leadWithCallback({ timeText: 'היום ב-14:00' });
+    clearOut();
+    setNow(il(2026, 11, 16, 13, 35));
+    process.env.CALLBACK_REMINDER_SINCE = 'tomorrow-ish';
+    try {
+      await worker.runCycle(store);
+      expect(staffRemindersFor(a).length + prospectReminders(a).length + staffRemindersFor(b).length + prospectReminders(b).length).toBe(0);
+      expect((await request(app).get('/api/admin/appointments/worker-status')).body.worker.newRequestsSince).toBe('unreadable');
+      process.env.CALLBACK_REMINDER_SINCE = il(2026, 11, 16, 12, 0).toISOString();
+      process.env.CALLBACK_PENDING_REMINDER_PHONES = a;
+      await worker.runCycle(store);
+      expect([staffRemindersFor(a).length, prospectReminders(a).length]).toEqual([1, 1]);
+      expect([staffRemindersFor(b).length, prospectReminders(b).length]).toEqual([0, 0]);
+    } finally { delete process.env.CALLBACK_REMINDER_SINCE; delete process.env.CALLBACK_PENDING_REMINDER_PHONES; }
+  });
+
   test('provider rejects the prospect reminder → not marked sent, retried next cycle', async () => {
     const phone = await leadWithCallback({ timeText: 'היום ב-14:00' });
     clearOut();

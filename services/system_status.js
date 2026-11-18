@@ -143,7 +143,7 @@ async function build(d = {}) {
     if (!mgr.length) return { state: 'fail', detail: 'לא הוגדר מספר מנהל להתראות (NOTIFY_PHONES).', action: 'להגדיר NOTIFY_PHONES.' };
     const pend = d.aptStore?.getCallbackPending ? d.aptStore.getCallbackPending() : [];
     const late = pend.filter(a => a.scheduledAt && new Date(a.scheduledAt).getTime() < now);
-    const base = `שיחה נקבעת רק עם שעה מפורשת; הלקוח מקבל סיכום אחד והמנהל (${mgr.map(tail).join(', ')}) התראה אחת.`;
+    const base = `בקשת חזרה נשמרת עם שעה מפורשת או עם טווח שעות ("מחר בין 14:00 ל-16:00") — שעה אינה מומצאת; הלקוח מקבל סיכום אחד והמנהל (${mgr.map(tail).join(', ')}) התראה אחת.`;
     if (late.length) return { state: 'limited', detail: `${base} ${late.length} בקשות חזרה שמועדן עבר ועדיין פתוחות.`, action: 'לסגור בפאנל ברק (בוצעה / אין מענה / בוטלה).' };
     return { state: 'live', detail: `${base} ${pend.length} בקשות ממתינות.` };
   });
@@ -153,10 +153,12 @@ async function build(d = {}) {
     const on = w.pendingAndProspectRemindersEnabled ?? /^enabled/.test(String(w.callbackPendingReminder));
     if (!on) return { state: 'off', detail: 'תזכורות לפני שיחה כבויות (CALLBACK_PENDING_REMINDER_ENABLED).', action: 'החלטה שלך אם להפעיל.' };
     if (list && list.length) {
-      return { state: 'limited', detail: `מוגבל למספר בדיקה בלבד (${list.map(tail).join(', ')}): ליד אמיתי שקבע שיחה אינו מקבל תזכורת, וגם המנהל לא. הסיכום בזמן הקביעה כן נשלח.`,
+      return { state: 'limited', detail: `${w.newRequestsSince ? 'מוכן לפתיחה לבקשות חדשות בלבד; כרגע ' : ''}מוגבל למספר בדיקה בלבד (${list.map(tail).join(', ')}): ליד אמיתי שקבע שיחה אינו מקבל תזכורת, וגם המנהל לא. הסיכום בזמן הקביעה כן נשלח.`,
                action: 'לאשר הסרה של הגבלת הבדיקה (CALLBACK_PENDING_REMINDER_PHONES) כדי שתזכורות יישלחו לכל הלידים.' };
     }
-    return { state: 'live', detail: 'תזכורת נשלחת לכל ליד שקבע שיחה ולמנהל, לפני מועד השיחה.' };
+    if (w.newRequestsSince === 'unreadable') return { state: 'fail', detail: 'CALLBACK_REMINDER_SINCE אינו תאריך קריא: שום תזכורת אינה נשלחת.', action: 'לתקן את הערך.' };
+    const since = w.newRequestsSince ? ` רק לבקשות שנוצרו או שמועדן שונה מאז ${new Date(w.newRequestsSince).toLocaleString('he-IL', { timeZone: 'Asia/Jerusalem', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}; בקשות ישנות יותר אינן מקבלות תזכורת.` : '';
+    return { state: 'live', detail: `תזכורת נשלחת לכל ליד שקבע שיחה ולמנהל, ${w.reminderMinutes ?? 30} דקות לפני מועד השיחה (בטווח שעות — לפני תחילת הטווח).${since} בשיחה שבטיפול ידני הלקוח מקבל תזכורת רק אם אישרת אותה בפאנל; המנהל מקבל תמיד.` };
   });
 
   // ── Tomer (members) ───────────────────────────────────────────────────────

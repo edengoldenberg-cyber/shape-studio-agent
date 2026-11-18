@@ -3257,3 +3257,4 @@ input:checked + .toggle-slider::before { transform: translateX(16px); }
 .sys-row-action { font-size: 13px; line-height: 1.55; margin-top: 6px; overflow-wrap: anywhere; }
 .tab-btn .tab-alert { display: inline-block; min-width: 18px; padding: 0 5px; margin-inline-start: 6px; border-radius: 999px;
                       background: #dc2626; color: #fff; font-size: 11px; font-weight: 700; line-height: 18px; text-align: center; }
+[data-loading="1"] { opacity: .35; }

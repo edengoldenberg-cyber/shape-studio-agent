@@ -138,11 +138,12 @@ try {
   if (!target) throw new Error('browser did not expose a page target');
   ws = new WebSocket(target.webSocketDebuggerUrl);
   await new Promise((res, rej) => { ws.onopen = res; ws.onerror = () => rej(new Error('CDP socket error')); });
-  let seq = 0; const pending = new Map(); const pageErrors = []; const dialogs = [];
+  let seq = 0; const pending = new Map(); const pageErrors = []; const dialogs = []; let onPaused = null;
   ws.onmessage = ev => {
     const m = JSON.parse(ev.data);
     if (m.id && pending.has(m.id)) { const { res, rej } = pending.get(m.id); pending.delete(m.id); m.error ? rej(new Error(m.error.message)) : res(m.result); }
     if (m.method === 'Runtime.exceptionThrown') pageErrors.push(m.params.exceptionDetails?.exception?.description ?? m.params.exceptionDetails?.text ?? 'unknown');
+    if (m.method === 'Fetch.requestPaused' && onPaused) onPaused(m.params);
     if (m.method === 'Page.javascriptDialogOpening') { dialogs.push(m.params.message); cdp('Page.handleJavaScriptDialog', { accept: false }).catch(() => {}); }
   };
   const cdp = (method, params = {}) => new Promise((res, rej) => { const id = ++seq; pending.set(id, { res, rej }); ws.send(JSON.stringify({ id, method, params })); });
@@ -485,6 +486,29 @@ try {
   check('desktop whatsapp: list and chat side by side', await evalJs(`(() => { const a = document.querySelector('.wa-threads-sidebar').getBoundingClientRect(), b = document.querySelector('.wa-chat-pane').getBoundingClientRect(); return a.width > 200 && b.width > 400 && Math.abs(a.top - b.top) < 4; })()`));
 
   check('no native alert()/prompt() dialogs were used', dialogs.length === 0, dialogs.join(' | '));
+  // ── a tap that arrives before the page scripts have loaded is not lost ──────
+  // Production, 2026-11-18: on the first load after a deployment (nothing cached) the Barak tab was tapped as soon as
+  // it was drawn and never opened. The tab row is in the HTML; its handlers come with app.js at the end of the page.
+  console.log('\n── slow connection ──');
+  await setViewport(390, 800, true);
+  // app.js is held back by the test (as a slow connection would) until the tab has been tapped
+  let heldAppJs = null;
+  onPaused = prm => { if (/\/app\.js(\?|$)/.test(prm.request.url) && !heldAppJs) heldAppJs = prm.requestId; else cdp('Fetch.continueRequest', { requestId: prm.requestId }).catch(() => {}); };
+  await cdp('Fetch.enable', { patterns: [{ urlPattern: '*/app.js*' }] });
+  await cdp('Page.navigate', { url: 'about:blank' });
+  await cdp('Page.navigate', { url: `${BASE}/` });
+  await until(`!!document.querySelector('.tab-btn[data-tab="barak"]') && getComputedStyle(document.querySelector('.tab-nav')).display !== 'block'`, 30000);   // drawn with its stylesheet
+  await waitFor(async () => !!heldAppJs, { timeoutMs: 15000 });
+  const early = await evalJs(`typeof loadBarakPanel === 'undefined'`);
+  await tap('.tab-btn[data-tab="barak"]');
+  check('slow connection: the tap came before the page scripts had loaded (the check tests what it claims)', early === true && !!heldAppJs);
+  check('slow connection: the tapped tab is marked at once, before the scripts arrive', (await evalJs(`document.querySelector('.tab-btn.active')?.dataset.tab`)) === 'barak');
+  await sleep(1500);
+  if (heldAppJs) await cdp('Fetch.continueRequest', { requestId: heldAppJs });
+  check('slow connection: a tab tapped before the scripts have loaded opens once they have', (await until(`typeof loadBarakPanel === 'function' && document.readyState === 'complete' && document.querySelector('.tab-btn[data-tab="barak"]').classList.contains('active') && document.getElementById('tab-barak').classList.contains('active')`, 30000)) === true,
+    await evalJs(`'active tab: ' + (document.querySelector('.tab-btn.active')?.dataset.tab ?? 'none') + ', active panel: ' + (document.querySelector('.tab-panel.active')?.id ?? 'none')`));
+  await cdp('Fetch.disable'); onPaused = null;
+
   check('no uncaught JavaScript errors on the page', pageErrors.length === 0, pageErrors.join(' | ').slice(0, 500));
 } catch (err) {
   fail++;

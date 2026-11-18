@@ -149,6 +149,10 @@ function clarify(reason, ctx = {}) {
       return `אפשר לתאם שיחה לשבועות הקרובים 🙂 איזה יום ושעה מתאימים לך?`;
     case 'outside_hours':
       return `אפשר לתאם שיחה בין השעות ${range} 🙂 איזו שעה מתאימה לך?`;
+    case 'range_unclear':
+      return `לא הצלחתי להבין את טווח השעות 🙂 בין איזו שעה לאיזו שעה נוח לך? (למשל "מחר בין 14:00 ל-16:00")`;
+    case 'range_outside_hours':
+      return `אנחנו מתקשרים בין השעות ${range} 🙂 איזה טווח בתוך השעות האלה נוח לך?`;
     default:
       return `מתי יהיה לך נוח שנחזור אליך? (יום ושעה, למשל "מחר ב-10:00")`;
   }
@@ -311,40 +315,112 @@ function resolveMeridiem(hour, hours) {
 
 // ── Main resolver ─────────────────────────────────────────────────────────────
 
-// A RANGE of hours ("בין 14:00-16:00", "בין 2 ל-4", "מ-10 עד 12", "14:00–16:00"). The range is the prospect's
-// availability: its start becomes scheduledAt (reminders are timed from it) and its end is kept as windowEndAt.
+// A RANGE of hours ("בין 14:00-16:00", "בין 2 ל-4", "בין שתיים לארבע", "מ-10 עד 12", "14:00–16:00", "מחר 14-16").
+// The range is the prospect's availability: its start becomes scheduledAt (reminders are timed from it) and its end is
+// kept as windowEndAt. A range is never turned into one appointed hour: when its end cannot be placed after its start,
+// or it leaves the calling hours, the prospect is asked — nothing is guessed and nothing valid is refused.
+const HOUR_WORD_ALT = HE_HOUR_WORDS.map(([w]) => w).join('|');
+// one hour inside a range: "14", "14:00", "14.00", "שתיים", optionally followed by "וחצי" / "ורבע"  (2 groups: token, suffix)
+const TOK = `(\\d{1,2}(?:[:.]\\d{2})?|${HOUR_WORD_ALT})(?![${HEB}\\d])(?:\\s*(וחצי|ורבע)(?![${HEB}]))?`;
+const DAY_LEAD = '(?:היום|מחר|מחרתיים|ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת|בשעות|בשעה|שעות)';
 const WINDOW_RES = [
-  /בין\s*(?:השעות\s*|השעה\s*)?(\d{1,2})(?::(\d{2}))?\s*(?:-|–|—|עד|ו-?\s*|ל-?\s*)\s*(\d{1,2})(?::(\d{2}))?/,
-  /(\d{1,2}):(\d{2})\s*(?:-|–|—|עד)\s*(\d{1,2}):(\d{2})/,
-  /מ-?\s*(\d{1,2})(?::(\d{2}))?\s*עד\s*(\d{1,2})(?::(\d{2}))?/,
+  new RegExp(`בין\\s*(?:השעות\\s*|השעה\\s*)?${TOK}\\s*(?:-|עד|ו-?|ל-?)\\s*(?:ה?שעה\\s*)?${TOK}`),
+  new RegExp(`(?<![\\d:.])(\\d{1,2}:\\d{2})()\\s*(?:-|עד)\\s*(\\d{1,2}:\\d{2})()(?![\\d:.])`),
+  new RegExp(`(?<![${HEB}])מ-?\\s*(?:ה?שעה\\s*)?${TOK}\\s*(?:עד|-)\\s*(?:ה?שעה\\s*)?${TOK}`),
+  // a bare "14-16" only when it is unmistakably hours: right after a day / "בשעות" …
+  new RegExp(`(?<=${DAY_LEAD}\\s+(?:ב-?\\s*)?)(\\d{1,2})()\\s*-\\s*(\\d{1,2})()(?![\\d./:${HEB}])`),
 ];
+// … or written on the 24-hour clock ("14-16", "9-13")
+const BARE_24H_RANGE = /(?<![\d./:א-ת-])(\d{1,2})()\s*-\s*(\d{1,2})()(?![\d./:א-ת-])/;
+
+/** One hour token → { h, m, written } or null (a "15.11" is a date, not 15:11). */
+function parseHourToken(raw, suffix) {
+  const d = /^(\d{1,2})(?:([:.])(\d{2}))?$/.exec(raw);
+  let h, m = 0, written = false;
+  if (d) {
+    h = Number(d[1]);
+    if (d[3] !== undefined) {
+      m = Number(d[3]); written = true;
+      if (d[2] === '.' && ![0, 15, 30, 45].includes(m)) return null;
+    }
+  } else {
+    const w = HE_HOUR_WORDS.find(([word]) => word === raw);
+    if (!w) return null;
+    h = w[1];
+  }
+  if (!written && suffix) m = suffix === 'וחצי' ? 30 : 15;
+  if (h > 23 || m > 59) return null;
+  return { h, m, written };
+}
 function extractWindow(text) {
-  for (const re of WINDOW_RES) {
+  const tryMatch = m => {
+    if (!m) return null;
+    const a = parseHourToken(m[1], m[2]), b = parseHourToken(m[3], m[4]);
+    return a && b ? { match: m[0], startH: a.h, startM: a.m, startExplicit: a.written || a.h >= 13, endH: b.h, endM: b.m } : null;
+  };
+  for (const re of WINDOW_RES) { const w = tryMatch(re.exec(text)); if (w) return w; }
+  const w = tryMatch(BARE_24H_RANGE.exec(text));
+  return w && (w.startH >= 13 || w.endH >= 13) && w.startH < w.endH ? w : null;
+}
+
+// An OPEN-ENDED range: "אחרי 16:00" (from then until the calling hours end) / "עד 12:00", "לפני 12" (from the start of
+// the calling hours, or from now, until then). The missing side is the calling hours themselves — the real limit of
+// when the studio calls — never an hour the prospect did not give. A bare number counts only at the end of a clause
+// ("אחרי 2 אימונים" is not an hour).
+const OPEN_TAIL = '(?=\\s*(?:$|[,.!?)]|בבוקר|בערב|בלילה|בצהריים|אחה"צ|אחר|אחרי|בדיוק|אם|זה|מתאים|נוח|טוב|בסדר|אפשר|יהיה|בבקשה|תודה))';
+const OPEN_HOUR = `(?:ה?שעה\\s*)?-?\\s*(?:(\\d{1,2}[:.]\\d{2})|(\\d{1,2}|${HOUR_WORD_ALT})(?![${HEB}\\d:.])(?:\\s*(וחצי|ורבע)(?![${HEB}]))?${OPEN_TAIL})`;
+const OPEN_RES = [
+  ['until', new RegExp(`(?<![${HEB}])(?:עד|לפני)\\s*${OPEN_HOUR}`)],
+  ['after', new RegExp(`(?<![${HEB}])(?:רק\\s+)?(?:אחרי|החל\\s+מ-?)\\s*${OPEN_HOUR}`)],
+];
+function extractOpenEnded(text) {
+  for (const [kind, re] of OPEN_RES) {
     const m = re.exec(text);
     if (!m) continue;
-    const a = Number(m[1]), b = Number(m[3]), am = Number(m[2] ?? 0), bm = Number(m[4] ?? 0);
-    if (a > 23 || b > 23 || am > 59 || bm > 59) continue;
-    return { match: m[0], startH: a, startM: am, startExplicit: m[2] !== undefined || a >= 13, endH: b, endM: bm };
+    const tok = parseHourToken(m[1] ?? m[2], m[3]);
+    if (tok) return { kind, match: m[0], ...tok };
   }
   return null;
 }
 
+const pad2 = n => String(n).padStart(2, '0');
+const hourText = (h, m, written) => (written || h >= 13 || m ? `${pad2(h)}:${pad2(m)}` : String(h));
+
 function resolveCallbackTime(rawText, ref = new Date(), opts = {}) {
   const hours = opts.hours ?? callingHours();
-  const w = extractWindow(String(rawText ?? ''));
-  if (!w) return resolveSingleTime(rawText, ref, opts);
-  const pad = n => String(n).padStart(2, '0');
-  // The range is replaced by its START hour and resolved by the ordinary strict rules (so "בין 2 ל-4" becomes the
-  // afternoon exactly as "ב-2" would). The end is then placed after the resolved start, on the same day.
-  const start = w.startExplicit ? `${pad(w.startH)}:${pad(w.startM)}` : String(w.startH);
-  const res = resolveSingleTime(String(rawText).replace(w.match, ` ב-${start} `), ref, opts);
+  const text = normalize(rawText);
+  const w = extractWindow(text);
+  if (w) {
+    // The range is replaced by its START hour and resolved by the ordinary strict rules (so "בין 2 ל-4" becomes the
+    // afternoon exactly as "ב-2" would). The end is then placed after the resolved start, on the same day.
+    const res = resolveSingleTime(text.replace(w.match, ` ב-${hourText(w.startH, w.startM, w.startExplicit)} `), ref, opts);
+    if (!res.ok) return res;
+    const p = ilParts(res.scheduledAt);
+    let endH = w.endH;
+    while (endH * 60 + w.endM <= p.hour * 60 + p.minute && endH + 12 <= 23) endH += 12;
+    if (endH * 60 + w.endM <= p.hour * 60 + p.minute) return fail('range_unclear');
+    if (endH > hours.end || (endH === hours.end && w.endM > 0)) return fail('range_outside_hours', { hours });
+    return { ...res, windowEndAt: ilDate(p.year, p.month, p.day, endH, w.endM) };
+  }
+  const o = extractOpenEnded(text);
+  if (!o) return resolveSingleTime(text, ref, opts);
+  const refDate = ref instanceof Date ? ref : new Date(ref);
+  const single = text.replace(o.match, ` ב-${hourText(o.h, o.m, o.written)} `);
+  if (o.kind === 'after') {
+    const res = resolveSingleTime(single, ref, opts);
+    if (!res.ok) return res;
+    const p = ilParts(res.scheduledAt);
+    return { ...res, windowEndAt: ilDate(p.year, p.month, p.day, hours.end, 0) };
+  }
+  // "until X": X may be the very end of the calling hours, which is not a callable START hour
+  const res = resolveSingleTime(single, ref, { ...opts, hours: { start: hours.start, end: Math.min(hours.end + 1, 24) } });
   if (!res.ok) return res;
-  const p = ilParts(res.scheduledAt);
-  let endH = w.endH;
-  while (endH * 60 + w.endM <= p.hour * 60 + p.minute && endH + 12 <= 23) endH += 12;
-  if (endH * 60 + w.endM <= p.hour * 60 + p.minute) return res;                     // no sensible end: only the start is kept
-  if (endH > hours.end || (endH === hours.end && w.endM > 0)) return res;           // the range leaves the calling hours: not claimed
-  return { ...res, windowEndAt: ilDate(p.year, p.month, p.day, endH, w.endM) };
+  const e = ilParts(res.scheduledAt);
+  if (e.hour * 60 + e.minute > hours.end * 60) return fail('outside_hours', { hours });
+  let start = ilDate(e.year, e.month, e.day, hours.start, 0);
+  if (start.getTime() <= refDate.getTime()) start = new Date(Math.ceil((refDate.getTime() + 60000) / 1800000) * 1800000);   // from now, on the half hour
+  if (start.getTime() >= res.scheduledAt.getTime()) return fail(e.hour * 60 + e.minute <= hours.start * 60 ? 'outside_hours' : 'past', { hours });
+  return { ...res, scheduledAt: start, windowEndAt: res.scheduledAt };
 }
 
 function resolveSingleTime(rawText, ref = new Date(), opts = {}) {

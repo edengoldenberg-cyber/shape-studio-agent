@@ -21,6 +21,10 @@
  *   CALLBACK_PENDING_REMINDER_ENABLED=true   activates pending-callback + prospect reminders
  *   CALLBACK_PENDING_REMINDER_MIN=30         minutes before the call (floor: 20)
  *   CALLBACK_PENDING_REMINDER_PHONES=…       optional lead-phone allowlist (controlled tests)
+ *   CALLBACK_REMINDER_SINCE=<ISO time>       reminders only for requests made (or moved to a new time) at or after
+ *                                            this moment. Opening reminders to every lead must never produce a message
+ *                                            about a request that was made before the owner switched them on. A value
+ *                                            that cannot be read as a time closes reminders (nothing is assumed).
  */
 
 const cron         = require('node-cron');
@@ -57,11 +61,23 @@ function reminderConfig() {
   const minutes = Math.max(Number.isFinite(raw) ? raw : 30, 20);
   const listRaw = (process.env.CALLBACK_PENDING_REMINDER_PHONES ?? '').trim();
   const allowlist = listRaw ? new Set(listRaw.split(',').map(s => s.trim()).filter(Boolean)) : null;
-  return { enabled, minutes, windowMs: minutes * 60 * 1000, allowlist };
+  const sinceRaw = (process.env.CALLBACK_REMINDER_SINCE ?? '').trim();
+  const sinceMs  = sinceRaw ? Date.parse(sinceRaw) : null;
+  const since    = sinceRaw ? (Number.isFinite(sinceMs) ? sinceMs : Infinity) : null;   // unreadable → nothing passes
+  return { enabled, minutes, windowMs: minutes * 60 * 1000, allowlist, since, sinceRaw: sinceRaw || null };
 }
 
-function applyAllowlist(due, allowlist) {
-  return allowlist ? due.filter(a => allowlist.has(a.leadPhone)) : due;
+/** When the request this record stands for was made: its creation, or the last move to a new time. */
+function requestedAt(a) {
+  const t = v => { const n = v instanceof Date ? v.getTime() : Date.parse(v); return Number.isFinite(n) ? n : 0; };
+  return Math.max(t(a.createdAt), t(a.rescheduledAt));
+}
+
+/** The test allow-list (when set) and the "new requests only" baseline (when set). */
+function applyScope(due, cfg) {
+  let out = cfg.allowlist ? due.filter(a => cfg.allowlist.has(a.leadPhone)) : due;
+  if (cfg.since !== null) out = out.filter(a => requestedAt(a) >= cfg.since);
+  return out;
 }
 
 // ── Staff reminder (shared by confirmed + pending passes) ─────────────────────
@@ -105,7 +121,7 @@ async function remindStaffFor(apt, store, eventName, extra = {}) {
 
 async function runReminderPass(store) {
   const cfg = reminderConfig();
-  const due = applyAllowlist(aptStore.getDueForReminder(cfg.windowMs), cfg.allowlist);
+  const due = applyScope(aptStore.getDueForReminder(cfg.windowMs), cfg);
   if (!due.length) return { reminders: 0 };
   logger.info('[apt-worker] Reminder pass (staff-confirmed)', { due: due.length, windowMin: cfg.minutes, allowlist: cfg.allowlist ? [...cfg.allowlist] : 'all' });
   let sent = 0;
@@ -143,7 +159,7 @@ async function runNoShowPass(store) {
 async function runCallbackPendingReminderPass(store) {
   const cfg = reminderConfig();
   if (!cfg.enabled) return { pendingReminders: 0 };
-  const due = applyAllowlist(aptStore.getPendingCallbacksDueForReminder(cfg.windowMs), cfg.allowlist);
+  const due = applyScope(aptStore.getPendingCallbacksDueForReminder(cfg.windowMs), cfg);
   if (!due.length) return { pendingReminders: 0 };
   logger.info('[apt-worker] Callback-pending reminder pass', { due: due.length, windowMin: cfg.minutes, allowlist: cfg.allowlist ? [...cfg.allowlist] : 'all' });
   let attempted = 0;
@@ -163,7 +179,7 @@ async function runProspectReminderPass(store) {
   // reminder for the 08:30 release — i.e. possibly AFTER the call it is about — so the
   // reminder is simply not sent while quiet hours are in force. Staff are still reminded.
   if (isQuietHours()) return { prospectReminders: 0, skippedQuietHours: true };
-  const due = applyAllowlist(aptStore.getCallbacksDueForProspectReminder(cfg.windowMs), cfg.allowlist);
+  const due = applyScope(aptStore.getCallbacksDueForProspectReminder(cfg.windowMs), cfg);
   if (!due.length) return { prospectReminders: 0 };
 
   logger.info('[apt-worker] Prospect reminder pass', { due: due.length, windowMin: cfg.minutes, allowlist: cfg.allowlist ? [...cfg.allowlist] : 'all' });
@@ -254,6 +270,7 @@ function workerStatus() {
     pendingAndProspectRemindersEnabled: cfg.enabled,
     reminderMinutes:  cfg.minutes,
     leadAllowlist:    cfg.allowlist ? [...cfg.allowlist] : null,
+    newRequestsSince: cfg.since === null ? null : (Number.isFinite(cfg.since) ? new Date(cfg.since).toISOString() : 'unreadable'),
   };
 }
 

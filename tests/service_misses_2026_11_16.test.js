@@ -976,9 +976,52 @@ describe('6. The range resolver', () => {
     expect(f('ביום רביעי בין 10:00 ל-12:00')).toBe('יום רביעי, 18.11.2026 בין 10:00 ל-12:00');
     expect(f('מחר מ-9 עד 11')).toBe('יום שלישי, 17.11.2026 בין 09:00 ל-11:00');
   });
-  test('a single hour is unchanged, and a range that leaves the calling hours is not claimed', () => {
+  test('a single hour is unchanged', () => {
     expect(f('מחר ב-15:00')).toBe('יום שלישי, 17.11.2026 בשעה 15:00');
-    expect(f('מחר בין 20:00 ל-23:00')).toBe('יום שלישי, 17.11.2026 בשעה 20:00');
     expect(f('ב-17.11 בשעה 15:00')).toBe('יום שלישי, 17.11.2026 בשעה 15:00');
+    expect(f('מחר בסביבות 15')).toBe('יום שלישי, 17.11.2026 בשעה 15:00');
+  });
+  // Owner rule, 2026-11-18: a range is a valid callback request and is kept as a range. It is never turned into one
+  // appointed hour (before: "בין שתיים לארבע" → 16:00, "בין 20:00 ל-23:00" → 20:00, "עד 12:00" → 12:00), and it is
+  // never refused for being a range ("מחר 14-16" was answered "באיזו שעה נוח לך?").
+  test('a range in words, without "בין", with dots or with half hours is still a range', () => {
+    expect(f('מחר בין שתיים לארבע')).toBe('יום שלישי, 17.11.2026 בין 14:00 ל-16:00');
+    expect(f('מתישהו מחר בין שתיים לארבע בצהריים')).toBe('יום שלישי, 17.11.2026 בין 14:00 ל-16:00');
+    expect(f('מחר בין עשר לשתים עשרה')).toBe('יום שלישי, 17.11.2026 בין 10:00 ל-12:00');
+    expect(f('מחר בין שתיים וחצי לארבע')).toBe('יום שלישי, 17.11.2026 בין 14:30 ל-16:00');
+    expect(f('מחר 14-16')).toBe('יום שלישי, 17.11.2026 בין 14:00 ל-16:00');
+    expect(f('מחר 10-12')).toBe('יום שלישי, 17.11.2026 בין 10:00 ל-12:00');
+    expect(f('אני זמינה 14-16')).toBe('יום שלישי, 17.11.2026 בין 14:00 ל-16:00');
+    expect(f('מחר בין 14.00 ל16.00')).toBe('יום שלישי, 17.11.2026 בין 14:00 ל-16:00');
+    expect(f('מחר בין 14:00–16:00')).toBe('יום שלישי, 17.11.2026 בין 14:00 ל-16:00');
+    expect(f('מחר מהשעה 9 עד השעה 11')).toBe('יום שלישי, 17.11.2026 בין 09:00 ל-11:00');
+  });
+  test('"after" and "until" are open ranges bounded by the calling hours, not an appointed hour', () => {
+    expect(f('מחר אחרי 16:00')).toBe('יום שלישי, 17.11.2026 בין 16:00 ל-22:00');
+    expect(f('מחר רק אחרי ארבע')).toBe('יום שלישי, 17.11.2026 בין 16:00 ל-22:00');
+    expect(f('מחר עד 12:00')).toBe('יום שלישי, 17.11.2026 בין 08:00 ל-12:00');
+    expect(f('מחר לפני 12')).toBe('יום שלישי, 17.11.2026 בין 08:00 ל-12:00');
+    expect(f('מחר עד 22:00')).toBe('יום שלישי, 17.11.2026 בין 08:00 ל-22:00');
+    expect(f('היום עד 20:00')).toBe('יום שני, 16.11.2026 בין 18:00 ל-20:00');          // from now (17:48), on the half hour
+    expect(f('היום עד 17:00')).toBe('past');
+    expect(f('מחר עד 7 בבוקר')).toBe('outside_hours');
+    expect(f('מחר עד 7')).toBe('יום שלישי, 17.11.2026 בין 08:00 ל-19:00');               // 7 without a qualifier is the evening, as for a single hour
+  });
+  test('a range that cannot be placed is asked about, never guessed', () => {
+    const r = t => callbackTime.resolveCallbackTime(t, ref);
+    expect(r('מחר בין 16:00 ל-14:00')).toMatchObject({ ok: false, reason: 'range_unclear' });
+    expect(r('מחר בין 20:00 ל-23:00')).toMatchObject({ ok: false, reason: 'range_outside_hours' });
+    expect(r('מחר בין 20:00 ל-23:00').clarification).toMatch(/08:00–22:00/);
+    expect(r('מחר בין 20:00 ל-22:00')).toMatchObject({ ok: true });
+  });
+  test('numbers that are not hours are not read as a range', () => {
+    const r = t => callbackTime.resolveCallbackTime(t, ref);
+    expect(r('אני בחו"ל בין 15.11 ל-20.11').windowEndAt).toBeUndefined();
+    expect(r('אני בחופשה עד 20.12').windowEndAt).toBeUndefined();
+    expect(r('אחרי 2 אימונים אני אחליט').ok).toBe(false);
+    expect(r('אני רוצה 2-3 אימונים בשבוע').ok).toBe(false);
+    expect(r('מנוי ל-3 חודשים').ok).toBe(false);
+    expect(r('מחר אחרי הצהריים')).toMatchObject({ ok: false, reason: 'missing_hour' });
+    expect(f('מחר ב-10 אחרי האימון')).toBe('יום שלישי, 17.11.2026 בשעה 10:00');
   });
 });
