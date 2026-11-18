@@ -3357,6 +3357,8 @@ memberCare = createMemberCare({
   state: {
     proactiveOn: () => _tomerSwitch() && tomerTest.proactiveEnabled(),
     allowed: phone => _tomerOn(phone),
+    // when Tomer serves everyone, the phones in TOMER_TEST_ONLY_PHONES are test phones: outside the regular programs
+    excluded: phone => { const s = tomerTest.status(); return s.mode === 'all' && s.allowlist.includes(String(phone)); },
     owner: phone => _conversationOwner(phone),
     // The last message that really was part of a conversation: anything the member wrote, or
     // anything of ours that went out (a refused / blocked send is not a conversation).

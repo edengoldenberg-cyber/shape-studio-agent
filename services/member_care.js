@@ -82,7 +82,7 @@ const EXCL_HE = {
   not_active: 'אין מנוי פעיל', joined_this_week: 'הצטרף/ה השבוע', attended_this_week: 'כבר התאמן/ה השבוע (כניסה מאומתת)',
   has_booking_this_week: 'יש רישום פעיל להמשך השבוע', absence_track: 'בטיפול תוכנית ההיעדרות (7+ ימים)',
   attendance_unknown: 'אין כניסה מאומתת ב-30 הימים האחרונים — משך ההיעדרות לא ידוע', new_never_attended: 'חבר/ה חדש/ה שעוד לא הגיע/ה לאימון ראשון',
-  not_in_window: 'לא בחלון הימים של התוכנית', before_baseline: 'האירוע קדם להפעלת התוכנית (אין שליחה רטרואקטיבית)', has_upcoming_booking: 'יש רישום לאימון קרוב', on_hold: 'המנוי בהקפאה', not_sending_day: 'יום ההולדת חל ביום שאין בו שליחה — דולג, בלי ברכה מאוחרת', still_active: 'יש מנוי פעיל',
+  not_in_window: 'לא בחלון הימים של התוכנית', before_baseline: 'האירוע קדם להפעלת התוכנית (אין שליחה רטרואקטיבית)', has_upcoming_booking: 'יש רישום לאימון קרוב', test_phone: 'מספר בדיקה — מוחרג מתוכניות השימור הרגילות (זמין לבדיקות מפורשות בלבד)', on_hold: 'המנוי בהקפאה', not_sending_day: 'יום ההולדת חל ביום שאין בו שליחה — דולג, בלי ברכה מאוחרת', still_active: 'יש מנוי פעיל',
   no_birthday: 'אין תאריך לידה ב-Arbox', birthday_invalid: 'תאריך הלידה ב-Arbox אינו סביר', not_today: 'לא היום',
   recurring: 'מנוי מתחדש אוטומטית', type_unknown: 'סוג המנוי נמחק ב-Arbox — לא ידוע אם מתחדש', no_end_date: 'אין תאריך סיום', renewed: 'כבר קיים מנוי חדש / ממשיך',
   not_first: 'אינו המנוי הראשון (חידוש)', earlier_unknown: 'קיים מנוי קודם מסוג לא ידוע — לא ניתן לאשר שזה חבר/ה חדש/ה', member_since_earlier: 'לפי Arbox החברות התחילה לפני המנוי הזה (ייבוא / חבר/ה ותיק/ה)',
@@ -382,6 +382,9 @@ function createMemberCare(deps) {
     const included = [], excluded = [];
     const rows = id === 'payment_failed' ? failedCharges(snap, base, settings) : snap.members.filter(m => m.isActive || id === 'welcome' || id === 'expired').map(m => ({ m, ...E[id](m, snap, base, settings) }));
     for (const r of rows) {
+      // The owner's test member (2026-11-18) is not part of the regular programs: no message and no owner task. It stays
+      // available for explicit, labelled test sends only. An episode already waiting for it is cancelled by the run.
+      if (!r.excl && r.m.phone && typeof st.excluded === 'function' && st.excluded(r.m.phone)) r.excl = ['test_phone'];
       if (r.excl) { excluded.push({ userId: r.m.userId, name: r.m.name, reasons: r.excl }); continue; }
       const key = store.episodeKey(id, r.m.userId, r.cand.key);
       const ep = store.getEpisode(key);

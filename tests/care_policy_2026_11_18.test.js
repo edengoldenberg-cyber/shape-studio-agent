@@ -59,7 +59,7 @@ describe('the programs, on a snapshot', () => {
     const care = createMemberCare({ gateway: { getBookings: async () => ({ bookings: [] }), getCancellations: async () => ({ cancellations: [] }), getMemberships: async () => ({ memberships: [] }), clearCache() {} },
       store, cases: { list: () => [] }, logger: { info() {}, warn() {}, error() {} }, now: () => now, openOwnerTask,
       sendMember: async (phone, text) => { sent.push({ phone, text }); return { state: 'sent', idMessage: `M${sent.length}` }; },
-      state: { proactiveOn: () => true, allowed: () => true, owner: () => 'tomer', lastConversationAt: () => null, testPhones: () => ['972526324276'] } });
+      state: { proactiveOn: () => true, allowed: () => true, owner: () => 'tomer', lastConversationAt: () => null, testPhones: () => ['972526324276'], excluded: ph => ph === '972587000999' } });
     const all = members.map((m, i) => { const act = m.memberships.filter(x => x.active && !x.cancelled); const last = (m.checkins ?? []).slice().sort().at(-1) ?? null;
       return { userId: String(100 + i), name: `מתאמנת ${i}`, firstName: 'נועה', gender: 'female', phone: `97258700010${i}`, phoneShared: false, freeze: 'not_frozen', isActive: act.length > 0, activeMs: act,
         first: m.memberships[0], firstStart: m.memberships[0]?.startDate ?? null, earliestActiveStart: act[0]?.startDate ?? null, checkins: m.checkins ?? [], lastAttendance: last,
@@ -136,6 +136,17 @@ describe('the programs, on a snapshot', () => {
     expect(onFri.evalP('birthday').excluded[0].reasons).toEqual(['not_sending_day']);
     onFri.snap.today = '2026-11-22';                                               // Sunday: no belated greeting
     expect(onFri.evalP('birthday').excluded[0].reasons).toEqual(['not_today']);
+  });
+
+  test('the test member is outside every regular program — no message, no owner task; it shows as excluded with the reason', () => {
+    const w = mk([{ memberships: [ms(1, day(0), day(90))], phone: '972587000999', checkins: [] }, { memberships: [ms(2, day(0), day(90))] }]);
+    for (const id of ['welcome', 'birthday', 'expiry5', 'absence7', 'onboarding7', 'onboarding14', 'absence14', 'expired']) {
+      expect(inc(w, id, 0)).toBeNull();
+      const r = reasons(w, id, 0);
+      expect(r === null || r.length > 0).toBe(true);
+    }
+    expect(reasons(w, 'welcome', 0)).toEqual(['test_phone']);
+    expect(inc(w, 'welcome', 1)).not.toBeNull();                                  // an ordinary new member is still welcomed
   });
 
   test('the welcome carries no group link and no guest sessions; an approved text that says who writes is not introduced twice', () => {
