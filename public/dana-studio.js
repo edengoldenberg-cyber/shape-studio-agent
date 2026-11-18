@@ -1686,3 +1686,17 @@
   (id ? open(id) : loadHome()).catch(e => notice(e.message, 'bad'));
   setInterval(() => { if (!current) loadHome().catch(e => refreshFailed(e)); }, 10000);
 })();
+
+// Phone: a field that receives focus is brought to the middle of the visible area when it is under the top bar, under
+// the fixed action bar, or cut by the edge of the screen (the on-screen keyboard shortens the screen after the tap).
+document.addEventListener('focusin', e => {
+  const el = e.target;
+  if (window.innerWidth >= 980 || !el || !el.matches || !el.matches('input:not([type=checkbox]):not([type=radio]):not([type=file]), textarea, select')) return;
+  setTimeout(() => {
+    if (document.activeElement !== el) return;
+    const r = el.getBoundingClientRect(), head = document.querySelector('header'), bar = document.getElementById('actions');
+    const top = head ? head.getBoundingClientRect().bottom : 0;
+    const bottom = bar && bar.getClientRects().length ? bar.getBoundingClientRect().top : window.innerHeight;
+    if (r.top < top + 4 || r.bottom > bottom - 4) el.scrollIntoView({ block: 'center' });
+  }, 300);
+});

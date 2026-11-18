@@ -188,9 +188,10 @@ try {
                      if (!t || !(t === e || e.contains(t) || t.contains(e) || t.closest('label')?.contains(e))) out.unreachable.push(name(e) + ' → ' + (t ? name(t) : 'nothing')); }
             }
             for (const e of controls.filter(e => e.matches('input:not([type=checkbox]):not([type=radio]):not([type=file]), textarea, select'))) {
-              e.focus(); await new Promise(r => setTimeout(r, 120));
+              e.focus(); await new Promise(r => setTimeout(r, 700));
               const b = e.getBoundingClientRect(), top = bar.getBoundingClientRect().top;
-              if (b.top < 0 || b.bottom > top + 1) out.focusHidden.push(name(e) + ' ' + Math.round(b.top) + '–' + Math.round(b.bottom) + ' (bar at ' + Math.round(top) + ')');
+              const headB = document.querySelector('header')?.getBoundingClientRect().bottom ?? 0;
+              if (b.top < headB - 1 || b.bottom > top + 1) out.focusHidden.push(name(e) + ' ' + Math.round(b.top) + '–' + Math.round(b.bottom) + ' (bar at ' + Math.round(top) + ')');
               e.blur();
             }
             scrollTo(0, document.documentElement.scrollHeight); await new Promise(r => requestAnimationFrame(() => r()));
