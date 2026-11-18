@@ -88,6 +88,38 @@ function createArboxMock() {
           default:                    apply(); return send(res, 200, { data: { ok: true } });
         }
       }
+      // Booking / cancelling ONE class for a member. Modelled on the real answers seen on 2026-11-18 (owner-approved
+      // verification): bookSession → 200 { booking_id: <schedule id>, date, start_time, … }, cancelUserBooking → 200
+      // { message: 'successfully cancelled user booking' }; a refusal is a 4xx, a server fault a 500 that changes nothing.
+      if (req.method === 'POST' && (p === '/v3/schedule/bookSession' || p === '/v3/schedule/cancelUserBooking')) {
+        const cls = state.schedule.find(c => String(c.schedule_id) === String(body.schedule_id));
+        const mine = b => String(b.user_id) === String(body.user_id) && cls && b.date === cls.date && b.time === cls.start_time && b.class_name === cls.session_name;
+        const book = p.endsWith('/bookSession');
+        const apply = () => {
+          if (!cls) return false;
+          if (book) {
+            if (state.bookings.some(mine)) return false;
+            const m = state.memberships.find(x => String(x.user_id) === String(body.user_id));
+            state.bookings.push({ user_id: Number(body.user_id), date: cls.date, time: cls.start_time, class_name: cls.session_name, staff_member: cls.staff_member?.name ?? null, check_in: 'No', sessions_left: null, membership_type_name: m?.membership_type_name ?? null });
+            cls.registration_count = (cls.registration_count ?? 0) + 1;
+          } else {
+            const i = state.bookings.findIndex(mine); if (i < 0) return false;
+            state.bookings.splice(i, 1);
+            state.cancellations.push({ user_id: Number(body.user_id), schedule_id: String(cls.schedule_id), date: cls.date, start_time: `${cls.date} ${cls.start_time}`, class_name: cls.session_name, cancelled_time: new Date().toISOString() });
+            cls.registration_count = Math.max(0, (cls.registration_count ?? 1) - 1);
+          }
+          return true;
+        };
+        const okBody = () => (book ? { statusCode: 200, data: { booking_id: Number(body.schedule_id), schedule_id: null, date: cls?.date ?? null, start_time: cls?.start_time ?? null, end_time: cls?.end_time ?? null }, extra: [] } : { statusCode: 200, data: { message: 'successfully cancelled user booking' }, extra: [] });
+        switch (mode.write) {
+          case 'reject':              return send(res, 422, { error: { message: book ? 'user cannot be booked to this session' : 'booking cannot be cancelled' } });
+          case 'timeout_after_apply': apply(); return;
+          case 'timeout_no_apply':    return;
+          case 'accept_no_apply':     return send(res, 200, okBody());
+          case 'error500_no_apply':   return send(res, 500, { statusCode: 500, error: { name: 'INTERNAL SERVER ERROR', code: 500, message: 'An unexpected server error occurred.' }, data: null });
+          default:                    return apply() ? send(res, 200, okBody()) : send(res, 422, { error: { message: 'not applicable' } });
+        }
+      }
       return send(res, 405, { error: { message: 'method not allowed' } });
     });
   });

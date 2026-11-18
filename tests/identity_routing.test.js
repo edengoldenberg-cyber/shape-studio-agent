@@ -710,3 +710,101 @@ describe('A registration conversation with questions in the middle (live failure
     expect(mockOut.alerts).toHaveLength(0);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Class registration and cancellation are switched on for the owner's test phone only (2026-11-18, after the direct
+// verification against Arbox). Through the full pipeline against the local Arbox stand-in.
+describe('Registration carried out in Arbox for the test phone only', () => {
+  const TESTER = '972507140001', OTHER = '972507140002';
+  const tasksOf = p => require('../utils/tomer_store').getTasks({ phone: p, type: 'class_change' });
+  const cls = (id, start, name, registered, cap, who) => ({ schedule_id: id, date: day(0), start_time: start, end_time: `${String(Number(start.slice(0, 2)) + 1).padStart(2, '0')}:00`, session_name: name, staff_member: { name: who }, max_participants: cap, registration_count: registered });
+  const last = p => textsTo(p).at(-1) ?? '';
+  let ids;
+  function setup() {
+    world();
+    for (const t of require('../utils/tomer_store').getOpenTasks()) require('../utils/tomer_store').resolveTask(t.id, { resolutionNote: 'test reset', resolvedBy: 'test' });
+    ids = { tester: person({ phone: '0' + TESTER.slice(3), first: 'בדיקה' }), other: person({ phone: '0' + OTHER.slice(3), first: 'מיכל' }) };
+    plan(ids.tester, { start: day(0), end: null }); plan(ids.other);
+    arbox.state.schedule.push(cls(41, '18:00', 'ALL IN', 3, 10, 'נוי לוי'), cls(42, '18:00', 'פילאטיס בר', 8, 8, 'דנה גל'), cls(43, '19:00', 'אימון כח', 5, 10, 'מירי כהן'));
+    process.env.ARBOX_WRITES_ENABLED = 'true'; process.env.ARBOX_WRITE_OPS = 'class_book,class_cancel'; process.env.ARBOX_WRITE_TEST_PHONES = TESTER; delete process.env.ARBOX_WRITE_AUDIENCE;
+  }
+  afterEach(() => { delete process.env.ARBOX_WRITES_ENABLED; delete process.env.ARBOX_WRITE_OPS; delete process.env.ARBOX_WRITE_TEST_PHONES; });
+  const posts = re => arbox.writes().filter(w => re.test(w.path));
+
+  test('only what was verified is executable: booking and cancelling a class; late move, freeze and membership cancel stay off', () => {
+    setup();
+    const st = gateway.writeStatus();
+    expect([st.class_book.executable, st.class_cancel.executable]).toEqual([true, true]);
+    expect([st.class_move_late.executable, st.membership_hold.executable, st.membership_cancel.executable]).toEqual([false, false, false]);
+  });
+
+  test('the conversation: choice → the exact action is shown → a question in the middle confirms nothing → "כן" → booked in Arbox → "נרשמת" only after the read-back', async () => {
+    setup();
+    await say(TESTER, 'אני רוצה להשתבץ לשיעור היום בשעה 18');
+    expect(last(TESTER)).toMatch(/ב-18:00 היום יש ALL IN ופילאטיס בר\. איזה שיעור התכוונת\?/);
+    await say(TESTER, 'אתה יכול לרשום אותי לall in?');
+    expect(last(TESTER)).toMatch(/רק לוודא לפני שאני משנה ב-Arbox:\nרישום לALL IN ב-18:00, היום, .*\nלאשר\?/);
+    expect(arbox.writes()).toHaveLength(0);                                       // nothing is sent before the written "כן"
+    await say(TESTER, 'יש מקום?');                                                // a question: not a confirmation
+    expect(last(TESTER)).toMatch(/ALL IN ב-18:00 — יש מקום \(7 מתוך 10 פנויים\)/);
+    expect(last(TESTER)).toMatch(/עדיין מחכה לאישור שלך: רישום לALL IN ב-18:00/);
+    expect(arbox.writes()).toHaveLength(0);
+    await say(TESTER, 'כן');
+    expect(posts(/bookSession/)).toHaveLength(1);
+    expect(posts(/bookSession/)[0].body).toMatchObject({ user_id: ids.tester, schedule_id: 41 });
+    expect(last(TESTER)).toMatch(/בוצע ✅ נרשמת לALL IN ב-18:00 היום\.\nאימתתי את זה עכשיו מול Arbox\./);
+    expect(arbox.state.bookings.filter(b => b.user_id === ids.tester)).toHaveLength(1);
+    expect(tasksOf(TESTER).filter(t => t.status === 'open')).toHaveLength(0);     // done and verified: nothing waits for the staff
+    expect(mockOut.alerts).toHaveLength(0);
+    // a confirmation is for that action only: a "כן" afterwards does nothing
+    await say(TESTER, 'כן');
+    expect(posts(/bookSession/)).toHaveLength(1);
+  });
+
+  test('"כן" to one class is not a "כן" to another: a new request replaces the one that was waiting, and asks again', async () => {
+    setup();
+    await say(TESTER, 'תרשום אותי לALL IN היום ב-18');
+    expect(last(TESTER)).toMatch(/רישום לALL IN ב-18:00[\s\S]*לאשר\?/);
+    await say(TESTER, 'בעצם תרשום אותי לאימון כוח ב-19');
+    expect(last(TESTER)).toMatch(/רישום לאימון כח ב-19:00[\s\S]*לאשר\?/);
+    expect(arbox.writes()).toHaveLength(0);
+    await say(TESTER, 'כן');
+    expect(posts(/bookSession/).map(w => w.body.schedule_id)).toEqual([43]);
+    expect(last(TESTER)).toMatch(/נרשמת לאימון כח ב-19:00 היום/);
+  });
+
+  test('any other member: nothing is written, the request goes to the staff and she is told she is not registered yet', async () => {
+    setup();
+    await say(OTHER, 'תרשמי אותי לALL IN היום ב-18');
+    expect(last(OTHER)).toMatch(/קיבלתי את הבקשה: רישום לALL IN ב-18:00 היום\.[\s\S]*העברתי את הבקשה לצוות\.[\s\S]*עדיין לא נרשמת/);
+    expect(last(OTHER)).not.toMatch(/לאשר\?|בוצע/);
+    expect(arbox.writes()).toHaveLength(0);
+    expect(tasksOf(OTHER).filter(t => t.status === 'open')).toHaveLength(1);
+  });
+
+  test('Arbox answers 500 (as it did once on 2026-11-18): nothing is claimed, nothing is sent again, the staff are told the exact state', async () => {
+    setup();
+    await say(TESTER, 'תרשום אותי לALL IN היום ב-18');
+    arbox.mode.write = 'error500_no_apply';
+    await say(TESTER, 'כן');
+    arbox.mode.write = 'success';
+    expect(posts(/bookSession/)).toHaveLength(1);                                 // not repeated
+    expect(last(TESTER)).not.toMatch(/נרשמת ל|בוצע ✅/);
+    expect(arbox.state.bookings.filter(b => b.user_id === ids.tester)).toHaveLength(0);
+    expect(mockOut.alerts.length).toBeGreaterThanOrEqual(1);
+    await say(TESTER, 'כן');                                                      // a later "כן" does not resend the request blindly
+    expect(posts(/bookSession/).length).toBeLessThanOrEqual(1);
+  });
+
+  test('Arbox refuses the booking: no "נרשמת"; the member is told it was not done and the staff are alerted', async () => {
+    setup();
+    await say(TESTER, 'תרשום אותי לALL IN היום ב-18');
+    arbox.mode.write = 'reject';
+    await say(TESTER, 'כן');
+    arbox.mode.write = 'success';
+    expect(last(TESTER)).not.toMatch(/נרשמת ל|בוצע ✅/);
+    expect(last(TESTER)).toMatch(/עדיין לא נרשמת/);
+    expect(arbox.state.bookings.filter(b => b.user_id === ids.tester)).toHaveLength(0);
+    expect(mockOut.alerts.length).toBeGreaterThanOrEqual(1);
+  });
+});

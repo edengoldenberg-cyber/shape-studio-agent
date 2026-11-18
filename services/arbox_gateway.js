@@ -339,13 +339,19 @@ const WRITE_CONTRACTS = {
   // A member's booking of ONE class session. Field names are the documented BookSessionRequest / CancelUserBookingRequest.
   // `book_without_membership`, `late_cancellation` and `without_late_cancellation` are never sent: their effect is not
   // documented, and a booking must be charged to the member's own membership exactly as the app would.
+  // VERIFIED against the real Arbox on 2026-11-18 with the owner's test member (user 12622086), by his approval:
+  //   bookSession  yoga 2026-11-20 08:30 → 200, read back (class 2/10 → 3/10); bookSession strength 10:30 → 200, read back;
+  //   cancelUserBooking yoga → 200, read back; cancelUserBooking strength → 200, read back (both outside the 12 h window).
+  //   Membership unchanged, no charge. Two bookings on the same day were held during the move.
+  //   One earlier bookSession answered 500 and changed nothing (cause not established).
+  // Still needs ARBOX_WRITES_ENABLED + ARBOX_WRITE_OPS, and the audience (ARBOX_WRITE_TEST_PHONES) in class_actions.
   class_book: {
-    verified: false, explicit: true, method: 'POST', path: '/v3/schedule/bookSession', required: ['userId', 'scheduleId'],
+    verified: true, explicit: true, method: 'POST', path: '/v3/schedule/bookSession', required: ['userId', 'scheduleId'],
     body: a => ({ user_id: Number(a.userId), schedule_id: Number(a.scheduleId), ...(a.membershipUserId ? { membership_user_id: Number(a.membershipUserId) } : {}) }),
     clears: a => [`bookings:${a.userId}`, 'classes:'],
   },
   class_cancel: {
-    verified: false, explicit: true, method: 'POST', path: '/v3/schedule/cancelUserBooking', required: ['userId', 'scheduleId'],
+    verified: true, explicit: true, method: 'POST', path: '/v3/schedule/cancelUserBooking', required: ['userId', 'scheduleId'],
     body: a => ({ schedule_id: Number(a.scheduleId), user_id: Number(a.userId) }),
     clears: a => [`bookings:${a.userId}`, 'classes:'],
   },
