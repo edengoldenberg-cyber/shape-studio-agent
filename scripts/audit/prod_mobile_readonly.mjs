@@ -86,15 +86,15 @@ try {
       return out; })()`);
     check(`${label}: no sideways scroll (document ${a.docW}px on a ${W}px screen)`, a.docW <= W + 1 && a.layoutW <= W + 1, `layout ${a.layoutW}`);
     check(`${label}: nothing reaches outside the screen`, a.off.length === 0, [...new Set(a.off)].slice(0, 6).join(' | '));
-    check(`${label}: every control is at least 44×44`, a.small.length === 0, [...new Set(a.small)].slice(0, 6).join(' | '));
+    if (W < 900) check(`${label}: every control is at least 44×44`, a.small.length === 0, [...new Set(a.small)].slice(0, 6).join(' | '));
     check(`${label}: nothing floats over the page`, a.covered.length === 0, [...new Set(a.covered)].slice(0, 6).join(' | '));
   };
 
   for (const W of WIDTHS) {
     console.log(`\n── ${W}px ──`);
-    await cdp('Emulation.setDeviceMetricsOverride', { width: W, height: 800, deviceScaleFactor: 2, mobile: true });
+    await cdp('Emulation.setDeviceMetricsOverride', { width: W, height: W < 900 ? 800 : 900, deviceScaleFactor: W < 900 ? 2 : 1, mobile: W < 900 });
     await cdp('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 });
-    await cdp('Emulation.setUserAgentOverride', { userAgent: 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36' });
+    await cdp('Emulation.setUserAgentOverride', { userAgent: W < 900 ? 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36' : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' });
     await cdp('Page.navigate', { url: BASE + '/' });
     check(`${W}: the dashboard opens with the session (not the login page)`, await until(`!!document.querySelector('.tab-btn[data-tab="barak"]') && !/login/.test(location.pathname)`));
     // Barak
@@ -174,6 +174,18 @@ try {
         await audit(`${W} member card`, W);
         await evalJs(`document.querySelector('#tw-mb-list .tw-mb-card.open').scrollIntoView({ block: 'start' })`);
         await shot(`prod-tomer-${W}-7-member-card`);
+        // search (client side) and a refresh (GET only): the search text, the chosen group and the open card must survive
+        const openId = await evalJs(`document.querySelector('#tw-mb-list .tw-mb-card.open')?.dataset.member ?? null`);
+        const total = await evalJs(`document.querySelectorAll('#tw-mb-list .tw-mb-card').length`);
+        const q = await evalJs(`(() => { const n = document.querySelector('#tw-mb-list .tw-mb-card.open .tw-mb-name').textContent.trim().slice(0, 3); const i = document.getElementById('tw-mb-search'); i.value = n; i.dispatchEvent(new Event('input', { bubbles: true })); return n; })()`);
+        await sleep(500);
+        const f = await evalJs(`({ shown: document.querySelectorAll('#tw-mb-list .tw-mb-card').length, allMatch: [...document.querySelectorAll('#tw-mb-list .tw-mb-card .tw-mb-name')].every(n => n.textContent.includes(${JSON.stringify('__Q__')}.replace('__Q__', document.getElementById('tw-mb-search').value))), open: document.querySelector('#tw-mb-list .tw-mb-card.open')?.dataset.member ?? null })`);
+        check(`${W} members: the search narrows the list to matching names (${f.shown} of ${total}) and keeps the open card`, f.shown >= 1 && f.shown < total && f.allMatch && f.open === openId, JSON.stringify(f));
+        await tap('#tw-refresh');
+        await sleep(4000);
+        const kept = await evalJs(`({ q: document.getElementById('tw-mb-search').value, group: document.querySelector('#tw-mb-groups .tw-mb-group.active')?.dataset.g, open: document.querySelector('#tw-mb-list .tw-mb-card.open')?.dataset.member ?? null, detail: (document.querySelector('#tw-mb-list .tw-mb-card.open .tw-mb-detail')?.innerText ?? '').length, shown: document.querySelectorAll('#tw-mb-list .tw-mb-card').length })`);
+        check(`${W} members: after a refresh the search text, the chosen group and the open card are still there`, kept.q === q && kept.group === 'active' && kept.open === openId && kept.detail > 40 && kept.shown === f.shown, JSON.stringify({ ...kept, q: '(kept)' }));
+        await evalJs(`(() => { const i = document.getElementById('tw-mb-search'); i.value = ''; i.dispatchEvent(new Event('input', { bubbles: true })); })()`);
       }
     }
     // Agent knowledge (GET only: the status rows; no save, restore, confirm or sync is tapped)

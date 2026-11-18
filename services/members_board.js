@@ -82,16 +82,19 @@ function createMembersBoard(d) {
       const curEnd = m.activeMs.map(x => x.endDate).filter(Boolean).sort().at(-1) ?? null;
       const openEnded = m.activeMs.some(x => !x.endDate);
       const renewed = service.some(x => x.startDate && curEnd && x.startDate > curEnd);
+      // "new and has not come yet" is only someone whose FIRST membership ever is recent. A long-time member who renewed and
+      // has no check-in in the 30 days that are read is absent, not new (production sample, 2026-11-18).
+      const notStarted = m.neverAttended && !!m.firstStart && diffD(today, m.firstStart) >= 0 && diffD(today, m.firstStart) <= 30;
       const groups = [];
       if (m.isActive) groups.push('active');
       if (m.isActive && m.firstStart && diffD(today, m.firstStart) >= 0 && diffD(today, m.firstStart) <= R.firstMonthDays) groups.push('first_month');
       if (m.isActive && !openEnded && curEnd && diffD(curEnd, today) <= R.expiringDays && !renewed) groups.push('expiring');
       if (expiredRecently) groups.push('expired');
       if (m.isActive && snap.src.attendance?.ok && m.freeze !== 'frozen') {
-        if (m.daysAbsent === null ? !m.neverAttended : m.daysAbsent >= R.absentDays) groups.push('absent');
+        if (m.daysAbsent === null ? !notStarted : m.daysAbsent >= R.absentDays) groups.push('absent');
         const last14 = m.checkins.filter(dd => dd > addD(today, -14)).length, prev14 = m.checkins.filter(dd => dd <= addD(today, -14) && dd > addD(today, -28)).length;
         if (prev14 >= 2 && last14 < prev14 * R.declineRatio && !groups.includes('absent')) groups.push('declining');
-        if (m.neverAttended) groups.push('not_started');
+        if (notStarted) groups.push('not_started');
       }
       if (m.freeze === 'frozen') groups.push('frozen');
       const oc = m.phone ? (openCases.get(m.phone) ?? []) : [], ot = m.phone ? (openTasks.get(m.phone) ?? []) : [];
@@ -110,7 +113,7 @@ function createMembersBoard(d) {
     const groups = [
       G('active', 'מנויים פעילים', 'שורת לקוח פעילה ב-Arbox עם מנוי שתחילתו עברה וסיומו לא עבר, שלא בוטל.', ['users', 'memberships', 'types']),
       G('first_month', 'בחודש הראשון', `מנוי פעיל שהמנוי הראשון שלו התחיל ב-${R.firstMonthDays} הימים האחרונים.`, ['users', 'memberships', 'types'], { provisional: 'firstMonthDays' }),
-      G('not_started', 'מנוי חדש שלא הגיע לאימון', 'מנוי פעיל שהתחיל ב-30 הימים האחרונים ואין לו אף כניסה רשומה.', ['users', 'memberships', 'attendance']),
+      G('not_started', 'מנוי חדש שלא הגיע לאימון', 'מנוי פעיל שהמנוי הראשון שלו התחיל ב-30 הימים האחרונים ואין לו אף כניסה רשומה. מנוי ותיק שחידש ולא הגיע מופיע ב"נעדרים".', ['users', 'memberships', 'attendance']),
       G('expiring', 'מנוי עומד להסתיים', `מנוי פעיל עם תאריך סיום בתוך ${R.expiringDays} ימים, שאין אחריו מנוי נוסף. מנוי בלי תאריך סיום (מתחדש) אינו נכלל.`, ['users', 'memberships', 'types'], { provisional: 'expiringDays' }),
       G('expired', 'מנוי שהסתיים לאחרונה', `אין מנוי בתוקף, והמנוי האחרון הסתיים ב-${R.expiredDays} הימים האחרונים.`, ['users', 'memberships', 'types'], { provisional: 'expiredDays' }),
       G('absent', 'נעדרים', `מנוי פעיל, לא בהקפאה, שהכניסה האחרונה שלו הייתה לפני ${R.absentDays} ימים או יותר (או שאין כניסה ב-30 הימים האחרונים).`, ['users', 'memberships', 'attendance'], { provisional: 'absentDays' }),
@@ -120,7 +123,7 @@ function createMembersBoard(d) {
         fetchedAt: now().toISOString(), state: 'ok', error: null, count: rows.filter(r => r.groups.includes('open_requests')).length, provisional: null, unit: 'מנויים' },
     ];
     return { ok: true, state: 'ok', today, generatedAt: now().toISOString(), sources: snap.src, groups, members: rows,
-      notes: ['יתרת כניסות אינה חלק מרשימת המנויים ש-Arbox מחזיר. היא מוצגת בכרטיס הלקוח, לפי הרישום האחרון שלו ב-Arbox.', 'נוכחות: 30 הימים האחרונים. רישומים קרובים: 7 הימים הבאים.',
+      notes: ['הלוח כולל לקוחות עם מנוי ישיר בסטודיו. חברי מועדון דרך גורם חיצוני ואנשי צוות אינם נכללים בו.', 'יתרת כניסות אינה חלק מרשימת המנויים ש-Arbox מחזיר. היא מוצגת בכרטיס הלקוח, לפי הרישום האחרון שלו ב-Arbox.', 'נוכחות: 30 הימים האחרונים. רישומים קרובים: 7 הימים הבאים.',
               snap.freeze?.sourceConfirmed ? null : 'מקור ההקפאות (דוח ההקפאות של Arbox) עדיין לא אושר מול Arbox — מנוי שאינו בדוח מוצג כ"הקפאה לא אומתה".'].filter(Boolean),
       decisions: Object.values(RULES).filter(r => !r.approved).map(r => r.ask) };
   }

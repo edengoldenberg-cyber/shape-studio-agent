@@ -36,6 +36,7 @@ const MEMBERS = () => [
   member(9, 'ט בהקפאה', { freeze: 'frozen', checkins: [day(-25)] }),
   member(10, 'י לא התחילה', { memberships: [plan(day(-6), day(24))], checkins: [], neverAttended: true }),
   member(11, 'כ בלי מנוי', { memberships: [] }),
+  member(12, 'ל ותיקה שחידשה', { memberships: [plan(day(-300), day(-17), { active: false }), plan(day(-16), null)], firstStart: day(-300), checkins: [], neverAttended: true }),
 ];
 function world({ src = {}, members = MEMBERS(), cases = [], tasks = [] } = {}) {
   const snap = { today: TODAY, members, byId: new Map(members.map(m => [m.userId, m])), freeze: { sourceConfirmed: false },
@@ -50,11 +51,11 @@ describe('the board follows the source data and states its rules', () => {
   test('each group holds exactly the members its rule describes', async () => {
     const b = await world().board();
     expect(b.ok).toBe(true);
-    expect(inGroup(b, 'active')).toEqual(['א רגילה', 'ב חדשה', 'ג מסתיים', 'ד חידשה', 'ז נעדרת', 'ח יורדת', 'ט בהקפאה', 'י לא התחילה']);
+    expect(inGroup(b, 'active')).toEqual(['א רגילה', 'ב חדשה', 'ג מסתיים', 'ד חידשה', 'ז נעדרת', 'ח יורדת', 'ט בהקפאה', 'י לא התחילה', 'ל ותיקה שחידשה']);
     expect(inGroup(b, 'first_month')).toEqual(['ב חדשה', 'י לא התחילה']);
     expect(inGroup(b, 'expiring')).toEqual(['ג מסתיים']);                         // "ד חידשה" has a next membership: not expiring
     expect(inGroup(b, 'expired')).toEqual(['ה הסתיים']);                          // "ו מזמן" ended 90 days ago: not listed at all
-    expect(inGroup(b, 'absent')).toEqual(['ז נעדרת']);                            // the frozen member is not "absent"
+    expect(inGroup(b, 'absent')).toEqual(['ז נעדרת', 'ל ותיקה שחידשה']);          // the frozen member is not "absent"; a long-time member who renewed and did not come is absent, not "new"
     expect(inGroup(b, 'declining')).toEqual(['ח יורדת']);
     expect(inGroup(b, 'frozen')).toEqual(['ט בהקפאה']);
     expect(inGroup(b, 'not_started')).toEqual(['י לא התחילה']);
