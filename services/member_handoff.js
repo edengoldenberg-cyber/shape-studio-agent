@@ -51,6 +51,15 @@ const KIND_HE = { move: 'מעבר לשיעור אחר', book: 'רישום לשי
 const MOVE_RE = /(נרשמתי|רשומה?|שובצתי|משובצ(?:ת|ים)?|קבעתי|שיבצתי)[^.?!\n]{0,45}(רוצה|אפשר|מבקשת?|צריכה?|אשמח|מעדיפה?)[^.?!\n]{0,25}(לבוא|להגיע|לעבור|להחליף|לשנות|להעביר|במקום)/;
 const HE_HOUR = { 'אחת עשרה': 11, 'שתים עשרה': 12, 'שתיים עשרה': 12, 'אחת': 1, 'שתיים': 2, 'שתים': 2, 'שלוש': 3, 'ארבע': 4, 'חמש': 5, 'שש': 6, 'שבע': 7, 'שמונה': 8, 'תשע': 9, 'עשר': 10 };
 
+// A class type named in a message → how it appears in Arbox class names.
+const TYPE_HINTS = [
+  [/מכשירים|רפורמר|reformer/i, /מכשירים|reformer/i], [/(?<![א-ת])בר(?![א-ת])|barre/i, /(?<![א-ת])בר(?![א-ת])|barre/i],
+  [/(?<![א-ת])כו?ח(?![א-ת])|strength|סטרנג/i, /כח|כוח|strength/i], [/יוגה|yoga/i, /יוגה|yoga/i], [/קנגו|קאנגו|kangoo/i, /קנגו|קאנגו|kangoo/i],
+  [/טונינג|toning|חיטוב|עיצוב/i, /toning|טונינג|חיטוב|עיצוב/i], [/all\s*in|אול\s*אין/i, /all\s*in/i], [/פילאטיס|pilates/i, /פילאטיס|pilates/i],
+];
+const typeHint = text => TYPE_HINTS.find(([q]) => q.test(String(text ?? ''))) ?? null;
+const heList = a => (a.length <= 1 ? a.join('') : `${a.slice(0, -1).join(', ')} ו${/^[\dA-Za-z]/.test(a[a.length - 1]) ? '-' : ''}${a[a.length - 1]}`);
+
 function detect(text) {
   const t = String(text ?? '').trim();
   if (!t) return null;
@@ -157,7 +166,7 @@ function createMemberHandoff(deps) {
   }
 
   /** The facts of one class request, read from Arbox. Nothing is written. */
-  async function readFacts(phone, text, ref, fixedDate = null) {
+  async function readFacts(phone, text, ref, fixedDate = null, { membership = false } = {}) {
     const dt = extractDayAndTime(text, ref);
     const p = ilParts(ref);
     const day = dt.day ?? { year: p.year, month: p.month, day: p.day };
@@ -173,13 +182,18 @@ function createMemberHandoff(deps) {
       try { const r = await gateway.getBookings(f.member.userId, { from: date, to: date, fresh: true }); f.bookings = r.bookings; calls.push(`getBookings ${date} → ${r.bookings.length}`); }
       catch (err) { calls.push(`getBookings ${date} → error: ${err.message}`); }
     }
+    // a registration needs a valid membership: read for the staff (the member is not told membership details here)
+    if (f.member && membership && typeof gateway.getMemberships === 'function') {
+      try { const r = await gateway.getMemberships(f.member.userId); f.memberships = r.memberships.filter(m => m.active && !m.cancelled && (!m.startDate || m.startDate <= date) && (!m.endDate || m.endDate >= date)); calls.push(`getMemberships → ${f.memberships.length} בתוקף ב-${date}`); }
+      catch (err) { f.memberships = null; calls.push(`getMemberships → error: ${err.message}`); }
+    }
     try { const r = await gateway.getClasses({ from: date, to: date }); f.classes = r.classes; f.occupancyAvailable = r.occupancyAvailable; calls.push(`getClasses ${date} → ${r.classes.length}${r.occupancyAvailable ? '' : ' (occupancy unavailable)'}`); }
     catch (err) { calls.push(`getClasses ${date} → error: ${err.message}`); }
     return f;
   }
 
   /** Which class she is in, and which one she asks for — from the hours in the message and what Arbox shows. */
-  function resolveRequest(kind, text, f) {
+  function resolveRequest(kind, text, f, latest = null) {
     const hrs = hoursIn(text);
     const bookStarts = (f.bookings ?? []).map(b => b.time), classStarts = (f.classes ?? []).map(c => c.start);
     let current = null, target = null;
@@ -193,7 +207,25 @@ function createMemberHandoff(deps) {
     if (kind === 'move' || kind === 'book') {
       const rest = hrs.filter(h => !current || !(matchHour(h, bookStarts.length ? bookStarts : classStarts).h === current.h && h.min === current.min));
       const pick = kind === 'move' ? rest[rest.length - 1] : hrs[hrs.length - 1];
-      if (pick) { const m = matchHour(pick, classStarts); target = { ...m, cls: (f.classes ?? []).find(c => startsAt(c.start, m.h, m.min)) ?? null }; }
+      if (kind === 'move') { if (pick) { const m = matchHour(pick, classStarts); target = { ...m, cls: (f.classes ?? []).find(c => startsAt(c.start, m.h, m.min)) ?? null }; } }
+      else {
+        // A registration names a class by its hour and, when several start together, by its type. The newest message
+        // wins for each detail; the other detail is kept from what was written before (the day is read from all of it).
+        const all = f.classes ?? [];
+        const lastHrs = latest ? hoursIn(latest) : [];
+        const hr = lastHrs.length ? lastHrs[lastHrs.length - 1] : pick;
+        const hint = (latest ? typeHint(latest) : null) ?? typeHint(text);
+        const ofType = hint ? all.filter(c => hint[1].test(c.name)) : [];
+        if (hr) {
+          const m = matchHour(hr, (ofType.length ? ofType : all).map(c => c.start));
+          const atHour = all.filter(c => startsAt(c.start, m.h, m.min));
+          const cands = hint ? atHour.filter(c => hint[1].test(c.name)) : atHour;
+          target = { ...m, cls: cands.length === 1 ? cands[0] : null, options: cands.length > 1 ? cands : null, atHour, ofType, typed: !!hint };
+          if (f.classes !== null && cands.length !== 1) return { current, target, missing: cands.length > 1 ? 'target_type' : 'target_class' };
+        } else if (hint && ofType.length === 1) {
+          const c = ofType[0]; target = { h: Number(c.start.slice(0, 2)), min: Number(c.start.slice(3, 5)), matched: true, cls: c, options: null, atHour: [c], ofType, typed: true };
+        } else if (hint && f.classes !== null) return { current, target: null, missing: 'target_time', ofType, typed: true };
+      }
     }
     return { current, target, missing: (kind === 'move' || kind === 'book') && !target ? 'target_time' : (kind === 'cancel' && !current && (f.bookings ?? []).length !== 1 ? 'which_class' : null) };
   }
@@ -247,13 +279,14 @@ function createMemberHandoff(deps) {
     }
     if (!answeredPending) pc = null;
     // the answer to "לאיזו שעה לעבור?" — an hour, within the hour after the question
-    if (!kind && existing?.missing && now().getTime() - new Date(existing.updatedAt).getTime() <= FOLLOWUP_MS && hoursIn(text).length) kind = existing.kind;
+    // (or the class type, when that was the missing detail: "כוח")
+    if (!kind && existing?.missing && now().getTime() - new Date(existing.updatedAt).getTime() <= FOLLOWUP_MS && (hoursIn(text).length || (existing.kind === 'book' && typeHint(text)))) kind = existing.kind;
     if (!kind) return null;
     if (existing && existing.kind !== kind && !existing.missing) existing = null;
 
     const fullText = pc ? existing.memberMessage : existing?.missing ? `${existing.memberMessage} ${text}` : text;
-    const f = await readFacts(phone, fullText, ref, pc?.date ?? null);
-    const rq = pc ? fromPending(pc, f) : resolveRequest(kind, fullText, f);
+    const f = await readFacts(phone, fullText, ref, pc?.date ?? null, { membership: kind === 'book' });
+    const rq = pc ? fromPending(pc, f) : resolveRequest(kind, fullText, f, existing?.missing ? text : null);
     const who = name ?? f.member?.name ?? local(phone);
     const dTxt = dayText(f, ref);
 
@@ -264,9 +297,32 @@ function createMemberHandoff(deps) {
     if (f.bookings === null) { facts.push('הרישומים של המתאמנ/ת לא נקראו מ-Arbox'); if (kind !== 'book') lines.push('לא הצלחתי לבדוק כרגע את הרישום שלך ב-Arbox.'); }
     else if (cur?.booking) { facts.push(`רישום קיים (Arbox): ${cur.booking.className ?? 'שיעור'} ${cur.booking.time.slice(0, 5)} ${f.date}`); lines.push(`בדקתי ב-Arbox: יש לך רישום ל${cur.booking.className ?? 'שיעור'} ב-${cur.booking.time.slice(0, 5)} ${dTxt}.`); }
     else if (kind !== 'book') { facts.push(`לא נמצא ב-Arbox רישום ${cur ? `ב-${hhmm(cur.h, cur.min)} ` : ''}${f.date}${f.bookings.length ? ` (רישומים באותו יום: ${f.bookings.map(b => b.time.slice(0, 5)).join(', ')})` : ''}`); lines.push(`בדקתי ב-Arbox ולא מצאתי רישום שלך ${cur ? `ב-${hhmm(cur.h, cur.min)} ` : ''}${dTxt}.`); }
+    if (kind === 'book' && f.member && f.memberships !== undefined) facts.push(f.memberships === null ? 'המנוי לא נקרא מ-Arbox' : f.memberships.length ? `מנוי בתוקף (Arbox): ${f.memberships.map(m => m.name).filter(Boolean).join(', ') || 'כן'}` : `לא נמצא ב-Arbox מנוי בתוקף ל-${f.date}`);
+    // classes of the day that have not started yet (for telling the member what there is)
+    const nowHm = (() => { const p = ilParts(ref); return f.date === ilDateString(p) ? hhmm(p.hour, p.minute) : '00:00'; })();
+    const ahead = list => (list ?? []).filter(c => String(c.start).slice(0, 5) > nowHm);
+    const uniq = a => [...new Set(a)];
+    if (!tgt && rq.missing === 'target_time' && rq.typed) {
+      const hrsOf = uniq(ahead(rq.ofType).map(c => c.start.slice(0, 5)));
+      const nm = rq.ofType[0]?.name ?? 'שיעור כזה';
+      facts.push(hrsOf.length ? `${nm} ${f.date}: ${hrsOf.join(', ')}` : `לא נמצא ב-Arbox שיעור מהסוג המבוקש ${f.date}`);
+      lines.push(hrsOf.length ? `${nm} יש ${dTxt} ב-${heList(hrsOf)}.` : `לא מצאתי ב-Arbox שיעור כזה ${dTxt}.`);
+    }
     if (tgt) {
       const t = hhmm(tgt.h, tgt.min);
       if (f.classes === null) { facts.push(`מערכת השיעורים לא נקראה מ-Arbox; שעה מבוקשת ${t}`); lines.push(`את השיעור של ${t} לא הצלחתי לבדוק כרגע ב-Arbox.`); }
+      else if (tgt.options) {
+        const names = uniq(tgt.options.map(c => c.name));
+        facts.push(`ב-${t} ${f.date} יש ב-Arbox כמה שיעורים: ${names.join(', ')}`);
+        lines.push(`ב-${t} ${dTxt} יש ${heList(names)}.`);
+      }
+      else if (!tgt.cls && kind === 'book' && tgt.typed) {
+        const nm = tgt.ofType[0]?.name ?? 'שיעור כזה', hrsOf = uniq(ahead(tgt.ofType).map(c => c.start.slice(0, 5))), here = uniq(ahead(tgt.atHour).map(c => c.name));
+        facts.push(`לא נמצא ב-Arbox ${nm} ב-${t} ${f.date}${hrsOf.length ? ` (${nm} באותו יום: ${hrsOf.join(', ')})` : ''}${here.length ? ` (ב-${t}: ${here.join(', ')})` : ''}`);
+        lines.push(`לא מצאתי ב-Arbox ${nm} ב-${t} ${dTxt}.`);
+        if (hrsOf.length) lines.push(`${nm} יש ${dTxt} ב-${heList(hrsOf)}.`);
+        if (here.length) lines.push(`ב-${t} יש ${heList(here)}.`);
+      }
       else if (!tgt.cls) { facts.push(`לא נמצא ב-Arbox שיעור ב-${t} ${f.date}`); lines.push(`לא מצאתי ב-Arbox שיעור ב-${t} ${dTxt}.`); }
       else {
         const o = tgt.cls.occupancy;
@@ -275,7 +331,7 @@ function createMemberHandoff(deps) {
           : `ב-${t} יש ${tgt.cls.name}; את מספר המקומות הפנויים לא הצלחתי לבדוק.`);
       }
     }
-    const want = kind === 'move' ? `מעבר ${cur ? `מ-${hhmm(cur.h, cur.min)} ` : ''}${tgt ? `ל-${hhmm(tgt.h, tgt.min)} ` : ''}${dTxt}` : kind === 'book' ? `רישום ${tgt ? `ל-${hhmm(tgt.h, tgt.min)} ` : ''}${dTxt}`
+    const want = kind === 'move' ? `מעבר ${cur ? `מ-${hhmm(cur.h, cur.min)} ` : ''}${tgt ? `ל-${hhmm(tgt.h, tgt.min)} ` : ''}${dTxt}` : kind === 'book' ? `רישום ${tgt?.cls ? `ל${tgt.cls.name} ב-${hhmm(tgt.h, tgt.min)} ` : tgt ? `ל-${hhmm(tgt.h, tgt.min)} ` : ''}${dTxt}`
       : kind === 'cancel' ? `ביטול הרישום ${cur ? `של ${hhmm(cur.h, cur.min)} ` : ''}${dTxt}` : 'שינוי בשיבוץ הקבוע';
 
     // ── do it in Arbox, when this system is permitted to (services/class_actions.js; off unless explicitly enabled) ──
@@ -348,7 +404,7 @@ function createMemberHandoff(deps) {
       : action?.plan && !action.plan.ok && !NO_PERMISSION.has(action.plan.reason) ? `לא בוצע אוטומטית: ${action.plan.text}` : BLOCK_REASON;
 
     // ── ONE durable task ────────────────────────────────────────────────────
-    const detail = [`בקשה: ${want}`, ...facts, ...actionLines, rq.missing ? `חסר: ${rq.missing === 'target_time' ? 'שעת היעד — המתאמנ/ת נשאל/ה' : 'איזה שיעור — המתאמנ/ת נשאל/ה'}` : null,
+    const detail = [`בקשה: ${want}`, ...facts, ...actionLines, rq.missing ? `חסר: ${rq.missing === 'target_time' ? 'שעת היעד — המתאמנ/ת נשאל/ה' : rq.missing === 'target_type' ? 'סוג השיעור (כמה שיעורים באותה שעה) — המתאמנ/ת נשאל/ה' : rq.missing === 'target_class' ? 'אין ב-Arbox שיעור כזה בשעה שנכתבה — המתאמנ/ת נשאל/ה לאיזה שיעור' : 'איזה שיעור — המתאמנ/ת נשאל/ה'}` : null,
       `למה זה אצל הצוות: ${whyStaff}`, `קריאות Arbox (קריאה בלבד): ${f.calls.join(' · ')}`].filter(Boolean).join('\n');
     let task, isNew = false;
     const wasMissing = existing?.missing ?? null;            // read before the task object is updated in place
@@ -373,6 +429,8 @@ function createMemberHandoff(deps) {
     // ── the member: only what is true ───────────────────────────────────────
     let replyText;
     if (rq.missing === 'target_time') replyText = `קיבלתי 🙏 ${lines.join(' ')} לאיזו שעה ${kind === 'move' ? 'לעבור' : 'לרשום אותך'}?`.replace(/\s+/g, ' ');
+    else if (rq.missing === 'target_type') replyText = `קיבלתי 🙏 ${lines.join(' ')} לאיזה מהם לרשום אותך?`.replace(/\s+/g, ' ');
+    else if (rq.missing === 'target_class') replyText = `${lines.join(' ')} לאיזה שיעור לרשום אותך? (סוג ושעה) עדיין לא נרשמת לשום שיעור.`.replace(/\s+/g, ' ');
     else if (rq.missing === 'which_class') replyText = `קיבלתי 🙏 ${lines.join(' ')} איזה שיעור לבטל? (יום ושעה)`.replace(/\s+/g, ' ');
     else if (res?.state === 'holds_both') replyText = [`רשמתי אותך ל${tgt.cls.name} ב-${hhmm(tgt.h, tgt.min)} ${dTxt}, ואימתתי את זה מול Arbox ✅`,
       `את הרישום ל-${hhmm(cur.h, cur.min)} לא הצלחתי לבטל, אז כרגע יש לך רישום לשני השיעורים.`, alert?.state === 'sent' ? `העברתי לצוות כדי שיבטלו את ${hhmm(cur.h, cur.min)}.` : `רשמתי לצוות לבטל את ${hhmm(cur.h, cur.min)}.`].join('\n');

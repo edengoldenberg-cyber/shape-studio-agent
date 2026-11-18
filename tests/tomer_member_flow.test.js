@@ -430,7 +430,7 @@ describe('C. Classes: a request to book / cancel / move goes to the class flow (
   test('booking while Arbox writes are off: facts from Arbox, ONE staff task and ONE alert, the member is not told she is booked', async () => {
     const m = member();
     await say(m.phone, 'תרשמי אותי למחר ב-9 לפילאטיס');
-    expect(lastTo(m.phone)).toMatch(/קיבלתי את הבקשה: רישום ל-09:00/);
+    expect(lastTo(m.phone)).toMatch(/קיבלתי את הבקשה: רישום לפילאטיס מכשירים ב-09:00/);   // since 2026-11-18 the request names the class, not only the hour
     expect(lastTo(m.phone)).toMatch(/3 מקומות פנויים/);
     expect(lastTo(m.phone)).toMatch(/העברתי את הבקשה לצוות/);
     expect(lastTo(m.phone)).toMatch(/עדיין לא נרשמת/);
@@ -455,7 +455,7 @@ describe('C. Classes: a request to book / cancel / move goes to the class flow (
     await say(m.phone, 'תרשמי אותי לפילאטיס מחר');
     expect(lastTo(m.phone)).toMatch(/לאיזו שעה לרשום אותך\?/);
     await say(m.phone, 'ב-9');
-    expect(lastTo(m.phone)).toMatch(/רישום ל-09:00/);
+    expect(lastTo(m.phone)).toMatch(/רישום לפילאטיס מכשירים ב-09:00/);
     const tasks = (await get('/api/tomer/tasks')).body.tasks.filter(t => t.phone === m.phone && t.type === 'class_change');
     expect(tasks).toHaveLength(1);
   });

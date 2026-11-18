@@ -438,3 +438,113 @@ describe('Members, leads, live availability and the management screens', () => {
     expect(cases.find(c => `case:${c.id}` === key).status).toBe('resolved');        // the owner's word is recorded on the case too
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Live test on production, 2026-11-18 11:35, from the owner's Arbox test member:
+//   1. "היי אני רוצה להשתבץ לשיעור היום בשעה 18"  → Tomer asked "שיעור, מנוי, תשלום או משהו אחר?"
+//   2. "אני רוצה להשתבץ לאימון כוח בשעה 18"       → "מצטער על התקלה", the app, an "app problem" case
+// Cause: "להשתבץ" was not a registration verb, so the class flow never ran (nothing was read from Arbox); the second
+// message was filed as an app problem because it held the word "אימון". The schedule below is that day's: at 18:00
+// there are ALL IN and Pilates Barre (full); strength is at 17:00, 19:00 and 20:00.
+describe('A registration request in two messages (live failure 2026-11-18)', () => {
+  const P = '972507120001';
+  const tasksOf = p => require('../utils/tomer_store').getTasks({ phone: p, type: 'class_change' });
+  const casesOf = p => { try { return JSON.parse(fs.readFileSync(CASES_FILE, 'utf8')).cases.filter(c => c.phone === p); } catch { return []; } };
+  const reads = re => arbox.log.filter(l => l.method === 'GET' && re.test(l.path)).length;
+  const cls = (id, start, name, registered, cap) => ({ schedule_id: id, date: day(0), start_time: start, end_time: `${String(Number(start.slice(0, 2)) + 1).padStart(2, '0')}:00`, session_name: name, staff_member: { name: 'מירי כהן' }, max_participants: cap, registration_count: registered });
+  function setup(phone = P) {
+    world();
+    for (const t of tasksOf(phone)) require('../utils/tomer_store').resolveTask(t.id, { resolutionNote: 'test reset', resolvedBy: 'test' });
+    const id = person({ phone: '0' + phone.slice(3), first: 'בדיקה' });
+    plan(id, { start: day(0), end: null });
+    arbox.state.schedule.push(cls(21, '17:00', 'אימון כח', 5, 10), cls(22, '18:00', 'ALL IN', 3, 10), cls(23, '18:00', 'פילאטיס בר', 8, 8), cls(24, '19:00', 'אימון כח', 5, 10), cls(25, '20:00', 'אימון כח', 0, 10));
+    return id;
+  }
+  const last = p => textsTo(p).at(-1) ?? '';
+
+  test('message 1 is a registration request: the class at 18:00 is read from Arbox and only the missing detail (the type) is asked', async () => {
+    setup();
+    const r = await say(P, 'היי אני רוצה להשתבץ לשיעור היום בשעה 18');
+    expect(r.route).toMatch(/^tomer/);
+    expect(last(P)).toMatch(/ב-18:00 היום יש ALL IN ופילאטיס בר\. לאיזה מהם לרשום אותך\?/);
+    expect(last(P)).not.toMatch(/שיעור, מנוי, תשלום|תקלה|אפליקצי/);
+    expect(reads(/\/v3\/schedule/)).toBeGreaterThan(0);                            // the exact day was read
+    expect(tasksOf(P).filter(t => t.status === 'open')).toHaveLength(1);
+    expect(tasksOf(P)[0]).toMatchObject({ kind: 'book', missing: 'target_type' });
+    expect(casesOf(P)).toHaveLength(0);                                           // no "unknown request" case
+    expect(arbox.writes()).toHaveLength(0);
+  });
+
+  test('message 2 completes the SAME request with the day and hour kept; a class that does not exist is said so, with what there is — never a "fault", never the app', async () => {
+    setup();
+    await say(P, 'היי אני רוצה להשתבץ לשיעור היום בשעה 18');
+    const alertsAfter1 = mockOut.alerts.length;
+    await say(P, 'אני רוצה להשתבץ לאימון כוח בשעה 18');
+    const t = last(P);
+    expect(t).toMatch(/לא מצאתי ב-Arbox אימון כח ב-18:00 היום\./);
+    expect(t).toMatch(/אימון כח יש היום ב-17:00, 19:00 ו-20:00\./);
+    expect(t).toMatch(/ב-18:00 יש ALL IN ופילאטיס בר\./);
+    expect(t).toMatch(/לאיזה שיעור לרשום אותך\?.*עדיין לא נרשמת/);
+    expect(t).not.toMatch(/תקלה|אפליקצי|העברתי|רשמתי את הבקשה/);                    // nothing was handed over yet, and it is not claimed
+    const open = tasksOf(P).filter(x => x.status === 'open');
+    expect(open).toHaveLength(1);                                                 // one request, not two
+    expect(open[0]).toMatchObject({ kind: 'book', missing: 'target_class' });
+    expect(open[0].memberMessage).toMatch(/היום בשעה 18.*אימון כוח בשעה 18/s);
+    expect(casesOf(P)).toHaveLength(0);
+    expect(mockOut.alerts.length).toBe(alertsAfter1);                             // no second alert while a detail is still missing
+
+    // the member picks an existing class: the request is complete, handed to the staff, and said exactly so
+    await say(P, 'ב-19');
+    const done = last(P);
+    expect(done).toMatch(/קיבלתי את הבקשה: רישום לאימון כח ב-19:00 היום\./);
+    expect(done).toMatch(/ב-19:00 יש אימון כח, ונכון לעכשיו יש בו 5 מקומות פנויים\./);
+    expect(done).toMatch(/העברתי את הבקשה לצוות\./);
+    expect(done).toMatch(/עדיין לא נרשמת: הצוות יאשר לך כאן\./);
+    expect(done).not.toMatch(/תקלה|אפליקצי|מצטער/);
+    const fin = tasksOf(P).filter(x => x.status === 'open');
+    expect(fin).toHaveLength(1);
+    expect(fin[0]).toMatchObject({ kind: 'book', missing: null, alert: { state: 'sent' } });
+    expect(fin[0].detail).toMatch(/שיעור מבוקש \(Arbox\): אימון כח 19:00 .* 5\/10 רשומים, 5 פנויים/);
+    expect(fin[0].detail).toMatch(/מנוי בתוקף \(Arbox\): מנוי חודשי/);
+    const alert = mockOut.alerts.at(-1);
+    expect(alert.subject).toMatch(/תומר — עדכון: רישום לשיעור/);
+    expect(alert.body).toMatch(/בקשה: רישום לאימון כח ב-19:00 היום/);
+    expect(alert.body).toMatch(/לא בוצע שום שינוי ב-Arbox/);
+    expect(reads(/\/v3\/users\/memberships/)).toBeGreaterThan(0);
+    expect(reads(/bookingsReport/)).toBeGreaterThan(0);
+    expect(arbox.writes()).toHaveLength(0);                                       // Arbox writes are off: nothing was sent
+  });
+
+  test('a complete request in one message goes straight to the staff; the type alone is enough when it names one class', async () => {
+    setup('972507120002');
+    await say('972507120002', 'אני רוצה להשתבץ לאימון כוח היום בשעה 19');
+    expect(last('972507120002')).toMatch(/קיבלתי את הבקשה: רישום לאימון כח ב-19:00 היום\.[\s\S]*העברתי את הבקשה לצוות\.[\s\S]*עדיין לא נרשמת/);
+    expect(tasksOf('972507120002').filter(x => x.status === 'open')).toHaveLength(1);
+    setup('972507120003');
+    await say('972507120003', 'אני רוצה להשתבץ לשיעור היום בשעה 18');
+    await say('972507120003', 'ALL IN');                                           // the answer to "לאיזה מהם?"
+    expect(last('972507120003')).toMatch(/קיבלתי את הבקשה: רישום לALL IN ב-18:00 היום\.[\s\S]*העברתי את הבקשה לצוות/);
+    expect(tasksOf('972507120003').filter(x => x.status === 'open')).toHaveLength(1);
+  });
+
+  test('the staff were NOT reached: the member is told the request is recorded, not that it was passed on', async () => {
+    setup('972507120004');
+    require('../services/whatsapp.service').alertOwner.mockImplementation(() => Promise.resolve({ sent: 0, results: [{ phone: MANAGER, skipped: false, idMessage: null, error: 'provider refused' }] }));
+    await say('972507120004', 'אני רוצה להשתבץ לאימון כוח היום בשעה 19');
+    const t = last('972507120004');
+    expect(t).toMatch(/רשמתי את הבקשה לטיפול הצוות\./);
+    expect(t).not.toMatch(/העברתי/);
+    expect(t).toMatch(/עדיין לא נרשמת/);
+    expect(tasksOf('972507120004').find(x => x.status === 'open')).toMatchObject({ alert: { state: 'failed', error: 'provider refused' } });
+  });
+
+  test('after "במה מדובר?" a class word is a topic, not a fault: no "מצטער על התקלה", no app-problem case', async () => {
+    setup('972507120005');
+    await say('972507120005', 'אפשר עזרה בבקשה');
+    expect(last('972507120005')).toMatch(/שיעור, מנוי, תשלום או משהו אחר/);
+    await say('972507120005', 'שיעור');
+    expect(last('972507120005')).toMatch(/רשמתי פנייה לצוות עם מה שכתבת\. שום רישום לא השתנה\./);
+    expect(last('972507120005')).not.toMatch(/תקלה|אפליקצי/);
+    expect(casesOf('972507120005').map(c => c.category)).toEqual(['general_request']);
+  });
+});

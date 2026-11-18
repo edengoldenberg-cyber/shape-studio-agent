@@ -621,7 +621,7 @@ function createTomerService(deps) {
 
   async function hCase(ctx, category, opts = {}) {
     const { case: c, isNew } = await openCase(ctx, category, opts);
-    await say(ctx.phone, isNew ? CASE_REPLY[category] : FOLLOWUP_REPLY, { handler: 'case', trigger: ctx.category, caseId: c.id, name: ctx.name });
+    await say(ctx.phone, isNew ? (opts.reply ?? CASE_REPLY[category]) : FOLLOWUP_REPLY, { handler: 'case', trigger: ctx.category, caseId: c.id, name: ctx.name });
     if (isNew && category === 'staff_request') cases.setConv(ctx.phone, 'callback_details', { caseId: c.id }, 45);
     return R(isNew ? 'case_opened' : 'case_updated', { caseId: c.id });
   }
@@ -745,9 +745,12 @@ function createTomerService(deps) {
         if (strong) return null;                               // the new message classifies on its own
         if (cls.category === 'social') return R('silent');
         const merged = classify(`${conv.data.original} ${ctx.text}`);
-        const hint = /שיעור|אימון/.test(ctx.text) ? 'app_problem' : /מנוי/.test(ctx.text) ? 'general_request' : /תשלום|חיוב|כסף/.test(ctx.text) ? 'billing_question' : null;
+        // a class word is a topic, not a fault: it used to open an "app problem" case answered with "מצטער על התקלה"
+        const classTopic = /שיעור|אימון/.test(ctx.text);
+        const hint = classTopic ? 'general_request' : /מנוי/.test(ctx.text) ? 'general_request' : /תשלום|חיוב|כסף/.test(ctx.text) ? 'billing_question' : null;
         const cat = (!NO_REPLY.has(merged.category) && !['unknown_request', 'general_question'].includes(merged.category) && CATEGORY[merged.category]) ? merged.category : (hint ?? 'general_request');
-        return hCase({ ...ctx, text: `${conv.data.original}\n${ctx.text}` }, cat);
+        return hCase({ ...ctx, text: `${conv.data.original}\n${ctx.text}` }, cat, classTopic && cat === 'general_request'
+          ? { summary: 'בקשה בנושא שיעור — לא זוהתה פעולה מדויקת', reply: 'קיבלתי. לא הצלחתי להבין בדיוק מה לעשות עם השיעור, אז רשמתי פנייה לצוות עם מה שכתבת. שום רישום לא השתנה.' } : {});
       }
       default: return null;
     }
