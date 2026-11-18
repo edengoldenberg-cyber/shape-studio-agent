@@ -166,7 +166,25 @@ const quietQueue = [];
  * Send a plain text WhatsApp message.
  * Automatically queues if quiet hours are active.
  */
+// The same text to the same number twice within a few seconds is one reply sent twice - by two routes answering the
+// same message, by a retry, or by the same message handled in parallel (production 2026-11-18 21:09: the location went
+// out twice, one second apart). The second one is not sent. The mark is set BEFORE the first send is awaited, so two
+// calls that run at the same moment are covered. A new request for the same content a little later is not affected.
+const DUP_SEND_WINDOW_MS = 20 * 1000;
+const _recentSends = new Map();
+function _isRepeatSend(to, text, now = Date.now()) {
+  for (const [k, ts] of _recentSends) if (now - ts > DUP_SEND_WINDOW_MS) _recentSends.delete(k);
+  const key = `${to} ${text}`;
+  if (_recentSends.has(key)) return true;
+  _recentSends.set(key, now);
+  return false;
+}
+
 async function sendText(to, text, { bypassQuietHours = false, linkPreview = true } = {}) {
+  if (_isRepeatSend(String(to), String(text))) {
+    logger.warn('[whatsapp] the same text to the same number within seconds - the repeat was not sent', { to, chars: String(text).length });
+    return { duplicate: true, idMessage: null };
+  }
   if (!bypassQuietHours && isQuietHours()) {
     logger.info('Quiet hours active — queuing message', { to });
     quietQueue.push({ to, text, queuedAt: new Date() });
@@ -819,4 +837,4 @@ async function ensureOutgoingWebhooks() {
   }
 }
 
-module.exports = { sendText, sendFileByUrl, alertOwner, notifyLeadTeam, releaseQueuedMessages, verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, probeGreenApiConnection, ensureOutgoingWebhooks, getGreenCreds, _tokenSourceVar, getTestSendLog, clearTestSendLog };
+module.exports = { _isRepeatSend, DUP_SEND_WINDOW_MS, sendText, sendFileByUrl, alertOwner, notifyLeadTeam, releaseQueuedMessages, verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, probeGreenApiConnection, ensureOutgoingWebhooks, getGreenCreds, _tokenSourceVar, getTestSendLog, clearTestSendLog };

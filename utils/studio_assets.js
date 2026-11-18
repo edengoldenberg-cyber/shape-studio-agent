@@ -47,11 +47,24 @@ function atomicWrite(filePath, data) {
  * Returns the current assets merged over defaults.
  * Reads from disk on every call so dashboard edits take effect immediately.
  */
+/**
+ * A link whose Hebrew was lost on the way (saved through a channel that was not UTF-8): the letters arrive as "?" or as
+ * the replacement character. Production held "q=???+????+12,+????+???-?????" from 2026-11-10 to 2026-11-18 and sent it
+ * to leads. Such a value is never used and never saved.
+ */
+function damagedUrl(v) {
+  const s = String(v ?? '');
+  if (!s) return false;
+  const q = s.indexOf('?');
+  return /\uFFFD/.test(s) || (q >= 0 && /\?/.test(s.slice(q + 1)));
+}
+
 function getAssets() {
   try {
     const raw = JSON.parse(fs.readFileSync(FILE, 'utf8'));
     const merged = { ...DEFAULTS };
     for (const [k, v] of Object.entries(raw)) {
+      if (/Url$/.test(k) && typeof v === 'string' && damagedUrl(v)) { logger.warn('[studio-assets] a stored link is damaged (lost encoding) - the default is used', { key: k }); continue; }
       // Booleans always win; strings only override when non-empty
       if (typeof v === 'boolean') { merged[k] = v; }
       else if (v !== '' && v !== null && v !== undefined) { merged[k] = v; }
@@ -68,6 +81,7 @@ function getAssets() {
  * Never overwrites timetableImageUploaded/timetableImageExt set by saveTimetableImage.
  */
 function saveAssets(data) {
+  for (const k of ['wazeUrl', 'timetableUrl']) if (damagedUrl(data?.[k])) throw new Error(`${k}: the link arrived damaged (its letters were lost) - nothing was saved`);
   const current = getAssets();
   const toSave  = {
     ...current,
@@ -173,7 +187,7 @@ function getTimetable2ImagePath() {
 
 module.exports = {
   DATA_DIR,  // exported so server.js startup log can verify it matches persist.DATA_DIR
-  getAssets, saveAssets,
+  getAssets, saveAssets, damagedUrl,
   saveTimetableImage,  getTimetableImagePath,
   saveTimetable2Image, getTimetable2ImagePath,
   DATA_DIR,

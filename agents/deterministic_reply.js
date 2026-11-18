@@ -27,6 +27,8 @@ const WAZE_REQUEST_RE = new RegExp(
     '^כתובת\\b', '^ניווט\\b', '^וויז\\b', '^waze\\b',
     // Address requests
     'מה.*כתובת', 'שלח.*כתובת', 'שלחי.*כתובת', 'כתובת.*הסטודיו',
+    // An explicit request to send it again ("אפשר לשלוח שוב את הכתובת?", "תשלח שוב מיקום")
+    'לשלוח.*(?:כתובת|מיקום)', 'שוב.*(?:כתובת|מיקום|ניווט)', '(?:כתובת|מיקום|ניווט).*שוב',
     // Navigation with studio context (require context word to avoid bare ניווט false positives)
     'ניווט.*(?:אליכם|לסטודיו|שלכם|אליכן)',
     // Waze brand name (anchored with word boundary)

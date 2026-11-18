@@ -9,7 +9,7 @@ const { sendText, alertOwner } = require('../services/whatsapp.service');
 const pricing = require('../utils/pricing');
 const salesRefusal = require('../utils/sales_refusal');
 const _aiFailureAlertAt = new Map();   // lead phone → when the manager was last told that the automatic reply failed
-const { tryDeterministicWazeReply, tryDeterministicScheduleReply } = require('./deterministic_reply');
+const { tryDeterministicWazeReply, tryDeterministicScheduleReply, WAZE_REQUEST_RE } = require('./deterministic_reply');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const studioAssets  = require('../utils/studio_assets');
@@ -243,8 +243,16 @@ function postProcessReply(reply, qualData, assets, ctx = {}) {
   //    Uses a literal string replacement via a replacer function to avoid $-sequence
   //    interpretation in the replacement string (e.g. a wazeUrl containing $1 or $&).
   const addressPresent  = /דרך השדה 12|פרדס חנה/.test(out);
+  // The location link goes out once, in answer to the request for the location. Later in the conversation it is not
+  // attached again by itself (a mention of the town is enough to trigger the injection below) and a link the model
+  // volunteers is removed; an explicit request to send it again is answered (deterministic_reply.js, before the model).
+  const _locAsked = WAZE_REQUEST_RE.test(String(ctx.userText ?? ''));
+  if (ctx.wazeAlreadySent && !_locAsked && /waze\.com|waze:\/\//.test(out)) {
+    out = out.split('\n').filter(l => !/waze\.com|waze:\/\//.test(l)).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    ppChanges.push('waze_repeat_removed');
+  }
   const wazeLinkPresent = /waze\.com|waze:\/\//.test(out);
-  if (addressPresent && !wazeLinkPresent && assets?.wazeUrl) {
+  if (addressPresent && !wazeLinkPresent && assets?.wazeUrl && !(ctx.wazeAlreadySent && !_locAsked)) {
     if (/דרך השדה 12/.test(out)) {
       // Insert link on a new line immediately after the street address occurrence.
       // The replacer function avoids $-sequence interpretation entirely.
@@ -1440,7 +1448,9 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
     store.upsertLead(from, _protDet ? { score } : { score, status });
     store.logEvent('score_update', from, { score, status });
     logger.info('[lead_agent] Score (deterministic)', { from, score, status });
-    return { reply: deterministicResult.reply, score, status };
+    // sendState tells the pipeline that this reply has already gone out. Without it the pipeline sent the same text
+    // again as its own automatic reply (production 2026-11-18 21:09: the location was sent twice, 1 second apart).
+    return { reply: deterministicResult.reply, score, status, sendState: 'sent' };
   }
 
   const turnSystemPrompt = buildTurnSystemPrompt(completedTurns, freshQualData, name, from, msgCount)
@@ -1492,7 +1502,8 @@ async function handleInbound({ from, name, text, _pendingMessages: pendingMap = 
     const _openCb = aptStore.getActiveCallback(from);
     const hasPersistedCallback = !!_openCb && _openCb.scheduledAt instanceof Date
       && !isNaN(_openCb.scheduledAt.getTime()) && _openCb.scheduledAt.getTime() > Date.now();
-    reply = postProcessReply(reply, freshQualData, assets, { hasPersistedCallback, userText: text });
+    reply = postProcessReply(reply, freshQualData, assets, { hasPersistedCallback, userText: text,
+      wazeAlreadySent: history.some(m => m.role === 'assistant' && /waze\.com|waze:\/\//.test(String(m.content ?? ''))) });
     // Prices come from the approved source only, and a membership question is not answered with the trial offer.
     const _pg = pricing.guard(text, reply, { callbackArranged: hasPersistedCallback });
     if (_pg.changed) {

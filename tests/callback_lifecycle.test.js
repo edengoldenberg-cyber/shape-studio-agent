@@ -1821,3 +1821,149 @@ describe('13. Refusal, "do not call", ownership and history — acceptance', () 
     expect(src('utils/pricing.js')).toEqual([]);
   });
 });
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Production, 2026-11-18 21:08–21:10 (a lead from Pardes Hanna). What went wrong, message by message:
+//   • the location was sent TWICE, one second apart: the agent's fixed location reply went out, and - because the agent
+//     did not report it as sent - the pipeline sent the same text again as its own automatic reply;
+//   • "כן אבל כמה עולה מנוי אצלך?" was read as a plain yes to the call and answered "מתי נוח לך" - the price was swallowed;
+//   • asked again, the lead was told there is no price and OFFERED the call a second time;
+//   • "עוד עשר דקות" was not read as a time (only digits were understood) and day + hour were asked for again.
+describe('14. The conversation of 2026-11-18 21:08: a price question while a call is arranged, a relative time, one location link', () => {
+  const T = new Date('2026-11-18T19:08:36.000Z');                       // Wednesday 21:08:36 Israel time
+  const at = s => new Date(T.getTime() + s * 1000);
+  const wazeTo = phone => textsTo(phone).filter(t => /waze\.com/.test(t.text));
+  const INVITE = 'מצוין! רוצה שנציג מהסטודיו יחזור אליך לשיחה קצרה ויעזור לך לבחור את המסלול המתאים?';
+
+  async function upToInvitation() {
+    setNow(T);
+    const phone = newPhone();
+    expect((await say(phone, 'אהלן אפשר לקבל פרטים על הסטודיו', { at: at(0) })).route).toBe('barak');
+    mockAi.queue.push('מעולה! אימוני הכוח שלנו פונקציונליים. מאיפה אתה מגיע?');
+    setNow(at(17)); await say(phone, 'אני מתעניין באימוני כוח', { at: at(17) });
+    setNow(at(43)); await say(phone, 'אני מפרדס חנה מאיפה אתם?', { at: at(43) });
+    mockAi.queue.push(INVITE);
+    setNow(at(63)); await say(phone, 'כן', { at: at(63) });
+    expect(lastTo(phone)).toBe(INVITE);
+    return phone;
+  }
+
+  test('the whole sequence: one location message, the price answered inside the arranging, "עוד עשר דקות" = 21:20, one summary', async () => {
+    const phone = await upToInvitation();
+
+    // the location: ONE message, with a whole link
+    expect(wazeTo(phone)).toHaveLength(1);
+    expect(wazeTo(phone)[0].text).toMatch(/^דרך השדה 12, פרדס חנה-כרכור/);
+    expect(wazeTo(phone)[0].text).toMatch(/https:\/\/waze\.com\/ul\?q=דרך\+השדה\+12,\+פרדס\+חנה-כרכור&navigate=yes/);
+    expect(wazeTo(phone)[0].text).not.toMatch(/\?\?/);
+
+    // "כן אבל כמה עולה מנוי אצלך?" - a yes WITH a question: the price is answered first (there is no approved price), then the time
+    let n = textsTo(phone).length;
+    const ai = mockAi.calls;
+    setNow(at(80)); let r = await say(phone, 'כן אבל כמה עולה מנוי אצלך?', { at: at(80) });
+    expect(r.route).toBe('callback_time_requested');
+    expect(textsTo(phone)).toHaveLength(n + 1);
+    expect(lastTo(phone)).toMatch(/^אין לי כאן מחיר מעודכן למנוי, ואני לא רוצה לתת לך מספר לא מדויק 🙏\nהנציג ייתן לך את המחירים המדויקים בשיחה\.\nמתי נוח לך שנחזור אליך\? \(יום ושעה\)$/);
+    expect(lastTo(phone)).not.toMatch(/\d+\s*₪|היכרות/);                 // no invented price, no introductory offer in its place
+    expect(mockAi.calls).toBe(ai);
+    expect(store.getLead(phone).meta.awaitingCallbackTime).toBe(true);
+
+    // asked again while the time is awaited: answered again, the call is NOT offered a second time, the context stays
+    n = textsTo(phone).length;
+    setNow(at(102)); r = await say(phone, 'אני אשמח לדעת כמה עולה מנוי קודם כל', { at: at(102) });
+    expect(textsTo(phone)).toHaveLength(n + 1);
+    expect(lastTo(phone)).toMatch(/אין לי כאן מחיר מעודכן למנוי[\s\S]*מתי נוח לך שנחזור אליך\?/);
+    expect(lastTo(phone)).not.toMatch(/רוצה שנציג יחזור/);
+    expect(store.getLead(phone).meta.awaitingCallbackTime).toBe(true);
+
+    // "עוד עשר דקות", sent at 21:10:54 → Wednesday 18.11 at 21:20, shown exactly
+    n = textsTo(phone).length;
+    setNow(at(138)); r = await say(phone, 'עוד עשר דקות', { at: at(138) });
+    expect(r.route).toBe('appointment_created');
+    expect(openApt(phone).scheduledAt.toISOString()).toBe(il(2026, 11, 18, 21, 20).toISOString());
+    expect(textsTo(phone)).toHaveLength(n + 1);
+    expect(lastTo(phone)).toMatch(/^רשמתי בקשת שיחה: יום רביעי, 18\.11\.2026 בשעה 21:20 ✅\nואיך קוראים לך\? 😊$/);
+    expect(summaries()).toHaveLength(0);
+
+    setNow(at(150)); await say(phone, 'פרסלי', { at: at(150) });
+    expect(summaries()).toHaveLength(1);
+    expect(summaries()[0].body).toMatch(/21:20/);
+
+    // the location went out once in the whole conversation
+    expect(wazeTo(phone)).toHaveLength(1);
+  });
+
+  test('the link is not attached again by itself later; an explicit request to send it again is answered', async () => {
+    const phone = await upToInvitation();
+    expect(wazeTo(phone)).toHaveLength(1);
+    mockAi.queue.push('כיף שאתה מפרדס חנה, זה ממש קרוב! מה המטרה שלך באימונים?');     // the model names the town
+    setNow(at(90)); await say(phone, 'האמת שאני עוד חושב על זה', { at: at(90) });
+    expect(lastTo(phone)).toMatch(/פרדס חנה/);
+    expect(lastTo(phone)).not.toMatch(/waze/);
+    mockAi.queue.push('בשמחה!\nדרך השדה 12, פרדס חנה-כרכור\nhttps://waze.com/ul?q=x\nמה המטרה שלך?');   // the model volunteers a link
+    setNow(at(120)); await say(phone, 'ואיזה ציוד יש אצלכם?', { at: at(120) });
+    expect(lastTo(phone)).not.toMatch(/waze/);
+    expect(wazeTo(phone)).toHaveLength(1);
+    const ai = mockAi.calls;
+    setNow(at(150)); await say(phone, 'אפשר לשלוח שוב את הכתובת?', { at: at(150) });          // asked for explicitly
+    expect(wazeTo(phone)).toHaveLength(2);
+    expect(mockAi.calls).toBe(ai);
+  });
+
+  test('the same webhook delivered again, and the same message handled twice at the same moment: one reply', async () => {
+    setNow(T);
+    const phone = newPhone();
+    await say(phone, 'היי, מתעניין באימוני כוח');
+    const body = id => ({ from: phone, text: 'מה הכתובת שלכם?', name: 'WA Profile', type: 'text', messageId: id, timestamp: new Date().toISOString() });
+    const send = id => request(app).post('/api/whatsapp/simulate').send(body(id)).set('Content-Type', 'application/json');
+    await Promise.all([send('dup-2108-a'), send('dup-2108-a')]);                              // handled in parallel
+    await send('dup-2108-a');                                                                 // delivered again later
+    expect(wazeTo(phone)).toHaveLength(1);
+  });
+
+  test('"כן, אבל ..." with another question is not swallowed by "מתי נוח לך"; a plain yes still is the request', async () => {
+    const phone = await upToInvitation();
+    mockAi.queue.push('יש אצלנו חניה חינם ליד הסטודיו 🙂 רוצה שנציג יחזור אליך?');
+    setNow(at(80)); let r = await say(phone, 'כן אבל יש חניה?', { at: at(80) });
+    expect(r.route).toBe('barak');
+    expect(lastTo(phone)).toMatch(/חניה/);
+    setNow(at(100)); r = await say(phone, 'כן בבקשה', { at: at(100) });
+    expect(r.route).toBe('callback_time_requested');
+    expect(lastTo(phone)).toMatch(/מתי נוח לך שנחזור אליך/);
+  });
+
+  test('relative times: words and digits, from the moment the message was sent; vague or past ones are not accepted', () => {
+    const ref = new Date('2026-11-18T19:10:54.000Z');
+    const hm = t => { const x = callbackTime.resolveCallbackTime(t, ref); return x.ok ? callbackTime.formatCallbackTime(x.scheduledAt).slice(-5) : x.reason; };
+    expect(hm('עוד עשר דקות')).toBe('21:20');
+    expect(hm('בעוד רבע שעה')).toBe('21:25');
+    expect(hm('עוד 40 דקות')).toBe('21:50');
+    expect(hm('עוד חצי שעה')).toBe('21:40');
+    expect(hm('עוד שעה')).toBe('outside_hours');                                       // 22:10 - no request is registered for that hour
+    expect(callbackTime.hasTimeSignal('עוד כמה דקות')).toBe(false);
+    expect(callbackTime.hasTimeSignal('עוד מעט')).toBe(false);
+    expect(callbackTime.hasTimeSignal('יש לכם עוד שיעורים?')).toBe(false);
+    const late = callbackTime.resolveCallbackTime('עוד עשר דקות', ref, { now: new Date(ref.getTime() + 11 * 60000) });   // handled after the moment passed
+    expect(late).toMatchObject({ ok: false, reason: 'past' });
+    expect(late.clarification).toMatch(/כבר עבר/);
+  });
+
+  test('the same text to the same number within seconds is sent once; a later repeat and a different text are sent', () => {
+    const wa = jest.requireActual('../services/whatsapp.service');
+    const t0 = 1000000;
+    expect(wa._isRepeatSend('972500000001', 'דרך השדה 12', t0)).toBe(false);
+    expect(wa._isRepeatSend('972500000001', 'דרך השדה 12', t0 + 900)).toBe(true);              // the second of two routes / a retry
+    expect(wa._isRepeatSend('972500000001', 'טקסט אחר', t0 + 900)).toBe(false);
+    expect(wa._isRepeatSend('972500000002', 'דרך השדה 12', t0 + 900)).toBe(false);             // another person
+    expect(wa._isRepeatSend('972500000001', 'דרך השדה 12', t0 + wa.DUP_SEND_WINDOW_MS + 1000)).toBe(false);   // asked again later
+  });
+
+  test('a link whose letters were lost is never used and never saved', () => {
+    const sa = require('../utils/studio_assets');
+    expect(sa.damagedUrl('https://waze.com/ul?q=???+????+12,+????+???-?????&navigate=yes')).toBe(true);    // what production held
+    expect(sa.damagedUrl('https://waze.com/ul?q=דרך+השדה+12,+פרדס+חנה-כרכור&navigate=yes')).toBe(false);
+    expect(sa.damagedUrl('https://waze.com/ul?ll=32.47,34.97&navigate=yes')).toBe(false);
+    expect(() => sa.saveAssets({ wazeUrl: 'https://waze.com/ul?q=???+????', timetableUrl: '' })).toThrow(/damaged/);
+    expect(sa.getAssets().wazeUrl).toMatch(/q=דרך\+השדה\+12/);
+  });
+});

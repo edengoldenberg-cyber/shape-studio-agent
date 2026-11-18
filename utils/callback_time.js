@@ -401,6 +401,27 @@ const hourText = (h, m, written) => (written || h >= 13 || m ? `${pad2(h)}:${pad
 const ENGLISH_TIME = /\b(?:tomorrow|today|tonight|noon|midnight|next\s+week|this\s+(?:morning|afternoon|evening|week)|in\s+the\s+(?:morning|afternoon|evening)|(?:mon|tues|wednes|thurs|fri|satur|sun)day)\b|\b(?:at|between|after|before|until|till|from|around|by)\s+\d|\bo'?clock\b|\b(?:an?|one|two|\d+)\s+(?:hours?|minutes?)\b/i;
 const isEnglishTime = text => ENGLISH_TIME.test(String(text ?? ''));
 
+// "עוד עשר דקות", "בעוד רבע שעה", "עוד 40 דקות", "עוד שלוש שעות" -> minutes from the moment the message was sent.
+// A vague offset ("עוד כמה דקות", "עוד מעט") is not a time.
+const REL_WORDS = [['חמש עשרה', 15], ['עשרים וחמש', 25], ['שלושים וחמש', 35], ['ארבעים וחמש', 45], ['חמישים', 50], ['ארבעים', 40], ['שלושים', 30], ['עשרים', 20],
+  ['שתיים', 2], ['שמונה', 8], ['שלוש', 3], ['ארבע', 4], ['חמש', 5], ['שבע', 7], ['תשע', 9], ['עשר', 10], ['שתי', 2], ['שש', 6]];
+function relativeOffsetMin(t) {
+  const m0 = String(t ?? '').match(/(?:^|[^א-ת])ב?עוד\s+(.{1,40})/);
+  if (!m0) return null;
+  const r = m0[1];
+  if (/^חצי\s+שעה/.test(r)) return 30;
+  if (/^רבע\s+שעה/.test(r)) return 15;
+  if (/^שלושת?\s+רבעי\s+שעה/.test(r)) return 45;
+  if (/^שעה\s+וחצי/.test(r)) return 90;
+  if (/^שעה\s+ורבע/.test(r)) return 75;
+  if (/^שעתיים/.test(r)) return 120;
+  if (/^שעה(?![א-ת])/.test(r)) return 60;
+  let m = r.match(/^(\d{1,3})\s+(דקות|דק(?![א-ת])|שעות)/);
+  if (m) return +m[1] * (m[2] === 'שעות' ? 60 : 1);
+  for (const [w, n] of REL_WORDS) { m = r.match(new RegExp('^' + w + '\\s+(דקות|שעות)')); if (m) return n * (m[1] === 'שעות' ? 60 : 1); }
+  return null;
+}
+
 function resolveCallbackTime(rawText, ref = new Date(), opts = {}) {
   const hours = opts.hours ?? callingHours();
   const text = normalize(rawText);
@@ -441,21 +462,16 @@ function resolveSingleTime(rawText, ref = new Date(), opts = {}) {
 
   // ── "בעוד שעה" / "בעוד 40 דקות" — relative offsets ───────────────────────────
   {
-    let offsetMin = null;
-    let m;
-    if (/(?:ב)?עוד\s+חצי\s+שעה/.test(t)) offsetMin = 30;
-    else if (/(?:ב)?עוד\s+שעה\s+וחצי/.test(t)) offsetMin = 90;
-    else if (/(?:ב)?עוד\s+שעתיים/.test(t)) offsetMin = 120;
-    else if (/(?:ב)?עוד\s+שעה(?![א-ת])/.test(t)) offsetMin = 60;
-    else if ((m = t.match(/(?:ב)?עוד\s+(\d{1,3})\s+דקות/))) offsetMin = +m[1];
-    else if ((m = t.match(/(?:ב)?עוד\s+(\d{1,2})\s+שעות/))) offsetMin = +m[1] * 60;
+    const offsetMin = relativeOffsetMin(t);
     if (offsetMin !== null) {
       if (offsetMin < 5 || offsetMin > 24 * 60) return fail('invalid_hour');
       const at = new Date(refDate.getTime() + offsetMin * 60000);
       at.setUTCSeconds(0, 0);
       const p = ilParts(at);
       if (!withinHours(p.hour, p.minute, hours)) return fail('outside_hours', { hours });
-      return { ok: true, scheduledAt: at, hasDate: true };
+      // counted from the moment the message was SENT; if it is handled late and the moment has passed, a new time is asked for
+      if (opts.now instanceof Date && at.getTime() <= opts.now.getTime()) return fail('past');
+      return { ok: true, scheduledAt: at, hasDate: true, relative: true };
     }
   }
 
@@ -565,7 +581,7 @@ function hasTimeSignal(rawText) {
   if (extractWeekday(t) !== null) return true;
   if (heWord('מחרתיים').test(t) || heWord('מחר').test(t) || heWord('היום').test(t)) return true;
   if (isEnglishTime(t)) return true;                       // answered with a request to write it in numbers
-  if (/(?:ב)?עוד\s+(?:חצי\s+שעה|שעה|שעתיים|\d{1,3}\s+(?:דקות|שעות))/.test(t)) return true;
+  if (relativeOffsetMin(t) !== null) return true;
   const hr = extractHour(t);
   return hr.found || !!hr.qualifierAm || !!hr.qualifierPm;
 }
@@ -616,6 +632,6 @@ function ilDateString(v = new Date()) {
 }
 
 module.exports = {
-  resolveCallbackTime, hasTimeSignal, formatCallbackTime, extractDayAndTime, ilDateString,
+  resolveCallbackTime, hasTimeSignal, formatCallbackTime, extractDayAndTime, ilDateString, relativeOffsetMin,
   ilParts, ilDate, addDays, callingHours, TZ, MAX_DAYS_AHEAD, HE_WEEKDAY_NAMES,
 };

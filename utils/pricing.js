@@ -96,18 +96,22 @@ const line = p => `${p.name} — ${p.price_ils} ₪ לחודש${termsOf(p).lengt
  *   or nothing approved fits the request → "I do not have an up-to-date price" + a representative
  * The introductory offer is never used in place of a membership price.
  */
-function membershipAnswer(pkg, { callbackArranged = false } = {}, userText = '') {
+function membershipAnswer(pkg, { callbackArranged = false, callbackPending = false } = {}, userText = '') {
   const w = wanted(userText);
   const candidates = pkg.packages.filter(p => fits(p, w)), priced = candidates.filter(p => num(p.price_ils));
-  const offer = callbackArranged ? 'הנציג יעבור איתך על המסלולים בשיחה שקבענו.' : 'רוצה שנציג יחזור אליך ויעזור לבחור את המסלול המתאים?';
+  // callbackPending: a call is being arranged right now (agreed, the time not yet set) - it is neither offered again
+  // nor described as already set
+  const offer = callbackPending ? 'הנציג יעבור איתך על המסלולים בשיחה.' : callbackArranged ? 'הנציג יעבור איתך על המסלולים בשיחה שקבענו.' : 'רוצה שנציג יחזור אליך ויעזור לבחור את המסלול המתאים?';
   if (priced.length === 1) return `${line(priced[0])}.\n${offer}`;
-  if (priced.length > 1) return [`יש כמה מסלולים שמתאימים:`, ...priced.slice(0, 5).map(p => `• ${line(p)}`), callbackArranged ? offer : 'איזה מהם מעניין אותך?'].join('\n');
+  if (priced.length > 1) return [`יש כמה מסלולים שמתאימים:`, ...priced.slice(0, 5).map(p => `• ${line(p)}`), callbackArranged || callbackPending ? offer : 'איזה מהם מעניין אותך?'].join('\n');
   const what = candidates.length || !(w.classType || w.entries !== null || w.unlimited || w.noCommitment) ? 'למנוי' : 'למסלול שביקשת';
+  if (callbackPending) return `אין לי כאן מחיר מעודכן ${what}, ואני לא רוצה לתת לך מספר לא מדויק 🙏\nהנציג ייתן לך את המחירים המדויקים בשיחה.`;
   return callbackArranged ? `אין לי כאן מחיר מעודכן ${what}, ואני לא רוצה לתת לך מספר לא מדויק 🙏\nהנציג ייתן לך את המחירים המדויקים בשיחה שקבענו.`
     : `אין לי כאן מחיר מעודכן ${what}, ואני לא רוצה לתת לך מספר לא מדויק 🙏\n${REP_OFFER}`;
 }
-function trialAnswer(pkg, { callbackArranged = false } = {}) {
+function trialAnswer(pkg, { callbackArranged = false, callbackPending = false } = {}) {
   const tr = trialOf(pkg);
+  if (!tr && callbackPending) return 'אין לי כאן מחיר מעודכן לשיעור ניסיון 🙏 הנציג ייתן לך אותו בשיחה.';
   if (tr) return `הצעת ההיכרות שלנו: ${tr.entries ? `${tr.entries} אימונים ב-` : ''}${tr.price_ils} ₪${tr.commitment === false ? ', ללא התחייבות' : ''}.`;
   return callbackArranged ? `אין לי כאן מחיר מעודכן לשיעור ניסיון 🙏 הנציג ייתן לך אותו בשיחה שקבענו.` : `אין לי כאן מחיר מעודכן לשיעור ניסיון, ואני לא רוצה לתת לך מספר לא מדויק 🙏\n${REP_OFFER}`;
 }

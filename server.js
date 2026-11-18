@@ -3967,6 +3967,25 @@ async function handleLeadCallbackFlow({ msg, fromNorm, fromIsraeli, clientMatch,
   const awaiting  = meta.awaitingCallbackTime === true;
   const inviteCtx = !CALL_DECLINED_RE.test(text) && leadAgent.isCallbackInviteContext(fromNorm);
 
+  // A PRICE question while a call is being arranged - "כן אבל כמה עולה מנוי?" in answer to the invitation, or a price
+  // question when asked for a time - is answered first, from the approved prices only (or "I do not have an up-to-date
+  // price"), and the arranging continues in the same message. Production 2026-11-18 21:09: "כן אבל כמה עולה מנוי אצלך?"
+  // was read as a plain yes and answered with "מתי נוח לך"; asked again, the lead was offered the call a second time.
+  const _priceTopic = hasTime ? null : pricing.topic(text);
+  const _accepts    = inviteCtx && _INVITE_ACCEPT_RE.test(text);
+  if (_priceTopic && !isRequest && (awaiting || _accepts)) {
+    const _pkg = pricing.load(), _o = { callbackPending: true };
+    const _ans = _priceTopic === 'trial' ? pricing.trialAnswer(_pkg, _o) : pricing.membershipAnswer(_pkg, _o, text);
+    const _ask = `${_ans}\nמתי נוח לך שנחזור אליך? (יום ושעה)`;
+    store.logEvent('callback_price_question_answered', fromNorm, { topic: _priceTopic, awaiting, preview: text.slice(0, 40) });
+    if (awaiting) return finish('callback_time_requested', _ask, { routeIntent: 'representative' });
+    store.logEvent('callback_invite_accepted', fromNorm, { preview: text.slice(0, 40) });
+    return askForTime(_ask);
+  }
+  // "כן, אבל ..." / "כן, רק ...?" is not an unreserved yes: the question is answered by the ordinary route (the
+  // invitation stays open), instead of being swallowed by "מתי נוח לך".
+  if (!isRequest && !awaiting && _accepts && !hasTime && /\?|(?<![א-ת])אבל(?![א-ת])|קודם/.test(text)) return null;
+
   // "כן בבקשה" right after Barak offered a representative's call IS the request. Without this the short answer was
   // treated as a brief acknowledgement and nobody answered the lead who had just agreed.
   if (!isRequest && !awaiting && inviteCtx && !hasTime && text.length <= 30 && _INVITE_ACCEPT_RE.test(text)) {

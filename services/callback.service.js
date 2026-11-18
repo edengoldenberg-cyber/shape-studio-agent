@@ -142,7 +142,7 @@ function createCallbackService(deps) {
    */
   function acceptTime({ phone, text, sentAt, source = 'unknown' }) {
     const ref = validDate(sentAt) ? sentAt : new Date();
-    const res = resolveCallbackTime(text, ref);
+    const res = resolveCallbackTime(text, ref, { now: new Date() });
     if (!res.ok) return { ok: false, reason: res.reason, clarification: res.clarification };
 
     const lead = getLead(phone);
