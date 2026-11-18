@@ -72,6 +72,7 @@ const MY_BOOK_RE = /(?:ל(?:איזה|אילו|מה)|מתי) (?:שיעור(?:ים
 const SCHED_RE   = /מה יש (?:היום|מחר|מחרתיים|ב|ביום)|איזה (?:שיעורים|אימונים)|אילו (?:שיעורים|אימונים)|לוח (?:ה)?שיעורים|מערכת (?:ה)?שעות|(?:ה)?לוז|לו"ז|לו״ז|מתי יש|באיזה (?:שעה|שעות|ימים)|שעות (?:ה)?(?:פעילות|שיעורים|אימונים)|מי (?:מדריכ|מעביר|מלמד)|עם מי ה(?:שיעור|אימון)|(?:יש|אין) (?:שיעור|אימון|אימונים|שיעורים)|רוב השיעורים|שעות (?:ה)?(?:בוקר|צהריים|ערב)/;
 const LOCATION_RE = /כתובת|וויז|waze|ניווט|איך מגיעים|איך להגיע|איפה אתם|איפה הסטודיו|היכן (?:אתם|הסטודיו)|מיקום|חני[הי]/i;
 
+const INSTRUCTOR_RE = /מי\s+(?:מעביר|מלמד|מדריך|מאמן|נותן)(?:ה|ת|ים|ות)?(?![א-ת])|עם מי(?![א-ת])|מי\s+ה(?:מדריכ|מאמנ|מור)|איז[הו]\s+(?:מדריכ|מאמנ)/;
 const NEG_CALL_RE = /(?:לא|אל)\s+(?:רוצה ש|צריך ש)?\s*(?:ת)?תקשר|רק (?:וואטסאפ|הודעות)/;
 
 function classify(rawText, { hasOpenCase = false } = {}) {
@@ -116,6 +117,7 @@ function classify(rawText, { hasOpenCase = false } = {}) {
   if (RENEW_RE.test(t) && (MEMBERSHIP_WORD.test(t) || /לחדש|חידוש/.test(t))) return out('membership_renew', 'renew / change membership');
 
   // Classes.
+  if (INSTRUCTOR_RE.test(t)) return out('instructor_query', 'asks who teaches a class');
   if (WAITLIST_RE.test(t)) return out('waitlist', 'waitlist wording');
   // "נרשמתי לשש ואני רוצה לבוא ב-17:00": registered for one class and wants another one - a move, not a question
   if (MOVE_BETWEEN_RE.test(t)) return out('class_reschedule', 'registered for one class, wants another');

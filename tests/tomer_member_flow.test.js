@@ -431,7 +431,7 @@ describe('C. Classes: a request to book / cancel / move goes to the class flow (
     const m = member();
     await say(m.phone, 'תרשמי אותי למחר ב-9 לפילאטיס');
     expect(lastTo(m.phone)).toMatch(/קיבלתי את הבקשה: רישום לפילאטיס מכשירים ב-09:00/);   // since 2026-11-18 the request names the class, not only the hour
-    expect(lastTo(m.phone)).toMatch(/3 מקומות פנויים/);
+    expect(lastTo(m.phone)).not.toMatch(/מקומות פנויים/);            // owner rule 2026-11-18: the count is for a question about room
     expect(lastTo(m.phone)).toMatch(/העברתי את הבקשה לצוות/);
     expect(lastTo(m.phone)).toMatch(/עדיין לא נרשמת/);
     expect(lastTo(m.phone)).not.toMatch(FALSE_CONFIRM);
@@ -446,7 +446,8 @@ describe('C. Classes: a request to book / cancel / move goes to the class flow (
   test('a full class is reported as full from the real count', async () => {
     const m = member();
     await say(m.phone, 'תרשמי אותי למחר ב-19 לפילאטיס');
-    expect(lastTo(m.phone)).toMatch(/הוא מלא כרגע/);
+    expect(lastTo(m.phone)).toMatch(/פילאטיס מכשירים ב-19:00 .* מלא כרגע\./);
+    expect(lastTo(m.phone)).not.toMatch(/\d+\/\d+|ברשימת המתנה/);
     expect(arbox.writes()).toHaveLength(0);
   });
 

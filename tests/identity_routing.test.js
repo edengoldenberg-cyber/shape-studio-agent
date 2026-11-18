@@ -451,13 +451,13 @@ describe('A registration request in two messages (live failure 2026-11-18)', () 
   const tasksOf = p => require('../utils/tomer_store').getTasks({ phone: p, type: 'class_change' });
   const casesOf = p => { try { return JSON.parse(fs.readFileSync(CASES_FILE, 'utf8')).cases.filter(c => c.phone === p); } catch { return []; } };
   const reads = re => arbox.log.filter(l => l.method === 'GET' && re.test(l.path)).length;
-  const cls = (id, start, name, registered, cap) => ({ schedule_id: id, date: day(0), start_time: start, end_time: `${String(Number(start.slice(0, 2)) + 1).padStart(2, '0')}:00`, session_name: name, staff_member: { name: 'מירי כהן' }, max_participants: cap, registration_count: registered });
+  const cls = (id, start, name, registered, cap, who = 'מירי כהן') => ({ schedule_id: id, date: day(0), start_time: start, end_time: `${String(Number(start.slice(0, 2)) + 1).padStart(2, '0')}:00`, session_name: name, staff_member: { name: who }, max_participants: cap, registration_count: registered });
   function setup(phone = P) {
     world();
     for (const t of require('../utils/tomer_store').getOpenTasks()) require('../utils/tomer_store').resolveTask(t.id, { resolutionNote: 'test reset', resolvedBy: 'test' });   // the task file is shared by the whole suite
     const id = person({ phone: '0' + phone.slice(3), first: 'בדיקה' });
     plan(id, { start: day(0), end: null });
-    arbox.state.schedule.push(cls(21, '17:00', 'אימון כח', 5, 10), cls(22, '18:00', 'ALL IN', 3, 10), cls(23, '18:00', 'פילאטיס בר', 8, 8), cls(24, '19:00', 'אימון כח', 5, 10), cls(25, '20:00', 'אימון כח', 0, 10));
+    arbox.state.schedule.push(cls(21, '17:00', 'אימון כח', 5, 10), cls(22, '18:00', 'ALL IN', 3, 10, 'נוי לוי'), cls(23, '18:00', 'פילאטיס בר', 8, 8, 'דנה גל'), cls(24, '19:00', 'אימון כח', 5, 10), cls(25, '20:00', 'אימון כח', 0, 10));
     return id;
   }
   const last = p => textsTo(p).at(-1) ?? '';
@@ -499,7 +499,7 @@ describe('A registration request in two messages (live failure 2026-11-18)', () 
     await say(P, 'ב-19');
     const done = last(P);
     expect(done).toMatch(/קיבלתי את הבקשה: רישום לאימון כח ב-19:00 היום\./);
-    expect(done).toMatch(/ב-19:00 יש אימון כח, ונכון לעכשיו יש בו 5 מקומות פנויים\./);
+    expect(done).not.toMatch(/מקומות פנויים|מקום פנוי/);                           // the count is told when the member asks about room, not here
     expect(done).toMatch(/העברתי את הבקשה לצוות\./);
     expect(done).toMatch(/עדיין לא נרשמת: הצוות יאשר לך כאן\./);
     expect(done).not.toMatch(/תקלה|אפליקצי|מצטער/);
@@ -570,5 +570,143 @@ describe('A registration request in two messages (live failure 2026-11-18)', () 
     expect(last('972507120005')).toMatch(/רשמתי פנייה לצוות עם מה שכתבת\. שום רישום לא השתנה\./);
     expect(last('972507120005')).not.toMatch(/תקלה|אפליקצי/);
     expect(casesOf('972507120005').map(c => c.category)).toEqual(['general_request']);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Second live test, 2026-11-18 12:03–12:05 (same member, same day's schedule):
+//   א. "אני רוצה להשתבץ לשיעור היום בשעה 18"   → ALL IN / פילאטיס בר offered (right), the manager alerted (too early)
+//   ב. "מי מעביר את השיעורים?"                  → a timetable of several days (the two classes just offered were forgotten)
+//   ג. "יש מקום היום לפילאטיס בר?"              → taken as the CHOICE of a class: the request went to the staff for Pilates Barre
+//   ד. "אתה יכול לרשום אותי לall in?"           → the task changed to ALL IN silently: the staff's last alert still said Pilates Barre
+describe('A registration conversation with questions in the middle (live failure 2026-11-18 12:03)', () => {
+  const tasksOf = p => require('../utils/tomer_store').getTasks({ phone: p, type: 'class_change' });
+  const openOf = p => tasksOf(p).filter(t => t.status === 'open');
+  const casesOf = p => { try { return JSON.parse(fs.readFileSync(CASES_FILE, 'utf8')).cases.filter(c => c.phone === p); } catch { return []; } };
+  const cls = (id, start, name, registered, cap, who) => ({ schedule_id: id, date: day(0), start_time: start, end_time: `${String(Number(start.slice(0, 2)) + 1).padStart(2, '0')}:00`, session_name: name, staff_member: { name: who }, max_participants: cap, registration_count: registered });
+  function setup(phone) {
+    world();
+    for (const t of require('../utils/tomer_store').getOpenTasks()) require('../utils/tomer_store').resolveTask(t.id, { resolutionNote: 'test reset', resolvedBy: 'test' });
+    plan(person({ phone: '0' + phone.slice(3), first: 'בדיקה' }), { start: day(0), end: null });
+    arbox.state.schedule.push(cls(31, '17:00', 'אימון כח', 5, 10, 'מירי כהן'), cls(32, '18:00', 'ALL IN', 3, 10, 'נוי לוי'), cls(33, '18:00', 'פילאטיס בר', 8, 8, 'דנה גל'), cls(34, '19:00', 'אימון כח', 5, 10, 'מירי כהן'));
+  }
+  const last = p => textsTo(p).at(-1) ?? '';
+
+  test('the four messages: the question about instructors and the question about room are answered and change nothing; the explicit request uses the day and hour already given; ONE task, ONE alert', async () => {
+    const P = '972507130001'; setup(P);
+    // א
+    await say(P, 'אני רוצה להשתבץ לשיעור היום בשעה 18');
+    expect(last(P)).toMatch(/ב-18:00 היום יש ALL IN ופילאטיס בר\. איזה שיעור התכוונת\?/);
+    expect(openOf(P)).toHaveLength(1);
+    const id = openOf(P)[0].id;
+    expect(mockOut.alerts).toHaveLength(0);
+    // ב — who teaches them: the two classes that were just offered, from Arbox; the request still waits
+    const rb = await say(P, 'מי מעביר את השיעורים?');
+    expect(rb.route).toBe('tomer_handoff');
+    expect(last(P)).toMatch(/לפי Arbox, היום:\n• ALL IN ב-18:00 — עם נוי לוי\n• פילאטיס בר ב-18:00 — עם דנה גל/);
+    expect(last(P)).toMatch(/בקשת הרישום שלך עדיין ממתינה, ושום דבר לא נרשם\. איזה שיעור התכוונת\?/);
+    expect(last(P)).not.toMatch(/17:00|19:00|אימון כח/);                             // not a timetable
+    expect(openOf(P)[0]).toMatchObject({ id, missing: 'target_type' });
+    expect(mockOut.alerts).toHaveLength(0);
+    // ג — is there room in Pilates Barre: the live number for that class at the hour already given; NOT a choice
+    await say(P, 'יש מקום היום לפילאטיס בר?');
+    expect(last(P)).toMatch(/נכון לרגע זה, לפי Arbox, היום:\n• פילאטיס בר ב-18:00 — מלא כרגע \(8\/8\)/);
+    expect(last(P)).not.toMatch(/העברתי|רשמתי את הבקשה|קיבלתי את הבקשה/);
+    expect(last(P)).toMatch(/שום דבר לא נרשם/);
+    expect(openOf(P)).toHaveLength(1);
+    expect(openOf(P)[0]).toMatchObject({ id, missing: 'target_type' });             // still waiting for the member's choice
+    expect(openOf(P)[0].summary).not.toMatch(/פילאטיס בר/);
+    expect(mockOut.alerts).toHaveLength(0);
+    expect(casesOf(P)).toHaveLength(0);
+    // ד — the explicit request: ALL IN, today at 18:00 from the context; membership and room were read; staff, once
+    await say(P, 'אתה יכול לרשום אותי לall in?');
+    const d = last(P);
+    expect(d).toMatch(/קיבלתי את הבקשה: רישום לALL IN ב-18:00 היום\./);
+    expect(d).toMatch(/העברתי את הבקשה לצוות\./);
+    expect(d).toMatch(/עדיין לא נרשמת: הצוות יאשר לך כאן\./);
+    expect(d).not.toMatch(/תקלה|אפליקצי|מקומות פנויים|פילאטיס בר/);
+    const fin = openOf(P);
+    expect(fin).toHaveLength(1);                                                   // one request for the staff
+    expect(fin[0]).toMatchObject({ id, kind: 'book', missing: null, alert: { state: 'sent' }, ctx: { target: { name: 'ALL IN', time: '18:00' } } });
+    expect(fin[0].detail).toMatch(/שיעור מבוקש \(Arbox\): ALL IN 18:00 .* 3\/10 רשומים, 7 פנויים/);
+    expect(fin[0].detail).toMatch(/מנוי בתוקף \(Arbox\)/);
+    expect(mockOut.alerts).toHaveLength(1);                                        // one alert, for the ripe request
+    expect(mockOut.alerts[0].subject).toMatch(/^📌 תומר: רישום לשיעור/);
+    expect(mockOut.alerts[0].body).toMatch(/בקשה: רישום לALL IN ב-18:00 היום/);
+    expect(mockOut.alerts[0].body).not.toMatch(/פילאטיס בר 18:00/);
+    expect(arbox.writes()).toHaveLength(0);
+  });
+
+  test('the member changes the choice after the request reached the staff: the SAME request is updated and the staff are told it replaces the earlier one', async () => {
+    const P = '972507130002'; setup(P);
+    await say(P, 'תרשום אותי לALL IN היום ב-18');
+    expect(mockOut.alerts).toHaveLength(1);
+    await say(P, 'בעצם תרשום אותי לאימון כוח ב-19');
+    expect(last(P)).toMatch(/עדכנתי את הבקשה: רישום לאימון כח ב-19:00 היום \(במקום ALL IN ב-18:00\)\./);
+    expect(last(P)).toMatch(/עדיין לא נרשמת/);
+    expect(openOf(P)).toHaveLength(1);
+    expect(mockOut.alerts).toHaveLength(2);
+    expect(mockOut.alerts[1].subject).toMatch(/^🔁 תומר — עדכון: רישום לשיעור/);
+    expect(mockOut.alerts[1].body).toMatch(/מחליף את הבקשה הקודמת \(ALL IN ב-18:00\) — זו הבקשה היחידה שפתוחה/);
+    await say(P, 'תרשום אותי לאימון כוח ב-19');                                      // the same request again: nothing new for the staff
+    expect(mockOut.alerts).toHaveLength(2);
+  });
+
+  test.each([
+    ['מי המדריכה?', /ALL IN ב-18:00 — עם נוי לוי[\s\S]*פילאטיס בר ב-18:00 — עם דנה גל/],
+    ['עם מי השיעורים האלה', /ALL IN ב-18:00 — עם נוי לוי/],
+    ['מי מלמדת את הALL IN?', /^לפי Arbox, היום:\n• ALL IN ב-18:00 — עם נוי לוי\n/],
+    ['נשאר מקום בבר?', /פילאטיס בר ב-18:00 — מלא כרגע \(8\/8\)/],
+    ['יש עוד מקום ב-ALL IN?', /ALL IN ב-18:00 — יש מקום \(7 מתוך 10 פנויים\)/],
+    ['הפילאטיס בר מלא?', /פילאטיס בר ב-18:00 — מלא כרגע/],
+    ['ויש מקום באימון כוח ב-19?', /אימון כח ב-19:00 — יש מקום \(5 מתוך 10 פנויים\)/],
+  ])('a question in other words — "%s" — is answered from Arbox and leaves the waiting request as it was', async (q, re) => {
+    const P = '972507130003'; setup(P);
+    await say(P, 'אני רוצה להשתבץ לשיעור היום בשעה 18');
+    const before = openOf(P)[0];
+    await say(P, q);
+    expect(last(P)).toMatch(re);
+    expect(last(P)).toMatch(/איזה שיעור התכוונת\?$/);
+    expect(openOf(P)).toHaveLength(1);
+    expect(openOf(P)[0]).toMatchObject({ id: before.id, missing: 'target_type', summary: before.summary });
+    expect(mockOut.alerts).toHaveLength(0);
+    expect(casesOf(P)).toHaveLength(0);
+  });
+
+  test.each([
+    ['ALL IN', /רישום לALL IN ב-18:00 היום/],
+    ['אני אלך על ALL IN', /רישום לALL IN ב-18:00 היום/],
+    ['אול אין בבקשה', /רישום לALL IN ב-18:00 היום/],
+    ['תרשום אותי לאול אין', /רישום לALL IN ב-18:00 היום/],
+    ['אני רוצה להירשם ל-ALL IN', /רישום לALL IN ב-18:00 היום/],
+  ])('the choice in other words — "%s" — completes the same request with the day and hour kept', async (a, re) => {
+    const P = '972507130004'; setup(P);
+    await say(P, 'אני רוצה להשתבץ לשיעור היום בשעה 18');
+    const id = openOf(P)[0].id;
+    await say(P, a);
+    expect(last(P)).toMatch(re);
+    expect(last(P)).toMatch(/העברתי את הבקשה לצוות\.[\s\S]*עדיין לא נרשמת/);
+    expect(openOf(P)).toHaveLength(1);
+    expect(openOf(P)[0]).toMatchObject({ id, missing: null });
+    expect(mockOut.alerts).toHaveLength(1);
+  });
+
+  test('a full class is said to be full in the request reply (without a count), and the request still goes to the staff as not done', async () => {
+    const P = '972507130005'; setup(P);
+    await say(P, 'תרשום אותי לפילאטיס בר היום ב-18');
+    expect(last(P)).toMatch(/פילאטיס בר ב-18:00 היום מלא כרגע\./);
+    expect(last(P)).not.toMatch(/8\/8|מקומות פנויים/);
+    expect(last(P)).toMatch(/עדיין לא נרשמת/);
+  });
+
+  test('with no open request, "who teaches" is answered from Arbox for the class named, or asks which class', async () => {
+    const P = '972507130006'; setup(P);
+    await say(P, 'מי מעביר את האימון כוח היום ב-19?');
+    expect(last(P)).toMatch(/לפי Arbox:\n• .* 19:00 אימון כח — עם מירי כהן/);
+    await say(P, 'מי מעביר את השיעורים?');
+    expect(last(P)).toMatch(/על איזה שיעור מדובר\?/);
+    expect(openOf(P)).toHaveLength(0);
+    expect(casesOf(P)).toHaveLength(0);
+    expect(mockOut.alerts).toHaveLength(0);
   });
 });

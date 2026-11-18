@@ -61,10 +61,25 @@ const TYPE_HINTS = [
 const typeHint = text => TYPE_HINTS.find(([q]) => q.test(String(text ?? ''))) ?? null;
 const heList = a => (a.length <= 1 ? a.join('') : `${a.slice(0, -1).join(', ')} ו${/^[\dA-Za-z]/.test(a[a.length - 1]) ? '-' : ''}${a[a.length - 1]}`);
 
+// A turn inside a conversation about a class is one of: an ACTION request (book / move / cancel — detect()), a QUESTION
+// (who teaches it, is there room) or an ANSWER to what Tomer asked (an hour, a class type). A question never completes
+// and never confirms a request, and never opens a task; an answer never is a question. (Live test 2026-11-18 12:04:
+// "יש מקום היום לפילאטיס בר?" was taken as the choice of a class, and "מי מעביר את השיעורים?" lost the context.)
+const INSTRUCTOR_Q = /מי\s+(?:מעביר|מלמד|מדריך|מאמן|נותן)(?:ה|ת|ים|ות)?(?![א-ת])|עם מי(?![א-ת])|מי\s+ה(?:מדריכ|מאמנ|מור)|איז[הו]\s+(?:מדריכ|מאמנ)/;
+const AVAIL_Q = /יש (?:עוד |שם |בו |בה )?מקו(?:ם|מות)|נשאר(?:ו)? (?:עוד )?מקו|נותר(?:ו)? (?:עוד )?מקו|(?<![א-ת])מלא(?:ה)?(?![א-ת])|התמלא|(?<![א-ת])פנוי|כמה מקומות/;
+function readTurn(text) {
+  const t = String(text ?? '').trim();
+  const cat = classify(t).category;
+  const ask = INSTRUCTOR_Q.test(t) ? 'instructor' : (cat === 'availability' || (AVAIL_Q.test(t) && !KIND_OF[cat])) ? 'availability' : null;
+  const answerish = !ask && !/\?/.test(t) && ['unknown_request', 'statement', 'social', 'general_question'].includes(cat);
+  return { ask, answerish, cat };
+}
+
 function detect(text) {
   const t = String(text ?? '').trim();
   if (!t) return null;
   if (MOVE_RE.test(t)) return 'move';
+  if (INSTRUCTOR_Q.test(t)) return null;                 // a question about the instructor is not a request to act
   return KIND_OF[classify(t).category] ?? null;
 }
 
@@ -172,6 +187,42 @@ function createMemberHandoff(deps) {
     tomerStore.appendAudit({ phone, memberName: task.memberName, event: 'member_handoff_reply', requestPreview: String(task.memberMessage ?? '').slice(0, 100),
       tomerAction: `handoff:${task.type}`, replyPreview: text.slice(0, 100), owner: 'tomer', taskId: task.id, sendState: state });
     return state;
+  }
+
+  /**
+   * A question asked while a class request is open: who teaches / is there room. Answered from Arbox (a fresh read for
+   * room) about the classes of that request - the day and hour already given are used when the question does not
+   * state its own. The request itself is not touched: not completed, not confirmed, no task, no alert.
+   */
+  async function answerAbout(ask, { phone, text, existing, ref, pending }) {
+    const c = existing.ctx, dt = extractDayAndTime(text, ref);
+    const date = dt.day ? ilDateString(dt.day) : c.date;
+    const dTxt = dayText({ date }, ref);
+    let classes = null;
+    try { classes = (await gateway.getClasses({ from: date, to: date, fresh: ask === 'availability' })).classes; } catch { /* said below */ }
+    const hint = typeHint(text), hrs = hoursIn(text);
+    let pool = classes ?? [];
+    if (hrs.length) { const m = matchHour(hrs[hrs.length - 1], pool.map(x => x.start)); pool = pool.filter(x => startsAt(x.start, m.h, m.min)); if (hint) pool = pool.filter(x => hint[1].test(x.name)); }
+    else if (hint) { const ofType = pool.filter(x => hint[1].test(x.name)); const atCtx = c.time && date === c.date ? ofType.filter(x => String(x.start).slice(0, 5) === c.time) : []; pool = atCtx.length ? atCtx : ofType; }
+    else if (date === c.date && c.options?.length) pool = pool.filter(x => c.options.some(o => String(o.scheduleId) === String(x.scheduleId)));
+    else if (date === c.date && c.target) pool = pool.filter(x => String(x.scheduleId) === String(c.target.scheduleId));
+    else if (date === c.date && c.time) pool = pool.filter(x => String(x.start).slice(0, 5) === c.time);
+    else pool = [];
+    pool = pool.slice(0, 6);
+    const one = x => `${x.name} ב-${String(x.start).slice(0, 5)}`;
+    let body;
+    if (classes === null) body = 'לא הצלחתי לקרוא כרגע את הנתונים מ-Arbox, אז אני לא מנחש.';
+    else if (!pool.length) body = `לא מצאתי ב-Arbox שיעור כזה ${dTxt}.`;
+    else if (ask === 'instructor') body = `לפי Arbox, ${dTxt}:\n` + pool.map(x => `• ${one(x)} — ${x.instructor ? `עם ${x.instructor}` : 'שם המדריך/ה לא מופיע ב-Arbox'}`).join('\n');
+    else body = `נכון לרגע זה, לפי Arbox, ${dTxt}:\n` + pool.map(x => { const o = x.occupancy; return `• ${one(x)} — ${!o ? 'את התפוסה לא הצלחתי לאמת כרגע' : o.spotsLeft > 0 ? `יש מקום (${o.spotsLeft} מתוך ${o.capacity} פנויים)` : `מלא כרגע (${o.registered}/${o.capacity})${o.standby ? `, ${o.standby} ברשימת המתנה` : ''}`}`; }).join('\n');
+    const pc = existing.pendingConfirm;
+    const tailTxt = existing.missing ? 'בקשת הרישום שלך עדיין ממתינה, ושום דבר לא נרשם. איזה שיעור התכוונת?'
+      : pc ? `עדיין מחכה לאישור שלך: ${pc.describe}. אפשר לענות "כן" או "לא".`
+      : 'הבקשה הקודמת שלך לא השתנתה.';
+    const replyText = `${body}\n${tailTxt}`;
+    const sendState = await reply(phone, replyText, existing, pending);
+    logger.info('[member-handoff] question about the classes of an open request answered - the request is unchanged', { tail: tail(phone), ask, taskId: existing.id, classes: pool.length, sendState });
+    return { handled: true, kind: `question_${ask}`, taskId: existing.id, isNew: false, missing: existing.missing ?? null, alert: null, replyText, sendState };
   }
 
   /** The facts of one class request, read from Arbox. Nothing is written. */
@@ -287,15 +338,30 @@ function createMemberHandoff(deps) {
       if (YES_RE.test(t)) { kind = existing.kind; answeredPending = true; confirmed = now().getTime() - new Date(pc.askedAt).getTime() <= CONFIRM_MS; }
     }
     if (!answeredPending) pc = null;
-    // the answer to "לאיזו שעה לעבור?" — an hour, within the hour after the question
-    // (or the class type, when that was the missing detail: "כוח")
-    if (!kind && existing?.missing && now().getTime() - new Date(existing.updatedAt).getTime() <= FOLLOWUP_MS && (hoursIn(text).length || (existing.kind === 'book' && typeHint(text)))) kind = existing.kind;
+    // ── the turn, read against the request that is open in this conversation ──
+    const recent = !!existing && now().getTime() - new Date(existing.updatedAt).getTime() <= FOLLOWUP_MS;
+    const turn = readTurn(text);
+    // a question in the middle (who teaches, is there room): answered from Arbox for the classes being discussed.
+    // The request is neither completed nor confirmed by it, nothing is opened and nobody is alerted.
+    if (!kind && !answeredPending && recent && existing.ctx && turn.ask && !fromVoice) return answerAbout(turn.ask, { phone, text, existing, ref, pending });
+    // the answer to what Tomer asked — an hour, or the class type — within the hour after the question. Never a question.
+    if (!kind && existing?.missing && recent && turn.answerish && (hoursIn(text).length || (existing.kind === 'book' && typeHint(text)))) kind = existing.kind;
     if (!kind) return null;
     if (existing && existing.kind !== kind && !existing.missing) existing = null;
 
-    const fullText = pc ? existing.memberMessage : existing?.missing ? `${existing.memberMessage} ${text}` : text;
+    // A registration request continues the one already open in this conversation: the details given before (day, hour)
+    // are kept, the newest message wins for what it states. A message that names its own day stands on its own.
+    const carry = !pc && !!existing && kind === 'book' && existing.kind === 'book' && (!!existing.missing || (recent && !!existing.ctx && !extractDayAndTime(text, ref).day));
+    const fullText = pc ? existing.memberMessage : (existing?.missing || carry) ? `${existing.memberMessage} ${text}` : text;
     const f = await readFacts(phone, fullText, ref, pc?.date ?? null, { membership: kind === 'book' });
-    const rq = pc ? fromPending(pc, f) : resolveRequest(kind, fullText, f, existing?.missing ? text : null);
+    const rq = pc ? fromPending(pc, f) : resolveRequest(kind, fullText, f, (existing?.missing || carry) ? text : null);
+    const ctxRec = { date: f.date, time: rq.target ? hhmm(rq.target.h, rq.target.min) : null,
+      options: (rq.target?.options ?? []).map(o => ({ scheduleId: o.scheduleId, start: o.start, name: o.name })),
+      target: rq.target?.cls ? { scheduleId: rq.target.cls.scheduleId, time: hhmm(rq.target.h, rq.target.min), name: rq.target.cls.name } : null };
+    // the member changed the choice in a request that was already passed to the staff: the SAME request is updated and
+    // the staff are told it replaces the earlier one - never two contradicting requests
+    const prevT = existing && !existing.missing && existing.alert ? existing.ctx?.target ?? null : null;
+    const changed = !!(prevT && ctxRec.target && String(prevT.scheduleId) !== String(ctxRec.target.scheduleId));
     const who = name ?? f.member?.name ?? local(phone);
     const dTxt = dayText(f, ref);
 
@@ -336,8 +402,8 @@ function createMemberHandoff(deps) {
       else {
         const o = tgt.cls.occupancy;
         facts.push(`שיעור מבוקש (Arbox): ${tgt.cls.name} ${t} ${f.date} — ${o ? `${o.registered}/${o.capacity} רשומים, ${o.spotsLeft} פנויים${o.standby ? `, ${o.standby} בהמתנה` : ''}` : 'תפוסה לא ידועה'}`);
-        lines.push(o ? (o.spotsLeft > 0 ? `ב-${t} יש ${tgt.cls.name}, ונכון לעכשיו יש בו ${o.spotsLeft === 1 ? 'מקום פנוי אחד' : `${o.spotsLeft} מקומות פנויים`}.` : `ב-${t} יש ${tgt.cls.name}, והוא מלא כרגע.`)
-          : `ב-${t} יש ${tgt.cls.name}; את מספר המקומות הפנויים לא הצלחתי לבדוק.`);
+        // checked for the staff and for the action; the member is told only what changes the request: that it is full
+        if (o && o.spotsLeft <= 0) lines.push(`${tgt.cls.name} ב-${t} ${dTxt} מלא כרגע.`);
       }
     }
     const want = kind === 'move' ? `מעבר ${cur ? `מ-${hhmm(cur.h, cur.min)} ` : ''}${tgt ? `ל-${hhmm(tgt.h, tgt.min)} ` : ''}${dTxt}` : kind === 'book' ? `רישום ${tgt?.cls ? `ל${tgt.cls.name} ב-${hhmm(tgt.h, tgt.min)} ` : tgt ? `ל-${hhmm(tgt.h, tgt.min)} ` : ''}${dTxt}`
@@ -366,6 +432,7 @@ function createMemberHandoff(deps) {
             task = tomerStore.updateTask(task.id, { kind, missing: null, arboxCalls: f.calls, pendingConfirm: pend, action: { state: 'awaiting_member_confirmation', at: pend.askedAt } });
             isNew = true;
           }
+          tomerStore.updateTask(task.id, { ctx: ctxRec });
           const askText = [fromVoice ? 'מהתמלול של ההודעה הקולית הבנתי את הבקשה כך:' : (answeredPending ? 'עבר זמן מאז ששאלתי, אז בדקתי שוב ב-Arbox. רק לוודא לפני שאני משנה:' : 'רק לוודא לפני שאני משנה ב-Arbox:'),
             `${describe}.`, `לאשר? אפשר לענות "כן" ואבצע, או "לא" ולא אשנה דבר.`].join('\n');
           const st = await reply(phone, askText, task, pending);
@@ -417,11 +484,11 @@ function createMemberHandoff(deps) {
       `למה זה אצל הצוות: ${whyStaff}`, `קריאות Arbox (קריאה בלבד): ${f.calls.join(' · ')}`].filter(Boolean).join('\n');
     let task, isNew = false;
     const wasMissing = existing?.missing ?? null;            // read before the task object is updated in place
-    if (existing) task = tomerStore.updateTask(existing.id, { summary: `${KIND_HE[kind]} — ${want}`, detail, memberMessage: fullText, missing: rq.missing, kind, arboxCalls: f.calls, pendingConfirm: null,
+    if (existing) task = tomerStore.updateTask(existing.id, { summary: `${KIND_HE[kind]} — ${want}`, detail, memberMessage: fullText, missing: rq.missing, kind, arboxCalls: f.calls, pendingConfirm: null, ctx: ctxRec,
       ...(pc ? { action: { state: 'not_done_after_confirmation', at: now().toISOString() } } : {}) });
     else {
       task = tomerStore.createTask({ type: 'class_change', phone, memberName: who, arboxId: f.member?.userId ?? null, summary: `${KIND_HE[kind]} — ${want}`, detail, memberMessage: text, priority: 'normal' });
-      task = tomerStore.updateTask(task.id, { kind, missing: rq.missing, arboxCalls: f.calls });
+      task = tomerStore.updateTask(task.id, { kind, missing: rq.missing, arboxCalls: f.calls, ctx: ctxRec });
       isNew = true;
     }
 
@@ -429,11 +496,12 @@ function createMemberHandoff(deps) {
     // detail the member can supply is missing, the request waits and the member is asked; if no answer comes the
     // sweep below alerts once ("the clarification is stuck"). A failure of an automatic action always alerts.
     let alert = task.alert ?? null;
-    if ((!rq.missing && (isNew || wasMissing || !task.alert)) || (pc && !task.alert) || (res && !task.alert)) {
+    if ((!rq.missing && (isNew || wasMissing || !task.alert || changed)) || (pc && !task.alert) || (res && !task.alert)) {
       alert = await sendAlert(task, `${task.alert ? '🔁 תומר — עדכון' : '📌 תומר'}: ${KIND_HE[kind]} — ${who}`,
         [`👤 ${who}`, `📱 ${local(phone)}`, `💬 "${String(fullText).slice(0, 200)}"`, ...detail.split('\n').slice(0, -1),
+         changed ? `⚠️ מחליף את הבקשה הקודמת (${prevT.name} ב-${prevT.time}) — זו הבקשה היחידה שפתוחה למתאמנ/ת.` : null,
          res?.state === 'holds_both' ? `⚠️ הרישום החדש בוצע ב-Arbox; הרישום הקודם לא בוטל — נדרש ביטול ידני.` : res?.state === 'unknown' ? `⚠️ נשלחה בקשה ל-Arbox ותוצאתה לא אומתה — נא לבדוק ב-Arbox.` : `לא בוצע שום שינוי ב-Arbox.`,
-         `מזהה פנייה: ${task.id}`, `💬 https://wa.me/${phone}`].join('\n'));
+         `מזהה פנייה: ${task.id}`, `💬 https://wa.me/${phone}`].filter(Boolean).join('\n'));
       if (res) tomerStore.updateTask(task.id, { priority: 'high', action: { state: res.state, done: res.done, failed: res.failed, log: res.log, balance: res.balance ?? null } });
     }
 
@@ -447,7 +515,7 @@ function createMemberHandoff(deps) {
       `את הרישום ל-${hhmm(cur.h, cur.min)} לא הצלחתי לבטל, אז כרגע יש לך רישום לשני השיעורים.`, alert?.state === 'sent' ? `העברתי לצוות כדי שיבטלו את ${hhmm(cur.h, cur.min)}.` : `רשמתי לצוות לבטל את ${hhmm(cur.h, cur.min)}.`].join('\n');
     else if (res?.state === 'unknown') replyText = [`קיבלתי את הבקשה: ${want}.`, `שלחתי אותה ל-Arbox, אבל לא הצלחתי לאמת שהיא בוצעה, ולכן אני לא אומר לך שזה נעשה.`,
       alert?.state === 'sent' ? `העברתי לצוות לבדיקה, ויעדכנו אותך כאן.` : `רשמתי לצוות לבדוק, ויעדכנו אותך כאן.`].join('\n');
-    else replyText = [`קיבלתי את הבקשה: ${want}.`, ...lines,
+    else replyText = [changed ? `עדכנתי את הבקשה: ${want} (במקום ${prevT.name} ב-${prevT.time}).` : `קיבלתי את הבקשה: ${want}.`, ...lines,
       (res || (action?.plan && !action.plan.ok && !NO_PERMISSION.has(action.plan.reason)))
         ? `${res ? 'ניסיתי לבצע את זה ב-Arbox ולא הצלחתי' : `לא ביצעתי את זה בעצמי: ${action.plan.text}`} ${alert?.state === 'sent' ? 'העברתי את הבקשה לצוות.' : 'רשמתי את הבקשה לטיפול הצוות.'}`
         : alert?.state === 'sent' ? `אין לי הרשאה לשנות רישום בעצמי, אז העברתי את הבקשה לצוות.` : `אין לי הרשאה לשנות רישום בעצמי, אז רשמתי את הבקשה לטיפול הצוות.`,

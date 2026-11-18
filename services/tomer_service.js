@@ -349,6 +349,20 @@ function createTomerService(deps) {
     return R('answered');
   }
 
+  /** "מי מעביר את השיעור מחר ב-9?" — from the Arbox timetable, for the class(es) the question names. */
+  async function hInstructor(ctx) {
+    let rc;
+    try { rc = await resolveClass(ctx); } catch { await arboxDown(ctx); return R('arbox_unavailable'); }
+    if (rc.error || !rc.hasFilter) {
+      await say(ctx.phone, `על איזה שיעור מדובר? כתבו לי יום ושעה או סוג שיעור, ואבדוק ב-Arbox מי מעביר/ה.`, { handler: 'instructor', trigger: ctx.category, name: ctx.name });
+      return R('clarification');
+    }
+    if (!rc.matches.length) { await say(ctx.phone, `לא מצאתי ב-Arbox שיעור שמתאים למה שכתבת.`, { handler: 'instructor', trigger: ctx.category, dataSource: rc.data.source, name: ctx.name }); return R('answered'); }
+    const rows = rc.matches.slice(0, 8).map(c => `• ${fmtDate(c.date)} ${c.start} ${c.name} — ${c.instructor ? `עם ${c.instructor}` : 'שם המדריך/ה לא מופיע ב-Arbox'}`);
+    await say(ctx.phone, `לפי Arbox:\n${rows.join('\n')}`, { handler: 'instructor', trigger: ctx.category, dataSource: rc.data.source, name: ctx.name });
+    return R('answered');
+  }
+
   async function describeOne(ctx, c, { intro }) {
     const lines = [intro, fmtClass(c)];
     if (c.occupancy) lines.push(c.occupancy.spotsLeft > 0
@@ -812,6 +826,7 @@ function createTomerService(deps) {
       case 'location':               out = await hLocation(ctx); break;
       case 'schedule_query':         out = await hSchedule(ctx); break;
       case 'availability':           out = await hAvailability(ctx); break;
+      case 'instructor_query':       out = await hInstructor(ctx); break;
       case 'waitlist':               out = await hWaitlist(ctx); break;
       case 'class_book':             out = await hBook(ctx); break;
       case 'class_reschedule':       out = await hBook(ctx, { reschedule: true }); break;

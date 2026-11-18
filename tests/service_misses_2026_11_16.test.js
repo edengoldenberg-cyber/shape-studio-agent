@@ -225,7 +225,8 @@ describe('1. Tomer — a member asks to move to another class', () => {
     expect(textsTo(m)).toHaveLength(1);
     expect(reply).toMatch(/קיבלתי את הבקשה: מעבר מ-18:00 ל-17:00 היום/);
     expect(reply).toMatch(/בדקתי ב-Arbox: יש לך רישום לפילאטיס מכשירים ב-18:00 היום/);
-    expect(reply).toMatch(/ב-17:00 יש פילאטיס מכשירים, ונכון לעכשיו יש בו 3 מקומות פנויים/);
+    // owner rule 2026-11-18: the number of free places is told when the member asks about room, not in a request reply
+    expect(reply).not.toMatch(/מקומות פנויים|מקום פנוי/);
     expect(reply).toMatch(/אין לי הרשאה לשנות רישום בעצמי, אז העברתי את הבקשה לצוות/);
     expect(reply).toMatch(/הרישום הקיים שלך לא השתנה/);                      // she is never left without her original place
     expect(reply).not.toMatch(/רשמתי אותך|עברת ל|שיניתי את|תצטרכי לבדוק|באפליקציה|אני רואה ש/);
