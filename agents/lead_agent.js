@@ -47,8 +47,9 @@ function buildPricingContext() {
     } else if (unconfigured.length > 0) {
       lines.push(`חבילות נוספות: פרטים אצל הצוות.`);
     }
-    if (pkg._universal_access) {
-      lines.push(`גישה: ${pkg._universal_access}`);
+    const _ua = require('../utils/unapproved_claims').universalAccess(pkg);          // only once the owner approved it
+    if (_ua) {
+      lines.push(`גישה: ${_ua}`);
     }
     return lines.length > 0 ? `## מחירים ומנויים\n${lines.join('\n')}` : '';
   } catch {
@@ -224,6 +225,9 @@ function postProcessReply(reply, qualData, assets, ctx = {}) {
   if (!reply) return reply;
   let out = reply;
   const ppChanges = [];
+  // a statement about what every membership includes is not made until the owner approves it (utils/unapproved_claims.js)
+  { const _uc = require('../utils/unapproved_claims'); let _ok = false; try { _ok = !!_uc.universalAccess(require('../utils/pricing').load()); } catch { /* not approved */ }
+    if (!_ok) { const s = _uc.strip(out); if (s.changed) { out = s.text; ppChanges.push('unapproved_membership_claim_removed'); } } }
 
   // 1. Strip "no image" hallucinations regardless of exact phrasing.
   //    Covers: "אין לי תמונה", "אין תמונות זמינות כרגע", "אין תמונה זמינה",

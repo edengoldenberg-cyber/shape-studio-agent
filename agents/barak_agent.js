@@ -71,8 +71,9 @@ function buildStaffContext() {
 // Build a compact subscription context string
 function buildSubscriptionContext() {
   const lines = ['## מנויי הסטודיו'];
-  if (SUB_PKG._universal_access) {
-    lines.push(`\n**כלול בכל מנוי:** ${SUB_PKG._universal_access}\n`);
+  const _uaS = require('../utils/unapproved_claims').universalAccess(SUB_PKG);        // only once the owner approved it
+  if (_uaS) {
+    lines.push(`\n**כלול בכל מנוי:** ${_uaS}\n`);
   }
   if (SUB_PKG.trial) {
     const t = SUB_PKG.trial;
@@ -90,8 +91,9 @@ function buildSubscriptionContext() {
 // Build a compact classes/workouts context string
 function buildClassesContext() {
   const lines = ['## שיעורים ואימונים — Shape Studio'];
-  if (CLASSES_DATA._universal_access) {
-    lines.push(`\n**כלול בכל מנוי:** ${CLASSES_DATA._universal_access}\n`);
+  const _uaC = require('../utils/unapproved_claims').universalAccess(CLASSES_DATA);   // only once the owner approved it
+  if (_uaC) {
+    lines.push(`\n**כלול בכל מנוי:** ${_uaC}\n`);
   }
   for (const c of usableClasses()) {
     const capN   = (() => { try { return KNOWLEDGE_FILTER.capacityOf(c); } catch { return null; } })();

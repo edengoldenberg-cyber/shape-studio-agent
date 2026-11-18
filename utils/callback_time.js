@@ -632,6 +632,7 @@ function ilDateString(v = new Date()) {
 }
 
 module.exports = {
-  resolveCallbackTime, hasTimeSignal, formatCallbackTime, extractDayAndTime, ilDateString, relativeOffsetMin,
+  resolveCallbackTime, hasTimeSignal, formatCallbackTime, extractDayAndTime, ilDateString,
+  relativeOffsetMin: t => relativeOffsetMin(normalize(t)),
   ilParts, ilDate, addDays, callingHours, TZ, MAX_DAYS_AHEAD, HE_WEEKDAY_NAMES,
 };

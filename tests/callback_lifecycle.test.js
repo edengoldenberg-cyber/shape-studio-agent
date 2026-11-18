@@ -1848,7 +1848,7 @@ describe('14. The conversation of 2026-11-18 21:08: a price question while a cal
     return phone;
   }
 
-  test('the whole sequence: one location message, the price answered inside the arranging, "עוד עשר דקות" = 21:20, one summary', async () => {
+  test('the whole sequence: one location message, the price answered inside the arranging, "עוד עשר דקות" = 21:20 confirmed, one summary', async () => {
     const phone = await upToInvitation();
 
     // the location: ONE message, with a whole link
@@ -1872,20 +1872,37 @@ describe('14. The conversation of 2026-11-18 21:08: a price question while a cal
     n = textsTo(phone).length;
     setNow(at(102)); r = await say(phone, 'אני אשמח לדעת כמה עולה מנוי קודם כל', { at: at(102) });
     expect(textsTo(phone)).toHaveLength(n + 1);
-    expect(lastTo(phone)).toMatch(/אין לי כאן מחיר מעודכן למנוי[\s\S]*מתי נוח לך שנחזור אליך\?/);
-    expect(lastTo(phone)).not.toMatch(/רוצה שנציג יחזור/);
-    expect(store.getLead(phone).meta.awaitingCallbackTime).toBe(true);
+    expect(lastTo(phone)).toMatch(/^אין לי כאן מחיר מעודכן למנוי, ואני לא רוצה לתת לך מספר לא מדויק 🙏\nהנציג ייתן לך את המחירים המדויקים בשיחה\.\nכשיתאים לך, אפשר לכתוב לי מתי נוח שנחזור אליך 🙂$/);
+    expect(lastTo(phone)).not.toMatch(/רוצה שנציג יחזור|\(יום ושעה\)/);            // "the price first": no time is demanded, the call is not offered again
+    expect(store.getLead(phone).meta.awaitingCallbackTime).toBe(true);               // the offer stays in the context
 
     // "עוד עשר דקות", sent at 21:10:54 → Wednesday 18.11 at 21:20, shown exactly
     n = textsTo(phone).length;
     setNow(at(138)); r = await say(phone, 'עוד עשר דקות', { at: at(138) });
+    expect(r.route).toBe('callback_time_confirm');
+    expect(textsTo(phone)).toHaveLength(n + 1);
+    expect(lastTo(phone)).toBe('רק לוודא: יום רביעי, 18.11.2026 בשעה 21:20.\nלאשר?');
+    expect(openApt(phone)).toBeFalsy();                                              // nothing is saved before she confirms
+    expect(alerts()).toHaveLength(0);
+
+    // an answer in between is not a confirmation: the question is answered and the same time is asked about again
+    n = textsTo(phone).length;
+    setNow(at(146)); r = await say(phone, 'כן אבל כמה זה עולה?', { at: at(146) });
+    expect(r.route).toBe('callback_time_confirm');
+    expect(textsTo(phone)).toHaveLength(n + 1);
+    expect(lastTo(phone)).toMatch(/אין לי כאן מחיר מעודכן[\s\S]*ולגבי השיחה: יום רביעי, 18\.11\.2026 בשעה 21:20 — לאשר\?$/);
+    expect(openApt(phone)).toBeFalsy();
+
+    // the confirmation: now the request is saved, for exactly that moment
+    n = textsTo(phone).length;
+    setNow(at(155)); r = await say(phone, 'כן', { at: at(155) });
     expect(r.route).toBe('appointment_created');
     expect(openApt(phone).scheduledAt.toISOString()).toBe(il(2026, 11, 18, 21, 20).toISOString());
     expect(textsTo(phone)).toHaveLength(n + 1);
     expect(lastTo(phone)).toMatch(/^רשמתי בקשת שיחה: יום רביעי, 18\.11\.2026 בשעה 21:20 ✅\nואיך קוראים לך\? 😊$/);
     expect(summaries()).toHaveLength(0);
 
-    setNow(at(150)); await say(phone, 'פרסלי', { at: at(150) });
+    setNow(at(165)); await say(phone, 'פרסלי', { at: at(165) });
     expect(summaries()).toHaveLength(1);
     expect(summaries()[0].body).toMatch(/21:20/);
 
@@ -1948,14 +1965,62 @@ describe('14. The conversation of 2026-11-18 21:08: a price question while a cal
     expect(late.clarification).toMatch(/כבר עבר/);
   });
 
+  test('a relative time: refused, replaced, or confirmed after the moment passed', async () => {
+    const phone = await upToInvitation();
+    setNow(at(80)); await say(phone, 'כן בבקשה', { at: at(80) });
+    setNow(at(90)); let r = await say(phone, 'עוד רבע שעה', { at: at(90) });
+    expect(r.route).toBe('callback_time_confirm');
+    expect(lastTo(phone)).toBe('רק לוודא: יום רביעי, 18.11.2026 בשעה 21:25.\nלאשר?');
+    setNow(at(100)); r = await say(phone, 'לא', { at: at(100) });                    // refused: nothing saved, a time is asked for
+    expect(lastTo(phone)).toMatch(/מתי נוח לך שנחזור אליך/);
+    expect(openApt(phone)).toBeFalsy();
+    setNow(at(110)); await say(phone, 'עוד עשר דקות', { at: at(110) });               // 21:10:26 + 10 minutes
+    expect(lastTo(phone)).toBe('רק לוודא: יום רביעי, 18.11.2026 בשעה 21:20.\nלאשר?');
+    setNow(at(120)); r = await say(phone, 'מחר ב-10:30', { at: at(120) });            // an ordinary time replaces it and is saved as always
+    expect(r.route).toBe('appointment_created');
+    expect(openApt(phone).scheduledAt.toISOString()).toBe(il(2026, 11, 19, 10, 30).toISOString());
+
+    const p2 = await upToInvitation();
+    setNow(at(80)); await say(p2, 'כן בבקשה', { at: at(80) });
+    setNow(at(90)); await say(p2, 'עוד עשר דקות', { at: at(90) });
+    setNow(at(90 + 11 * 60)); r = await say(p2, 'כן', { at: at(90 + 11 * 60) });     // confirmed after the moment has passed
+    expect(lastTo(p2)).toMatch(/המועד הזה כבר עבר/);
+    expect(openApt(p2)).toBeFalsy();
+  });
+
+  test('"every membership includes every kind of class" is not said while the owner has not approved it', async () => {
+    setNow(T);
+    const phone = newPhone();
+    await say(phone, 'היי, מתעניין באימוני כוח');
+    mockAi.queue.push('מעולה! אימוני הכוח שלנו פונקציונליים. כל מנוי כולל גישה מלאה לכל סוגי האימונים בסטודיו. מאיפה אתה מגיע?');
+    await say(phone, 'ספר לי עוד');
+    expect(lastTo(phone)).toBe('מעולה! אימוני הכוח שלנו פונקציונליים. מאיפה אתה מגיע?');
+    const uc = require('../utils/unapproved_claims');
+    expect(uc.universalAccess({ _universal_access: 'כל מנוי כולל הכל' })).toBe('');                                  // the source is kept, not used
+    expect(uc.universalAccess({ _universal_access: 'כל מנוי כולל הכל', _universal_access_approved: true })).toBe('כל מנוי כולל הכל');
+    const barak = require('../agents/barak_agent');
+    expect(barak.getSubscriptionContext()).not.toMatch(/כלול בכל מנוי|גישה מלאה/);
+  });
+
+  test('duplicates are recognised by the inbound message: the same text for the same message once; a new message asking again is sent at once', () => {
+    const wa = jest.requireActual('../services/whatsapp.service');
+    const t0 = 5000000;
+    expect(wa._isRepeatSend('972500000009', 'דרך השדה 12', t0, 'IN-1')).toBe(false);
+    expect(wa._isRepeatSend('972500000009', 'דרך השדה 12', t0 + 500, 'IN-1')).toBe(true);                // a second route / a retry / a parallel handler
+    expect(wa._isRepeatSend('972500000009', 'דרך השדה 12', t0 + 60000, 'IN-1')).toBe(true);              // still the same inbound message
+    expect(wa._isRepeatSend('972500000009', 'דרך השדה 12', t0 + 1000, 'IN-2')).toBe(false);              // "send it again" one second later: sent
+    expect(wa._isRepeatSend('972500000009', 'דרך השדה 12', t0 + 1200, 'IN-2')).toBe(true);
+  });
+
   test('the same text to the same number within seconds is sent once; a later repeat and a different text are sent', () => {
     const wa = jest.requireActual('../services/whatsapp.service');
     const t0 = 1000000;
-    expect(wa._isRepeatSend('972500000001', 'דרך השדה 12', t0)).toBe(false);
-    expect(wa._isRepeatSend('972500000001', 'דרך השדה 12', t0 + 900)).toBe(true);              // the second of two routes / a retry
-    expect(wa._isRepeatSend('972500000001', 'טקסט אחר', t0 + 900)).toBe(false);
-    expect(wa._isRepeatSend('972500000002', 'דרך השדה 12', t0 + 900)).toBe(false);             // another person
-    expect(wa._isRepeatSend('972500000001', 'דרך השדה 12', t0 + wa.DUP_SEND_WINDOW_MS + 1000)).toBe(false);   // asked again later
+    // sends that belong to no inbound message (a reminder, a worker): the short text window
+    expect(wa._isRepeatSend('972500000001', 'דרך השדה 12', t0, null)).toBe(false);
+    expect(wa._isRepeatSend('972500000001', 'דרך השדה 12', t0 + 900, null)).toBe(true);
+    expect(wa._isRepeatSend('972500000001', 'טקסט אחר', t0 + 900, null)).toBe(false);
+    expect(wa._isRepeatSend('972500000002', 'דרך השדה 12', t0 + 900, null)).toBe(false);             // another person
+    expect(wa._isRepeatSend('972500000001', 'דרך השדה 12', t0 + wa.DUP_SEND_WINDOW_MS + 1000, null)).toBe(false);   // later
   });
 
   test('a link whose letters were lost is never used and never saved', () => {

@@ -170,13 +170,24 @@ const quietQueue = [];
 // same message, by a retry, or by the same message handled in parallel (production 2026-11-18 21:09: the location went
 // out twice, one second apart). The second one is not sent. The mark is set BEFORE the first send is awaited, so two
 // calls that run at the same moment are covered. A new request for the same content a little later is not affected.
+//
+// What is recognised is the handling of the SAME inbound message: every send made while an inbound message is being
+// handled carries that message's id (set by the pipeline with markInbound), and the same text for the same inbound
+// message is sent once - however many routes, retries or parallel handlers produce it. A NEW inbound message ("send
+// me the address again", a second later) has another id and is never blocked. Only a send that belongs to no inbound
+// message (a reminder, a worker) falls back to the short text window.
+const { AsyncLocalStorage } = require('async_hooks');
+const _inboundCtx = new AsyncLocalStorage();
+/** Called by the pipeline when it starts handling an inbound message: sends made from here on belong to it. */
+function markInbound(messageId) { if (messageId) _inboundCtx.enterWith({ id: String(messageId) }); }
 const DUP_SEND_WINDOW_MS = 20 * 1000;
+const DUP_INBOUND_TTL_MS = 10 * 60 * 1000;
 const _recentSends = new Map();
-function _isRepeatSend(to, text, now = Date.now()) {
-  for (const [k, ts] of _recentSends) if (now - ts > DUP_SEND_WINDOW_MS) _recentSends.delete(k);
-  const key = `${to} ${text}`;
+function _isRepeatSend(to, text, now = Date.now(), inboundId = _inboundCtx.getStore()?.id ?? null) {
+  for (const [k, v] of _recentSends) if (now - v.at > v.ttl) _recentSends.delete(k);
+  const key = JSON.stringify([to, inboundId ?? '', text]);
   if (_recentSends.has(key)) return true;
-  _recentSends.set(key, now);
+  _recentSends.set(key, { at: now, ttl: inboundId ? DUP_INBOUND_TTL_MS : DUP_SEND_WINDOW_MS });
   return false;
 }
 
@@ -837,4 +848,4 @@ async function ensureOutgoingWebhooks() {
   }
 }
 
-module.exports = { _isRepeatSend, DUP_SEND_WINDOW_MS, sendText, sendFileByUrl, alertOwner, notifyLeadTeam, releaseQueuedMessages, verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, probeGreenApiConnection, ensureOutgoingWebhooks, getGreenCreds, _tokenSourceVar, getTestSendLog, clearTestSendLog };
+module.exports = { _isRepeatSend, markInbound, DUP_SEND_WINDOW_MS, DUP_INBOUND_TTL_MS, sendText, sendFileByUrl, alertOwner, notifyLeadTeam, releaseQueuedMessages, verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, probeGreenApiConnection, ensureOutgoingWebhooks, getGreenCreds, _tokenSourceVar, getTestSendLog, clearTestSendLog };

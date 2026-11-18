@@ -2504,6 +2504,9 @@ async function buildSchedulingReply(intent, msg, clientMatch, { noMatchPassthrou
     // Check if the question is specifically about what's included
     const isIncludesQ = /מה זה כולל|כולל מה|מה כלול|מה נכלל|איזה שיעורים כלול/.test(msgText);
 
+    const _uaOk = !!require('./utils/unapproved_claims').universalAccess(pricing.load());
+    // what a membership includes is stated only from terms the owner approved; until then it is not described
+    if (isIncludesQ && !_uaOk) return `אין לי כאן פירוט מאושר של מה שכלול בכל מנוי, ואני לא רוצה לתת לך מידע לא מדויק 🙏\nרוצה שנציג יחזור אליך עם הפרטים?`;
     if (isIncludesQ) {
       return (
         `המנוי כולל גישה מלאה לכל סוגי האימונים בסטודיו 🏋️\n\n` +
@@ -2529,10 +2532,10 @@ async function buildSchedulingReply(intent, msg, clientMatch, { noMatchPassthrou
     const _subAi = await tomerAgent.chat(
       `המשתמש שאל: "${msgText}"\n\n` +
       `ענה בעברית על מבנה המנויים של Shape Studio לפי הנתונים הבאים:\n\n${subCtx}\n\n` +
-      `כלל חשוב: כל מנוי כולל גישה לכל סוגי האימונים. ציין זאת בתשובה. ` +
+      (_uaOk ? `כלל חשוב: כל מנוי כולל גישה לכל סוגי האימונים. ציין זאת בתשובה. ` : `אל תאמר מה כלול במנוי ואל תאמר שמנוי כולל את כל סוגי האימונים - המידע הזה לא אושר. `) +
       `אם המחיר לא מצוין (null) — ציין "אשמח לחבר אותך עם נציג שייתן לך את הפרטים". אל תציין מחיר שאינו בנתונים. עד 4 שורות.`
     );
-    const _subG = pricing.guard(msgText, _subAi, {});
+    const _subG = pricing.guard(msgText, _uaOk ? _subAi : require('./utils/unapproved_claims').strip(_subAi).text, {});
     if (_subG.changed) logger.info('[pipeline] price guard replaced a subscription answer', { topic: _subG.topic, reason: _subG.reason });
     return _subG.reply;
   }
@@ -3597,6 +3600,9 @@ function _isManualCallbackAnswer(phone, msg) {
     && at - new Date(m.timestamp).getTime() >= 0 && at - new Date(m.timestamp).getTime() <= 30 * 60 * 1000);
 }
 
+// a plain confirmation / refusal of a time that was shown for confirmation - nothing else in the message
+const _CALLBACK_CONFIRM_RE = /^(?:כן|כן כן|מאשר|מאשרת|אישור|נכון|בדיוק|מתאים|מעולה|סבבה|בסדר|אוקיי?|יאללה|כן מאשר|כן מאשרת|כן בבקשה|כן תודה|yes|ok)[\s.!,🙂😊👍✅]*$/iu;
+const _CALLBACK_REFUSE_RE  = /^(?:לא|לא מתאים|לא נכון|לא טוב|ביטול|לא תודה|no)[\s.!,]*$/iu;
 const _INVITE_ACCEPT_RE = /^(?:כן|בטח|ברור|אשמח|בשמחה|יאללה|סבבה|מעולה|אוקיי?|אוקי|בסדר|נשמע טוב|מתאים|yes|ok|sure)(?:[\s,.!]|$)/i;
 /**
  * An explicit decision NOT to register / "do not call me", and the messages that follow it (utils/sales_refusal.js;
@@ -3785,9 +3791,9 @@ async function handleLeadCallbackFlow({ msg, fromNorm, fromIsraeli, clientMatch,
   }
 
   // Resolve + persist the time, then either close (name known) or ask for the name.
-  async function acceptAndRespond(source) {
+  async function acceptAndRespond(source, timeText = text) {
     if (!store.getLead(fromNorm)) store.upsertLead(fromNorm, { name: msg.name ?? undefined });
-    const r = callbackSvc.acceptTime({ phone: fromNorm, text, sentAt, source });
+    const r = callbackSvc.acceptTime({ phone: fromNorm, text: timeText, sentAt, source });
 
     if (!r.ok && r.reason === 'persist_failed') {
       patchMeta({ awaitingCallbackTime: false, callbackNeedsManualAt: new Date().toISOString() });
@@ -3973,11 +3979,43 @@ async function handleLeadCallbackFlow({ msg, fromNorm, fromIsraeli, clientMatch,
   // was read as a plain yes and answered with "מתי נוח לך"; asked again, the lead was offered the call a second time.
   const _priceTopic = hasTime ? null : pricing.topic(text);
   const _accepts    = inviteCtx && _INVITE_ACCEPT_RE.test(text);
+
+  // A RELATIVE time ("עוד עשר דקות") is shown as an exact date and hour and CONFIRMED before anything is saved or any
+  // summary is sent. Only a plain confirmation confirms: a question, "כן אבל...", or any other message does not.
+  const _fmtIL = d => callbackTime.formatCallbackTime(d);
+  const _pend  = awaiting && meta.pendingCallbackConfirm?.at ? meta.pendingCallbackConfirm : null;
+  if (_pend) {
+    const _at = new Date(_pend.at);
+    if (!hasTime && _CALLBACK_CONFIRM_RE.test(text)) {
+      patchMeta({ pendingCallbackConfirm: null });
+      if (!(_at.getTime() > Date.now())) {
+        store.logEvent('callback_relative_time_expired', fromNorm, { at: _pend.at });
+        return finish('callback_time_clarify', `המועד הזה כבר עבר 🙂 מתי יהיה לך נוח שנחזור אליך? (יום ושעה)`, { routeIntent: 'callback_time' });
+      }
+      const p = callbackTime.ilParts(_at), z = n => String(n).padStart(2, '0');
+      store.logEvent('callback_relative_time_confirmed', fromNorm, { at: _pend.at });
+      return acceptAndRespond(_pend.source ?? 'callback_time', `${p.day}.${p.month + 1}.${p.year} בשעה ${z(p.hour)}:${z(p.minute)}`);
+    }
+    if (!hasTime && _CALLBACK_REFUSE_RE.test(text)) {
+      patchMeta({ pendingCallbackConfirm: null });
+      return finish('callback_time_requested', `אין בעיה 🙂 מתי נוח לך שנחזור אליך? (יום ושעה)`, { routeIntent: 'representative' });
+    }
+    // a new time replaces the one that waited; any other message that is not about the price drops it (not a confirmation)
+    if (hasTime || !_priceTopic) patchMeta({ pendingCallbackConfirm: null });
+  }
+
   if (_priceTopic && !isRequest && (awaiting || _accepts)) {
     const _pkg = pricing.load(), _o = { callbackPending: true };
     const _ans = _priceTopic === 'trial' ? pricing.trialAnswer(_pkg, _o) : pricing.membershipAnswer(_pkg, _o, text);
-    const _ask = `${_ans}\nמתי נוח לך שנחזור אליך? (יום ושעה)`;
     store.logEvent('callback_price_question_answered', fromNorm, { topic: _priceTopic, awaiting, preview: text.slice(0, 40) });
+    // a time is waiting for her confirmation: the price is answered and the same question is asked again
+    if (_pend && !hasTime) return finish('callback_time_confirm', `${_ans}\nולגבי השיחה: ${_fmtIL(new Date(_pend.at))} — לאשר?`, { routeIntent: 'callback_time' });
+    // "I want to know the price FIRST": the price (or that there is no approved price) is the answer. No time is
+    // demanded in the same message; the offer of the call stays open and a time written later is taken.
+    if (/קודם|לפני\s+ש|לפני\s+הכל/.test(text)) {
+      return finish('callback_price_answered', `${_ans}\nכשיתאים לך, אפשר לכתוב לי מתי נוח שנחזור אליך 🙂`, { routeIntent: 'representative' });
+    }
+    const _ask = `${_ans}\nמתי נוח לך שנחזור אליך? (יום ושעה)`;
     if (awaiting) return finish('callback_time_requested', _ask, { routeIntent: 'representative' });
     store.logEvent('callback_invite_accepted', fromNorm, { preview: text.slice(0, 40) });
     return askForTime(_ask);
@@ -4003,7 +4041,18 @@ async function handleLeadCallbackFlow({ msg, fromNorm, fromIsraeli, clientMatch,
   if (awaiting && !isRequest && looksLikeClassQuestion) return null;
 
   if (!hasTime) return askForTime(`בשמחה! 😊 מתי נוח לך שנחזור אליך? (יום ושעה)`);
-  return acceptAndRespond(isRequest ? 'callback_request' : (awaiting ? 'callback_time' : 'invite_reply'));
+  const _src = isRequest ? 'callback_request' : (awaiting ? 'callback_time' : 'invite_reply');
+  if (callbackTime.relativeOffsetMin(text) !== null) {
+    const _rel = callbackTime.resolveCallbackTime(text, sentAt, { now: new Date() });
+    if (_rel.ok && _rel.relative) {
+      if (!store.getLead(fromNorm)) store.upsertLead(fromNorm, { name: msg.name ?? undefined });
+      patchMeta({ awaitingCallbackTime: true, callbackTimeAttempts: 0, callbackRequestedAt: meta.callbackRequestedAt ?? sentAt.toISOString(),
+        pendingCallbackConfirm: { at: _rel.scheduledAt.toISOString(), raw: text.slice(0, 60), source: _src, askedAt: new Date().toISOString() } });
+      store.logEvent('callback_relative_time_proposed', fromNorm, { at: _rel.scheduledAt.toISOString(), preview: text.slice(0, 40) });
+      return finish('callback_time_confirm', `רק לוודא: ${_fmtIL(_rel.scheduledAt)}.\nלאשר?`, { routeIntent: 'callback_time' });
+    }
+  }
+  return acceptAndRespond(_src);
 }
 
 /**
@@ -4056,6 +4105,9 @@ async function processInboundWAMessage(msg) {
 
   const fromNorm    = normalizeToE164(msg.from);
   const fromIsraeli = e164ToIsraeli(fromNorm);
+
+  // every reply sent while this message is handled is tied to it: the same text is never sent twice for one message
+  try { require('./services/whatsapp.service').markInbound?.(msg.messageId); } catch { /* the guard is optional */ }
 
   // ── Deduplication: skip if Green API already delivered this messageId ────────
   if (_isDuplicateInbound(msg.messageId)) {
@@ -6832,7 +6884,8 @@ app.post('/api/admin/sync-agent-knowledge', async (_req, res) => {
     const subCtx = barakAgent.getSubscriptionContext();
     checks.push({
       test:   'subscription_context_includes_universal_access',
-      passed: subCtx.includes('כלול בכל מנוי') || subCtx.includes('גישה מלאה'),
+      // the statement appears only when the owner approved it (utils/unapproved_claims.js)
+      passed: !!require('./utils/unapproved_claims').universalAccess(pricing.load()) === (subCtx.includes('כלול בכל מנוי') || subCtx.includes('גישה מלאה')),
       sample: subCtx.slice(0, 120),
     });
 
