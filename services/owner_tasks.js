@@ -54,7 +54,8 @@ function createOwnerTasks(d) {
     const out = [];
     try { for (const c of cases.list({ open: true, limit: 500 })) out.push({ key: `case:${c.id}`, agent: 'tomer', kind: 'פנייה', title: caseLabel(c), who: c.memberName ?? tail(c.phone), createdAt: c.createdAt, dueAt: c.createdAt, link: `#tomer/case/${c.id}` }); }
     catch (err) { out.error = `cases: ${err.message}`; }
-    try { for (const t of tomerStore.getOpenTasks()) out.push({ key: `task:${t.id}`, agent: 'tomer', kind: 'משימה', title: t.title ?? TASK_HE[t.type] ?? 'משימה לצוות', who: t.memberName ?? tail(t.phone), createdAt: t.createdAt, dueAt: t.createdAt, link: '#tomer' }); }
+    try { for (const t of tomerStore.getOpenTasks()) if (!(t.missing && !t.alert)) out.push({   // a request still being clarified with the member is not the owner's yet
+       key: `task:${t.id}`, agent: 'tomer', kind: 'משימה', title: t.title ?? TASK_HE[t.type] ?? 'משימה לצוות', who: t.memberName ?? tail(t.phone), createdAt: t.createdAt, dueAt: t.createdAt, link: '#tomer' }); }
     catch (err) { out.error = `${out.error ? out.error + '; ' : ''}tasks: ${err.message}`; }
     try {
       for (const a of aptStore.getAll()) {

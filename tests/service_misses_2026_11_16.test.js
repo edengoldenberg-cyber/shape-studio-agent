@@ -273,7 +273,8 @@ describe('1. Tomer — a member asks to move to another class', () => {
     expect(all).toHaveLength(1);
     expect(all[0]).toMatchObject({ id: t.id, missing: null });
     expect(all[0].summary).toMatch(/מעבר מ-18:00 ל-17:00/);
-    expect(alerts().map(a => a.subject)).toEqual([expect.stringMatching(/📌 תומר: מעבר/), expect.stringMatching(/🔁 תומר — עדכון: מעבר/)]);
+    // owner rule 2026-11-18: no alert while the member is still being asked for a detail — ONE alert when the request is ready
+    expect(alerts().map(a => a.subject)).toEqual([expect.stringMatching(/📌 תומר: מעבר/)]);
     expect(lastTo(m)).toMatch(/קיבלתי את הבקשה: מעבר מ-18:00 ל-17:00 היום/);
   });
 

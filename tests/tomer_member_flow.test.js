@@ -453,7 +453,7 @@ describe('C. Classes: a request to book / cancel / move goes to the class flow (
   test('no hour given → ONE focused question; the answer completes the SAME request', async () => {
     const m = member();
     await say(m.phone, 'תרשמי אותי לפילאטיס מחר');
-    expect(lastTo(m.phone)).toMatch(/לאיזו שעה לרשום אותך\?/);
+    expect(lastTo(m.phone)).toMatch(/לאיזו שעה התכוונת\?/);
     await say(m.phone, 'ב-9');
     expect(lastTo(m.phone)).toMatch(/רישום לפילאטיס מכשירים ב-09:00/);
     const tasks = (await get('/api/tomer/tasks')).body.tasks.filter(t => t.phone === m.phone && t.type === 'class_change');

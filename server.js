@@ -7920,5 +7920,6 @@ module.exports = app;
 // the listen callback).
 module.exports._recoverClosingSummaries = _recoverClosingSummaries;
 module.exports._reconcileLeads = _reconcileLeads;
+module.exports._memberHandoff = memberHandoff;                       // tests: the periodic sweep (failed alerts, unanswered questions)
 module.exports._purgeKnownMembersFromLeadStore = _purgeKnownMembersFromLeadStore;
 

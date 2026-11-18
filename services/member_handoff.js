@@ -37,6 +37,7 @@ const BLOCK_REASON = 'אין לתומר הרשאה לשנות רישום לשי�
 const MAX_ALERT_ATTEMPTS = 3;
 const FOLLOWUP_MS = 60 * 60 * 1000;
 const CONFIRM_MS = 30 * 60 * 1000;            // a written "כן" confirms the exact action shown, for this long
+const CLARIFY_STUCK_MS = 30 * 60 * 1000;      // a question about a missing detail that got no answer: the manager is told once
 const CONFIRM_KEEP_MS = 6 * 60 * 60 * 1000;   // after that a late "כן" gets the question again, with fresh facts, for this long
 const YES_RE = /^(?:כן+|כן כן|כן בבקשה|כן תודה|כן מאשרת?|מאשרת?|אני מאשרת?|מאושר|אשר|אשרי|בטח|ברור|יאללה|סבבה|נכון|בדיוק|אוקיי?|או קיי|ok|okay|yes)[\s.!,🙏👍✅❤️]*$/i;
 const NO_RE = /^(?:לא+|לא תודה|לא צריך|לא לאשר|לא מאשרת?|ביטול|בטל|בטלי|תבטלי?|עזוב|עזבי|תשאיר|תשאירי|טעות|no)[\s.!,🙏]*$/i;
@@ -134,6 +135,14 @@ function createMemberHandoff(deps) {
   async function sweepConfirmations() {
     let escalated = 0;
     for (const t of tomerStore.getOpenTasks()) {
+      // a clarification the member did not answer: one alert, the request stays open; the member is not messaged
+      if (t.type === 'class_change' && t.missing && !t.alert && !t.clarifyEscalated && now().getTime() - new Date(t.updatedAt).getTime() > CLARIFY_STUCK_MS) {
+        tomerStore.updateTask(t.id, { clarifyEscalated: now().toISOString(), detail: `${t.detail}\nהמתאמנ/ת נשאל/ה על הפרט החסר ולא ענה/תה בתוך 30 דקות.` });
+        await sendAlert(t, `📌 תומר: ${KIND_HE[t.kind] ?? 'בקשת שיעור'} — ${t.memberName ?? local(t.phone)} (הבירור נתקע)`,
+          [`👤 ${t.memberName ?? local(t.phone)}`, `📱 ${local(t.phone)}`, `💬 "${String(t.memberMessage ?? '').slice(0, 200)}"`, ...String(t.detail ?? '').split('\n').slice(0, -1),
+           `תומר שאל את המתאמנ/ת על הפרט החסר, ולא התקבלה תשובה בתוך 30 דקות.`, `לא בוצע שום שינוי ב-Arbox.`, `מזהה פנייה: ${t.id}`, `💬 https://wa.me/${t.phone}`].join('\n'));
+        escalated++;
+      }
       const pc = t.pendingConfirm;
       if (!pc) continue;
       const age = now().getTime() - new Date(pc.askedAt).getTime();
@@ -416,10 +425,12 @@ function createMemberHandoff(deps) {
       isNew = true;
     }
 
-    // ── the manager: once when the task is opened, once more when a missing detail arrived ──
+    // ── the manager (owner rule, 2026-11-18): alerted when the request is ready for him — not on every step. While a
+    // detail the member can supply is missing, the request waits and the member is asked; if no answer comes the
+    // sweep below alerts once ("the clarification is stuck"). A failure of an automatic action always alerts.
     let alert = task.alert ?? null;
-    if (isNew || (wasMissing && !rq.missing) || (pc && !task.alert)) {
-      alert = await sendAlert(task, `${isNew ? '📌 תומר' : '🔁 תומר — עדכון'}: ${KIND_HE[kind]} — ${who}`,
+    if ((!rq.missing && (isNew || wasMissing || !task.alert)) || (pc && !task.alert) || (res && !task.alert)) {
+      alert = await sendAlert(task, `${task.alert ? '🔁 תומר — עדכון' : '📌 תומר'}: ${KIND_HE[kind]} — ${who}`,
         [`👤 ${who}`, `📱 ${local(phone)}`, `💬 "${String(fullText).slice(0, 200)}"`, ...detail.split('\n').slice(0, -1),
          res?.state === 'holds_both' ? `⚠️ הרישום החדש בוצע ב-Arbox; הרישום הקודם לא בוטל — נדרש ביטול ידני.` : res?.state === 'unknown' ? `⚠️ נשלחה בקשה ל-Arbox ותוצאתה לא אומתה — נא לבדוק ב-Arbox.` : `לא בוצע שום שינוי ב-Arbox.`,
          `מזהה פנייה: ${task.id}`, `💬 https://wa.me/${phone}`].join('\n'));
@@ -428,9 +439,9 @@ function createMemberHandoff(deps) {
 
     // ── the member: only what is true ───────────────────────────────────────
     let replyText;
-    if (rq.missing === 'target_time') replyText = `קיבלתי 🙏 ${lines.join(' ')} לאיזו שעה ${kind === 'move' ? 'לעבור' : 'לרשום אותך'}?`.replace(/\s+/g, ' ');
-    else if (rq.missing === 'target_type') replyText = `קיבלתי 🙏 ${lines.join(' ')} לאיזה מהם לרשום אותך?`.replace(/\s+/g, ' ');
-    else if (rq.missing === 'target_class') replyText = `${lines.join(' ')} לאיזה שיעור לרשום אותך? (סוג ושעה) עדיין לא נרשמת לשום שיעור.`.replace(/\s+/g, ' ');
+    if (rq.missing === 'target_time') replyText = `קיבלתי 🙏 ${lines.join(' ')} ${kind === 'move' ? 'לאיזו שעה לעבור' : 'לאיזו שעה התכוונת'}?`.replace(/\s+/g, ' ');
+    else if (rq.missing === 'target_type') replyText = `קיבלתי 🙏 ${lines.join(' ')} איזה שיעור התכוונת?`.replace(/\s+/g, ' ');
+    else if (rq.missing === 'target_class') replyText = `${lines.join(' ')} איזה שיעור התכוונת? (סוג ושעה) עדיין לא נרשמת לשום שיעור.`.replace(/\s+/g, ' ');
     else if (rq.missing === 'which_class') replyText = `קיבלתי 🙏 ${lines.join(' ')} איזה שיעור לבטל? (יום ושעה)`.replace(/\s+/g, ' ');
     else if (res?.state === 'holds_both') replyText = [`רשמתי אותך ל${tgt.cls.name} ב-${hhmm(tgt.h, tgt.min)} ${dTxt}, ואימתתי את זה מול Arbox ✅`,
       `את הרישום ל-${hhmm(cur.h, cur.min)} לא הצלחתי לבטל, אז כרגע יש לך רישום לשני השיעורים.`, alert?.state === 'sent' ? `העברתי לצוות כדי שיבטלו את ${hhmm(cur.h, cur.min)}.` : `רשמתי לצוות לבטל את ${hhmm(cur.h, cur.min)}.`].join('\n');

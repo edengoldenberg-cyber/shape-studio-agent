@@ -454,7 +454,7 @@ describe('A registration request in two messages (live failure 2026-11-18)', () 
   const cls = (id, start, name, registered, cap) => ({ schedule_id: id, date: day(0), start_time: start, end_time: `${String(Number(start.slice(0, 2)) + 1).padStart(2, '0')}:00`, session_name: name, staff_member: { name: 'מירי כהן' }, max_participants: cap, registration_count: registered });
   function setup(phone = P) {
     world();
-    for (const t of tasksOf(phone)) require('../utils/tomer_store').resolveTask(t.id, { resolutionNote: 'test reset', resolvedBy: 'test' });
+    for (const t of require('../utils/tomer_store').getOpenTasks()) require('../utils/tomer_store').resolveTask(t.id, { resolutionNote: 'test reset', resolvedBy: 'test' });   // the task file is shared by the whole suite
     const id = person({ phone: '0' + phone.slice(3), first: 'בדיקה' });
     plan(id, { start: day(0), end: null });
     arbox.state.schedule.push(cls(21, '17:00', 'אימון כח', 5, 10), cls(22, '18:00', 'ALL IN', 3, 10), cls(23, '18:00', 'פילאטיס בר', 8, 8), cls(24, '19:00', 'אימון כח', 5, 10), cls(25, '20:00', 'אימון כח', 0, 10));
@@ -466,7 +466,9 @@ describe('A registration request in two messages (live failure 2026-11-18)', () 
     setup();
     const r = await say(P, 'היי אני רוצה להשתבץ לשיעור היום בשעה 18');
     expect(r.route).toMatch(/^tomer/);
-    expect(last(P)).toMatch(/ב-18:00 היום יש ALL IN ופילאטיס בר\. לאיזה מהם לרשום אותך\?/);
+    expect(last(P)).toMatch(/ב-18:00 היום יש ALL IN ופילאטיס בר\. איזה שיעור התכוונת\?/);
+    expect(last(P)).not.toMatch(/לרשום אותך/);                                    // it must not sound as if the registration is about to be made
+    expect(mockOut.alerts).toHaveLength(0);                                       // a detail the member can supply: the manager is not alerted yet
     expect(last(P)).not.toMatch(/שיעור, מנוי, תשלום|תקלה|אפליקצי/);
     expect(reads(/\/v3\/schedule/)).toBeGreaterThan(0);                            // the exact day was read
     expect(tasksOf(P).filter(t => t.status === 'open')).toHaveLength(1);
@@ -478,20 +480,20 @@ describe('A registration request in two messages (live failure 2026-11-18)', () 
   test('message 2 completes the SAME request with the day and hour kept; a class that does not exist is said so, with what there is — never a "fault", never the app', async () => {
     setup();
     await say(P, 'היי אני רוצה להשתבץ לשיעור היום בשעה 18');
-    const alertsAfter1 = mockOut.alerts.length;
     await say(P, 'אני רוצה להשתבץ לאימון כוח בשעה 18');
     const t = last(P);
     expect(t).toMatch(/לא מצאתי ב-Arbox אימון כח ב-18:00 היום\./);
     expect(t).toMatch(/אימון כח יש היום ב-17:00, 19:00 ו-20:00\./);
     expect(t).toMatch(/ב-18:00 יש ALL IN ופילאטיס בר\./);
-    expect(t).toMatch(/לאיזה שיעור לרשום אותך\?.*עדיין לא נרשמת/);
+    expect(t).toMatch(/איזה שיעור התכוונת\?.*עדיין לא נרשמת/);
     expect(t).not.toMatch(/תקלה|אפליקצי|העברתי|רשמתי את הבקשה/);                    // nothing was handed over yet, and it is not claimed
     const open = tasksOf(P).filter(x => x.status === 'open');
     expect(open).toHaveLength(1);                                                 // one request, not two
     expect(open[0]).toMatchObject({ kind: 'book', missing: 'target_class' });
     expect(open[0].memberMessage).toMatch(/היום בשעה 18.*אימון כוח בשעה 18/s);
     expect(casesOf(P)).toHaveLength(0);
-    expect(mockOut.alerts.length).toBe(alertsAfter1);                             // no second alert while a detail is still missing
+    expect(mockOut.alerts).toHaveLength(0);                                       // still being clarified: no alert
+    expect((await request(app).get('/api/owner-tasks')).body.open.map(x => x.key)).not.toContain(`task:${open[0].id}`);   // and not in the owner's task list yet
 
     // the member picks an existing class: the request is complete, handed to the staff, and said exactly so
     await say(P, 'ב-19');
@@ -506,8 +508,10 @@ describe('A registration request in two messages (live failure 2026-11-18)', () 
     expect(fin[0]).toMatchObject({ kind: 'book', missing: null, alert: { state: 'sent' } });
     expect(fin[0].detail).toMatch(/שיעור מבוקש \(Arbox\): אימון כח 19:00 .* 5\/10 רשומים, 5 פנויים/);
     expect(fin[0].detail).toMatch(/מנוי בתוקף \(Arbox\): מנוי חודשי/);
+    expect((await request(app).get('/api/owner-tasks')).body.open.map(x => x.key)).toContain(`task:${fin[0].id}`);       // now it is the owner's
     const alert = mockOut.alerts.at(-1);
-    expect(alert.subject).toMatch(/תומר — עדכון: רישום לשיעור/);
+    expect(mockOut.alerts).toHaveLength(1);                                       // ONE alert, when the request is ready for the owner
+    expect(alert.subject).toMatch(/^📌 תומר: רישום לשיעור/);
     expect(alert.body).toMatch(/בקשה: רישום לאימון כח ב-19:00 היום/);
     expect(alert.body).toMatch(/לא בוצע שום שינוי ב-Arbox/);
     expect(reads(/\/v3\/users\/memberships/)).toBeGreaterThan(0);
@@ -536,6 +540,26 @@ describe('A registration request in two messages (live failure 2026-11-18)', () 
     expect(t).not.toMatch(/העברתי/);
     expect(t).toMatch(/עדיין לא נרשמת/);
     expect(tasksOf('972507120004').find(x => x.status === 'open')).toMatchObject({ alert: { state: 'failed', error: 'provider refused' } });
+  });
+
+  test('the clarification is stuck: after 30 minutes without an answer the manager is told once; nothing is sent to the member', async () => {
+    setup('972507120006');
+    await say('972507120006', 'היי אני רוצה להשתבץ לשיעור היום בשעה 18');
+    const sentToMember = textsTo('972507120006').length;
+    const store2 = require('../utils/tomer_store');
+    const t = tasksOf('972507120006').find(x => x.status === 'open');
+    expect(mockOut.alerts).toHaveLength(0);
+    jest.setSystemTime(new Date(T0.getTime() + 31 * 60 * 1000));
+    try {
+      await app._memberHandoff.retryFailedAlerts();                              // what the 15-minute job runs
+      expect(mockOut.alerts).toHaveLength(1);
+      expect(mockOut.alerts[0].subject).toMatch(/רישום לשיעור — .*\(הבירור נתקע\)/);
+      expect(mockOut.alerts[0].body).toMatch(/לא התקבלה תשובה בתוך 30 דקות/);
+      await app._memberHandoff.retryFailedAlerts();
+      expect(mockOut.alerts).toHaveLength(1);                                     // once
+      expect(textsTo('972507120006')).toHaveLength(sentToMember);                 // the member is not messaged
+      expect(store2.getTasks({ phone: '972507120006', type: 'class_change' }).find(x => x.id === t.id).status).toBe('open');
+    } finally { jest.setSystemTime(T0); }
   });
 
   test('after "במה מדובר?" a class word is a topic, not a fault: no "מצטער על התקלה", no app-problem case', async () => {
