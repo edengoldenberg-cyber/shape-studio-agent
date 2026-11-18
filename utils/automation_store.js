@@ -102,7 +102,10 @@ const DEFAULT_WORKERS = [
     nameEn:   'Evening WhatsApp Report',
     schedule: 'יומי 20:00',
     agent:    'scheduler',
-    enabled:  true,
+    // Off by default (owner, 2026-11-18): the owner's summaries go out at 09:00 and 17:00 only (owner_tasks digest).
+    // This older statistics report was a third daily message. It can still be switched on from the automations screen
+    // (in memory, until the next restart).
+    enabled:  false,
     lastRun:  null,
     runCount: 0,
   },

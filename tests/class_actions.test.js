@@ -25,7 +25,7 @@ const booking = time => ({ date: DAY, time, className: 'פילאטיס מכשי�
 
 /** A stateful fake of Arbox as the gateway shows it. Writes change the bookings unless told to fail. */
 function fakeArbox(over = {}) {
-  const s = { bookings: [booking('18:00')], classes: [cls(101, '17:00'), cls(102, '18:00')], memberships: [{ membershipUserId: 77, active: true, cancelled: false, startDate: '2026-01-01', endDate: '2026-12-31', type: 'plan' }],
+  const s = { bookings: [booking('18:00')], classes: [cls(101, '17:00'), cls(102, '18:00')], memberships: [{ membershipUserId: 77, active: true, cancelled: false, startDate: '2026-01-01', endDate: '2026-12-31', type: 'plan', name: 'חופשי חודשי' }],
     enabled: new Set(['class_book', 'class_cancel']), writes: [], reads: 0, fail: {}, lag: {}, ...over };
   const gw = {
     writesEnabled: op => s.enabled.has(op),
@@ -108,6 +108,15 @@ describe('B. the plan: what may be done automatically', () => {
     expect(pl).toMatchObject({ ok: true, late: true });
     expect(pl.steps.map(x => x.op)).toEqual(['class_book', 'class_cancel']);           // still: the new class first
     expect((await late.plan({ kind: 'cancel', ...facts(s, { tgt: null }) })).reason).toBe('inside_cancellation_window');   // the exception is for a move only
+    // a membership with a limited number of entries: the effect of a late move on the entries was never verified
+    // (Arbox reports no count through the API) - it goes to the staff, until ARBOX_LATE_MOVE_LIMITED=verified
+    s.memberships[0].name = 'מנוי 1 אימונים בשבוע ( 5 כניסות) - הו"ק';
+    expect((await late.plan({ kind: 'move', ...facts(s) })).reason).toBe('late_move_limited_unverified');
+    expect((await actionsOn(gw).plan({ kind: 'move', ...facts(s) })).ok).toBe(true);                                      // outside the window: unchanged
+    process.env.ARBOX_LATE_MOVE_LIMITED = 'verified';
+    try { expect((await late.plan({ kind: 'move', ...facts(s) })).ok).toBe(true); } finally { delete process.env.ARBOX_LATE_MOVE_LIMITED; }
+    s.memberships[0].name = 'חופשי חודשי';
+    expect(s.writes).toHaveLength(0);
     expect((await actionsOn(gw).plan({ kind: 'move', ...facts(s) })).late).toBe(false);                                   // outside the window nothing is "late"
   });
 

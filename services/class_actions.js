@@ -55,6 +55,7 @@ const REASON_HE = {
   current_class_unclear:     'השיעור של הרישום הקיים לא זוהה באופן חד-משמעי במערכת השיעורים.',
   cancel_rule_unknown:       'כלל הביטול של השיעור לא נקרא מ-Arbox.',
   inside_cancellation_window: 'הביטול נסגר לפי הכלל של השיעור ב-Arbox (ביטול מאוחר). ביטול בלי שיעור חלופי כפוף למדיניות הביטול, וההחלטה אצל הצוות.',
+  late_move_limited_unverified: 'המעבר הוא בתוך חלון הביטול והמנוי הוא עם מספר כניסות מוגבל. ההשפעה של מעבר כזה על יתרת הכניסות עדיין לא נבדקה מול Arbox, ולכן הוא מטופל על ידי הצוות.',
   late_move_unverified:      'המעבר הוא בתוך חלון הביטול של השיעור. מעבר מאוחר מאושר עסקית, אבל עדיין לא אומת ש-Arbox מאפשר אותו דרך ה-API, ולכן הוא מבוצע על ידי הצוות.',
   current_started:           'השיעור שממנו מבקשים לעבור כבר התחיל.',
   same_class:                'השיעור המבוקש הוא השיעור שהיא כבר רשומה אליו.',
@@ -91,7 +92,7 @@ function createClassActions({ gateway, logger, now = () => new Date(), sleep = m
     // itself is checked above and by the caller.
     if (member.role && member.role !== 'client') return refuse('external_member');
     const steps = [];
-    let membershipUserId = null, late = false;
+    let membershipUserId = null, late = false, lateWin = null;
 
     if (kind === 'move' || kind === 'cancel') {
       const b = current?.booking;
@@ -107,7 +108,7 @@ function createClassActions({ gateway, logger, now = () => new Date(), sleep = m
         // a cancellation with no replacement stays under the cancellation policy; a MOVE is the owner-approved exception
         if (kind !== 'move') return refuse('inside_cancellation_window', win);
         if (!enabled('class_move_late')) return refuse('late_move_unverified', win);
-        late = true;
+        late = true; lateWin = win;
       }
       steps.push({ op: 'class_cancel', args: { userId: member.userId, scheduleId: cls.scheduleId }, slot: { date: cls.date, time: hhmm(cls.start), name: cls.name }, what: `ביטול ${cls.name} ${hhmm(cls.start)}` });
     }
@@ -124,6 +125,12 @@ function createClassActions({ gateway, logger, now = () => new Date(), sleep = m
       if (!live.length) return refuse('no_active_membership');
       if (live.length > 1) return refuse('membership_ambiguous');
       membershipUserId = live[0].membershipUserId;
+      // A move inside the cancellation window was verified on an UNLIMITED membership only (2026-11-18). Arbox reports no
+      // remaining-entries count through the API for any membership (measured: null on every booking row of the limited
+      // ones too), so whether such a move costs a member with a limited number of entries an extra entry cannot be read
+      // back. Until it is checked on a test member with a limited membership, only a membership named "חופשי" moves
+      // late automatically; any other goes to the staff. Opened with ARBOX_LATE_MOVE_LIMITED=verified.
+      if (late && process.env.ARBOX_LATE_MOVE_LIMITED !== 'verified' && !/חופשי/.test(String(live[0].name ?? ''))) return refuse('late_move_limited_unverified', lateWin ?? {});
       // the new class is booked FIRST: a move must never start by giving up the place she has
       steps.unshift({ op: 'class_book', args: { userId: member.userId, scheduleId: cls.scheduleId, membershipUserId }, slot: { date: cls.date, time: hhmm(cls.start), name: cls.name }, what: `רישום ל${cls.name} ${hhmm(cls.start)}` });
     }
