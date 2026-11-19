@@ -211,5 +211,8 @@ function mount(app, express) {
   app.use(middleware);
 }
 
-module.exports = { mount, middleware, isPublic, isAuthenticated, issueToken, validToken, parseToken, csrfFor,
+/** Timing-safe check that a supplied password equals the configured dashboard password. */
+function verifyPassword(pw) { return !!password() && typeof pw === 'string' && safeEqual(pw, password()); }
+
+module.exports = { mount, middleware, isPublic, isAuthenticated, verifyPassword, issueToken, validToken, parseToken, csrfFor,
   COOKIE, CSRF_COOKIE, _resetForTests: () => { _fails.clear(); _recent = []; _revoked = null; } };

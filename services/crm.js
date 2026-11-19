@@ -83,6 +83,13 @@ function createCrm({
   const crmStateOf = lead => lead?.meta?.crmState ?? 'active';
   const isActiveState = lead => crmStateOf(lead) === 'active';
 
+  // ── central classification (the SAME one the system uses) ─────────────────────────────
+  // A sales lead only. Members, aggregators, staff numbers, test batches and non-sales
+  // "contact" records are classified by utils/contact_kind and kept OUT of the funnel, its
+  // counts and its reports. With no classifier injected (unit tests) everything is a lead.
+  function kindInfo(lead) { if (!kindOf) return null; try { return kindOf(lead); } catch { return null; } }
+  function inSalesList(lead) { const k = kindInfo(lead); return k ? k.salesList === true : true; }
+
   // ── ownership of the conversation (barak / staff), independent of stage and assignee ──
   function ownerOf(lead) {
     const st = lead?.status;
@@ -207,9 +214,10 @@ function createCrm({
       if (crmState === 'active' && cs !== 'active') return false;
       if (crmState === 'trash' && cs !== 'trashed') return false;
       if (crmState === 'archive' && cs !== 'archived') return false;
-      // the CRM is the SALES tool: confirmed members and non-sales conversations are not working leads
-      // (kept reachable through 'registered' view / search by phone, not in the default pipeline)
-      if (view !== 'registered' && crmState === 'active' && ownerOf(lead) === 'member' && !qTrim) return false;
+      // the CRM funnel is sales leads only (same classification the system uses). Members / staff /
+      // test / non-sales contacts never enter the active pipeline, its counts or its reports. The
+      // 'registered' view is the exception: it shows leads that became members (sales history kept).
+      if (crmState === 'active' && view !== 'registered' && !inSalesList(lead)) return false;
       if (qTrim) {
         const hay = [displayNameOf(lead), lead.name, ...(tagsOf(lead))].filter(Boolean).join(' ').toLowerCase();
         const textHit = hay.includes(qTrim.toLowerCase());
@@ -246,7 +254,7 @@ function createCrm({
   // counts for the whole active pipeline, per stage — for the board columns / badges
   function stageCounts() {
     const out = Object.fromEntries(SALES_STAGES.map(s => [s.id, 0]));
-    for (const lead of store.getAllLeads()) { if (crmStateOf(lead) === 'active' && ownerOf(lead) !== 'member') out[stageOf(lead)]++; }
+    for (const lead of store.getAllLeads()) { if (crmStateOf(lead) === 'active' && inSalesList(lead)) out[stageOf(lead)]++; }
     return out;
   }
 
@@ -270,6 +278,10 @@ function createCrm({
       firstSeen: iso(lead.firstSeen), lastActivity: iso(lead.lastActivity),
       objections: Array.isArray(m.objections) ? m.objections : [],
       notes: Array.isArray(m.notes) ? m.notes : [],
+      calls: (Array.isArray(m.calls) ? m.calls : []).slice(-20),
+      registration: registrationOf(lead),
+      trialInfo: { scheduledAt: m.trialScheduledAt ?? null, scheduledBy: m.trialScheduledBy ?? null, attendedAt: m.trialAttendedAt ?? null, attendedSource: m.trialAttendedSource ?? null },
+      lostReason: m.lostReason ?? null,
       summary: m.leadBrief ? { text: m.qualProfile?.qualificationReason ?? null, goal: m.leadBrief?.goal ?? null, source: 'AI', at: m.briefGeneratedAt ?? null } : null,
       qualProfile: m.qualProfile ?? null,          // AI estimate — labelled as such in the UI
       arbox: { synced: !!lead.arboxSynced, id: lead.arboxId ?? null },
@@ -359,10 +371,14 @@ function createCrm({
     return { cancelledCallbacks, cancelledTasks };
   }
 
+  // Only the hold that THIS removal creates is ours to clear later. A pre-existing hold (a refusal,
+  // an identity review, any other block) is left exactly as it is, and restore never lifts it.
+  const holdPatch = lead => (lead.meta?.outreachHold ? {} : { outreachHold: true, outreachHoldSetByCrm: true });
+
   function trash(phone, { by = 'צוות' } = {}) {
     const lead = store.getLead(phone); if (!lead) return { ok: false, error: 'not_found' };
     const stopped = stopFutureSalesActions(phone, 'lead_trashed');
-    patchMeta(phone, { crmState: 'trashed', trashedAt: iso(now()), trashedBy: by, archivedAt: null, outreachHold: true });
+    patchMeta(phone, { crmState: 'trashed', trashedAt: iso(now()), trashedBy: by, archivedAt: null, ...holdPatch(lead) });
     store.logEvent('crm_lead_trashed', phone, { by, ...stopped });
     broadcast('crm_lead', { phone });
     log.info('[crm] lead trashed', { by, ...stopped });
@@ -372,7 +388,7 @@ function createCrm({
   function archive(phone, { by = 'צוות' } = {}) {
     const lead = store.getLead(phone); if (!lead) return { ok: false, error: 'not_found' };
     // parked out of day-to-day work: no proactive outreach, but a genuinely scheduled callback is left alone
-    patchMeta(phone, { crmState: 'archived', archivedAt: iso(now()), archivedBy: by, outreachHold: true });
+    patchMeta(phone, { crmState: 'archived', archivedAt: iso(now()), archivedBy: by, ...holdPatch(lead) });
     store.logEvent('crm_lead_archived', phone, { by });
     broadcast('crm_lead', { phone });
     return { ok: true, phone };
@@ -382,8 +398,11 @@ function createCrm({
     const lead = store.getLead(phone); if (!lead) return { ok: false, error: 'not_found' };
     const was = crmStateOf(lead);
     if (was === 'active') return { ok: true, phone, unchanged: true };
-    // restoring does NOT revive the callbacks / reminders / messages that trashing stopped, and sends nothing
-    patchMeta(phone, { crmState: 'active', trashedAt: null, archivedAt: null, outreachHold: false, restoredAt: iso(now()), restoredBy: by });
+    // restoring does NOT revive the callbacks / reminders / messages that trashing stopped, and sends nothing.
+    // It lifts ONLY the hold that the archive/trash itself placed — never a refusal or another block.
+    const m = lead.meta ?? {};
+    const liftHold = m.outreachHoldSetByCrm ? { outreachHold: false, outreachHoldSetByCrm: null } : {};
+    patchMeta(phone, { crmState: 'active', trashedAt: null, archivedAt: null, ...liftHold, restoredAt: iso(now()), restoredBy: by });
     store.logEvent('crm_lead_restored', phone, { by, from: was });
     broadcast('crm_lead', { phone });
     return { ok: true, phone, from: was };
@@ -441,8 +460,118 @@ function createCrm({
     return { ok: true, taskId, phone: t.phone };
   }
 
+  // ── call logging + outcomes (§7) ──────────────────────────────────────────────────────
+  // A dialled number is NOT proof a call happened; logging the outcome is a separate, explicit act.
+  const CALL_OUTCOMES = {
+    answered:           { he: 'ענה/תה', stage: null },
+    no_answer:          { he: 'לא ענה/תה', stage: null },
+    call_back_requested:{ he: 'ביקש/ה לחזור', stage: 'arranging_call' },
+    undecided:          { he: 'מתלבט/ת', stage: null },
+    trial_scheduled:    { he: 'נקבע ניסיון', stage: 'trial_scheduled' },
+    registered:         { he: 'נרשם/ה', stage: 'registered' },
+    not_interested:     { he: 'לא מעוניין/ת', stage: 'lost' },
+  };
+  function logCall(phone, { outcome, note = null, followUpAt = null, by = 'צוות' } = {}) {
+    const lead = store.getLead(phone); if (!lead) return { ok: false, error: 'not_found' };
+    const o = CALL_OUTCOMES[outcome]; if (!o) return { ok: false, error: 'invalid_outcome' };
+    const m = lead.meta ?? {}, at = iso(now());
+    const calls = [...(Array.isArray(m.calls) ? m.calls : []), { at, outcome, note: note ? String(note).slice(0, 500) : null, by, followUpAt: followUpAt ?? null }];
+    const patch = { calls };
+    // staff report — never confused with Arbox verification (§9)
+    if (outcome === 'registered') { patch.salesStage = 'registered'; patch.registeredSource = m.registeredSource === 'arbox' ? 'arbox' : 'staff_report'; patch.registeredAt = m.registeredAt ?? at; }
+    else if (outcome === 'not_interested') { patch.salesStage = 'lost'; patch.lostReason = note ? String(note).slice(0, 120) : 'לא מעוניין/ת'; patch.lostAt = at; }
+    else if (outcome === 'trial_scheduled') { patch.salesStage = 'trial_scheduled'; patch.trialScheduledAt = followUpAt ?? m.trialScheduledAt ?? null; patch.trialScheduledBy = by; patch.trialSource = 'staff_plan'; }
+    else if (o.stage && !stageSetManually(lead)) patch.salesStage = o.stage;
+    if (followUpAt && outcome !== 'trial_scheduled') patch.nextAction = { text: `מעקב אחרי שיחה (${o.he})`, dueAt: followUpAt, setBy: by, setAt: at };
+    patchMeta(phone, patch);
+    store.logEvent('crm_call_logged', phone, { by, outcome });
+    // after "no answer" / "undecided" a follow-up task is OFFERED (created only when a date was given); never a send
+    if (followUpAt && ['no_answer', 'undecided', 'call_back_requested'].includes(outcome)) {
+      try { const t = tomerStore.createTask({ type: CRM_TASK_TYPE, phone, memberName: displayNameOf(lead), summary: `מעקב: ${o.he}${note ? ' — ' + note : ''}`, priority: 'normal' }); tomerStore.updateTask(t.id, { dueAt: followUpAt, createdBy: by, title: 'מעקב מכירה' }); } catch (e) { log.warn('[crm] follow-up task failed', { error: e.message }); }
+    }
+    broadcast('crm_lead', { phone });
+    return { ok: true, phone, card: card(phone) };
+  }
+
+  // ── trials & conversion (§9) ──────────────────────────────────────────────────────────
+  function trial(phone, { action, at = null, note = null, by = 'צוות' } = {}) {
+    const lead = store.getLead(phone); if (!lead) return { ok: false, error: 'not_found' };
+    const stamp = iso(now());
+    if (action === 'schedule') { patchMeta(phone, { trialScheduledAt: at ?? null, trialScheduledBy: by, trialSource: 'staff_plan', salesStage: 'trial_scheduled', trialNote: note ? String(note).slice(0, 300) : null }); store.logEvent('crm_trial_scheduled', phone, { by, at }); }
+    else if (action === 'attended') { patchMeta(phone, { trialAttendedAt: at ?? stamp, trialAttendedBy: by, trialAttendedSource: 'staff_report', salesStage: 'trial_attended' }); store.logEvent('crm_trial_attended', phone, { by }); }
+    else return { ok: false, error: 'invalid_action' };
+    broadcast('crm_lead', { phone });
+    return { ok: true, phone, card: card(phone) };
+  }
+
+  // Is this lead a registered member, and is it VERIFIED by Arbox or only a staff report?
+  function registrationOf(lead) {
+    const m = lead.meta ?? {};
+    const arboxVerified = lead.status === 'converted_member' || m.isConfirmedMember === true || ownerOf(lead) === 'member';
+    if (arboxVerified) return { registered: true, verified: true, source: 'arbox', at: m.convertedAt ?? null };
+    if (m.registeredSource === 'staff_report' || stageOf(lead) === 'registered') return { registered: true, verified: false, source: 'staff_report', at: m.registeredAt ?? null };
+    return { registered: false, verified: false, source: null, at: null };
+  }
+
+  // ── "my day today" (§1) ───────────────────────────────────────────────────────────────
+  function lastInbound(phone) { const th = getThread ? getThread(phone) : null; const ms = th?.messages ?? []; for (let i = ms.length - 1; i >= 0; i--) if (ms[i].direction === 'in') return ms[i]; return null; }
+  function awaitingReply(phone) { const th = getThread ? getThread(phone) : null; const ms = th?.messages ?? []; let lastIn = null, lastOut = null; for (const x of ms) { const t = Date.parse(x.timestamp); if (!Number.isFinite(t)) continue; if (x.direction === 'in') lastIn = t; else if (x.direction === 'out') lastOut = t; } return lastIn != null && (lastOut == null || lastIn > lastOut); }
+  function today() {
+    const t = now().getTime(), dayEnd = new Date(t); dayEnd.setHours(23, 59, 59, 999);
+    const active = store.getAllLeads().filter(l => crmStateOf(l) === 'active' && inSalesList(l));
+    const scheduledCalls = [], tasksDue = [], waitingStaff = [], unanswered = [];
+    for (const l of active) {
+      const apt = openCallback(l.phone);
+      if (apt && apt.scheduledAt && Date.parse(iso(apt.scheduledAt)) <= dayEnd.getTime()) scheduledCalls.push(row(l));
+      const tks = openSalesTasks(l.phone).filter(tk => !tk.dueAt || Date.parse(tk.dueAt) <= dayEnd.getTime());
+      if (tks.length) tasksDue.push({ ...row(l), dueTasks: tks.length, overdueTasks: tks.filter(tk => tk.dueAt && Date.parse(tk.dueAt) < new Date(t).setHours(0, 0, 0, 0)).length });
+      if (ownerOf(l) === 'staff') waitingStaff.push(row(l));
+      if (awaitingReply(l.phone)) unanswered.push(row(l));
+    }
+    const cmpDue = (a, b) => (toTime(a.nextAction?.dueAt) ?? Infinity) - (toTime(b.nextAction?.dueAt) ?? Infinity);
+    scheduledCalls.sort((a, b) => (toTime(a.callbackAt) ?? 0) - (toTime(b.callbackAt) ?? 0));
+    return {
+      counts: { scheduledCalls: scheduledCalls.length, tasksDue: tasksDue.length, waitingStaff: waitingStaff.length, unanswered: unanswered.length },
+      groups: { scheduledCalls, tasksDue: tasksDue.sort(cmpDue), waitingStaff, unanswered },
+    };
+  }
+
+  // ── sales reports (§10) — durable per-lead facts, kept apart from the active lists ──────
+  function reports({ from = null, to = null } = {}) {
+    const f = from ? Date.parse(from) : -Infinity, tt = to ? Date.parse(to) : Infinity;
+    const inRange = iso => { const x = Date.parse(iso); return Number.isFinite(x) && x >= f && x <= tt; };
+    const leads = store.getAllLeads();
+    const salesLeads = leads.filter(inSalesList);
+    const bySource = {};                                  // source is never invented; a missing one is "ללא מקור"
+    const bump = (obj, key, k = 1) => { obj[key] = (obj[key] ?? 0) + k; };
+    const inquiries = saleLeadsInquiries();
+    function saleLeadsInquiries() { let n = 0; for (const l of salesLeads) if (inRange(iso(l.firstSeen))) { n++; bump(bySource, sourceOf(l) ?? 'ללא מקור'); } return n; }
+    let callsTotal = 0; const callsByOutcome = {};
+    for (const l of leads) for (const c of (l.meta?.calls ?? [])) if (inRange(c.at)) { callsTotal++; bump(callsByOutcome, c.outcome); }
+    const trialsScheduled = salesLeads.filter(l => l.meta?.trialScheduledAt && inRange(l.meta.trialScheduledAt)).length;
+    const trialsAttendedStaff = salesLeads.filter(l => l.meta?.trialAttendedAt && inRange(l.meta.trialAttendedAt)).length;
+    const regArbox = leads.filter(l => { const r = registrationOf(l); return r.registered && r.verified && (r.at ? inRange(r.at) : true); }).length;
+    const regStaff = salesLeads.filter(l => l.meta?.registeredSource === 'staff_report' && inRange(l.meta.registeredAt ?? iso(l.lastActivity))).length;
+    const lost = salesLeads.filter(l => stageOf(l) === 'lost' && (l.meta?.lostAt ? inRange(l.meta.lostAt) : true));
+    const lostReasons = {}; for (const l of lost) bump(lostReasons, l.meta?.lostReason ?? 'לא צוין');
+    return {
+      ok: true, period: { from: from ?? null, to: to ?? null },
+      metrics: [
+        { id: 'inquiries', he: 'פניות (לידים חדשים)', value: inquiries, definition: 'לידים שסווגו כליד מכירה ושנקלטו לראשונה בטווח (לפי firstSeen).', breakdown: bySource },
+        { id: 'calls', he: 'שיחות שתועדו', value: callsTotal, definition: 'שיחות שהצוות תיעד ידנית בטווח. חיוג שלא תועד אינו נספר.', breakdown: Object.fromEntries(Object.entries(callsByOutcome).map(([k, v]) => [CALL_OUTCOMES[k]?.he ?? k, v])) },
+        { id: 'trials_scheduled', he: 'ניסיונות שנקבעו', value: trialsScheduled, definition: 'לידים שנקבע להם מועד ניסיון בטווח (תכנון ידני של הצוות).' },
+        { id: 'trials_attended', he: 'הגיעו לניסיון (דיווח צוות)', value: trialsAttendedStaff, definition: 'סומנו כמי שהגיעו לניסיון בטווח. דיווח צוות — לא אומת מול נוכחות ב-Arbox.' },
+        { id: 'registered_arbox', he: 'נרשמו — אומת ב-Arbox', value: regArbox, definition: 'לידים שהפכו למנויים לפי Arbox (converted_member / מנוי בתוקף). זהו האימות, לא דיווח.' },
+        { id: 'registered_staff', he: 'נרשמו — דיווח צוות בלבד', value: regStaff, definition: 'סומנו כנרשמו על ידי הצוות אך עדיין לא אומתו ב-Arbox.' },
+        { id: 'lost', he: 'לא נסגרו', value: lost.length, definition: 'לידים בשלב "לא נסגר" בטווח, לפי סיבה.', breakdown: lostReasons },
+      ],
+      note: 'הדוח מחושב מעובדות שמורות לכל ליד (firstSeen, שיחות, מועדי ניסיון, מקור ההרשמה), בנפרד מהרשימות הפעילות. מקור קמפיין לא מומצא — חסר מוצג כ"ללא מקור".',
+    };
+  }
+
   return {
-    SALES_STAGES, SAVED_VIEWS, STAGE_HE, CRM_TASK_TYPE,
+    SALES_STAGES, SAVED_VIEWS, STAGE_HE, CRM_TASK_TYPE, CALL_OUTCOMES,
+    registrationOf, logCall, trial, today, reports,
     nsn, phoneMatches, crmStateOf, ownerOf, stageOf,
     search, stageCounts, card, row, timelineOf,
     createLead, updateLead, setStage, addNote, createLeadTask, updateLeadTask,

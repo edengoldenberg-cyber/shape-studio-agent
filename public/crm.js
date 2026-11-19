@@ -19,6 +19,8 @@
   const saveS = () => { try { localStorage.setItem(SKEY, JSON.stringify(S)); } catch {} };
 
   let META = null, LAST = { rows: [], total: 0, byStage: {} }, SEL = new Set(), mounted = false, loading = false, lastError = null;
+  let TODAY = null, dayGroup = null;
+  const DAY_LABELS = { scheduledCalls: '📞 שיחות היום', tasksDue: '✔️ משימות להיום', waitingStaff: '🙋 ממתינים לצוות', unanswered: '💬 ללא מענה' };
 
   const STAGE_CLS = { new: 'muted', needs: 'warm', arranging_call: 'warm', call_scheduled: 'hot', trial_scheduled: 'hot', trial_attended: 'green', registered: 'green', lost: 'muted' };
   const stageHe = id => (META?.stages.find(s => s.id === id)?.he) ?? id;
@@ -75,9 +77,24 @@
       .crm-sec h5{margin:0 0 6px;font-size:13px}
       .crm-ai{background:#eef3fb;border-radius:8px;padding:8px;font-size:12px}
       .crm-tag{display:inline-flex;align-items:center;gap:4px;background:var(--bg2,#eef);border-radius:12px;padding:2px 8px;font-size:12px}
-      .crm-bulkbar{position:sticky;bottom:0;background:var(--panel,#fff);border:1px solid var(--border,#ddd);border-radius:12px;padding:8px 12px;display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap}
+      .crm-bulkbar{position:sticky;bottom:0;background:var(--panel,#fff);border:1px solid var(--border,#ddd);border-radius:12px;padding:8px 12px;display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap;z-index:5}
       .crm-note{font-size:12px;color:var(--muted,#888);margin:2px 0 10px}
-      @media(max-width:560px){.crm-card{grid-template-columns:auto 1fr}.crm-card .act{grid-column:1 / -1;display:flex;gap:6px;margin-top:4px}.crm-count{width:100%;margin:4px 0}}
+      .crm-today{display:flex;gap:8px;overflow-x:auto;margin-bottom:10px;padding-bottom:4px}
+      .crm-tile{flex:1 1 120px;min-width:120px;background:var(--panel,#fff);border:1px solid var(--border,#eee);border-right:4px solid var(--primary,#6b46c1);border-radius:12px;padding:10px 12px;cursor:pointer;text-align:start}
+      .crm-tile.on{background:var(--primary,#6b46c1);color:#fff}
+      .crm-tile .v{font-size:22px;font-weight:700}.crm-tile .l{font-size:12px}
+      .crm-outcomes{display:flex;flex-wrap:wrap;gap:6px}
+      .crm-oc{border:1px solid var(--border,#ddd);background:var(--bg2,#fafafa);color:inherit;border-radius:18px;padding:7px 12px;font-size:13px;cursor:pointer}
+      .crm-oc.sel{background:var(--primary,#6b46c1);color:#fff;border-color:var(--primary,#6b46c1)}
+      .crm-verif{display:inline-block;border-radius:8px;padding:1px 8px;font-size:11px}
+      .crm-verif.ok{background:#e6f6ec;color:#1e8449}.crm-verif.staff{background:#fef3e0;color:#b9770e}
+      .crm-taskrow{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;padding:6px 0;border-bottom:1px dashed var(--border,#eee)}
+      .crm-taskrow .ta{display:flex;gap:4px;flex-wrap:wrap}
+      .crm-mini{padding:3px 8px;font-size:12px;border-radius:8px;border:1px solid var(--border,#ddd);background:var(--bg2,#fafafa);color:inherit;cursor:pointer}
+      .crm-rep table{width:100%;border-collapse:collapse;font-size:13px}
+      .crm-rep td,.crm-rep th{border-bottom:1px solid var(--border,#eee);padding:6px 4px;text-align:start;vertical-align:top}
+      .crm-rep .def{font-size:11px;color:var(--muted,#888)}
+      @media(max-width:560px){.crm-card{grid-template-columns:auto 1fr}.crm-card .act{grid-column:1 / -1;display:flex;gap:6px;margin-top:4px}.crm-count{width:100%;margin:4px 0}.crm-sel{width:26px;height:26px}}
     `));
   }
 
@@ -89,22 +106,41 @@
     injectStyle();
     r.innerHTML = `
       <div class="crm-note" id="crm-headnote"></div>
+      <div class="crm-today" id="crm-today"></div>
       <div class="crm-bar">
         <div class="crm-search"><span>🔎</span><input id="crm-q" type="search" placeholder="חיפוש: שם, טלפון (05/972/חלק ממספר) או תגית" autocomplete="off"></div>
         <button class="crm-btn" id="crm-add">➕ ליד חדש</button>
         <button class="crm-btn sec" id="crm-mode">🗂️ לוח שלבים</button>
+        <button class="crm-btn sec" id="crm-reports">📊 דוחות</button>
       </div>
       <div class="crm-views" id="crm-views"></div>
       <div class="crm-filters" id="crm-filters"></div>
+      <div id="crm-daybanner"></div>
       <div id="crm-results"><div class="crm-empty">טוען…</div></div>
       <div id="crm-bulk"></div>`;
     $('#crm-q').value = S.q;
-    $('#crm-q').addEventListener('input', debounce(e => { S.q = e.target.value; saveS(); refresh(); }, 300));
+    $('#crm-reports').addEventListener('click', openReports);
+    $('#crm-q').addEventListener('input', debounce(e => { S.q = e.target.value; saveS(); dayGroup = null; refresh(); }, 300));
     $('#crm-add').addEventListener('click', openCreate);
     $('#crm-mode').addEventListener('click', () => { S.mode = S.mode === 'table' ? 'board' : 'table'; saveS(); renderResults(); $('#crm-mode').textContent = S.mode === 'table' ? '🗂️ לוח שלבים' : '📋 טבלה'; });
     $('#crm-mode').textContent = S.mode === 'table' ? '🗂️ לוח שלבים' : '📋 טבלה';
     mounted = true;
     return true;
+  }
+
+  async function renderToday() {
+    const box = $('#crm-today'); if (!box) return;
+    const res = await api('/api/crm/today');
+    if (!res.ok || !res.data?.ok) { box.innerHTML = ''; return; }
+    TODAY = res.data;
+    const c = TODAY.counts;
+    box.innerHTML = Object.keys(DAY_LABELS).map(k => `<div class="crm-tile ${dayGroup === k ? 'on' : ''}" data-day="${k}"><div class="v">${c[k] ?? 0}</div><div class="l">${DAY_LABELS[k]}</div></div>`).join('');
+    box.querySelectorAll('[data-day]').forEach(t => t.addEventListener('click', () => { dayGroup = (dayGroup === t.dataset.day) ? null : t.dataset.day; renderToday(); renderDayBanner(); renderResults(); renderBulk(); }));
+  }
+  function renderDayBanner() {
+    const b = $('#crm-daybanner'); if (!b) return;
+    b.innerHTML = dayGroup ? `<div class="crm-note" style="display:flex;justify-content:space-between;align-items:center"><span>${DAY_LABELS[dayGroup]} — ${(TODAY?.groups?.[dayGroup] || []).length} רשומות</span><button class="crm-mini" id="crm-dayclear">← חזרה לכל הלידים</button></div>` : '';
+    $('#crm-dayclear')?.addEventListener('click', () => { dayGroup = null; renderToday(); renderDayBanner(); renderResults(); });
   }
 
   function renderViews() {
@@ -137,7 +173,7 @@
       <select id="f-own">${ownOpts}</select>
       <select id="f-sort">${sortOpts}</select>
       <span class="crm-count" id="crm-count"></span>`;
-    const bind = (id, key) => $(id).addEventListener('change', e => { S[key] = e.target.value; saveS(); refresh(); });
+    const bind = (id, key) => $(id).addEventListener('change', e => { S[key] = e.target.value; saveS(); dayGroup = null; refresh(); });
     bind('#f-stage', 'stage'); bind('#f-asg', 'assignee'); bind('#f-src', 'source'); bind('#f-int', 'interest'); bind('#f-own', 'owner'); bind('#f-sort', 'sort');
   }
 
@@ -165,7 +201,7 @@
     if (S.assignee === '__none') rows = rows.filter(r => !r.assignee);   // "ללא אחראי" handled client-side (empty string filter is ambiguous)
     LAST = { rows, total: S.assignee === '__none' ? rows.length : (res.data.total ?? rows.length), byStage: res.data.byStage ?? {} };
     SEL = new Set([...SEL].filter(ph => rows.some(r => r.phone === ph)));
-    renderResults(); renderBulk();
+    renderResults(); renderBulk(); renderToday(); renderDayBanner();
     const c = $('#crm-count'); if (c) c.textContent = `${LAST.total} רשומות`;
     try { const y = parseInt(sessionStorage.getItem('crm.scroll') || '0', 10); if (y) window.scrollTo(0, y); } catch {}
   }
@@ -194,6 +230,13 @@
 
   function renderResults() {
     const box = $('#crm-results'); if (!box) return;
+    if (dayGroup) {
+      const rows = (TODAY?.groups?.[dayGroup]) || [];
+      box.innerHTML = rows.length ? `<div class="crm-list">${rows.map(card).join('')}</div>` : '<div class="crm-empty">אין פריטים בקבוצה הזו כרגע 🎉</div>';
+      box.querySelectorAll('.crm-card').forEach(c => c.addEventListener('click', () => openCard(c.dataset.phone)));
+      box.querySelectorAll('.crm-sel').forEach(cb => cb.addEventListener('change', () => { if (cb.checked) SEL.add(cb.dataset.phone); else SEL.delete(cb.dataset.phone); renderBulk(); }));
+      return;
+    }
     if (loading) { box.innerHTML = '<div class="crm-empty">טוען…</div>'; return; }
     if (lastError) { box.innerHTML = `<div class="crm-empty err">⚠️ ${esc(lastError)} — נסו שוב בעוד רגע.</div>`; return; }
     const rows = LAST.rows;
@@ -253,10 +296,22 @@
       return `<div class="it"><span class="t">${fmtDate(it.at)}</span><span>${txt}</span></div>`;
     }).join('') || '<div class="crm-empty" style="padding:10px">אין תיעוד עדיין</div>';
 
-    const tasks = (c.tasks || []).map(t => `<div class="it"><span class="t">${fmtDay(t.createdAt)}</span><span>${esc(t.summary)} — <b>${esc(t.status)}</b>${t.dueAt ? ' · עד ' + fmtDay(t.dueAt) : ''}${t.outcome ? ' · ' + esc(t.outcome) : ''} ${(t.status === 'open' || t.status === 'eden_assigned') ? `<button class="crm-btn sec" style="padding:2px 8px;font-size:12px" data-done="${t.id}">סמן בוצע</button>` : ''}</span></div>`).join('') || '<div style="font-size:12px;color:var(--muted)">אין משימות</div>';
+    const TASK_STATUS_HE = { open: 'פתוחה', eden_assigned: 'שויכה', in_progress: 'בטיפול', resolved: 'בוצעה', cancelled: 'בוטלה' };
+    const asgMini = t => `<select class="crm-mini" data-assign="${t.id}"><option value="">שייך…</option>${META.staff.map(s => `<option value="${s.id}" ${t.assignedTo === s.id ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}</select>`;
+    const tasks = (c.tasks || []).map(t => {
+      const openT = ['open', 'eden_assigned', 'in_progress'].includes(t.status);
+      const acts = openT
+        ? `${asgMini(t)}<button class="crm-mini" data-defer="${t.id}">דחה</button><button class="crm-mini" data-done="${t.id}">בוצע</button>`
+        : `<button class="crm-mini" data-reopen="${t.id}">פתח מחדש</button>`;
+      return `<div class="crm-taskrow"><span style="flex:1 1 140px">${esc(t.summary)} — <b>${esc(TASK_STATUS_HE[t.status] || t.status)}</b>${t.dueAt ? ' · עד ' + fmtDay(t.dueAt) : ''}${t.outcome ? ' · ' + esc(t.outcome) : ''}${t.assignedTo ? ' · ' + esc(META.staff.find(s => s.id === t.assignedTo)?.name || t.assignedTo) : ''}</span><span class="ta">${acts}</span></div>`;
+    }).join('') || '<div style="font-size:12px;color:var(--muted)">אין משימות</div>';
 
-    const meaning = c.owner === 'member' ? 'כבר מנוי/ה — נרשם/ה' : c.optedOut ? 'ביקש/ה הסרה — אין פנייה יזומה' : c.humanOwns ? 'בטיפול ידני של הצוות' : (c.nextAction ? 'יש פעולה הבאה' : 'אין פעולה הבאה מוגדרת');
+    const reg = c.registration || {};
+    const regBadge = reg.registered ? (reg.verified ? '<span class="crm-verif ok">נרשם — אומת ב-Arbox</span>' : '<span class="crm-verif staff">נרשם — דיווח צוות (לא אומת ב-Arbox)</span>') : '';
+    const meaning = reg.registered ? (reg.verified ? 'מנוי מאומת ב-Arbox' : 'דווח כנרשם — טרם אומת ב-Arbox') : c.optedOut ? 'ביקש/ה הסרה — אין פנייה יזומה' : c.humanOwns ? 'בטיפול ידני של הצוות' : (c.nextAction ? 'יש פעולה הבאה' : 'אין פעולה הבאה מוגדרת');
     const nextTxt = c.nextAction ? `${c.nextAction.text}${c.nextAction.dueAt ? ' · ' + fmtDate(c.nextAction.dueAt) : ''}` : '— טרם הוגדרה —';
+    const ti = c.trialInfo || {};
+    const callHist = (c.calls || []).slice().reverse().map(x => `<div class="it"><span class="t">${fmtDate(x.at)}</span><span>${esc(({ answered: 'ענה/תה', no_answer: 'לא ענה/תה', call_back_requested: 'ביקש/ה לחזור', undecided: 'מתלבט/ת', trial_scheduled: 'נקבע ניסיון', registered: 'נרשם/ה', not_interested: 'לא מעוניין/ת' }[x.outcome] || x.outcome))}${x.note ? ' — ' + esc(x.note) : ''} <i style="color:var(--muted)">— ${esc(x.by || '')}</i></span></div>`).join('') || '<div style="font-size:12px;color:var(--muted)">לא תועדו שיחות</div>';
 
     const { ov, m } = overlay(`
       <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
@@ -269,7 +324,26 @@
         <button class="crm-btn sec" id="cm-note">📝 הערה</button>
         <button class="crm-btn sec" id="cm-task">✔️ משימה</button>
       </div>
-      <div class="crm-ai" style="background:var(--bg2,#f3f3f7)"><b>משמעות:</b> ${esc(meaning)} · <b>אחראי:</b> ${esc(META.staff.find(s => s.id === c.assignee)?.name || '—')} · <b>פעולה הבאה:</b> ${esc(nextTxt)}</div>
+      <div class="crm-ai" style="background:var(--bg2,#f3f3f7)"><b>משמעות:</b> ${esc(meaning)} ${regBadge} · <b>אחראי:</b> ${esc(META.staff.find(s => s.id === c.assignee)?.name || '—')} · <b>פעולה הבאה:</b> ${esc(nextTxt)}</div>
+
+      <div class="crm-sec"><h5>תיעוד שיחה</h5>
+        <div class="crm-note">חיוג מהכרטיס אינו מתעד שיחה. בחרו תוצאה ותעדו ידנית.</div>
+        <div class="crm-outcomes" id="cm-oc">
+          ${Object.entries({ answered: 'ענה/תה', no_answer: 'לא ענה/תה', call_back_requested: 'ביקש/ה לחזור', undecided: 'מתלבט/ת', trial_scheduled: 'נקבע ניסיון', registered: 'נרשם/ה', not_interested: 'לא מעוניין/ת' }).map(([k, v]) => `<button type="button" class="crm-oc" data-oc="${k}">${v}</button>`).join('')}
+        </div>
+        <div class="row"><div class="crm-field" style="flex:1 1 100%"><input id="cm-callnote" placeholder="הערת שיחה (לא נשלחת ללקוח)"></div>
+          <div class="crm-field"><label>מועד המשך (לא חובה)</label><input id="cm-callfu" type="date"></div>
+          <button class="crm-btn" id="cm-logcall">שמור שיחה</button></div>
+      </div>
+
+      <div class="crm-sec"><h5>ניסיון</h5>
+        <div class="crm-note">תכנון ושיוך ידני של הצוות. הגעה לניסיון כאן = דיווח צוות, לא אימות נוכחות ב-Arbox.</div>
+        ${ti.scheduledAt ? `<div class="it"><span class="t">${fmtDate(ti.scheduledAt)}</span><span>נקבע ניסיון${ti.scheduledBy ? ' · ' + esc(ti.scheduledBy) : ''}</span></div>` : ''}
+        ${ti.attendedAt ? `<div class="it"><span class="t">${fmtDate(ti.attendedAt)}</span><span>סומן כהגיע/ה לניסיון (דיווח צוות)</span></div>` : ''}
+        <div class="row"><div class="crm-field"><label>מועד ניסיון</label><input id="cm-trialdate" type="datetime-local"></div>
+          <button class="crm-btn sec" id="cm-trialset">קבע ניסיון</button>
+          <button class="crm-btn sec" id="cm-trialatt">סמן הגיע/ה</button></div>
+      </div>
 
       <div class="row">
         <div class="crm-field"><label>שלב מכירה</label><select id="cm-stage">${stageSel}</select></div>
@@ -295,6 +369,7 @@
       ${c.qualProfile ? `<div class="crm-sec"><h5>הערכת AI (לא עובדה)</h5><div class="crm-ai">${esc(c.qualProfile.qualificationReason || '')} · מוכנות: ${esc(c.qualProfile.readiness || '—')}</div></div>` : ''}
 
       <div class="crm-sec"><h5>משימות</h5><div id="cm-tasks">${tasks}</div></div>
+      <div class="crm-sec"><h5>שיחות שתועדו</h5><div>${callHist}</div></div>
       <div class="crm-sec"><h5>הערות</h5><div id="cm-notes">${(c.notes || []).slice().reverse().map(n => `<div class="it"><span class="t">${fmtDate(n.at)}</span><span>${esc(n.text)} <i style="color:var(--muted)">— ${esc(n.by || '')}</i></span></div>`).join('') || '<div style="font-size:12px;color:var(--muted)">אין הערות</div>'}</div></div>
 
       <div class="crm-sec"><h5>ציר זמן</h5><div class="crm-tl">${tl}</div></div>
@@ -326,10 +401,43 @@
     });
     $('#cm-perm', m)?.addEventListener('click', async () => {
       if (!confirm(`מחיקה לצמיתות של "${c.name || local05(c.phone)}".\n\nיימחק: רשומת המכירה וההיסטוריה שלה כאן.\nלא יימחק: מנוי או רשומת לקוח ב-Arbox, ומשימות שירות של תומר.\nפעולה זו אינה הפיכה. להמשיך?`)) return;
-      if (prompt('להמשך, הקלידו: מחק') !== 'מחק') return;
-      const r = await api('/api/crm/lead/' + encodeURIComponent(c.phone) + '/permanent', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ adminConfirmed: true }) });
-      if (!r.ok) alert(r.data?.message || 'המחיקה נדחתה'); close();
+      const pw = prompt('מחיקה לצמיתות דורשת אימות — הקלידו את סיסמת הניהול:');
+      if (!pw) return;
+      const r = await api('/api/crm/lead/' + encodeURIComponent(c.phone) + '/permanent', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ adminConfirmed: true, password: pw }) });
+      if (!r.ok) { alert(r.data?.message || 'המחיקה נדחתה'); return; }
+      close();
     });
+
+    // ── call logging (§7): pick one outcome, optional note + follow-up date ──
+    let selOutcome = null;
+    m.querySelectorAll('#cm-oc .crm-oc').forEach(b => b.addEventListener('click', () => {
+      selOutcome = b.dataset.oc;
+      m.querySelectorAll('#cm-oc .crm-oc').forEach(x => x.classList.toggle('sel', x === b));
+    }));
+    $('#cm-logcall', m)?.addEventListener('click', async () => {
+      if (!selOutcome) { alert('בחרו תוצאת שיחה'); return; }
+      const fu = $('#cm-callfu', m).value;
+      await api('/api/crm/lead/' + encodeURIComponent(c.phone) + '/call', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+        outcome: selOutcome, note: $('#cm-callnote', m).value.trim() || null, followUpAt: fu ? new Date(fu + 'T08:00:00+02:00').toISOString() : null }) });
+      ov.remove(); openCard(c.phone);
+    });
+
+    // ── trials (§9): staff planning / staff-reported attendance ──
+    $('#cm-trialset', m)?.addEventListener('click', async () => {
+      const v = $('#cm-trialdate', m).value;
+      await api('/api/crm/lead/' + encodeURIComponent(c.phone) + '/trial', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'schedule', at: v ? new Date(v).toISOString() : null }) });
+      ov.remove(); openCard(c.phone);
+    });
+    $('#cm-trialatt', m)?.addEventListener('click', async () => {
+      await api('/api/crm/lead/' + encodeURIComponent(c.phone) + '/trial', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'attended' }) });
+      ov.remove(); openCard(c.phone);
+    });
+
+    // ── task lifecycle (§8): assign / defer / resolve / reopen ──
+    const taskPost = (id, body) => api('/api/crm/task/' + encodeURIComponent(id), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(() => { ov.remove(); openCard(c.phone); });
+    m.querySelectorAll('[data-assign]').forEach(s => s.addEventListener('change', () => taskPost(s.dataset.assign, { status: s.value ? 'eden_assigned' : 'open', assignedTo: s.value || '' })));
+    m.querySelectorAll('[data-defer]').forEach(b => b.addEventListener('click', () => { const d = prompt('דחה עד תאריך (YYYY-MM-DD):', new Date(Date.now() + 86400000).toISOString().slice(0, 10)); if (d) taskPost(b.dataset.defer, { dueAt: new Date(d + 'T08:00:00+02:00').toISOString() }); }));
+    m.querySelectorAll('[data-reopen]').forEach(b => b.addEventListener('click', () => taskPost(b.dataset.reopen, { status: 'open' })));
   }
 
   function openCreate() {
@@ -343,16 +451,48 @@
       <div class="row"><div class="crm-field"><label>תגיות</label><input id="nc-tags" placeholder="מופרדות בפסיק"></div></div>
       <div class="row"><button class="crm-btn" id="nc-save">➕ יצירה</button><button class="crm-btn sec" id="nc-x">ביטול</button></div>
       <div id="nc-msg" style="color:var(--hot);font-size:13px;margin-top:6px"></div>`);
-    $('#nc-x', m).addEventListener('click', () => ov.remove());
+    // draft persistence: a half-typed new lead survives a refresh (restored on next open)
+    const DKEY = 'crm.draft.new', fields = ['nc-phone', 'nc-name', 'nc-int', 'nc-src', 'nc-tags'];
+    try { const d = JSON.parse(localStorage.getItem(DKEY) || '{}'); for (const f of fields) if (d[f]) $('#' + f, m).value = d[f]; } catch {}
+    const saveDraft = () => { try { const d = {}; for (const f of fields) d[f] = $('#' + f, m).value; localStorage.setItem(DKEY, JSON.stringify(d)); } catch {} };
+    const clearDraft = () => { try { localStorage.removeItem(DKEY); } catch {} };
+    fields.forEach(f => $('#' + f, m).addEventListener('input', saveDraft));
+    $('#nc-x', m).addEventListener('click', () => { ov.remove(); });
     $('#nc-save', m).addEventListener('click', async () => {
       const phone = $('#nc-phone', m).value.trim();
       if (!phone) { $('#nc-msg', m).textContent = 'נדרש טלפון'; return; }
       const body = { phone, name: $('#nc-name', m).value.trim() || null, interest: $('#nc-int', m).value.trim() || null, source: $('#nc-src', m).value.trim() || null, tags: $('#nc-tags', m).value.split(',').map(s => s.trim()).filter(Boolean) };
       const r = await api('/api/crm/lead', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-      if (r.ok) { ov.remove(); refresh(); openCard(r.data.phone); }
-      else if (r.data?.error === 'duplicate') { if (confirm('כבר קיימת רשומה למספר הזה. לפתוח אותה?')) { ov.remove(); openCard(r.data.existing.phone); } }
+      if (r.ok) { clearDraft(); ov.remove(); refresh(); openCard(r.data.phone); }
+      else if (r.data?.error === 'duplicate') { if (confirm('כבר קיימת רשומה למספר הזה. לפתוח אותה?')) { clearDraft(); ov.remove(); openCard(r.data.existing.phone); } }
       else $('#nc-msg', m).textContent = r.data?.error === 'invalid_phone' ? 'מספר טלפון לא תקין' : 'היצירה נכשלה';
     });
+  }
+
+  // ── reports (§10) ─────────────────────────────────────────────────────────────────────
+  async function openReports() {
+    const to = new Date(), from = new Date(Date.now() - 30 * 86400000);
+    const d = x => x.toISOString().slice(0, 10);
+    const { ov, m } = overlay(`
+      <div style="display:flex;justify-content:space-between;align-items:center"><h3>📊 דוחות מכירה</h3><button class="crm-btn sec" id="rp-x">✕</button></div>
+      <div class="crm-note">כל מדד מוגדר במפורש. הנתונים היסטוריים, מופרדים מהרשימות הפעילות; מקור קמפיין לא מומצא.</div>
+      <div class="row"><div class="crm-field"><label>מתאריך</label><input id="rp-from" type="date" value="${d(from)}"></div>
+        <div class="crm-field"><label>עד תאריך</label><input id="rp-to" type="date" value="${d(to)}"></div>
+        <button class="crm-btn" id="rp-go">הצג</button></div>
+      <div id="rp-body"><div class="crm-empty">טוען…</div></div>`);
+    $('#rp-x', m).addEventListener('click', () => ov.remove());
+    const run = async () => {
+      const body = $('#rp-body', m); body.innerHTML = '<div class="crm-empty">טוען…</div>';
+      const r = await api('/api/crm/reports?from=' + $('#rp-from', m).value + '&to=' + $('#rp-to', m).value);
+      if (!r.ok || !r.data?.ok) { body.innerHTML = '<div class="crm-empty err">שגיאת טעינה</div>'; return; }
+      const rows = r.data.metrics.map(x => {
+        const bd = x.breakdown && Object.keys(x.breakdown).length ? `<div class="def">${Object.entries(x.breakdown).map(([k, v]) => `${esc(k)}: ${v}`).join(' · ')}</div>` : '';
+        return `<tr><td><b>${esc(x.he)}</b><div class="def">${esc(x.definition)}</div>${bd}</td><td style="font-size:20px;font-weight:700;text-align:center">${x.value}</td></tr>`;
+      }).join('');
+      body.innerHTML = `<div class="crm-rep"><table><thead><tr><th>מדד</th><th>כמות</th></tr></thead><tbody>${rows}</tbody></table></div><div class="crm-note" style="margin-top:8px">${esc(r.data.note)}</div>`;
+    };
+    $('#rp-go', m).addEventListener('click', run);
+    run();
   }
 
   // ── public ────────────────────────────────────────────────────────────────────────────

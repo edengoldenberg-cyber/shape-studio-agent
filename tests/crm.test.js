@@ -90,6 +90,50 @@ describe('crm — search across all records, not one page', () => {
   });
 });
 
+describe('crm — the funnel uses the central classification (the 13 vs 69 gap)', () => {
+  function withKinds() {
+    const store = new LeadStore();
+    const aptStore = makeApt(), tomerStore = makeTasks();
+    const kindOf = lead => ({ salesList: (lead.meta?._kind ?? 'lead') === 'lead' || (lead.meta?._kind) === 'trial' || (lead.meta?._kind) === 'former_member' || (lead.meta?._kind) === 'unclear', kind: lead.meta?._kind ?? 'lead' });
+    const crm = createCrm({ store, aptStore, tomerStore, inbox: { getThread: () => null }, persist: { saveLeads() {} }, logger: { info() {}, warn() {}, error() {} }, normalizePhone, isMember: () => false, kindOf });
+    return { store, crm };
+  }
+  test('members, staff and test records stay out of the active funnel and the stage counts', () => {
+    const { store, crm } = withKinds();
+    store.upsertLead('972521111111', { name: 'ליד אמיתי', meta: { crmState: 'active', _kind: 'lead' } });
+    store.upsertLead('972522222222', { name: 'מתעניין', meta: { crmState: 'active', _kind: 'trial' } });
+    store.upsertLead('972523333333', { name: 'מנוי', status: 'cold', meta: { crmState: 'active', _kind: 'member' } });
+    store.upsertLead('972524444444', { name: 'צוות', meta: { crmState: 'active', _kind: 'staff' } });
+    store.upsertLead('972525555555', { name: 'בדיקה', meta: { crmState: 'active', _kind: 'test' } });
+    expect(crm.search({}).total).toBe(2);                                    // only the lead + the trial
+    const counts = crm.stageCounts();
+    expect(Object.values(counts).reduce((a, b) => a + b, 0)).toBe(2);
+    // a member is not pulled into the funnel even by a name search
+    expect(crm.search({ q: 'מנוי' }).total).toBe(0);
+    // but the 'registered' view shows leads that became members (sales history kept)
+    store.upsertLead('972526666666', { name: 'נרשם', status: 'converted_member', meta: { crmState: 'active', _kind: 'member', isConfirmedMember: true } });
+    expect(crm.search({ view: 'registered' }).rows.some(r => r.name === 'נרשם')).toBe(true);
+  });
+});
+
+describe('crm — restore lifts only the hold that the removal created', () => {
+  test('a pre-existing hold (refusal) survives trash → restore; a trash-only hold is lifted', () => {
+    const { store, crm } = build();
+    store.upsertLead('972521111111', { name: 'סירוב', meta: { crmState: 'active', outreachHold: true } });   // held for another reason
+    crm.trash('972521111111', { by: 'עדן' });
+    expect(store.getLead('972521111111').meta.outreachHoldSetByCrm).toBeFalsy();                               // trash did not claim it
+    crm.restore('972521111111', { by: 'עדן' });
+    expect(store.getLead('972521111111').meta.outreachHold).toBe(true);                                        // the refusal hold stays
+
+    store.upsertLead('972522222222', { name: 'ליד', meta: { crmState: 'active' } });                          // no hold
+    crm.trash('972522222222', { by: 'עדן' });
+    expect(store.getLead('972522222222').meta.outreachHold).toBe(true);
+    expect(store.getLead('972522222222').meta.outreachHoldSetByCrm).toBe(true);
+    crm.restore('972522222222', { by: 'עדן' });
+    expect(store.getLead('972522222222').meta.outreachHold).toBe(false);                                       // the trash hold is lifted
+  });
+});
+
 describe('crm — create, dedupe, edit, stage independence', () => {
   test('a manual lead is created with no contact, and a second create on the same number is refused as a duplicate', () => {
     const { store, crm } = build();
@@ -166,6 +210,96 @@ describe('crm — archive, trash, restore, permanent delete', () => {
     const refused = crm.permanentDelete('972522222222', { adminConfirmed: true });
     expect(refused).toMatchObject({ ok: false, error: 'refusal_protected' });
     expect(store.getLead('972522222222')).not.toBeNull();                    // the refusal record survives
+  });
+});
+
+describe('crm — call logging and outcomes (§7)', () => {
+  test('a logged call is recorded with its outcome; registered is a STAFF report, not Arbox verification', () => {
+    const { store, crm } = build();
+    store.upsertLead('972521111111', { name: 'ליד', meta: { crmState: 'active' } });
+    const r = crm.logCall('972521111111', { outcome: 'registered', note: 'סגר מנוי', by: 'עדן' });
+    expect(r.ok).toBe(true);
+    const c = crm.card('972521111111');
+    expect(c.stage).toBe('registered');
+    expect(c.registration).toMatchObject({ registered: true, verified: false, source: 'staff_report' });   // NOT Arbox-verified
+    expect(c.calls).toHaveLength(1);
+    expect(crm.logCall('972521111111', { outcome: 'nonsense' }).error).toBe('invalid_outcome');
+  });
+  test('not interested → lost with a reason; it is not an opt-out and sends nothing', () => {
+    const { store, crm } = build();
+    store.upsertLead('972521111111', { name: 'ליד', status: 'warm', meta: { crmState: 'active' } });
+    crm.logCall('972521111111', { outcome: 'not_interested', note: 'מחיר גבוה', by: 'עדן' });
+    const c = crm.card('972521111111');
+    expect(c.stage).toBe('lost');
+    expect(c.lostReason).toBe('מחיר גבוה');
+    expect(store.getLead('972521111111').status).toBe('warm');          // ownership/communication status unchanged (not opt-out)
+  });
+  test('a follow-up date after "no answer" creates a follow-up task (no send)', () => {
+    const { store, tomerStore, crm } = build();
+    store.upsertLead('972521111111', { name: 'ליד', meta: { crmState: 'active' } });
+    crm.logCall('972521111111', { outcome: 'no_answer', followUpAt: '2026-11-20T08:00:00Z', by: 'עדן' });
+    const t = tomerStore.getTasks({ phone: '972521111111' });
+    expect(t).toHaveLength(1);
+    expect(t[0].type).toBe('sales_followup');
+    expect(t[0].dueAt).toBe('2026-11-20T08:00:00Z');
+  });
+});
+
+describe('crm — trials and conversion (§9)', () => {
+  test('staff planning and staff-reported attendance are labelled, and an Arbox member is verified', () => {
+    const { store, crm } = build();
+    store.upsertLead('972521111111', { name: 'ליד', meta: { crmState: 'active' } });
+    crm.trial('972521111111', { action: 'schedule', at: '2026-11-21T06:30:00Z', by: 'עדן' });
+    expect(crm.card('972521111111').stage).toBe('trial_scheduled');
+    crm.trial('972521111111', { action: 'attended', by: 'עדן' });
+    const c = crm.card('972521111111');
+    expect(c.stage).toBe('trial_attended');
+    expect(c.trialInfo.attendedSource).toBe('staff_report');            // not an Arbox attendance check
+    // a confirmed Arbox member reads as verified registration
+    store.upsertLead('972522222222', { name: 'מנוי', status: 'converted_member', meta: { crmState: 'active', isConfirmedMember: true, convertedAt: '2026-11-10' } });
+    expect(crm.registrationOf(store.getLead('972522222222'))).toMatchObject({ registered: true, verified: true, source: 'arbox' });
+  });
+});
+
+describe('crm — my day today (§1) and reports (§10)', () => {
+  function withInbox(threads) {
+    const store = new LeadStore(), aptStore = makeApt(), tomerStore = makeTasks();
+    const inbox = { getThread: p => threads[p] ?? null };
+    const crm = createCrm({ store, aptStore, tomerStore, inbox, getThread: p => threads[p] ?? null, persist: { saveLeads() {} }, logger: { info() {}, warn() {}, error() {} }, normalizePhone, isMember: () => false });
+    return { store, aptStore, tomerStore, crm };
+  }
+  test('today groups scheduled calls, due tasks, staff-owned and unanswered leads', () => {
+    const now = new Date();
+    const threads = { '972524444444': { messages: [{ direction: 'in', timestamp: now.toISOString(), text: 'שלום?' }] } };
+    const { store, aptStore, tomerStore, crm } = withInbox(threads);
+    store.upsertLead('972521111111', { name: 'שיחה היום', meta: { crmState: 'active' } });
+    aptStore.add({ leadPhone: '972521111111', status: 'confirmed', scheduledAt: now });
+    store.upsertLead('972522222222', { name: 'משימה היום', meta: { crmState: 'active' } });
+    const tk = tomerStore.createTask({ type: 'sales_followup', phone: '972522222222', summary: 'לחזור' }); tomerStore.updateTask(tk.id, { dueAt: now.toISOString() });
+    store.upsertLead('972523333333', { name: 'ממתין לצוות', status: 'human_owns', meta: { crmState: 'active' } });
+    store.upsertLead('972524444444', { name: 'ללא מענה', meta: { crmState: 'active' } });
+    const d = crm.today();
+    expect(d.counts.scheduledCalls).toBe(1);
+    expect(d.counts.tasksDue).toBe(1);
+    expect(d.counts.waitingStaff).toBe(1);
+    expect(d.counts.unanswered).toBe(1);
+  });
+  test('reports separate Arbox-verified registrations from staff reports, and never invent a source', () => {
+    const store = new LeadStore(), aptStore = makeApt(), tomerStore = makeTasks();
+    const kindOf = lead => { const k = lead.meta?.isConfirmedMember ? 'member' : (lead.meta?._kind ?? 'lead'); return { kind: k, salesList: ['lead', 'trial', 'former_member', 'unclear'].includes(k) }; };
+    const crm = createCrm({ store, aptStore, tomerStore, inbox: { getThread: () => null }, persist: { saveLeads() {} }, logger: { info() {}, warn() {}, error() {} }, normalizePhone, isMember: () => false, kindOf });
+    store.upsertLead('972521111111', { name: 'פנייה', firstSeen: new Date('2026-11-10'), meta: { crmState: 'active', source: 'פייסבוק' } });
+    store.upsertLead('972522222222', { name: 'בלי מקור', firstSeen: new Date('2026-11-11'), meta: { crmState: 'active' } });
+    store.upsertLead('972523333333', { name: 'נרשם צוות', firstSeen: new Date('2026-11-12'), meta: { crmState: 'active', source: 'אתר', registeredSource: 'staff_report', registeredAt: '2026-11-12', salesStage: 'registered' } });
+    store.upsertLead('972524444444', { name: 'נרשם Arbox', status: 'converted_member', meta: { crmState: 'active', isConfirmedMember: true, convertedAt: '2026-11-12' } });
+    const rep = crm.reports({ from: '2026-11-01', to: '2026-11-30' });
+    const m = Object.fromEntries(rep.metrics.map(x => [x.id, x]));
+    expect(m.inquiries.value).toBe(3);                                    // the Arbox member is not a sales-list inquiry
+    expect(m.inquiries.breakdown['ללא מקור']).toBe(1);
+    expect(m.inquiries.breakdown['פייסבוק']).toBe(1);
+    expect(m.registered_staff.value).toBe(1);
+    expect(m.registered_arbox.value).toBe(1);
+    expect(m.inquiries.definition).toMatch(/firstSeen/);
   });
 });
 

@@ -773,9 +773,14 @@ app.delete('/api/crm/lead/:phone', jsonBody, (req, res) => {
   const r = crm.trash(norm, { by: _crmBy(req) }); res.status(r.ok ? 200 : 404).json(r);
 });
 
-// permanent delete — recycle bin only, admin + explicit confirmation
+// permanent delete — recycle bin only. Protected by a SERVER-SIDE re-check of the dashboard
+// password (the only credential this single shared account has — there are no per-user roles),
+// plus the explicit confirmation flag. CSRF is already enforced on every non-GET by middleware/auth.
 app.delete('/api/crm/lead/:phone/permanent', jsonBody, (req, res) => {
   const norm = _crmPhone(req); if (!norm) return res.status(400).json({ ok: false, error: 'invalid_phone' });
+  if (!require('./middleware/auth').verifyPassword(req.body?.password)) {
+    return res.status(401).json({ ok: false, error: 'password_required', message: 'מחיקה לצמיתות דורשת אימות סיסמת הניהול.' });
+  }
   const r = crm.permanentDelete(norm, { by: _crmBy(req), adminConfirmed: req.body?.adminConfirmed === true });
   const code = r.ok ? 200 : r.error === 'confirmation_required' ? 428 : r.error === 'refusal_protected' ? 409 : r.error === 'not_in_trash' ? 409 : 404;
   res.status(code).json(r);
@@ -786,6 +791,33 @@ app.post('/api/crm/task/:id', jsonBody, (req, res) => {
   const b = req.body ?? {};
   const r = crm.updateLeadTask(String(req.params.id), { status: b.status ?? null, outcome: b.outcome ?? null, assignedTo: b.assignedTo ?? null, dueAt: b.dueAt ?? null, by: _crmBy(req) });
   res.status(r.ok ? 200 : (r.error === 'not_a_sales_task' ? 403 : 404)).json(r);
+});
+
+// log a call outcome (§7) — an explicit action; a dialled number is not proof a call happened
+app.post('/api/crm/lead/:phone/call', jsonBody, (req, res) => {
+  const norm = _crmPhone(req); if (!norm) return res.status(400).json({ ok: false, error: 'invalid_phone' });
+  const b = req.body ?? {};
+  const r = crm.logCall(norm, { outcome: b.outcome, note: b.note ?? null, followUpAt: b.followUpAt ?? null, by: _crmBy(req) });
+  res.status(r.ok ? 200 : (r.error === 'invalid_outcome' ? 400 : 404)).json(r);
+});
+
+// trial lifecycle (§9) — staff planning / staff-reported attendance (never an Arbox write)
+app.post('/api/crm/lead/:phone/trial', jsonBody, (req, res) => {
+  const norm = _crmPhone(req); if (!norm) return res.status(400).json({ ok: false, error: 'invalid_phone' });
+  const b = req.body ?? {};
+  const r = crm.trial(norm, { action: b.action, at: b.at ?? null, note: b.note ?? null, by: _crmBy(req) });
+  res.status(r.ok ? 200 : (r.error === 'invalid_action' ? 400 : 404)).json(r);
+});
+
+// "my day today" (§1)
+app.get('/api/crm/today', (_req, res) => {
+  try { res.json({ ok: true, ...crm.today() }); } catch (err) { logger.error('[crm] today failed', { error: err.message }); res.status(500).json({ ok: false, error: 'load_failed' }); }
+});
+
+// sales reports (§10) — explicit calculation definitions in each metric
+app.get('/api/crm/reports', (req, res) => {
+  try { res.json(crm.reports({ from: req.query.from || null, to: req.query.to || null })); }
+  catch (err) { logger.error('[crm] reports failed', { error: err.message }); res.status(500).json({ ok: false, error: 'load_failed' }); }
 });
 
 // bulk soft actions on selected records (never a send)
@@ -4329,7 +4361,11 @@ async function processInboundWAMessage(msg) {
   {
     const _tr = store.getLead(fromNorm);
     if (_tr && _tr.meta?.crmState === 'trashed') {
-      store.upsertLead(fromNorm, { meta: { ...(_tr.meta ?? {}), crmState: 'active', outreachHold: false, trashedAt: null, crmReactivatedAt: new Date().toISOString(), crmReactivatedBy: 'inbound' } });
+      // Lift ONLY the hold the trash itself placed; a refusal / identity / other block stays, and the
+      // existing opt-out and routing rules below still decide what (if anything) happens. Nothing is sent here,
+      // and no old reminder or follow-up is revived (those were cancelled at trash time and stay cancelled).
+      const _lift = _tr.meta?.outreachHoldSetByCrm ? { outreachHold: false, outreachHoldSetByCrm: null } : {};
+      store.upsertLead(fromNorm, { meta: { ...(_tr.meta ?? {}), crmState: 'active', trashedAt: null, ..._lift, crmReactivatedAt: new Date().toISOString(), crmReactivatedBy: 'inbound' } });
       store.logEvent('crm_reactivated_by_inbound', fromNorm, {});
       persist.saveLeads(store);
       logger.info('[crm] a recycle-bin lead sent a new message — brought back to the pipeline', { });
