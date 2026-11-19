@@ -182,8 +182,11 @@
     injectStyle();
     const root = $('#maya-reminders-root'); if (!root) return;
     const board = await api('/api/tomer/board');
-    const s = board.data?.settings || { enabled: false, times: [], weekdays: [0, 1, 2, 3, 4], minGapHours: 20 };
-    const r = board.data?.reminders || {};
+    const r2 = board.data || {};
+    const s = r2.settings || { enabled: false, times: [], weekdays: [0, 1, 2, 3, 4], minGapHours: 20 };
+    const r = r2.reminders || {};
+    const snoozed = (r2.items || []).filter(x => x.state === 'snoozed');
+    const digests = r2.recentDigests || [];
     const stateCls = r.state === 'on' ? 'ok' : r.state === 'failed' ? 'bad' : 'warn';
     const WD = ['א', 'ב', 'ג', 'ד', 'ה', 'ו', 'ש'];
     const wk = WD.map((d, i) => `<label><input type="checkbox" class="mc-wd" value="${i}" ${(s.weekdays || []).includes(i) ? 'checked' : ''}>${d}</label>`).join('');
@@ -192,8 +195,12 @@
         <div class="mc-note">${esc(r.text || '')}</div>
         <div class="mc-row"><span class="t">תזכורת אחרונה</span><span>${fmt(r.lastAt)} ${r.lastState ? '· ' + esc(r.lastState) : ''}</span></div>
         <div class="mc-row"><span class="t">תזכורת הבאה</span><span>${r.nextAt ? esc(String(r.nextAt)) : '—'}</span></div>
+        <div class="mc-row"><span class="t">נמען מאומת</span><span>${r2.recipient ? esc(r2.recipient) + ' (מנהל)' : '<span class="mc-pill bad">לא הוגדר מספר מנהל</span>'}</span></div>
         <div class="mc-note">✅ תזכורת מרוכזת אחת בכל שעה מוגדרת — אותה משימה לא תוזכר שוב בתוך חלון המרווח. אין סיכומים כפולים: זו תזכורת המנהל היחידה (דוח 20:00 כבוי; תדריך 08:00 נרשם ביומן בלבד). משימות ה-CRM מופיעות באותה תזכורת.</div>
+        <div class="mc-note">נמען התזכורות כרגע הוא המנהל המאומת בלבד. הוספת איש צוות כנמען דורשת מיפוי שם→מספר ואימות לפני הפעלה — לא מוגדר אוטומטית ואין ניחוש מספרים.</div>
       </div>
+      <div class="mc-sec"><h3>משימות שנדחו</h3>${snoozed.length ? snoozed.map(x => `<div class="mc-row"><span class="t">${esc(agentHe(x.agent))} · ${esc(x.title || '')}${x.who ? ' — ' + esc(x.who) : ''}</span><span class="mc-pill warn">חוזר ${fmt(x.snoozeUntil)}</span></div>`).join('') : '<div class="mc-note">אין משימות דחויות. משימה פתוחה שלא בוצעה חוזרת בתזכורת עד ביצוע, ביטול או דחייה.</div>'}</div>
+      <div class="mc-sec"><h3>היסטוריית ריצות</h3>${digests.length ? digests.map(g => `<div class="mc-row"><span class="t">${fmt(g.at)}${g.slot ? ' · ' + esc(g.slot) : ''}</span><span>${g.state === 'sent' ? '✅ נשלחה (' + g.count + ' משימות)' : g.state === 'nothing_due' ? 'אין משימות — לא נשלחה' : '⚠️ ' + esc(g.state) + (g.error ? ' · ' + esc(g.error) : '')}</span></div>`).join('') : '<div class="mc-note">אין היסטוריה עדיין.</div>'}</div>
       <div class="mc-sec"><h3>הגדרות</h3>
         <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end">
           <div class="mc-field"><label>שעות שליחה (מופרדות בפסיק)</label><input id="mr-times" value="${esc((s.times || []).join(', '))}" placeholder="09:00, 17:00"></div>

@@ -199,6 +199,8 @@ function createOwnerTasks(d) {
     const last = s.digests.at(-1) ?? null;
     return { ok: true, generatedAt: now().toISOString(), sources: sy.sources ?? null, sourceError: sy.error, items, recentDone, today,
       counts: { open: items.length, byStatus, ...Object.fromEntries(Object.entries(today).map(([k, v]) => [k, v.length])) }, statuses: BOARD_HE,
+      recentDigests: s.digests.slice(-12).reverse().map(g => ({ at: g.at, slot: g.slot ?? null, state: g.state, count: (g.keys ?? []).length, attempts: g.attempts ?? null, error: g.error ?? null })),
+      recipient: (() => { const p = managerPhone(); return p ? (String(p).length >= 7 ? String(p).slice(0, 5) + '•••' + String(p).slice(-3) : p) : null; })(),
       settings: s.settings, reminders: { ...status(), lastAt: last?.at ?? null, lastState: last?.state ?? null, nextAt: nextReminderAt(t) }, lastDigest: last };
   }
 
