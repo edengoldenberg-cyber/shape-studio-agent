@@ -59,11 +59,18 @@ describe('maya_control — anomaly detection, dedup and resolution', () => {
   });
 
   test('integration down and failed sends are flagged; a healthy system is not', async () => {
-    const { mc } = build({ systemRows: async () => [{ id: 'arbox', label: 'Arbox', state: 'fail', detail: 'לא מחובר' }, { id: 'wa', label: 'WhatsApp', state: 'live' }], deliverySummary: () => ({ failed: 3, byStatus: { failed: 3 }, oldestUnconfirmedAt: null, anyStatusReported: true }) });
+    const { mc } = build({ systemRows: async () => [
+      { id: 'arbox', label: 'Arbox', state: 'fail', detail: 'לא מחובר' },
+      { id: 'wa', label: 'WhatsApp', state: 'live' },
+      { id: 'ig', label: 'אינסטגרם', state: 'off' },          // deliberately off — not an anomaly
+      { id: 'prices', label: 'מחירים', state: 'blocked' },    // a config gap shown on Health — not an integration failure
+    ], deliverySummary: () => ({ failed: 3, byStatus: { failed: 3 }, oldestUnconfirmedAt: null, anyStatusReported: true }) });
     await mc.tick();
     const open = mc.list().open;
     expect(open.some(a => a.type === 'integration_down' && a.key === 'integration:arbox')).toBe(true);
     expect(open.some(a => a.key === 'integration:wa')).toBe(false);                                        // a live system is not an anomaly
+    expect(open.some(a => a.key === 'integration:ig')).toBe(false);                                        // off ≠ down
+    expect(open.some(a => a.key === 'integration:prices')).toBe(false);                                    // a config gap ≠ integration down
     expect(open.some(a => a.type === 'send_failure' && a.key === 'delivery:failed')).toBe(true);
   });
 });

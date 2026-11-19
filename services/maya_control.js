@@ -125,16 +125,20 @@ function createMayaControl({
       });
     });
 
-    // 5. an agent / integration that is down
+    // 5. an agent / integration / worker that is UNAVAILABLE. Only a genuine failure counts — the informational
+    //    statuses the Health screen shows (off = deliberately off, blocked / limited / partial = a known config gap or
+    //    partial feature) are NOT control anomalies and must not nag here.
+    const DOWN = new Set(['fail', 'down', 'error', 'unavailable']);
     if (systemRows) src('system', () => {
       const rows = systemRows.__rows ?? [];                   // filled by the async wrapper before scan()
       for (const r of rows) {
-        if (!r.state || ['live', 'ok', 'on', 'green', 'info'].includes(r.state)) continue;
+        const down = DOWN.has(r.state), unknown = r.state === 'unknown';
+        if (!down && !unknown) continue;
         add('integration:' + (r.id || r.label), {
-          type: 'integration_down', severity: r.state === 'fail' ? 'high' : 'normal',
-          title: `${r.label || r.id}: ${r.state === 'off' ? 'כבוי' : r.state === 'unknown' ? 'לא נבדק' : 'תקלה'}`,
+          type: 'integration_down', severity: down ? 'high' : 'normal',
+          title: `${r.label || r.id}: ${unknown ? 'לא נבדק' : 'לא זמין'}`,
           evidence: r.detail || r.state, who: null, link: '#health',
-          responsible: 'מנהל', nextAction: r.action || 'לבדוק את האינטגרציה/העובד',
+          responsible: 'מנהל', nextAction: r.action || (unknown ? 'המצב לא נקרא — לבדוק ידנית' : 'לבדוק את האינטגרציה/העובד'),
         });
       }
     });
