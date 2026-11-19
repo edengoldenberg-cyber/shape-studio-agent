@@ -38,9 +38,11 @@ try {
     check(`${W}: dashboard opens`, await until(`!!document.querySelector('#maya-subnav')`));
     // Control & Tasks
     check(`${W}: control sub-view opens`, await tap('#maya-subnav [data-mview="control"]') && await until(`!!document.querySelector('#maya-control-root .mc-tiles')`, 12000));
-    const ctl = await evalJs(`({tiles:document.querySelectorAll('#maya-control-root .mc-tile').length, secs:document.querySelectorAll('#maya-control-root .mc-sec').length, crmLink:!!document.querySelector('#mc-crm'), boardLink:!!document.querySelector('#mc-board')})`);
-    console.log(`  (tiles:${ctl.tiles} sections:${ctl.secs})`);
-    check(`${W}: control shows tiles, task/CRM/health sections and links`, ctl.tiles >= 5 && ctl.secs >= 3 && ctl.crmLink && ctl.boardLink);
+    const ctl = await evalJs(`({tiles:document.querySelectorAll('#maya-control-root .mc-tile').length, day:document.querySelectorAll('#maya-control-root .mc-day .mc-chip').length, filters:document.querySelectorAll('#maya-control-root .mc-filters select').length, list:document.querySelectorAll('#maya-control-root .mc-sec').length, crmLink:!!document.querySelector('#mc-crm'), boardLink:!!document.querySelector('#mc-board')})`);
+    console.log(`  (bucket tiles:${ctl.tiles} day-chips:${ctl.day} filters:${ctl.filters} list-sections:${ctl.list})`);
+    check(`${W}: control shows the 8 buckets, day summary, filters, list and source links`, ctl.tiles >= 8 && ctl.day >= 3 && ctl.filters >= 2 && ctl.list >= 1 && ctl.crmLink && ctl.boardLink);
+    // clicking a bucket filters the list
+    check(`${W}: a bucket tile filters the list`, await tap('#maya-control-root [data-bucket="needs_action"]') && await until(`/דורש פעולה/.test(document.querySelector('#maya-control-root .mc-sec h3')?.textContent||'')`, 6000));
     check(`${W} control: no sideways scroll`, await noHScroll(W));
     await shot(`prod-maya-${W}-1-control`);
     // Reminders

@@ -10,6 +10,7 @@
   const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const api = async (url, opts) => { const r = await fetch(url, opts); let d = null; try { d = await r.json(); } catch {} return { status: r.status, ok: r.ok, data: d }; };
   const fmt = s => { if (!s) return '—'; try { return new Date(s).toLocaleString('he-IL', { timeZone: 'Asia/Jerusalem', day: 'numeric', month: 'numeric', hour: '2-digit', minute: '2-digit' }); } catch { return '—'; } };
+  let CTRL = { board: null, today: null, sys: null, bucket: null, agent: '', assignee: '', q: '' };
 
   function injectStyle() {
     if ($('#maya-style')) return;
@@ -33,6 +34,15 @@
       #tab-maya .mc-note{font-size:12px;color:var(--muted,#888);margin:4px 0}
       #tab-maya .mc-field{display:flex;flex-direction:column;gap:4px;font-size:13px}
       #tab-maya .mc-field input,#tab-maya .mc-field select{border:1px solid var(--border,#ddd);border-radius:8px;padding:8px;background:var(--bg2,#fafafa);color:inherit;min-height:40px}
+      #tab-maya .mc-day{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+      #tab-maya .mc-chip{background:var(--bg2,#f3f3f7);border-radius:10px;padding:4px 10px;font-size:13px}
+      #tab-maya .mc-filters{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+      #tab-maya .mc-filters select{border:1px solid var(--border,#ddd);border-radius:8px;padding:7px;background:var(--panel,#fff);color:inherit;min-height:40px}
+      #tab-maya .mc-item{background:var(--panel,#fff);border:1px solid var(--border,#eee);border-radius:10px;padding:10px;margin-bottom:8px}
+      #tab-maya .mc-item-h{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;color:var(--muted,#777);margin-bottom:2px}
+      #tab-maya .mc-item-a{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+      #tab-maya .mc-mini{border:1px solid var(--border,#ddd);background:var(--bg2,#fafafa);color:inherit;border-radius:8px;padding:6px 10px;font-size:12px;cursor:pointer;min-height:36px}
+      #tab-maya .mc-hist{margin-top:6px;border-top:1px dashed var(--border,#eee);padding-top:6px}
       #tab-maya .mc-wk{display:flex;flex-wrap:wrap;gap:6px}
       #tab-maya .mc-wk label{display:inline-flex;align-items:center;gap:4px;font-size:13px;border:1px solid var(--border,#ddd);border-radius:8px;padding:4px 8px}
       @media(max-width:560px){#tab-maya .mc-tile{flex:1 1 calc(50% - 10px)}}`;
@@ -45,59 +55,103 @@
   async function loadControl() {
     injectStyle();
     const root = $('#maya-control-root'); if (!root) return;
-    const [board, sc, today, sys] = await Promise.all([
-      api('/api/tomer/board'), api('/api/crm/stage-counts'), api('/api/crm/today'), api('/api/system/status'),
-    ]);
+    const [board, today, sys] = await Promise.all([api('/api/tomer/board'), api('/api/crm/today'), api('/api/system/status')]);
     if (!board.ok || !board.data) { root.innerHTML = '<div class="empty-state">לא ניתן לטעון את לוח הבקרה.</div>'; return; }
-    const b = board.data, items = new Map((b.items || []).map(x => [x.key, x]));
-    const needsOwner = (b.today?.needsOwner || []).map(k => items.get(k)).filter(Boolean);
-    const counts = b.counts || {};
-    const stage = (sc.data?.counts) || {};
-    const crmActive = Object.values(stage).reduce((a, v) => a + v, 0);
-    const tc = today.data?.counts || {};
-    const srcErr = b.sourceError ? `<span class="mc-pill warn" title="${esc(b.sourceError)}">מקור נתונים חלקי</span>` : '';
+    CTRL.board = board.data; CTRL.today = today.data; CTRL.sys = sys.data;
+    renderControl();
+  }
 
-    const tiles = [
-      { k: 'needsOwner', v: counts.needsOwner ?? needsOwner.length, l: 'דורש אותך', c: 'var(--hot,#e53e3e)', go: goBoard },
-      { k: 'overdue', v: counts.overdue ?? 0, l: 'באיחור', c: 'var(--hot,#e53e3e)', go: goBoard },
-      { k: 'stuck', v: counts.stuck ?? 0, l: 'תקועות', c: 'var(--warm,#dd8800)', go: goBoard },
-      { k: 'crm', v: crmActive, l: 'לידים פעילים', c: 'var(--primary,#6b46c1)', go: goCrm },
-      { k: 'calls', v: tc.scheduledCalls ?? 0, l: 'שיחות היום', c: 'var(--primary,#6b46c1)', go: goCrm },
-    ];
+  // Which bucket a board item belongs to. The owner_tasks board already computed each item's state,
+  // overdue flag, assignee, next action and source — Maya only groups and shows them (no parallel logic).
+  const BUCKETS = [
+    { id: 'needs_action', he: 'דורש פעולה', c: 'var(--hot,#e53e3e)', match: x => x.board === 'waiting_owner' || x.board === 'blocked' },
+    { id: 'in_progress', he: 'בטיפול', c: 'var(--primary,#6b46c1)', match: x => x.board === 'in_progress' || x.board === 'todo' },
+    { id: 'waiting_client', he: 'ממתין ללקוח', c: 'var(--warm,#dd8800)', match: x => x.board === 'waiting_member' },
+    { id: 'planned', he: 'מתוכנן', c: 'var(--muted,#888)', match: x => x.board === 'planned' },
+    { id: 'overdue', he: 'באיחור', c: 'var(--hot,#e53e3e)', match: x => x.overdue === true },
+    { id: 'stuck', he: 'תקוע/נכשל', c: 'var(--warm,#dd8800)', match: x => x.board === 'blocked' || x.board === 'waiting_external' },
+    { id: 'done', he: 'הושלם', c: 'var(--green,#1e8449)', closed: true, match: x => x.state === 'done' },
+    { id: 'cancelled', he: 'בוטל', c: 'var(--muted,#888)', closed: true, match: x => x.state === 'cancelled' },
+  ];
+  const agentHe = a => a === 'barak' ? 'ברק' : a === 'tomer' ? 'תומר' : a === 'dana' ? 'דנה' : (a || '');
 
-    const STAGE_HE = { new: 'חדש', needs: 'בירור', arranging_call: 'תיאום', call_scheduled: 'שיחה', trial_scheduled: 'ניסיון', trial_attended: 'הגיע', registered: 'נרשם', lost: 'לא נסגר' };
-    const stageBar = Object.entries(STAGE_HE).filter(([k]) => (stage[k] ?? 0) > 0).map(([k, he]) => `<div class="mc-stage">${esc(he)}: <b>${stage[k]}</b></div>`).join('') || '<span class="mc-note">אין לידים פעילים</span>';
+  function renderControl() {
+    const root = $('#maya-control-root'); if (!root) return;
+    const b = CTRL.board, open = b.items || [], closed = b.recentDone || [];
+    const srcErr = b.sourceError ? `<span class="mc-pill warn" title="${esc(b.sourceError)}">מקור חלקי: חלק מהמשימות אולי לא נקראו</span>` : '';
+    const srcBad = Object.entries(b.sources || {}).filter(([, v]) => v && v.ok === false);
+    const srcNote = srcBad.length ? `<div class="mc-note">⚠️ מקורות שלא נבדקו: ${srcBad.map(([k, v]) => esc(k) + (v.error ? ' (' + esc(v.error) + ')' : '')).join(', ')} — המשימות שלהם אינן ידועות, לא אפס.</div>` : '';
+    const t = CTRL.today?.counts || {};
+    // day summaries
+    const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
+    const inToday = open.filter(x => x.createdAt && new Date(x.createdAt) >= dayStart).length;
+    const doneToday = closed.filter(x => x.closedAt && new Date(x.closedAt) >= dayStart).length;
+    const count = bk => (bk.closed ? closed : open).filter(bk.match).length;
 
-    const rows = needsOwner.slice(0, 12).map(x => `<div class="mc-row">
-      <span class="t"><b>${esc(x.agent === 'barak' ? 'ברק' : 'תומר')}</b> · ${esc(x.kind || '')}: ${esc(x.title || '')}${x.who ? ' — ' + esc(x.who) : ''}</span>
-      <span class="mc-pill ${x.overdue ? 'bad' : 'warn'}">${esc(x.boardLabel || '')}${x.waiting ? ' · ' + esc(x.waiting) : ''}</span>
-      <span style="display:flex;gap:6px"><button class="mc-btn" data-done="${esc(x.key)}">בוצע</button><button class="mc-btn sec" data-snooze="${esc(x.key)}">דחה</button></span>
-    </div>`).join('') || '<div class="mc-note">אין משימות שדורשות אותך כרגע 🎉</div>';
+    const sysRows = (CTRL.sys?.rows) || [];
+    const badSys = sysRows.filter(r => r.state && !['live', 'ok', 'on', 'green', 'info'].includes(r.state));
+    const healthChip = sysRows.length ? (badSys.length ? `<span class="mc-chip" style="background:#fde8e8;color:#c0392b" title="${esc(badSys.map(r => (r.label || r.id) + ': ' + (r.detail || r.state)).join(' · '))}">מערכות בבעיה: ${badSys.length}</span>` : '<span class="mc-chip" style="background:#e6f6ec;color:#1e8449">מערכות תקינות</span>') : '';
+    const filters = `<div class="mc-day"><span class="mc-chip">נכנס היום: <b>${inToday}</b></span><span class="mc-chip">טופל היום: <b>${doneToday}</b></span><span class="mc-chip">פתוח כעת: <b>${open.length}</b></span>${t.unanswered ? `<span class="mc-chip">ללא מענה (CRM): <b>${t.unanswered}</b></span>` : ''}${healthChip}</div>`;
+    const tiles = `<div class="mc-tiles">${BUCKETS.map(bk => `<div class="mc-tile ${CTRL.bucket === bk.id ? 'on' : ''}" data-bucket="${bk.id}" style="--c:${bk.c}"><div class="v">${count(bk)}</div><div class="l">${bk.he}</div></div>`).join('')}</div>`;
 
-    const sysRows = (sys.data?.rows || sys.data?.statuses || []);
-    const bad = sysRows.filter(r => r.state && !['live', 'ok', 'on', 'green', 'info'].includes(r.state));
-    const health = !sysRows.length ? '<span class="mc-note">—</span>'
-      : bad.length ? bad.slice(0, 6).map(r => `<div class="mc-row"><span class="t">${esc(r.label || r.id || '')}</span><span class="mc-pill warn">${esc(r.detail || r.state)}</span></div>`).join('')
-        : '<span class="mc-pill ok">כל המערכות תקינות</span>';
+    const staffSet = [...new Set(open.concat(closed).map(x => x.assignee).filter(Boolean))];
+    const ctrlBar = `<div class="mc-filters">
+      <select id="mc-agent"><option value="">כל הסוכנים</option><option value="barak" ${CTRL.agent === 'barak' ? 'selected' : ''}>ברק</option><option value="tomer" ${CTRL.agent === 'tomer' ? 'selected' : ''}>תומר</option><option value="dana" ${CTRL.agent === 'dana' ? 'selected' : ''}>דנה</option></select>
+      <select id="mc-asg"><option value="">כל האחראים</option><option value="__none" ${CTRL.assignee === '__none' ? 'selected' : ''}>ללא אחראי</option>${staffSet.map(s => `<option value="${esc(s)}" ${CTRL.assignee === s ? 'selected' : ''}>${esc(s)}</option>`).join('')}</select>
+      <input id="mc-q" placeholder="חיפוש" value="${esc(CTRL.q || '')}" style="flex:1;min-width:120px;border:1px solid var(--border,#ddd);border-radius:8px;padding:7px">
+      <button class="mc-btn sec" id="mc-crm">CRM ←</button><button class="mc-btn sec" id="mc-board">הלוח ←</button>
+    </div>`;
+
+    // selected list
+    const bk = BUCKETS.find(x => x.id === CTRL.bucket);
+    let list = bk ? (bk.closed ? closed : open).filter(bk.match) : open;
+    if (CTRL.agent) list = list.filter(x => x.agent === CTRL.agent);
+    if (CTRL.assignee === '__none') list = list.filter(x => !x.assignee);
+    else if (CTRL.assignee) list = list.filter(x => x.assignee === CTRL.assignee);
+    if (CTRL.q) { const q = CTRL.q.toLowerCase(); list = list.filter(x => `${x.title || ''} ${x.who || ''} ${x.kind || ''}`.toLowerCase().includes(q)); }
+
+    const card = x => {
+      const closedItem = ['done', 'cancelled'].includes(x.state);
+      const due = x.dueSetAt ? `${x.overdue ? '<span class="mc-pill bad">באיחור</span> ' : ''}עד ${fmt(x.dueSetAt)}` : `גיל ${esc(x.waiting || '—')} · <span class="mc-pill">ללא מועד</span>`;
+      const acts = closedItem
+        ? `<button class="mc-mini" data-act="reopen" data-key="${esc(x.key)}">פתח מחדש</button>`
+        : `<button class="mc-mini" data-act="assign" data-key="${esc(x.key)}">שייך</button><button class="mc-mini" data-act="in_progress" data-key="${esc(x.key)}">בטיפול</button><button class="mc-mini" data-act="snooze" data-key="${esc(x.key)}">דחה</button><button class="mc-mini" data-act="done" data-key="${esc(x.key)}">בוצע</button><button class="mc-mini" data-act="cancel" data-key="${esc(x.key)}">בטל</button>`;
+      return `<div class="mc-item">
+        <div class="mc-item-h"><b>${esc(agentHe(x.agent))}</b> · ${esc(x.kind || '')}${x.who ? ' · ' + esc(x.who) : ''}
+          <span class="mc-pill ${x.overdue ? 'bad' : closedItem ? 'ok' : 'warn'}">${esc(x.boardLabel || x.state || '')}</span></div>
+        <div>${esc(x.title || '')}</div>
+        <div class="mc-note">${x.reason ? 'מקור: ' + esc(x.reason) + ' · ' : ''}אחראי: ${x.assignee ? esc(x.assignee) : '<span class="mc-pill warn">ללא אחראי</span>'} · ${due}</div>
+        ${x.next ? `<div class="mc-note">➡️ ${esc(x.next)}</div>` : ''}
+        ${x.blocked ? `<div class="mc-note" style="color:var(--hot)">⚠️ ${esc(x.blocked)}</div>` : ''}
+        <div class="mc-item-a">${acts}${x.link ? `<button class="mc-mini" data-src="${esc(x.link)}">פתח מקור ←</button>` : ''}<button class="mc-mini" data-hist="${esc(x.key)}">היסטוריה</button></div>
+        <div class="mc-hist" id="h-${esc(x.key)}" hidden>${(x.trail || []).map(e => `<div class="mc-note">${e.at ? fmt(e.at) + ' · ' : ''}${esc(e.text || '')}</div>`).join('') || '<div class="mc-note">—</div>'}${closedItem && x.closedAt ? `<div class="mc-note">נסגר ${fmt(x.closedAt)}</div>` : ''}</div>
+      </div>`;
+    };
 
     root.innerHTML = `
-      <div class="mc-note">בקרה ומשימות — מעל לוח המשימות האחד (ברק ותומר) ומחובר ל-CRM המכירות. ${srcErr}</div>
-      <div class="mc-tiles">${tiles.map(t => `<div class="mc-tile" data-go="${t.k}" style="--c:${t.c}"><div class="v">${t.v}</div><div class="l">${t.l}</div></div>`).join('')}</div>
+      <div class="mc-note">בקרה ומשימות — לוח המשימות האחד של ברק, תומר ודנה. אותה משימה נספרת פעם אחת; משימה ללא אחראי מסומנת. ${srcErr}</div>
+      ${srcNote}${filters}${tiles}${ctrlBar}
+      <div class="mc-sec"><h3>${bk ? esc(bk.he) : 'כל הפתוחות'} — ${list.length} <span class="mc-note" id="mc-clear" style="cursor:pointer">${CTRL.bucket ? '· נקה סינון' : ''}</span></h3>
+        ${list.length ? list.slice(0, 100).map(card).join('') : '<div class="mc-note">אין פריטים בקבוצה הזו 🎉</div>'}</div>`;
 
-      <div class="mc-sec"><h3>משימות שדורשות אותך <button class="mc-btn sec" id="mc-board">הלוח המלא ←</button></h3>${rows}</div>
-
-      <div class="mc-sec"><h3>משפך מכירות (CRM) <button class="mc-btn sec" id="mc-crm">פתח CRM ←</button></h3>
-        <div class="mc-stages">${stageBar}</div>
-        <div class="mc-note">שיחות היום: ${tc.scheduledCalls ?? 0} · ממתינים לצוות: ${tc.waitingStaff ?? 0} · ללא מענה: ${tc.unanswered ?? 0}</div>
-      </div>
-
-      <div class="mc-sec"><h3>מצב מערכת</h3>${health}</div>`;
-
-    root.querySelectorAll('[data-go]').forEach(t => t.addEventListener('click', () => { const k = t.dataset.go; (k === 'crm' || k === 'calls') ? goCrm() : goBoard(); }));
-    $('#mc-board', root)?.addEventListener('click', goBoard);
-    $('#mc-crm', root)?.addEventListener('click', goCrm);
-    root.querySelectorAll('[data-done]').forEach(b2 => b2.addEventListener('click', async () => { await act(b2.dataset.done, 'done'); loadControl(); }));
-    root.querySelectorAll('[data-snooze]').forEach(b2 => b2.addEventListener('click', async () => { const d = prompt('דחה עד תאריך (YYYY-MM-DD):', new Date(Date.now() + 86400000).toISOString().slice(0, 10)); if (d) { await act(b2.dataset.snooze, 'snooze', { until: new Date(d + 'T08:00:00+02:00').toISOString() }); loadControl(); } }));
+    const re = () => renderControl();
+    $('#mc-agent', root).addEventListener('change', e => { CTRL.agent = e.target.value; re(); });
+    $('#mc-asg', root).addEventListener('change', e => { CTRL.assignee = e.target.value; re(); });
+    $('#mc-q', root).addEventListener('input', e => { CTRL.q = e.target.value; re(); });
+    $('#mc-crm', root).addEventListener('click', goCrm);
+    $('#mc-board', root).addEventListener('click', goBoard);
+    $('#mc-clear', root)?.addEventListener('click', () => { CTRL.bucket = null; re(); });
+    root.querySelectorAll('[data-bucket]').forEach(el => el.addEventListener('click', () => { CTRL.bucket = CTRL.bucket === el.dataset.bucket ? null : el.dataset.bucket; re(); }));
+    root.querySelectorAll('[data-hist]').forEach(el => el.addEventListener('click', () => { const h = $('#h-' + CSS.escape(el.dataset.hist), root); if (h) h.hidden = !h.hidden; }));
+    root.querySelectorAll('[data-src]').forEach(el => el.addEventListener('click', () => { const link = el.dataset.src; if (link.startsWith('#barak')) goCrm(); else if (link.startsWith('#tomer')) { location.hash = link; goBoard(); } }));
+    root.querySelectorAll('[data-act]').forEach(el => el.addEventListener('click', async () => {
+      const key = el.dataset.key, a = el.dataset.act, extra = {};
+      if (a === 'assign') { const to = prompt('שם האחראי/ת:'); if (!to) return; extra.to = to; }
+      if (a === 'snooze') { const d = prompt('דחה עד תאריך (YYYY-MM-DD):', new Date(Date.now() + 86400000).toISOString().slice(0, 10)); if (!d) return; extra.until = new Date(d + 'T08:00:00+02:00').toISOString(); }
+      if (a === 'cancel') { const note = prompt('סיבת הביטול:'); if (note === null) return; extra.note = note; }
+      el.disabled = true;
+      await act(key, a, extra); await loadControl();
+    }));
   }
   const act = (key, action, extra = {}) => api('/api/owner-tasks/act', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key, action, by: 'עדן', ...extra }) });
 
