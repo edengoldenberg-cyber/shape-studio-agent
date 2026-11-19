@@ -60,6 +60,16 @@
     ══════════════════════════════════════════════════════════════════════════ -->
     <section id="tab-maya" class="tab-panel active">
 
+      <nav class="barak-subnav" id="maya-subnav">
+        <button class="barak-sv-btn active" data-mview="overview">🏢 סקירה</button>
+        <button class="barak-sv-btn" data-mview="control">🎛️ בקרה ומשימות</button>
+        <button class="barak-sv-btn" data-mview="reminders">⏰ תזכורות</button>
+      </nav>
+
+      <div id="maya-view-control" style="display:none"><div id="maya-control-root"><div class="empty-state">טוען…</div></div></div>
+      <div id="maya-view-reminders" style="display:none"><div id="maya-reminders-root"><div class="empty-state">טוען…</div></div></div>
+
+      <div id="maya-view-overview">
       <div class="stats-grid" id="maya-stats"></div>
 
       <!-- Executive Summary -->
@@ -151,6 +161,7 @@
           <span style="font-size:12px;color:var(--muted)">מתרענן כל 10 שניות · 50 פעולות אחרונות</span>
         </div>
       </div>
+      </div><!-- /maya-view-overview -->
     </section>
 
     <!-- ══════════════════════════════════════════════════════════════════════
@@ -1488,6 +1499,7 @@
 
   <script src="app.js"></script>
   <script src="crm.js"></script>
+  <script src="maya.js"></script>
   <script src="tomer-panel.js"></script>
   <script src="tomer-manage.js"></script>
 </body>
