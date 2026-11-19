@@ -3305,6 +3305,8 @@ const crm = require('./services/crm').createCrm({
   isMember: p => phoneRegistry.isMember(p),
   getThread: p => inbox.getThread(p),
   kindOf: lead => { try { return require('./utils/contact_kind').kindOf(lead, { id: identity.peek(lead.phone), thread: inbox.getThread(lead.phone), hasAppointment: !!aptStore.getActiveCallback(lead.phone) }); } catch { return null; } },
+  // the SAME batch-aware classification the old screen used (it alone flags a test batch)
+  classify: () => _contactKinds(),
   broadcast: (ev, data) => broadcastSse(ev, data),
 });
 

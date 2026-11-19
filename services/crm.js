@@ -72,7 +72,7 @@ function phoneMatches(query, phone) {
 
 function createCrm({
   store, aptStore, tomerStore, inbox, persist, logger,
-  normalizePhone, isMember = () => false, kindOf = null, getThread = null,
+  normalizePhone, isMember = () => false, kindOf = null, classify = null, getThread = null,
   broadcast = () => {}, now = () => new Date(),
 }) {
   const log = logger ?? { info() {}, warn() {}, error() {} };
@@ -86,9 +86,13 @@ function createCrm({
   // ── central classification (the SAME one the system uses) ─────────────────────────────
   // A sales lead only. Members, aggregators, staff numbers, test batches and non-sales
   // "contact" records are classified by utils/contact_kind and kept OUT of the funnel, its
-  // counts and its reports. With no classifier injected (unit tests) everything is a lead.
-  function kindInfo(lead) { if (!kindOf) return null; try { return kindOf(lead); } catch { return null; } }
-  function inSalesList(lead) { const k = kindInfo(lead); return k ? k.salesList === true : true; }
+  // counts and its reports. `classify()` returns the batch-aware Map(phone→{kind,label,salesList})
+  // exactly as the old screen used it — it alone can flag a test batch (per-lead kindOf cannot).
+  // Each public method computes the map ONCE and passes it down. With nothing injected (unit
+  // tests) everything is treated as a sales lead.
+  function classMap() { if (!classify) return null; try { return classify(); } catch (e) { log.warn('[crm] classify failed', { error: e.message }); return null; } }
+  function kindInfo(lead, map) { const k = map ? map.get(lead.phone) : null; if (k) return k; if (!kindOf) return null; try { return kindOf(lead); } catch { return null; } }
+  function salesOf(lead, map) { const k = kindInfo(lead, map); return k ? k.salesList === true : true; }
 
   // ── ownership of the conversation (barak / staff), independent of stage and assignee ──
   function ownerOf(lead) {
@@ -149,9 +153,9 @@ function createCrm({
   const tagsOf = lead => Array.isArray(lead.meta?.tags) ? lead.meta.tags : [];
 
   // ── enrich one lead into a list row ───────────────────────────────────────────────────
-  function row(lead) {
+  function row(lead, map = null) {
     const stage = stageOf(lead), na = nextActionOf(lead), apt = openCallback(lead.phone);
-    const kind = kindOf ? (() => { try { return kindOf(lead, { isMember, getThread }); } catch { return null; } })() : null;
+    const kind = kindInfo(lead, map);
     return {
       phone: lead.phone,
       name: displayNameOf(lead),
@@ -207,6 +211,7 @@ function createCrm({
     crmState = 'active', sort = 'recent', limit = 500 } = {}) {
     const t = now().getTime();
     const qTrim = String(q ?? '').trim();
+    const map = classMap();
     const all = store.getAllLeads();
     let rows = all.filter(lead => {
       // crmState gate: 'active' default hides archived+trashed; 'trash' shows only trashed; 'archive' only archived; 'all' everything
@@ -217,7 +222,7 @@ function createCrm({
       // the CRM funnel is sales leads only (same classification the system uses). Members / staff /
       // test / non-sales contacts never enter the active pipeline, its counts or its reports. The
       // 'registered' view is the exception: it shows leads that became members (sales history kept).
-      if (crmState === 'active' && view !== 'registered' && !inSalesList(lead)) return false;
+      if (crmState === 'active' && view !== 'registered' && !salesOf(lead, map)) return false;
       if (qTrim) {
         const hay = [displayNameOf(lead), lead.name, ...(tagsOf(lead))].filter(Boolean).join(' ').toLowerCase();
         const textHit = hay.includes(qTrim.toLowerCase());
@@ -235,7 +240,7 @@ function createCrm({
       if (activitySince) { const la = toTime(iso(lead.lastActivity)); if (la == null || la < toTime(activitySince)) return false; }
       if (view && !matchesView(lead, view, t)) return false;
       return true;
-    }).map(row);
+    }).map(l => row(l, map));
 
     const stageOrder = Object.fromEntries(SALES_STAGES.map((s, i) => [s.id, i]));
     const cmp = {
@@ -254,7 +259,8 @@ function createCrm({
   // counts for the whole active pipeline, per stage — for the board columns / badges
   function stageCounts() {
     const out = Object.fromEntries(SALES_STAGES.map(s => [s.id, 0]));
-    for (const lead of store.getAllLeads()) { if (crmStateOf(lead) === 'active' && inSalesList(lead)) out[stageOf(lead)]++; }
+    const map = classMap();
+    for (const lead of store.getAllLeads()) { if (crmStateOf(lead) === 'active' && salesOf(lead, map)) out[stageOf(lead)]++; }
     return out;
   }
 
@@ -518,15 +524,16 @@ function createCrm({
   function awaitingReply(phone) { const th = getThread ? getThread(phone) : null; const ms = th?.messages ?? []; let lastIn = null, lastOut = null; for (const x of ms) { const t = Date.parse(x.timestamp); if (!Number.isFinite(t)) continue; if (x.direction === 'in') lastIn = t; else if (x.direction === 'out') lastOut = t; } return lastIn != null && (lastOut == null || lastIn > lastOut); }
   function today() {
     const t = now().getTime(), dayEnd = new Date(t); dayEnd.setHours(23, 59, 59, 999);
-    const active = store.getAllLeads().filter(l => crmStateOf(l) === 'active' && inSalesList(l));
+    const map = classMap();
+    const active = store.getAllLeads().filter(l => crmStateOf(l) === 'active' && salesOf(l, map));
     const scheduledCalls = [], tasksDue = [], waitingStaff = [], unanswered = [];
     for (const l of active) {
       const apt = openCallback(l.phone);
-      if (apt && apt.scheduledAt && Date.parse(iso(apt.scheduledAt)) <= dayEnd.getTime()) scheduledCalls.push(row(l));
+      if (apt && apt.scheduledAt && Date.parse(iso(apt.scheduledAt)) <= dayEnd.getTime()) scheduledCalls.push(row(l, map));
       const tks = openSalesTasks(l.phone).filter(tk => !tk.dueAt || Date.parse(tk.dueAt) <= dayEnd.getTime());
-      if (tks.length) tasksDue.push({ ...row(l), dueTasks: tks.length, overdueTasks: tks.filter(tk => tk.dueAt && Date.parse(tk.dueAt) < new Date(t).setHours(0, 0, 0, 0)).length });
-      if (ownerOf(l) === 'staff') waitingStaff.push(row(l));
-      if (awaitingReply(l.phone)) unanswered.push(row(l));
+      if (tks.length) tasksDue.push({ ...row(l, map), dueTasks: tks.length, overdueTasks: tks.filter(tk => tk.dueAt && Date.parse(tk.dueAt) < new Date(t).setHours(0, 0, 0, 0)).length });
+      if (ownerOf(l) === 'staff') waitingStaff.push(row(l, map));
+      if (awaitingReply(l.phone)) unanswered.push(row(l, map));
     }
     const cmpDue = (a, b) => (toTime(a.nextAction?.dueAt) ?? Infinity) - (toTime(b.nextAction?.dueAt) ?? Infinity);
     scheduledCalls.sort((a, b) => (toTime(a.callbackAt) ?? 0) - (toTime(b.callbackAt) ?? 0));
@@ -540,8 +547,9 @@ function createCrm({
   function reports({ from = null, to = null } = {}) {
     const f = from ? Date.parse(from) : -Infinity, tt = to ? Date.parse(to) : Infinity;
     const inRange = iso => { const x = Date.parse(iso); return Number.isFinite(x) && x >= f && x <= tt; };
+    const map = classMap();
     const leads = store.getAllLeads();
-    const salesLeads = leads.filter(inSalesList);
+    const salesLeads = leads.filter(l => salesOf(l, map));
     const bySource = {};                                  // source is never invented; a missing one is "ללא מקור"
     const bump = (obj, key, k = 1) => { obj[key] = (obj[key] ?? 0) + k; };
     const inquiries = saleLeadsInquiries();
@@ -550,7 +558,8 @@ function createCrm({
     for (const l of leads) for (const c of (l.meta?.calls ?? [])) if (inRange(c.at)) { callsTotal++; bump(callsByOutcome, c.outcome); }
     const trialsScheduled = salesLeads.filter(l => l.meta?.trialScheduledAt && inRange(l.meta.trialScheduledAt)).length;
     const trialsAttendedStaff = salesLeads.filter(l => l.meta?.trialAttendedAt && inRange(l.meta.trialAttendedAt)).length;
-    const regArbox = leads.filter(l => { const r = registrationOf(l); return r.registered && r.verified && (r.at ? inRange(r.at) : true); }).length;
+    const unbounded = f === -Infinity && tt === Infinity;   // existing members with no recorded conversion date are not attributed to a specific period
+    const regArbox = leads.filter(l => { const r = registrationOf(l); return r.registered && r.verified && (r.at ? inRange(r.at) : unbounded); }).length;
     const regStaff = salesLeads.filter(l => l.meta?.registeredSource === 'staff_report' && inRange(l.meta.registeredAt ?? iso(l.lastActivity))).length;
     const lost = salesLeads.filter(l => stageOf(l) === 'lost' && (l.meta?.lostAt ? inRange(l.meta.lostAt) : true));
     const lostReasons = {}; for (const l of lost) bump(lostReasons, l.meta?.lostReason ?? 'לא צוין');
@@ -561,7 +570,7 @@ function createCrm({
         { id: 'calls', he: 'שיחות שתועדו', value: callsTotal, definition: 'שיחות שהצוות תיעד ידנית בטווח. חיוג שלא תועד אינו נספר.', breakdown: Object.fromEntries(Object.entries(callsByOutcome).map(([k, v]) => [CALL_OUTCOMES[k]?.he ?? k, v])) },
         { id: 'trials_scheduled', he: 'ניסיונות שנקבעו', value: trialsScheduled, definition: 'לידים שנקבע להם מועד ניסיון בטווח (תכנון ידני של הצוות).' },
         { id: 'trials_attended', he: 'הגיעו לניסיון (דיווח צוות)', value: trialsAttendedStaff, definition: 'סומנו כמי שהגיעו לניסיון בטווח. דיווח צוות — לא אומת מול נוכחות ב-Arbox.' },
-        { id: 'registered_arbox', he: 'נרשמו — אומת ב-Arbox', value: regArbox, definition: 'לידים שהפכו למנויים לפי Arbox (converted_member / מנוי בתוקף). זהו האימות, לא דיווח.' },
+        { id: 'registered_arbox', he: 'נרשמו — אומת ב-Arbox', value: regArbox, definition: 'מנויים מאומתים ב-Arbox שתאריך ההמרה שלהם נופל בטווח. מנוי קיים ללא תאריך המרה מתועד אינו נספר בטווח תחום (רק בדוח כולל ללא טווח).' },
         { id: 'registered_staff', he: 'נרשמו — דיווח צוות בלבד', value: regStaff, definition: 'סומנו כנרשמו על ידי הצוות אך עדיין לא אומתו ב-Arbox.' },
         { id: 'lost', he: 'לא נסגרו', value: lost.length, definition: 'לידים בשלב "לא נסגר" בטווח, לפי סיבה.', breakdown: lostReasons },
       ],
