@@ -50,9 +50,10 @@ try {
     await shot(`prod-maya-${W}-1-control`);
     // Reminders
     check(`${W}: reminders sub-view opens`, await tap('#maya-subnav [data-mview="reminders"]') && await until(`!!document.querySelector('#mr-times')`, 10000));
-    const rem = await evalJs(`({times:document.querySelector('#mr-times')?.value, hasSave:!!document.querySelector('#mr-save'), hasToggle:!!document.querySelector('#mr-toggle'), single:/תזכורת מרוכזת אחת/.test(document.querySelector('#maya-reminders-root')?.textContent||'')})`);
+    const rem = await evalJs(`(() => { const txt = document.querySelector('#maya-reminders-root')?.textContent||''; return {times:document.querySelector('#mr-times')?.value, hasSave:!!document.querySelector('#mr-save'), hasToggle:!!document.querySelector('#mr-toggle'), single:/תזכורת מרוכזת אחת/.test(txt), recipient:/נמען מאומת/.test(txt), snoozed:/משימות שנדחו/.test(txt), history:/היסטוריית ריצות/.test(txt)}; })()`);
     console.log(`  (reminder times: ${rem.times})`);
     check(`${W}: reminders screen shows times, save/toggle and the single-digest note`, rem.hasSave && rem.hasToggle && rem.single && /09:00/.test(rem.times || ''));
+    check(`${W}: reminders screen shows the verified recipient, snoozed tasks and run history`, rem.recipient && rem.snoozed && rem.history);
     check(`${W} reminders: no sideways scroll`, await noHScroll(W));
     await shot(`prod-maya-${W}-2-reminders`);
   }
