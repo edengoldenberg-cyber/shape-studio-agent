@@ -1335,8 +1335,20 @@ async function loadCases() {
 function closeCase({ keepHash = false } = {}) {
   const d = $id('tw-case-drawer'); if (d) d.hidden = true;
   _openCaseId = null;
-  _caseDirty = false;
+  _caseDirty = false; _caseStale = false;
+  document.body.classList.remove('tw-case-open');                    // release the background scroll lock
   if (!keepHash && /^#tomer\/case\//.test(location.hash)) history.replaceState(null, '', '#tomer');
+}
+let _caseStale = false;
+// A live update arrived for a case the staff member is mid-editing. We do NOT redraw (that would wipe the draft); we
+// show a non-destructive banner so the update is never silently lost, with a safe, explicit refresh.
+function showStaleBanner() {
+  const body = $id('tw-case-body'); if (!body || !_openCaseId) return;
+  let b = $id('tw-cd-stale');
+  if (!b) { b = document.createElement('div'); b.id = 'tw-cd-stale'; b.className = 'tw-cd-stale'; body.insertBefore(b, body.firstChild); }
+  b.innerHTML = 'הפנייה עודכנה בצד אחר בזמן שאתם עורכים. סיימו את הפעולה כדי לראות את המצב המעודכן, או ' +
+    '<button type="button" class="btn-xs" id="tw-cd-stale-refresh">רענן עכשיו</button> (הטיוטה שלא נשמרה תאבד).';
+  $id('tw-cd-stale-refresh')?.addEventListener('click', () => { if (confirm('לרענן? הערה/בחירה שלא נשמרה תאבד.')) { _caseDirty = false; _caseStale = false; openCase(_openCaseId); } });
 }
 
 function renderConversation(conv) {
@@ -1453,6 +1465,7 @@ async function openCase(id, { flash = null } = {}) {
   const same = _openCaseId === id;
   _openCaseId = id;
   drawer.hidden = false;
+  document.body.classList.add('tw-case-open');                       // lock the background from scrolling behind the drawer
   if (!same) { body.innerHTML = '<div class="tw-empty" data-state="loading">טוען פנייה…</div>'; if (title) title.textContent = 'פנייה'; }
   if (location.hash !== '#tomer/case/' + id) history.replaceState(null, '', '#tomer/case/' + id);
   const d = await caseApi('/api/tomer/cases/' + encodeURIComponent(id));
@@ -1466,7 +1479,7 @@ async function openCase(id, { flash = null } = {}) {
   if (title) title.textContent = (_caseLabels[d.case.category] || 'פנייה') + ' — ' + (d.case.memberName || 'חבר/ה');
   const html = renderCaseDetail(d.case, d.conversation);
   if (same) swapHTML(body, html); else { body.innerHTML = html; body.__html = html; body.__first = body.firstChild; }
-  _caseDirty = false;                                   // a fresh render of the case — no unsaved edits
+  _caseDirty = false; _caseStale = false;               // a fresh render of the case — no unsaved edits, no pending update
   if (flash) caseFlash(flash.text, flash.ok);
 }
 function caseFlash(text, ok = true) {
@@ -1506,7 +1519,12 @@ async function caseAct(act, btn) {
   if (r.ok && r.warning === 'sent_not_recorded') { text = 'ההודעה נשלחה, אך לא נרשמה בפנייה (שגיאת שמירה)'; ok = false; }
   if (ok && op === 'reply') { const t = $id('tw-cd-reply'), a = $id('tw-cd-await'); if (t) t.value = ''; if (a) a.checked = false; }
   toast(text, ok);
-  await Promise.all([openCase(id, { flash: { text, ok } }), loadCases()]);
+  // Only the draft-bearing actions carry text the staff member typed (a closing note+outcome, a message to the member).
+  // If one of THOSE fails, do not re-render — that would wipe the draft; keep it (and _caseDirty) so they can fix and
+  // retry. Every other action (and every success) re-renders to show the fresh state.
+  const draftAction = op === 'resolve' || op === 'reply';
+  if (!ok && draftAction) { caseFlash(text, false); loadCases(); }
+  else { await Promise.all([openCase(id, { flash: { text, ok } }), loadCases()]); }
 }
 
 $id('tw-cases-list')?.addEventListener('click', e => {
@@ -1556,6 +1574,7 @@ window.openTomerCase = function (id) {
       // form (dirty) — on a phone the field loses focus between steps, so focus alone is not enough.
       const typing = document.activeElement && $id('tw-case-body')?.contains(document.activeElement) && ['TEXTAREA', 'INPUT', 'SELECT'].includes(document.activeElement.tagName);
       if (_openCaseId && !typing && !_caseDirty) openCase(_openCaseId);
+      else if (_openCaseId && _caseDirty) { _caseStale = true; showStaleBanner(); }   // a concurrent update, not silently dropped
     }, 400);
   };
   try {

@@ -2078,6 +2078,15 @@ describe('14. The conversation of 2026-11-18 21:08: a price question while a cal
     expect(wa._isRepeatSend('972500000001', 'טקסט אחר', t0 + 900, null)).toBe(false);
     expect(wa._isRepeatSend('972500000002', 'דרך השדה 12', t0 + 900, null)).toBe(false);             // another person
     expect(wa._isRepeatSend('972500000001', 'דרך השדה 12', t0 + wa.DUP_SEND_WINDOW_MS + 1000, null)).toBe(false);   // later
+    // a send that did NOT go out releases its marker, so a legitimate retry of the same text is allowed at once
+    // (a failed notification must be re-sendable — this was blocking the manager-alert retry)
+    const t1 = 9_000_000;
+    expect(wa._isRepeatSend('972509000001', 'התראה למנהל', t1, 'IN-x')).toBe(false);
+    wa._forgetRecentSend('972509000001', 'התראה למנהל', 'IN-x');               // the send failed → forget
+    expect(wa._isRepeatSend('972509000001', 'התראה למנהל', t1 + 500, 'IN-x')).toBe(false);   // retry is NOT blocked
+    expect(wa._wentOut({ idMessage: 'MOCK-1' })).toBe(true);
+    expect(wa._wentOut({ duplicate: true, idMessage: null })).toBe(false);
+    expect(wa._wentOut({ blocked: true, idMessage: 'blocked-1' })).toBe(false);
   });
 
   test('a link whose letters were lost is never used and never saved', () => {

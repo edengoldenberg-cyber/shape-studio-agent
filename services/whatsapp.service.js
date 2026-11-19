@@ -183,31 +183,50 @@ function markInbound(messageId, from = null) { if (messageId) _inboundCtx.enterW
 const DUP_SEND_WINDOW_MS = 20 * 1000;
 const DUP_INBOUND_TTL_MS = 10 * 60 * 1000;
 const _recentSends = new Map();
+const _recentKey = (to, text, inboundId) => JSON.stringify([to, inboundId ?? '', text]);
 function _isRepeatSend(to, text, now = Date.now(), inboundId = _inboundCtx.getStore()?.id ?? null) {
   for (const [k, v] of _recentSends) if (now - v.at > v.ttl) _recentSends.delete(k);
-  const key = JSON.stringify([to, inboundId ?? '', text]);
+  const key = _recentKey(to, text, inboundId);
   if (_recentSends.has(key)) return true;
   _recentSends.set(key, { at: now, ttl: inboundId ? DUP_INBOUND_TTL_MS : DUP_SEND_WINDOW_MS });
   return false;
 }
+// A send that did NOT actually leave (the provider refused, it was blocked, or it threw) releases its dedup marker, so a
+// legitimate RETRY of the same text is not swallowed as a duplicate. Only a message that really went out (a real message
+// id) or was deliberately queued for quiet hours keeps the marker. Without this, a failed notification could not be
+// re-sent for 20 s (it blocked the manager-alert retry — tomer_panel_browser_check, 2026-11-19).
+function _forgetRecentSend(to, text, inboundId = _inboundCtx.getStore()?.id ?? null) { _recentSends.delete(_recentKey(to, text, inboundId)); }
+const _wentOut = r => !!(r && r.idMessage && !r.blocked && !r.testMode && !r.demo && !r.duplicate);
 
 async function sendText(to, text, { bypassQuietHours = false, linkPreview = true } = {}) {
-  if (_isRepeatSend(String(to), String(text))) {
-    logger.warn('[whatsapp] the same text to the same number within seconds - the repeat was not sent', { to, chars: String(text).length });
+  const T = String(to), X = String(text);
+  if (_isRepeatSend(T, X)) {
+    logger.warn('[whatsapp] the same text to the same number within seconds - the repeat was not sent', { to, chars: X.length });
     return { duplicate: true, idMessage: null };
   }
-  if (!bypassQuietHours && isQuietHours()) {
-    // Quiet hours stop PROACTIVE messages. A reply to a message this person has just written is not one: it is sent,
-    // so the conversation (and a request for a call at a permitted future time) continues at night as well.
-    const _ctx = _inboundCtx.getStore();
-    if (_ctx?.from && _ctx.from === String(to)) return _dispatch(to, text, { linkPreview });
-    // Anything else waits for the morning release. Nothing is sent now: "נחזור אליך מחר בבוקר" was a promise nobody
-    // had made (owner, 2026-11-18) - quiet hours are not a commitment to call back.
-    logger.info('Quiet hours active — queuing message', { to });
-    quietQueue.push({ to, text, queuedAt: new Date() });
-    return { queued: true, releaseAt: nextMorningRelease() };
+  let result;
+  try {
+    if (!bypassQuietHours && isQuietHours()) {
+      // Quiet hours stop PROACTIVE messages. A reply to a message this person has just written is not one: it is sent,
+      // so the conversation (and a request for a call at a permitted future time) continues at night as well.
+      const _ctx = _inboundCtx.getStore();
+      if (_ctx?.from && _ctx.from === T) result = await _dispatch(to, text, { linkPreview });
+      else {
+        // Anything else waits for the morning release. Nothing is sent now: "נחזור אליך מחר בבוקר" was a promise nobody
+        // had made (owner, 2026-11-18) - quiet hours are not a commitment to call back.
+        logger.info('Quiet hours active — queuing message', { to });
+        quietQueue.push({ to, text, queuedAt: new Date() });
+        return { queued: true, releaseAt: nextMorningRelease() };     // a deliberate hold keeps the marker (no re-queue)
+      }
+    } else {
+      result = await _dispatch(to, text, { linkPreview });
+    }
+  } catch (err) {
+    _forgetRecentSend(T, X);                                          // it did not go out — a retry must be allowed
+    throw err;
   }
-  return _dispatch(to, text, { linkPreview });
+  if (!_wentOut(result)) _forgetRecentSend(T, X);                    // blocked / no id / intercepted — allow a retry
+  return result;
 }
 
 /**
@@ -853,4 +872,4 @@ async function ensureOutgoingWebhooks() {
   }
 }
 
-module.exports = { _isRepeatSend, markInbound, DUP_SEND_WINDOW_MS, DUP_INBOUND_TTL_MS, sendText, sendFileByUrl, alertOwner, notifyLeadTeam, releaseQueuedMessages, verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, probeGreenApiConnection, ensureOutgoingWebhooks, getGreenCreds, _tokenSourceVar, getTestSendLog, clearTestSendLog };
+module.exports = { _isRepeatSend, _forgetRecentSend, _wentOut, markInbound, DUP_SEND_WINDOW_MS, DUP_INBOUND_TTL_MS, sendText, sendFileByUrl, alertOwner, notifyLeadTeam, releaseQueuedMessages, verifyWebhook, parseInbound, parseInboundRich, parseGreenApiWebhook, probeGreenApiConnection, ensureOutgoingWebhooks, getGreenCreds, _tokenSourceVar, getTestSendLog, clearTestSendLog };
