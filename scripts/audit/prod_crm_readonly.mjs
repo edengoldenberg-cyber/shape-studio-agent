@@ -90,6 +90,24 @@ try {
     check(`${W}: the list loaded without an error state`, got && !info.err);
     await audit(`${W} CRM list`, W);
     await shot(`prod-crm-${W}-1-list`);
+    // "my day today" tiles (§1)
+    const tiles = await evalJs(`document.querySelectorAll('#crm-today .crm-tile').length`);
+    check(`${W}: "העבודה שלי היום" shows its tiles`, tiles >= 4, `tiles=${tiles}`);
+    // reports (§10) — GET only
+    if (await tap('#crm-reports') && await until(`!!document.querySelector('.crm-rep table')`, 8000)) {
+      const rowsR = await evalJs(`document.querySelectorAll('.crm-rep tbody tr').length`);
+      check(`${W}: reports open with defined metrics`, rowsR >= 5, `rows=${rowsR}`);
+      const fitsR = await evalJs(`(() => { const r = document.querySelector('.crm-modal').getBoundingClientRect(); return r.left >= -1 && r.right <= ${W} + 1; })()`);
+      check(`${W}: the reports panel fits the screen`, fitsR);
+      await shot(`prod-crm-${W}-3-reports`);
+      await tap('#rp-x');
+    } else check(`${W}: reports open`, false);
+    // mobile multi-select + bulk bar (§6)
+    if (W < 900 && info.cards) {
+      const bulk = await evalJs(`(() => { const cb = document.querySelector('#crm-root .crm-sel'); if (!cb) return 'no-checkbox'; cb.click(); const bar = document.querySelector('#crm-bulk .crm-bulkbar'); const r = bar && bar.getBoundingClientRect(); return bar ? ('bar ' + (r.right <= ${W} + 1 ? 'fits' : 'overflow')) : 'no-bar'; })()`);
+      check(`${W}: selecting a card shows the bulk bar (multi-select on mobile)`, bulk === 'bar fits', bulk);
+      await evalJs(`document.querySelector('#crm-root .crm-sel')?.click()`);   // deselect
+    }
     // open one lead card (GET only) and check it fits
     if (info.cards) {
       const opened = await tap('#crm-root .crm-card') && await until(`!!document.querySelector('.crm-modal')`, 8000);

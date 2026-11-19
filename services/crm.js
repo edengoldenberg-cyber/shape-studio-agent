@@ -570,7 +570,7 @@ function createCrm({
         { id: 'calls', he: 'שיחות שתועדו', value: callsTotal, definition: 'שיחות שהצוות תיעד ידנית בטווח. חיוג שלא תועד אינו נספר.', breakdown: Object.fromEntries(Object.entries(callsByOutcome).map(([k, v]) => [CALL_OUTCOMES[k]?.he ?? k, v])) },
         { id: 'trials_scheduled', he: 'ניסיונות שנקבעו', value: trialsScheduled, definition: 'לידים שנקבע להם מועד ניסיון בטווח (תכנון ידני של הצוות).' },
         { id: 'trials_attended', he: 'הגיעו לניסיון (דיווח צוות)', value: trialsAttendedStaff, definition: 'סומנו כמי שהגיעו לניסיון בטווח. דיווח צוות — לא אומת מול נוכחות ב-Arbox.' },
-        { id: 'registered_arbox', he: 'נרשמו — אומת ב-Arbox', value: regArbox, definition: 'מנויים מאומתים ב-Arbox שתאריך ההמרה שלהם נופל בטווח. מנוי קיים ללא תאריך המרה מתועד אינו נספר בטווח תחום (רק בדוח כולל ללא טווח).' },
+        { id: 'registered_arbox', he: 'נרשמו — אומת ב-Arbox', value: regArbox, definition: 'מנויים מאומתים ב-Arbox שתאריך רישום ההמרה שלהם (convertedAt — מתי המערכת זיהתה אותם כמנויים, לא בהכרח מועד ההצטרפות ב-Arbox) נופל בטווח. מנוי ללא תאריך מתועד נספר רק בדוח כולל ללא טווח.' },
         { id: 'registered_staff', he: 'נרשמו — דיווח צוות בלבד', value: regStaff, definition: 'סומנו כנרשמו על ידי הצוות אך עדיין לא אומתו ב-Arbox.' },
         { id: 'lost', he: 'לא נסגרו', value: lost.length, definition: 'לידים בשלב "לא נסגר" בטווח, לפי סיבה.', breakdown: lostReasons },
       ],
