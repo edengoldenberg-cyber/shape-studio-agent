@@ -680,9 +680,11 @@ const _crmPhone = req => normalizeToE164(decodeURIComponent(req.params.phone));
 app.get('/api/crm/meta', (_req, res) => {
   const leads = store.getAllLeads();
   const distinct = (fn) => [...new Set(leads.map(fn).filter(Boolean))].sort();
+  let _staff = (staffConfig.staff ?? []).filter(s => s.active !== false).map(s => ({ id: s.id, name: s.name_he ?? s.name ?? s.name_en ?? s.id }));
+  if (!_staff.length) _staff = [{ id: 'eden', name: 'עדן' }];   // the volume has no staff roster yet — the owner is always an assignee; a staff_config.json adds the rest
   res.json({ ok: true,
     stages: crm.SALES_STAGES, savedViews: crm.SAVED_VIEWS,
-    staff: (staffConfig.staff ?? []).filter(s => s.active !== false).map(s => ({ id: s.id, name: s.name })),
+    staff: _staff,
     sources: distinct(l => l.meta?.source ?? l.meta?.leadSource),
     interests: distinct(l => l.meta?.interest ?? l.meta?.qualData?.fitnessInterest ?? l.meta?.leadBrief?.workoutStyle),
     tags: [...new Set(leads.flatMap(l => Array.isArray(l.meta?.tags) ? l.meta.tags : []))].sort(),
