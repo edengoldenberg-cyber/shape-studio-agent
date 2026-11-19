@@ -1249,6 +1249,12 @@ const MEMBERSHIP_CATS = ['membership_cancel', 'membership_freeze'];
 let _caseFilter = 'open';           // open | awaiting_staff | in_progress | awaiting_member | resolved
 let _caseLabels = {}, _caseOutcomes = {};
 let _openCaseId = null;
+// The open case must never be redrawn out from under someone who is filling it in. On a phone the
+// field loses focus the moment you tap the outcome picker or scroll, so a focus-only guard is not
+// enough: a live 'tomer_case' update (e.g. the member sending a message) would wipe the note and the
+// chosen outcome, making it impossible to write a note or close the inquiry. We track "dirty" — any
+// edit to the drawer's form — and skip the auto-redraw while dirty; the next explicit action redraws.
+let _caseDirty = false;
 const staffName = () => { try { return (localStorage.getItem('tw_staff_name') || '').trim(); } catch { return ''; } };
 const dmyHe = iso => String(iso || '').split('-').reverse().join('.');
 
@@ -1329,6 +1335,7 @@ async function loadCases() {
 function closeCase({ keepHash = false } = {}) {
   const d = $id('tw-case-drawer'); if (d) d.hidden = true;
   _openCaseId = null;
+  _caseDirty = false;
   if (!keepHash && /^#tomer\/case\//.test(location.hash)) history.replaceState(null, '', '#tomer');
 }
 
@@ -1459,6 +1466,7 @@ async function openCase(id, { flash = null } = {}) {
   if (title) title.textContent = (_caseLabels[d.case.category] || 'פנייה') + ' — ' + (d.case.memberName || 'חבר/ה');
   const html = renderCaseDetail(d.case, d.conversation);
   if (same) swapHTML(body, html); else { body.innerHTML = html; body.__html = html; body.__first = body.firstChild; }
+  _caseDirty = false;                                   // a fresh render of the case — no unsaved edits
   if (flash) caseFlash(flash.text, flash.ok);
 }
 function caseFlash(text, ok = true) {
@@ -1510,6 +1518,11 @@ $id('tw-case-body')?.addEventListener('click', e => {
   const b = e.target.closest('[data-act]');
   if (b && !b.disabled) caseAct(b.dataset.act, b);
 });
+// Any edit to the drawer's form marks it dirty, so a live update does not wipe the staff member's
+// note / chosen outcome before they finish. Cleared on the next (re)render of the case.
+const _markCaseDirty = e => { if (_openCaseId && e.target.closest('#tw-cd-reply, #tw-cd-note, #tw-cd-outcome, #tw-cd-owner, #tw-cd-status, #tw-cd-await')) _caseDirty = true; };
+$id('tw-case-body')?.addEventListener('input', _markCaseDirty);
+$id('tw-case-body')?.addEventListener('change', _markCaseDirty);
 $id('tw-case-close')?.addEventListener('click', () => closeCase());
 $id('tw-case-overlay')?.addEventListener('click', () => closeCase());
 document.addEventListener('keydown', e => { if (e.key === 'Escape' && _openCaseId && !document.querySelector('.modal-overlay')) closeCase(); });
@@ -1539,9 +1552,10 @@ window.openTomerCase = function (id) {
     t = setTimeout(() => {
       if (!document.querySelector('.tab-btn[data-tab="tomer"].active')) return;
       loadCases();
-      // Never redraw the open case under someone who is typing in it.
+      // Never redraw the open case under someone who is typing in it OR who has started filling the
+      // form (dirty) — on a phone the field loses focus between steps, so focus alone is not enough.
       const typing = document.activeElement && $id('tw-case-body')?.contains(document.activeElement) && ['TEXTAREA', 'INPUT', 'SELECT'].includes(document.activeElement.tagName);
-      if (_openCaseId && !typing) openCase(_openCaseId);
+      if (_openCaseId && !typing && !_caseDirty) openCase(_openCaseId);
     }, 400);
   };
   try {
