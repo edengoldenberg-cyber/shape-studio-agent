@@ -10,7 +10,7 @@
   const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const api = async (url, opts) => { const r = await fetch(url, opts); let d = null; try { d = await r.json(); } catch {} return { status: r.status, ok: r.ok, data: d }; };
   const fmt = s => { if (!s) return '—'; try { return new Date(s).toLocaleString('he-IL', { timeZone: 'Asia/Jerusalem', day: 'numeric', month: 'numeric', hour: '2-digit', minute: '2-digit' }); } catch { return '—'; } };
-  let CTRL = { board: null, today: null, sys: null, bucket: null, agent: '', assignee: '', q: '' };
+  let CTRL = { board: null, today: null, sys: null, checks: null, bucket: null, agent: '', assignee: '', q: '' };
 
   function injectStyle() {
     if ($('#maya-style')) return;
@@ -55,10 +55,29 @@
   async function loadControl() {
     injectStyle();
     const root = $('#maya-control-root'); if (!root) return;
-    const [board, today, sys] = await Promise.all([api('/api/tomer/board'), api('/api/crm/today'), api('/api/system/status')]);
+    const [board, today, sys, checks] = await Promise.all([api('/api/tomer/board'), api('/api/crm/today'), api('/api/system/status'), api('/api/maya/control-checks')]);
     if (!board.ok || !board.data) { root.innerHTML = '<div class="empty-state">לא ניתן לטעון את לוח הבקרה.</div>'; return; }
-    CTRL.board = board.data; CTRL.today = today.data; CTRL.sys = sys.data;
+    CTRL.board = board.data; CTRL.today = today.data; CTRL.sys = sys.data; CTRL.checks = checks.data;
     renderControl();
+  }
+
+  function anomaliesHtml() {
+    const c = CTRL.checks; if (!c || !c.ok) return '';
+    const open = c.open || [];
+    const srcBad = Object.entries(c.sources || {}).filter(([, v]) => v && v.ok === false);
+    const srcNote = srcBad.length ? `<div class="mc-note">⚠️ בדיקות שלא רצו: ${srcBad.map(([k, v]) => esc(k) + (v.error ? ' (' + esc(v.error) + ')' : '')).join(', ')} — הממצאים שלהן אינם ידועים.</div>` : '';
+    const rows = open.slice(0, 40).map(a => `<div class="mc-item" style="border-right:4px solid ${a.severity === 'high' ? 'var(--hot,#e53e3e)' : 'var(--warm,#dd8800)'}">
+      <div class="mc-item-h">${a.severity === 'high' ? '🔴' : '🟠'} <b>${esc(a.title || a.type)}</b></div>
+      <div class="mc-note">${esc(a.evidence || '')}</div>
+      <div class="mc-note">זוהה ${fmt(a.detectedAt)} · נבדק לאחרונה ${fmt(a.lastCheckedAt)} · אחראי: ${esc(a.responsible || '—')}</div>
+      <div class="mc-note">➡️ ${esc(a.nextAction || '')}</div>
+      ${a.link ? `<div class="mc-item-a"><button class="mc-mini" data-anlink="${esc(a.link)}">פתח ←</button></div>` : ''}
+    </div>`).join('');
+    const last = c.lastRun ? `רצה לאחרונה ${fmt(c.lastRun.at)}` : 'טרם רצה';
+    return `<div class="mc-sec"><h3>בקרה יומית — חריגות ${open.length ? `(${open.length}${c.counts?.high ? `, ${c.counts.high} דחופות` : ''})` : '✓'} <button class="mc-btn sec" id="mc-runcheck">בדוק עכשיו</button></h3>
+      <div class="mc-note">${esc(last)}. הבדיקה רצה אוטומטית כל 10 דקות ומזהה הודעות ללא מענה, שיחות שעבר מועדן, פניות שנסגרו בלי תוצאה, כשלי שליחה, אינטגרציה שנפלה ועבודת דנה שממתינה.</div>
+      ${srcNote}
+      ${open.length ? rows : '<div class="mc-note">אין חריגות פתוחות כרגע 🎉</div>'}</div>`;
   }
 
   // Which bucket a board item belongs to. The owner_tasks board already computed each item's state,
@@ -130,6 +149,7 @@
 
     root.innerHTML = `
       <div class="mc-note">בקרה ומשימות — לוח המשימות האחד של ברק, תומר ודנה. אותה משימה נספרת פעם אחת; משימה ללא אחראי מסומנת. ${srcErr}</div>
+      ${anomaliesHtml()}
       ${srcNote}${filters}${tiles}${ctrlBar}
       <div class="mc-sec"><h3>${bk ? esc(bk.he) : 'כל הפתוחות'} — ${list.length} <span class="mc-note" id="mc-clear" style="cursor:pointer">${CTRL.bucket ? '· נקה סינון' : ''}</span></h3>
         ${list.length ? list.slice(0, 100).map(card).join('') : '<div class="mc-note">אין פריטים בקבוצה הזו 🎉</div>'}</div>`;
@@ -141,6 +161,8 @@
     $('#mc-crm', root).addEventListener('click', goCrm);
     $('#mc-board', root).addEventListener('click', goBoard);
     $('#mc-clear', root)?.addEventListener('click', () => { CTRL.bucket = null; re(); });
+    $('#mc-runcheck', root)?.addEventListener('click', async e => { e.target.disabled = true; e.target.textContent = 'בודק…'; await api('/api/maya/control-checks/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); loadControl(); });
+    root.querySelectorAll('[data-anlink]').forEach(el => el.addEventListener('click', () => { const link = el.dataset.anlink; if (link.startsWith('#barak')) goCrm(); else if (link.startsWith('#tomer')) { location.hash = link; goBoard(); } else if (link.startsWith('#whatsapp')) document.querySelector('.tab-btn[data-tab="whatsapp"]')?.click(); else if (link.startsWith('#dana')) document.querySelector('.tab-btn[data-tab="dana"]')?.click(); else if (link.startsWith('#health')) document.querySelector('.tab-btn[data-tab="health"]')?.click(); }));
     root.querySelectorAll('[data-bucket]').forEach(el => el.addEventListener('click', () => { CTRL.bucket = CTRL.bucket === el.dataset.bucket ? null : el.dataset.bucket; re(); }));
     root.querySelectorAll('[data-hist]').forEach(el => el.addEventListener('click', () => { const h = $('#h-' + CSS.escape(el.dataset.hist), root); if (h) h.hidden = !h.hidden; }));
     root.querySelectorAll('[data-src]').forEach(el => el.addEventListener('click', () => { const link = el.dataset.src; if (link.startsWith('#barak')) goCrm(); else if (link.startsWith('#tomer')) { location.hash = link; goBoard(); } }));

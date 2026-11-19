@@ -914,24 +914,22 @@ async function _greenStateCached() {
   _greenStateCache = { at: Date.now(), state };
   return _greenStateCache;
 }
+async function _buildSystemStatus() {
+  const danaStudio = require('./services/dana_studio');
+  return require('./services/system_status').build({
+    store, aptStore, appointmentWorker, arboxGateway, tomerTest, tomerStore, serviceCases, barakAgent, identity, studioKnowledge, ownerTasks: app.locals.ownerTasks, delivery: require('./utils/delivery_ledger'),
+    pricing: require('./utils/pricing'),
+    voiceIntake: app.locals.voiceIntake, memberCare: app.locals.memberCare,
+    danaStudio: { workerStatus: danaStudio.workerStatus,
+      summary: () => ({ awaitingReview: danaStudio.list().filter(p => p.status === 'ready_for_review').length }) },
+    danaReferences: { count: () => require('./services/dana_references').list().length },
+    danaNotify: require('./services/dana_notify'),
+    greenState: _greenStateCached,
+  });
+}
 app.get('/api/system/status', async (_req, res) => {
-  try {
-    const danaStudio = require('./services/dana_studio');
-    const out = await require('./services/system_status').build({
-      store, aptStore, appointmentWorker, arboxGateway, tomerTest, tomerStore, serviceCases, barakAgent, identity, studioKnowledge, ownerTasks: app.locals.ownerTasks, delivery: require('./utils/delivery_ledger'),
-      pricing: require('./utils/pricing'),
-      voiceIntake: app.locals.voiceIntake, memberCare: app.locals.memberCare,
-      danaStudio: { workerStatus: danaStudio.workerStatus,
-        summary: () => ({ awaitingReview: danaStudio.list().filter(p => p.status === 'ready_for_review').length }) },
-      danaReferences: { count: () => require('./services/dana_references').list().length },
-      danaNotify: require('./services/dana_notify'),
-      greenState: _greenStateCached,
-    });
-    res.json({ ok: true, ...out });
-  } catch (err) {
-    logger.error('[system-status] failed', { error: err.message });
-    res.status(500).json({ ok: false, error: 'status_failed' });
-  }
+  try { res.json({ ok: true, ...(await _buildSystemStatus()) }); }
+  catch (err) { logger.error('[system-status] failed', { error: err.message }); res.status(500).json({ ok: false, error: 'status_failed' }); }
 });
 
 // GET /api/maya/summary — executive summary: conversion funnel + campaign KPIs
@@ -3623,6 +3621,21 @@ app.get('/api/tomer/board', (_req, res) => {
 app.get('/api/tomer/board/roles', (_req, res) => { try { res.json(tomerRoles.roles()); } catch (err) { res.status(500).json({ ok: false, error: err.message }); } });
 app.get('/api/tomer/board/proposals', async (_req, res) => { try { res.json(await tomerRoles.proposals()); } catch (err) { logger.error('[board] proposals failed', { error: err.message }); res.status(500).json({ ok: false, state: 'sync_error', error: err.message }); } });
 app.get('/api/tomer/members-external', async (_req, res) => { try { const out = await tomerRoles.external(); res.status(out.ok ? 200 : 503).json(out); } catch (err) { res.status(500).json({ ok: false, error: err.message }); } });
+
+// ── Maya's daily control check — detects operational anomalies over the existing stores, deduped, resolvable.
+const mayaControl = app.locals.mayaControl = require('./services/maya_control').createMayaControl({
+  logger,
+  getBoard: () => ownerTasks.board(),
+  getAppointments: () => aptStore.getAll(), activeStatuses: aptStore.ACTIVE_STATUSES, isSuperseded: a => aptStore.isSuperseded(a),
+  getThreads: ({ limit } = {}) => inbox.getThreads({ limit }), leadOf: p => store.getLead(p),
+  deliverySummary: opts => require('./utils/delivery_ledger').summary(opts),
+  systemRows: async () => (await _buildSystemStatus()).rows,
+  danaList: () => require('./services/dana_studio').list(),
+  casesList: () => serviceCases.list({ limit: 1000 }),
+});
+if (process.env.NODE_ENV !== 'test') { mayaControl.tick().catch(() => {}); setInterval(() => mayaControl.tick().catch(err => logger.error('[maya-control] tick failed', { error: err.message })), 10 * 60 * 1000); }
+app.get('/api/maya/control-checks', (_req, res) => { try { res.json(mayaControl.list()); } catch (err) { logger.error('[maya-control] list failed', { error: err.message }); res.status(500).json({ ok: false, error: 'list_failed' }); } });
+app.post('/api/maya/control-checks/run', jsonBody, async (_req, res) => { try { res.json(await mayaControl.tick()); } catch (err) { res.status(500).json({ ok: false, error: err.message }); } });
 
 // Every 15 minutes: run the programs that are due today. Does nothing while the switch is off.
 if (process.env.TEST_NO_BIND !== 'true') {

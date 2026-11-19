@@ -41,8 +41,11 @@ try {
     const ctl = await evalJs(`({tiles:document.querySelectorAll('#maya-control-root .mc-tile').length, day:document.querySelectorAll('#maya-control-root .mc-day .mc-chip').length, filters:document.querySelectorAll('#maya-control-root .mc-filters select').length, list:document.querySelectorAll('#maya-control-root .mc-sec').length, crmLink:!!document.querySelector('#mc-crm'), boardLink:!!document.querySelector('#mc-board')})`);
     console.log(`  (bucket tiles:${ctl.tiles} day-chips:${ctl.day} filters:${ctl.filters} list-sections:${ctl.list})`);
     check(`${W}: control shows the 8 buckets, day summary, filters, list and source links`, ctl.tiles >= 8 && ctl.day >= 3 && ctl.filters >= 2 && ctl.list >= 1 && ctl.crmLink && ctl.boardLink);
+    // the daily control-check (anomalies) section with its "check now" button
+    const anom = await evalJs(`({ sec: /בקרה יומית/.test(document.querySelector('#maya-control-root')?.textContent||''), run: !!document.querySelector('#mc-runcheck') })`);
+    check(`${W}: the daily control-check (anomalies) section renders with a "check now" button`, anom.sec && anom.run);
     // clicking a bucket filters the list
-    check(`${W}: a bucket tile filters the list`, await tap('#maya-control-root [data-bucket="needs_action"]') && await until(`/דורש פעולה/.test(document.querySelector('#maya-control-root .mc-sec h3')?.textContent||'')`, 6000));
+    check(`${W}: a bucket tile filters the list`, await tap('#maya-control-root [data-bucket="needs_action"]') && await until(`/דורש פעולה/.test([...document.querySelectorAll('#maya-control-root .mc-sec h3')].map(h=>h.textContent).join(' '))`, 6000));
     check(`${W} control: no sideways scroll`, await noHScroll(W));
     await shot(`prod-maya-${W}-1-control`);
     // Reminders
