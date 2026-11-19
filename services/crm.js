@@ -223,6 +223,10 @@ function createCrm({
       // test / non-sales contacts never enter the active pipeline, its counts or its reports. The
       // 'registered' view is the exception: it shows leads that became members (sales history kept).
       if (crmState === 'active' && view !== 'registered' && !salesOf(lead, map)) return false;
+      // a lead that became a verified member has left the active work list (it lives in the 'registered'
+      // view and in the conversion reports, with its source kept). Caught here too for robustness, even if
+      // the Arbox classification has not refreshed yet.
+      if (crmState === 'active' && view !== 'registered' && registrationOf(lead).verified) return false;
       if (qTrim) {
         const hay = [displayNameOf(lead), lead.name, ...(tagsOf(lead))].filter(Boolean).join(' ').toLowerCase();
         const textHit = hay.includes(qTrim.toLowerCase());
@@ -260,7 +264,7 @@ function createCrm({
   function stageCounts() {
     const out = Object.fromEntries(SALES_STAGES.map(s => [s.id, 0]));
     const map = classMap();
-    for (const lead of store.getAllLeads()) { if (crmStateOf(lead) === 'active' && salesOf(lead, map)) out[stageOf(lead)]++; }
+    for (const lead of store.getAllLeads()) { if (crmStateOf(lead) === 'active' && salesOf(lead, map) && !registrationOf(lead).verified) out[stageOf(lead)]++; }
     return out;
   }
 
@@ -525,7 +529,7 @@ function createCrm({
   function today() {
     const t = now().getTime(), dayEnd = new Date(t); dayEnd.setHours(23, 59, 59, 999);
     const map = classMap();
-    const active = store.getAllLeads().filter(l => crmStateOf(l) === 'active' && salesOf(l, map));
+    const active = store.getAllLeads().filter(l => crmStateOf(l) === 'active' && salesOf(l, map) && !registrationOf(l).verified);
     const scheduledCalls = [], tasksDue = [], waitingStaff = [], unanswered = [];
     for (const l of active) {
       const apt = openCallback(l.phone);
@@ -559,8 +563,14 @@ function createCrm({
     const trialsScheduled = salesLeads.filter(l => l.meta?.trialScheduledAt && inRange(l.meta.trialScheduledAt)).length;
     const trialsAttendedStaff = salesLeads.filter(l => l.meta?.trialAttendedAt && inRange(l.meta.trialAttendedAt)).length;
     const unbounded = f === -Infinity && tt === Infinity;   // existing members with no recorded conversion date are not attributed to a specific period
-    const regArbox = leads.filter(l => { const r = registrationOf(l); return r.registered && r.verified && (r.at ? inRange(r.at) : unbounded); }).length;
-    const regStaff = salesLeads.filter(l => l.meta?.registeredSource === 'staff_report' && inRange(l.meta.registeredAt ?? iso(l.lastActivity))).length;
+    // A converted member is excluded from the active lists by contact_kind, but NOT from the conversion
+    // reports: these count over ALL leads, and attribute each conversion to the lead's kept source.
+    const regArboxLeads = leads.filter(l => { const r = registrationOf(l); return r.registered && r.verified && (r.at ? inRange(r.at) : unbounded); });
+    const regArbox = regArboxLeads.length;
+    const regArboxBySource = {}; for (const l of regArboxLeads) bump(regArboxBySource, sourceOf(l) ?? 'ללא מקור');
+    const regStaffLeads = salesLeads.filter(l => l.meta?.registeredSource === 'staff_report' && inRange(l.meta.registeredAt ?? iso(l.lastActivity)));
+    const regStaff = regStaffLeads.length;
+    const regStaffBySource = {}; for (const l of regStaffLeads) bump(regStaffBySource, sourceOf(l) ?? 'ללא מקור');
     const lost = salesLeads.filter(l => stageOf(l) === 'lost' && (l.meta?.lostAt ? inRange(l.meta.lostAt) : true));
     const lostReasons = {}; for (const l of lost) bump(lostReasons, l.meta?.lostReason ?? 'לא צוין');
     return {
@@ -570,8 +580,8 @@ function createCrm({
         { id: 'calls', he: 'שיחות שתועדו', value: callsTotal, definition: 'שיחות שהצוות תיעד ידנית בטווח. חיוג שלא תועד אינו נספר.', breakdown: Object.fromEntries(Object.entries(callsByOutcome).map(([k, v]) => [CALL_OUTCOMES[k]?.he ?? k, v])) },
         { id: 'trials_scheduled', he: 'ניסיונות שנקבעו', value: trialsScheduled, definition: 'לידים שנקבע להם מועד ניסיון בטווח (תכנון ידני של הצוות).' },
         { id: 'trials_attended', he: 'הגיעו לניסיון (דיווח צוות)', value: trialsAttendedStaff, definition: 'סומנו כמי שהגיעו לניסיון בטווח. דיווח צוות — לא אומת מול נוכחות ב-Arbox.' },
-        { id: 'registered_arbox', he: 'נרשמו — אומת ב-Arbox', value: regArbox, definition: 'מנויים מאומתים ב-Arbox שתאריך רישום ההמרה שלהם (convertedAt — מתי המערכת זיהתה אותם כמנויים, לא בהכרח מועד ההצטרפות ב-Arbox) נופל בטווח. מנוי ללא תאריך מתועד נספר רק בדוח כולל ללא טווח.' },
-        { id: 'registered_staff', he: 'נרשמו — דיווח צוות בלבד', value: regStaff, definition: 'סומנו כנרשמו על ידי הצוות אך עדיין לא אומתו ב-Arbox.' },
+        { id: 'registered_arbox', he: 'נרשמו — אומת ב-Arbox', value: regArbox, definition: 'מנויים מאומתים ב-Arbox שתאריך רישום ההמרה שלהם (convertedAt — מתי המערכת זיהתה אותם כמנויים, לא בהכרח מועד ההצטרפות ב-Arbox) נופל בטווח. מנוי ללא תאריך מתועד נספר רק בדוח כולל ללא טווח. סינון contact_kind לא מסיר המרות מכאן — נספרות על כל הרשומות, עם שיוך למקור הפנייה המקורי.', breakdown: regArboxBySource },
+        { id: 'registered_staff', he: 'נרשמו — דיווח צוות בלבד', value: regStaff, definition: 'סומנו כנרשמו על ידי הצוות אך עדיין לא אומתו ב-Arbox.', breakdown: regStaffBySource },
         { id: 'lost', he: 'לא נסגרו', value: lost.length, definition: 'לידים בשלב "לא נסגר" בטווח, לפי סיבה.', breakdown: lostReasons },
       ],
       note: 'הדוח מחושב מעובדות שמורות לכל ליד (firstSeen, שיחות, מועדי ניסיון, מקור ההרשמה), בנפרד מהרשימות הפעילות. מקור קמפיין לא מומצא — חסר מוצג כ"ללא מקור".',

@@ -303,6 +303,39 @@ describe('crm — my day today (§1) and reports (§10)', () => {
   });
 });
 
+describe('crm — ACCEPTANCE: a converted lead leaves the active list but stays in conversion reports + source attribution', () => {
+  test('contact_kind filtering does not erase a conversion from the reports', () => {
+    const store = new LeadStore(), aptStore = makeApt(), tomerStore = makeTasks();
+    // classifier: once a lead is a confirmed member it is classified 'member' (NOT a sales lead), exactly like contact_kind
+    const kindOf = lead => { const k = lead.meta?.isConfirmedMember ? 'member' : 'lead'; return { kind: k, salesList: k === 'lead' }; };
+    const crm = createCrm({ store, aptStore, tomerStore, inbox: { getThread: () => null }, persist: { saveLeads() {} }, logger: { info() {}, warn() {}, error() {} }, normalizePhone, isMember: () => false, kindOf, classify: () => new Map(store.getAllLeads().map(l => [l.phone, kindOf(l)])) });
+
+    store.upsertLead('972521111111', { name: 'ליד פעיל', firstSeen: new Date('2026-11-10'), meta: { crmState: 'active', source: 'פייסבוק' } });
+    // a lead that came from Instagram and converted to a member (source kept on the record)
+    store.upsertLead('972522222222', { name: 'הומר למנוי', status: 'converted_member', firstSeen: new Date('2026-11-05'), meta: { crmState: 'active', source: 'אינסטגרם', isConfirmedMember: true, convertedAt: '2026-11-12' } });
+
+    // 1. it left the active work list
+    const active = crm.search({ crmState: 'active' });
+    expect(active.rows.some(r => r.phone === '972522222222')).toBe(false);
+    expect(active.rows.some(r => r.phone === '972521111111')).toBe(true);
+    expect(crm.stageCounts().registered).toBe(0);                       // not an active-pipeline stage count
+    // and it does not show in "my day today"
+    const d = crm.today();
+    expect(Object.values(d.groups).flat().some(r => r.phone === '972522222222')).toBe(false);
+
+    // 2. it is still reachable in the 'registered' view (sales history kept)
+    expect(crm.search({ view: 'registered' }).rows.some(r => r.phone === '972522222222')).toBe(true);
+
+    // 3. it is still counted in the conversion report, attributed to its ORIGINAL source
+    const rep = crm.reports({ from: '2026-11-01', to: '2026-11-30' });
+    const m = Object.fromEntries(rep.metrics.map(x => [x.id, x]));
+    expect(m.registered_arbox.value).toBe(1);                           // contact_kind did NOT erase the conversion
+    expect(m.registered_arbox.breakdown['אינסטגרם']).toBe(1);          // source attribution kept
+    expect(m.inquiries.breakdown['אינסטגרם']).toBeUndefined();          // it is no longer an active inquiry
+    expect(m.inquiries.breakdown['פייסבוק']).toBe(1);
+  });
+});
+
 describe('crm — tasks live on the shared store, and the timeline merges real sources', () => {
   test('a lead task is created in the task store with the sales type', () => {
     const { store, tomerStore, crm } = build();
