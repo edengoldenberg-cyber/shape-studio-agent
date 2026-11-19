@@ -62,7 +62,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
     switch (btn.dataset.tab) {
       case 'maya':        loadMayaStats();       break;
-      case 'barak':       loadBarakPanel(); loadArboxOverview(); break;
+      case 'barak':       loadBarakPanel(); loadArboxOverview(); window.CRM?.load(); break;
       case 'tomer':       loadTomerQueue(); loadTomerSegments(); break;
       case 'health':      loadHealth();          break;
       case 'sandbox':     initSandbox();         break;
@@ -1371,6 +1371,7 @@ document.querySelectorAll('.barak-sv-btn').forEach(btn => {
     document.querySelectorAll('[id^="barak-view-"]').forEach(v => v.style.display = 'none');
     const viewEl = document.getElementById('barak-view-' + activeBarakView);
     if (viewEl) viewEl.style.display = '';
+    if (activeBarakView === 'crm')          window.CRM?.load();
     if (activeBarakView === 'members')      loadArboxMembers();
     if (activeBarakView === 'memberships')  loadMemberships();
     if (activeBarakView === 'attendance')   loadAttendance();

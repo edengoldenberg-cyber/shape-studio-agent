@@ -705,7 +705,8 @@
 
       <!-- Sub-navigation -->
       <nav class="barak-subnav">
-        <button class="barak-sv-btn active" data-bview="pipeline">📋 לידים</button>
+        <button class="barak-sv-btn active" data-bview="crm">🗂️ CRM מכירות</button>
+        <button class="barak-sv-btn" data-bview="pipeline">📋 לידים (קלאסי)</button>
         <button class="barak-sv-btn" data-bview="memberships">💳 מנויים</button>
         <button class="barak-sv-btn" data-bview="attendance">📊 נוכחות</button>
         <button class="barak-sv-btn" data-bview="staff">👩‍🏫 צוות</button>
@@ -726,8 +727,13 @@
         </div>
       </div>
 
-      <!-- VIEW: Local lead pipeline -->
-      <div id="barak-view-pipeline">
+      <!-- VIEW: CRM (operational sales workspace) -->
+      <div id="barak-view-crm">
+        <div class="panel"><div id="crm-root"><div class="empty-state">טוען CRM…</div></div></div>
+      </div>
+
+      <!-- VIEW: Local lead pipeline (classic, kept) -->
+      <div id="barak-view-pipeline" style="display:none">
         <div class="panel" style="margin-bottom:24px">
           <div class="panel-header">
             <h2>פייפליין לידים מקומיים</h2>
@@ -1481,6 +1487,7 @@
   </main>
 
   <script src="app.js"></script>
+  <script src="crm.js"></script>
   <script src="tomer-panel.js"></script>
   <script src="tomer-manage.js"></script>
 </body>

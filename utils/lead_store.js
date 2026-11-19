@@ -133,9 +133,11 @@ class LeadStore {
    * view (staff need to see them) but are skipped by getSendableLeads().
    */
   getActiveLeads() {
-    // a member, a staff number, a number the staff merely wrote to and a test record are conversations, not leads
+    // a member, a staff number, a number the staff merely wrote to and a test record are conversations, not leads.
+    // A lead moved to the CRM archive or recycle bin (crmState archived/trashed) is out of the active sales funnel.
     return this.getAllLeads().filter(l =>
-      l.status !== 'converted_member' && l.status !== 'opted_out' && !l.meta?.notSalesLead
+      l.status !== 'converted_member' && l.status !== 'opted_out' && !l.meta?.notSalesLead &&
+      (l.meta?.crmState ?? 'active') === 'active'
     );
   }
 
@@ -155,8 +157,10 @@ class LeadStore {
                           'call_completed', 'call_cancelled', 'call_no_answer']);
     // An explicit decision not to register stops every automated follow-up for that interest (owner rule 2026-11-18).
     // A record whose classification was corrected or is under review is held too: a correction never starts a campaign.
+    // A lead in the CRM archive or recycle bin (crmState archived/trashed) gets no automated outreach either.
     return this.getAllLeads().filter(l => !SKIP.has(l.status) && l.meta?.qualData?.registrationDeclined !== true
-      && !l.meta?.outreachHold && !l.meta?.classificationReview && !l.meta?.notSalesLead);
+      && !l.meta?.outreachHold && !l.meta?.classificationReview && !l.meta?.notSalesLead
+      && (l.meta?.crmState ?? 'active') === 'active');
   }
 
   getHotLeads()   { return this.getActiveLeads().filter(l => l.score >= 8); }

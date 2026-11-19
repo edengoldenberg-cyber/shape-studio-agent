@@ -668,6 +668,134 @@ app.get('/api/leads/kinds', (_req, res) => {
     identityAt: (() => { try { return identity.summary().at ? new Date(identity.summary().at).toISOString() : null; } catch { return null; } })() });
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+// CRM API — the sales workspace. Every record comes from the stores that already exist;
+// these endpoints only read and operate on them. Behind the dashboard session (one role);
+// a full phone is returned because an authenticated staff member needs it to call / WhatsApp.
+// No endpoint here ever sends a message to a lead.
+// ══════════════════════════════════════════════════════════════════════════════
+const _crmBy = req => (req.session?.user || req.user?.name || 'צוות');
+const _crmPhone = req => normalizeToE164(decodeURIComponent(req.params.phone));
+
+app.get('/api/crm/meta', (_req, res) => {
+  const leads = store.getAllLeads();
+  const distinct = (fn) => [...new Set(leads.map(fn).filter(Boolean))].sort();
+  res.json({ ok: true,
+    stages: crm.SALES_STAGES, savedViews: crm.SAVED_VIEWS,
+    staff: (staffConfig.staff ?? []).filter(s => s.active !== false).map(s => ({ id: s.id, name: s.name })),
+    sources: distinct(l => l.meta?.source ?? l.meta?.leadSource),
+    interests: distinct(l => l.meta?.interest ?? l.meta?.qualData?.fitnessInterest ?? l.meta?.leadBrief?.workoutStyle),
+    tags: [...new Set(leads.flatMap(l => Array.isArray(l.meta?.tags) ? l.meta.tags : []))].sort(),
+  });
+});
+
+app.get('/api/crm/search', (req, res) => {
+  try {
+    const q = req.query;
+    const out = crm.search({
+      q: q.q ?? '', stage: q.stage || null, assignee: q.assignee || null, source: q.source || null,
+      interest: q.interest || null, owner: q.owner || null, tag: q.tag || null,
+      hasTask: q.hasTask === '1' ? true : q.hasTask === '0' ? false : null,
+      activitySince: q.activitySince || null, view: q.view || null,
+      crmState: q.crmState || 'active', sort: q.sort || 'recent',
+      limit: Math.min(1000, parseInt(q.limit ?? '500', 10) || 500),
+    });
+    res.json(out);
+  } catch (err) {
+    logger.error('[crm] search failed', { error: err.message });
+    res.status(500).json({ ok: false, error: 'load_failed', message: err.message });
+  }
+});
+
+app.get('/api/crm/stage-counts', (_req, res) => {
+  try { res.json({ ok: true, counts: crm.stageCounts() }); }
+  catch (err) { res.status(500).json({ ok: false, error: 'load_failed' }); }
+});
+
+app.get('/api/crm/lead/:phone', (req, res) => {
+  const norm = _crmPhone(req); if (!norm) return res.status(400).json({ ok: false, error: 'invalid_phone' });
+  const c = crm.card(norm); if (!c) return res.status(404).json({ ok: false, error: 'not_found' });
+  res.json({ ok: true, card: c });
+});
+
+app.post('/api/crm/lead', jsonBody, (req, res) => {
+  const b = req.body ?? {};
+  const r = crm.createLead({ phone: b.phone, name: b.name ?? null, interest: b.interest ?? null, source: b.source ?? null,
+    tags: b.tags ?? [], assignee: b.assignee ?? null, confirmedName: b.confirmedName ?? null, note: b.note ?? null, by: _crmBy(req) });
+  res.status(r.ok ? 201 : (r.error === 'duplicate' ? 409 : 400)).json(r);
+});
+
+app.patch('/api/crm/lead/:phone', jsonBody, (req, res) => {
+  const norm = _crmPhone(req); if (!norm) return res.status(400).json({ ok: false, error: 'invalid_phone' });
+  const r = crm.updateLead(norm, req.body ?? {}, { by: _crmBy(req) });
+  res.status(r.ok ? 200 : 404).json(r);
+});
+
+app.post('/api/crm/lead/:phone/stage', jsonBody, (req, res) => {
+  const norm = _crmPhone(req); if (!norm) return res.status(400).json({ ok: false, error: 'invalid_phone' });
+  const r = crm.setStage(norm, req.body?.stage, { by: _crmBy(req) });
+  res.status(r.ok ? 200 : (r.error === 'invalid_stage' ? 400 : 404)).json(r);
+});
+
+app.post('/api/crm/lead/:phone/note', jsonBody, (req, res) => {
+  const norm = _crmPhone(req); if (!norm) return res.status(400).json({ ok: false, error: 'invalid_phone' });
+  const r = crm.addNote(norm, req.body?.text, { by: _crmBy(req) });
+  res.status(r.ok ? 200 : 400).json(r);
+});
+
+app.post('/api/crm/lead/:phone/task', jsonBody, (req, res) => {
+  const norm = _crmPhone(req); if (!norm) return res.status(400).json({ ok: false, error: 'invalid_phone' });
+  const b = req.body ?? {};
+  const r = crm.createLeadTask(norm, { summary: b.summary, dueAt: b.dueAt ?? null, assignedTo: b.assignedTo ?? null, priority: b.priority ?? 'normal', by: _crmBy(req) });
+  res.status(r.ok ? 201 : 400).json(r);
+});
+
+app.get('/api/crm/lead/:phone/impact', (req, res) => {
+  const norm = _crmPhone(req); if (!norm) return res.status(400).json({ ok: false, error: 'invalid_phone' });
+  const r = crm.impact(norm); res.status(r.ok ? 200 : 404).json(r);
+});
+
+app.post('/api/crm/lead/:phone/archive', jsonBody, (req, res) => {
+  const norm = _crmPhone(req); if (!norm) return res.status(400).json({ ok: false, error: 'invalid_phone' });
+  const r = crm.archive(norm, { by: _crmBy(req) }); res.status(r.ok ? 200 : 404).json(r);
+});
+
+app.post('/api/crm/lead/:phone/restore', jsonBody, (req, res) => {
+  const norm = _crmPhone(req); if (!norm) return res.status(400).json({ ok: false, error: 'invalid_phone' });
+  const r = crm.restore(norm, { by: _crmBy(req) }); res.status(r.ok ? 200 : 404).json(r);
+});
+
+// soft delete → recycle bin (reversible)
+app.delete('/api/crm/lead/:phone', jsonBody, (req, res) => {
+  const norm = _crmPhone(req); if (!norm) return res.status(400).json({ ok: false, error: 'invalid_phone' });
+  const r = crm.trash(norm, { by: _crmBy(req) }); res.status(r.ok ? 200 : 404).json(r);
+});
+
+// permanent delete — recycle bin only, admin + explicit confirmation
+app.delete('/api/crm/lead/:phone/permanent', jsonBody, (req, res) => {
+  const norm = _crmPhone(req); if (!norm) return res.status(400).json({ ok: false, error: 'invalid_phone' });
+  const r = crm.permanentDelete(norm, { by: _crmBy(req), adminConfirmed: req.body?.adminConfirmed === true });
+  const code = r.ok ? 200 : r.error === 'confirmation_required' ? 428 : r.error === 'refusal_protected' ? 409 : r.error === 'not_in_trash' ? 409 : 404;
+  res.status(code).json(r);
+});
+
+// update a CRM sales task (assign / due / outcome / resolve) — an explicit action, not "viewed"
+app.post('/api/crm/task/:id', jsonBody, (req, res) => {
+  const b = req.body ?? {};
+  const r = crm.updateLeadTask(String(req.params.id), { status: b.status ?? null, outcome: b.outcome ?? null, assignedTo: b.assignedTo ?? null, dueAt: b.dueAt ?? null, by: _crmBy(req) });
+  res.status(r.ok ? 200 : (r.error === 'not_a_sales_task' ? 403 : 404)).json(r);
+});
+
+// bulk soft actions on selected records (never a send)
+app.post('/api/crm/bulk', jsonBody, (req, res) => {
+  const b = req.body ?? {}, action = b.action, phones = Array.isArray(b.phones) ? b.phones : [];
+  const fn = { trash: crm.trash, archive: crm.archive, restore: crm.restore }[action];
+  if (!fn) return res.status(400).json({ ok: false, error: 'invalid_action' });
+  const by = _crmBy(req), results = [];
+  for (const p of phones.slice(0, 500)) { const norm = normalizeToE164(p); if (!norm) { results.push({ phone: p, ok: false, error: 'invalid_phone' }); continue; } results.push({ phone: norm, ...fn(norm, { by }) }); }
+  res.json({ ok: true, action, count: results.filter(r => r.ok).length, results });
+});
+
 // GET /api/version — running code identity, for deployment verification
 // Returns the git commit SHA baked in at build time via RAILWAY_GIT_COMMIT_SHA,
 // plus the active webhook URL so callers can confirm which provider is configured.
@@ -3135,6 +3263,18 @@ const callbackSvc = createCallbackService({
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
+// CRM — the operational sales view over the stores that already exist (no parallel DB)
+// ══════════════════════════════════════════════════════════════════════════════
+const crm = require('./services/crm').createCrm({
+  store, aptStore, tomerStore, inbox, persist, logger,
+  normalizePhone: normalizeToE164,
+  isMember: p => phoneRegistry.isMember(p),
+  getThread: p => inbox.getThread(p),
+  kindOf: lead => { try { return require('./utils/contact_kind').kindOf(lead, { id: identity.peek(lead.phone), thread: inbox.getThread(lead.phone), hasAppointment: !!aptStore.getActiveCallback(lead.phone) }); } catch { return null; } },
+  broadcast: (ev, data) => broadcastSse(ev, data),
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
 // TOMER — EXISTING-MEMBER SERVICE
 // ══════════════════════════════════════════════════════════════════════════════
 // services/tomer_service.js owns every member message (text + media). Kill switch:
@@ -4178,6 +4318,20 @@ async function processInboundWAMessage(msg) {
   //     and reminders are neither read-modified nor consumed while the override is on.
   if (_tomerSwitch() && tomerTest.routeOverride(fromNorm)) {
     return _processTomerTestMessage(msg, fromNorm, fromIsraeli);
+  }
+
+  // A genuine new inbound from a lead that was moved to the CRM recycle bin brings it back into
+  // the working pipeline, with its history intact (owner rule 2026-11-19). It only flips the CRM
+  // flag and logs — routing, ownership and opt-out rules below still decide what happens next, and
+  // nothing is sent here. (An archived lead stays parked; the staff un-archive it deliberately.)
+  {
+    const _tr = store.getLead(fromNorm);
+    if (_tr && _tr.meta?.crmState === 'trashed') {
+      store.upsertLead(fromNorm, { meta: { ...(_tr.meta ?? {}), crmState: 'active', outreachHold: false, trashedAt: null, crmReactivatedAt: new Date().toISOString(), crmReactivatedBy: 'inbound' } });
+      store.logEvent('crm_reactivated_by_inbound', fromNorm, {});
+      persist.saveLeads(store);
+      logger.info('[crm] a recycle-bin lead sent a new message — brought back to the pipeline', { });
+    }
   }
 
   // 1. Identity — ONE shared resolver (services/identity_resolver.js).
